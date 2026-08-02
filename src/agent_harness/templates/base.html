@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-harness</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fff; --fg: #16181d; --muted: #5c6370; --line: #e2e5ea;
+    --card: #f7f8fa; --rpm: #2f6feb; --window: #b8860b; --terminal: #c0392b;
+    --unclassified: #6b7280; --ok: #1f8b4c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1116; --fg:#e6e8ec; --muted:#9aa2ae; --line:#262a33; --card:#161922; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+  header { border-bottom:1px solid var(--line); padding:14px 20px; display:flex; gap:20px; align-items:baseline; flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0; letter-spacing:.02em; }
+  nav a, .windows a { color:var(--muted); text-decoration:none; margin-right:14px; font-size:13px; }
+  nav a:hover, .windows a:hover { color:var(--fg); }
+  nav a.on, .windows a.on { color:var(--fg); font-weight:600; }
+  main { padding:20px; max-width:1100px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:18px; }
+  h2 { font-size:14px; margin:0 0 12px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); }
+  table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }
+  th, td { text-align:left; padding:6px 10px 6px 0; border-bottom:1px solid var(--line); font-size:14px; }
+  th { color:var(--muted); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
+  td.n, th.n { text-align:right; }
+  .scroll { overflow-x:auto; }
+  .swatch { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:7px; vertical-align:baseline; }
+  .rpm { background:var(--rpm); } .window_cap { background:var(--window); }
+  .terminal_cap { background:var(--terminal); } .unclassified { background:var(--unclassified); }
+  .note { color:var(--muted); font-size:13px; margin:10px 0 0; }
+  .warn { border-left:3px solid var(--window); padding-left:12px; }
+  .big { font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .bar { display:flex; height:8px; border-radius:4px; overflow:hidden; margin:10px 0 14px; background:var(--line); }
+  .bar span { display:block; height:100%; }
+  code { font:13px ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .empty { color:var(--muted); font-style:italic; }
+  #live { font-size:12px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>agent-harness</h1>
+  <nav>
+    <a href="/panel/errors?window={{ window }}">errors</a>
+    <a href="/panel/fleet?window={{ window }}">fleet</a>
+    <a href="/panel/pipeline?window={{ window }}">pipeline</a>
+    <a href="/panel/quota?window={{ window }}">quota</a>
+    <a href="/panel/verdicts?window={{ window }}">verdicts</a>
+  </nav>
+  <span class="windows">
+    {% for w in windows|default(['1h','24h','72h','7d','all']) %}
+      <a href="?window={{ w }}" class="{{ 'on' if w == window else '' }}">{{ w }}</a>
+    {% endfor %}
+  </span>
+  <span id="live">connecting…</span>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+<script>
+// SSE (T28). The panel re-fetches on an event rather than the stream
+// carrying rendered HTML, so a burst of events costs one render, not N.
+(function () {
+  var live = document.getElementById('live');
+  var pending = null;
+  var es = new EventSource('/events/stream' + window.location.search);
+  es.onopen = function () { live.textContent = 'live'; };
+  es.onerror = function () { live.textContent = 'reconnecting…'; };
+  es.addEventListener('harness', function () {
+    live.textContent = 'live';
+    if (pending) return;
+    pending = setTimeout(function () { pending = null; location.reload(); }, 1500);
+  });
+})();
+</script>
+</body>
+</html>

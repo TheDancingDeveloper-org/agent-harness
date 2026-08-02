@@ -147,7 +147,13 @@ def _run(args: argparse.Namespace) -> int:
     from .model_client import ModelClient, Route
     from .work import WorkQueue, WorkRecord
 
+    # With a session host the CLI agent does the implementing, so only the
+    # reviewer needs a model. Demanding three would be asking for two that are
+    # never called.
+    session_mode = bool(args.session_host)
     roles = {"planner": args.planner, "implementer": args.implementer, "reviewer": args.reviewer}
+    if session_mode:
+        roles = {"reviewer": args.reviewer}
     missing = [name for name, model in roles.items() if not model]
     if missing:
         print(f"no model configured for: {', '.join(missing)}", file=sys.stderr)
@@ -185,7 +191,14 @@ def _run(args: argparse.Namespace) -> int:
     counts = queue.counts()
     print(f"queue: {counts or 'empty'}")
     print(f"repo: {args.work}   base: {args.base}   push: {not args.no_push}")
-    print(f"roles: planner={args.planner} implementer={args.implementer} reviewer={args.reviewer}")
+    if session_mode:
+        print(f"agents: `{args.agent}` as sessions on {args.session_host}")
+        print(f"reviewer: {args.reviewer}")
+    else:
+        print(
+            f"roles: planner={args.planner} implementer={args.implementer} "
+            f"reviewer={args.reviewer}   (no --session-host: nothing to attach to)"
+        )
     print(f"checks before review: {args.check or '(none — nothing verifies the diff)'}")
     if args.dry_run:
         print("\ndry run: no model calls, no commits, no pull requests.")
@@ -206,16 +219,37 @@ def _run(args: argparse.Namespace) -> int:
         transport=_http_transport(api_key),
         on_event=emit,
     )
-    executor = Executor(
-        queue,
-        client,
-        args.work,
-        checks=checks,
-        github=GitHub(args.repo),
-        base_branch=args.base,
-        on_event=emit,
-        push=not args.no_push,
-    )
+
+    executor: Any
+    if session_mode:
+        from .session_executor import AgentSpec, SessionExecutor
+        from .session_host import HttpSessionHost
+
+        host_token = os.environ.get("AIDEVENV_TOKEN", "") or api_key
+        executor = SessionExecutor(
+            queue,
+            HttpSessionHost(args.session_host, token=host_token),
+            args.work,
+            agent=AgentSpec(command=tuple(shlex.split(args.agent))),
+            checks=checks,
+            reviewer=client,
+            github=GitHub(args.repo),
+            base_branch=args.base,
+            ui_base_url=args.session_host,
+            on_event=emit,
+            push=not args.no_push,
+        )
+    else:
+        executor = Executor(
+            queue,
+            client,
+            args.work,
+            checks=checks,
+            github=GitHub(args.repo),
+            base_branch=args.base,
+            on_event=emit,
+            push=not args.no_push,
+        )
     outcomes = executor.run(limit=args.limit)
     if not outcomes:
         print("nothing to do")
@@ -296,6 +330,20 @@ def main(argv: list[str] | None = None) -> int:
         metavar="CMD",
         help="shell-free check command, repeatable, e.g. "
         "--check 'pytest -q'. Run BEFORE the reviewer.",
+    )
+    p_run.add_argument(
+        "--session-host",
+        default=os.environ.get("AIDEVENV_URL", ""),
+        metavar="URL",
+        help="base URL of a session host (AIDevEnv). With this, each agent runs as a "
+        "TERMINAL SESSION you can attach to, which is the point. Without it, the "
+        "harness calls the model API directly and there is nothing to watch.",
+    )
+    p_run.add_argument(
+        "--agent",
+        default="claude -p {prompt_file}",
+        metavar="CMD",
+        help="CLI agent to run per item. `{prompt_file}` is substituted.",
     )
     p_run.add_argument("--limit", type=int, help="stop after N items")
     p_run.add_argument("--base", default="main", help="branch to base work on")

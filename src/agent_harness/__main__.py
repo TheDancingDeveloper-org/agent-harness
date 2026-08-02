@@ -319,21 +319,9 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run", action="store_true", help="show what would run, call nothing, change nothing"
     )
 
-    p_serve = sub.add_parser("serve", help="run the dashboard")
+    p_serve = sub.add_parser("serve", help="serve the JSON API (no GUI — see MyDevEnv2)")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8099)
-    p_serve.add_argument(
-        "--baseline",
-        metavar="TOTAL:DAYS:LABEL",
-        help="a prior measurement to compare against, e.g. 27662:8:'pre-classification'. "
-        "Treated as an unclassified TOTAL unless --baseline-classified is passed, "
-        "so the panel will not imply a per-class delta that does not exist.",
-    )
-    p_serve.add_argument(
-        "--baseline-classified",
-        action="store_true",
-        help="the baseline has a per-class breakdown of its own",
-    )
 
     args = parser.parse_args(argv)
 
@@ -368,22 +356,11 @@ def main(argv: list[str] | None = None) -> int:
 
     import uvicorn
 
-    from .app import Baseline, create_app
-
-    baseline = None
-    if args.baseline:
-        parts = args.baseline.split(":")
-        if len(parts) < 2:
-            raise SystemExit("--baseline must be TOTAL:DAYS[:LABEL]")
-        baseline = Baseline(
-            total=int(parts[0]),
-            days=float(parts[1]),
-            window=parts[2] if len(parts) > 2 else "prior measurement",
-            classified=args.baseline_classified,
-        )
+    from .api import create_api
+    from .work import WorkQueue
 
     uvicorn.run(
-        create_app(store, token=token, baseline=baseline),
+        create_api(store, queue=WorkQueue(args.db), token=token),
         host=args.host,
         port=args.port,
         log_level="info",

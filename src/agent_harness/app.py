@@ -11,6 +11,7 @@ writes to `events`; the only writer is the ingester.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime
 import json
 import os
@@ -32,11 +33,32 @@ from .events import (
 )
 from .store import EventStore
 
-# docs/HARNESS-PLAN.md §2.1, measured 2026-07-22 -> 2026-07-30. A TOTAL,
-# with no per-class breakdown available and none recoverable.
-BASELINE_429_TOTAL = 27_662
-BASELINE_DAYS = 8
-BASELINE_WINDOW = "2026-07-22 → 2026-07-30"
+
+@dataclasses.dataclass(frozen=True)
+class Baseline:
+    """A prior measurement to compare the current window against.
+
+    Optional, and supplied by whoever is running the harness — there is no
+    built-in number, because a baseline belongs to a workload and this
+    service is not tied to one.
+
+    `classified` is the field that matters. A baseline taken before error
+    classification existed is a **total** with no per-class breakdown, and
+    none can be recovered by re-parsing. Comparing it class-by-class against
+    a classified window would fabricate a delta. When this is False, every
+    view says so instead of quietly implying like-for-like.
+    """
+
+    total: int
+    days: float
+    window: str
+    classified: bool = False
+    label: str = "baseline"
+
+    @property
+    def per_day(self) -> float:
+        return self.total / self.days if self.days else 0.0
+
 
 TEMPLATES = Path(__file__).parent / "templates"
 
@@ -67,6 +89,7 @@ def _ago(ts: float | None, now: float | None = None) -> str:
 def create_app(
     store: EventStore,
     token: str | None = None,
+    baseline: Baseline | None = None,
     stream_max_seconds: float = 300.0,
     stream_poll_seconds: float = 1.0,
 ) -> FastAPI:
@@ -85,6 +108,7 @@ def create_app(
     templates.env.filters["ago"] = _ago
     app.state.store = store
     app.state.token = token
+    app.state.baseline = baseline
     app.state.stream_max_seconds = stream_max_seconds
     app.state.stream_poll_seconds = stream_poll_seconds
 
@@ -140,9 +164,11 @@ def create_app(
     def index(
         request: Request, window: str = Query("24h"), _: None = Depends(require_token)
     ) -> HTMLResponse:
-        """The landing page IS the errors panel. It is the one that would
-        have surfaced the 27,662-error problem in a day rather than eight,
-        so it is what you see without asking."""
+        """The landing page IS the errors panel.
+
+        Rate-limit classification is the thing a fleet operator most often
+        cannot see and most needs to, so it is what you get without asking
+        for it."""
         return templates.TemplateResponse(
             request,
             "panels/errors.html",
@@ -181,10 +207,7 @@ def create_app(
             "unknown_classes": unknown,
             "total_classified": total_classified,
             "per_day": (total_classified / days) if days >= 1 else None,
-            "baseline_total": BASELINE_429_TOTAL,
-            "baseline_days": BASELINE_DAYS,
-            "baseline_window": BASELINE_WINDOW,
-            "baseline_per_day": BASELINE_429_TOTAL / BASELINE_DAYS,
+            "baseline": app.state.baseline,
             "by_worker": store.group_counts("worker", since),
             "by_endpoint": store.group_counts("endpoint", since),
             "by_role": store.group_counts("role", since),
@@ -289,14 +312,12 @@ def create_app(
                 "classified": context["classified"],
                 "unclassified": context["unclassified"],
                 "total_classified": context["total_classified"],
-                "baseline": {
-                    "total": BASELINE_429_TOTAL,
-                    "days": BASELINE_DAYS,
-                    "window": BASELINE_WINDOW,
-                    # The flag that stops a consumer treating the baseline as a
-                    # breakdown. It never had one.
-                    "classified": False,
-                },
+                # None when no baseline is configured. When present,
+                # `classified` is the flag that stops a consumer treating a
+                # pre-classification total as though it were a breakdown.
+                "baseline": (
+                    dataclasses.asdict(app.state.baseline) if app.state.baseline else None
+                ),
             }
         )
 

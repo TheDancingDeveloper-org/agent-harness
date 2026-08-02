@@ -13,9 +13,11 @@
   {% set rejected = outcomes.get('review_rejected', 0) %}
   {% if total %}
   <p class="note">Review rejection rate <strong>{{ (100 * rejected / total)|round(2) }}%</strong>
-  of {{ total }} outcomes. The 8-day baseline was 360/14,546 = 2.5%. Plan §2.4 flags
-  self-review as a live hypothesis for why it is that low; D9's A/B is what settles it,
-  and it needs this number split by reviewer configuration.</p>
+  of {{ total }} outcomes. A rejection rate near zero is worth suspicion, not celebration:
+  the usual cause is a reviewer drawn from the same pool as the author, which makes some
+  share of reviews a model grading its own work. Splitting this number by reviewer
+  configuration is what distinguishes "the work is good" from "the review is not
+  independent".</p>
   {% endif %}
   {% else %}<p class="empty">No lessons in this window.</p>{% endif %}
 </div>

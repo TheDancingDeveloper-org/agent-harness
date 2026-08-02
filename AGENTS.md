@@ -1,8 +1,26 @@
 # AGENTS.md — agent-harness
 
-Binding guidance for anyone, human or agent, working in this repository. The canonical
-design document is [`docs/HARNESS-PLAN.md`](docs/HARNESS-PLAN.md); read §0, §3 and §5 before
-writing code.
+Binding guidance for anyone, human or agent, working in this repository.
+
+## The first rule: this framework is generic
+
+It is **not tied to any project, language or workload**, and must not become so. That is an
+owner ruling, not a preference.
+
+Concretely, in the core (`providers`, `model_client`, `store`, `ingest`, `sources`, `app`):
+
+- no hardcoded log paths, file layouts or directory conventions;
+- no numbers belonging to one workload — a baseline is *supplied*, never built in;
+- no prose asserting one project's measurements as universal fact;
+- no import of anything in `adapters/`.
+
+Anything that must know a specific tool's format is an **adapter** (`adapters/`), opt-in and
+imported lazily. If you find yourself wanting the core to know about a particular repo, the
+answer is an adapter or a config value.
+
+The original design document [`docs/HARNESS-PLAN.md`](docs/HARNESS-PLAN.md) predates this
+ruling and assumes a single named consumer throughout. Read it for evidence and reasoning;
+do not follow its phase order or its coupling.
 
 ## Rules of engagement (binding)
 

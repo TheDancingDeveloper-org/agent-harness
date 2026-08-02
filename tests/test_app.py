@@ -9,12 +9,23 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_harness.app import BASELINE_429_TOTAL, create_app
-from agent_harness.events import MODEL_CALL, Event
-from agent_harness.ingest import UNCLASSIFIED
+from agent_harness.app import Baseline, create_app
+from agent_harness.events import MODEL_CALL, UNCLASSIFIED, Event
 from agent_harness.store import EventStore
 
 TOKEN = "test-token"  # noqa: S105 - a fixture, not a credential
+
+# A baseline is supplied by the operator, never built in -- the service is
+# not tied to any workload. This one stands in for "a total measured before
+# anything classified errors", which is the case the panel must not turn
+# into a per-class delta.
+BASELINE = Baseline(
+    total=27662,
+    days=8,
+    window="2026-07-22 - 2026-07-30",
+    classified=False,
+    label="pre-classification",
+)
 
 
 def call(ts: float, **kw: object) -> Event:
@@ -62,7 +73,13 @@ def store(tmp_path: Path) -> EventStore:
 def client(store: EventStore) -> Iterator[TestClient]:
     # A short stream lifetime so the SSE tests terminate. Reconnect is
     # gapless via Last-Event-ID, which is exactly what production relies on.
-    app = create_app(store, token=TOKEN, stream_max_seconds=2.0, stream_poll_seconds=0.05)
+    app = create_app(
+        store,
+        token=TOKEN,
+        baseline=BASELINE,
+        stream_max_seconds=2.0,
+        stream_poll_seconds=0.05,
+    )
     with TestClient(app) as c:
         yield c
 
@@ -139,9 +156,18 @@ def test_the_errors_panel_breaks_429s_out_by_class(client: httpx.Client) -> None
     assert "window_cap" in body
 
 
-def test_the_errors_panel_reports_the_baseline(client: httpx.Client) -> None:
+def test_the_errors_panel_reports_a_configured_baseline(client: httpx.Client) -> None:
     body = client.get("/panel/errors", headers=auth()).text
-    assert str(BASELINE_429_TOTAL) in body
+    assert str(BASELINE.total) in body
+
+
+def test_no_baseline_card_when_none_is_configured(store: EventStore) -> None:
+    """There is no built-in number to fall back on. A workload that has not
+    measured one yet gets no comparison rather than someone else's."""
+    with TestClient(create_app(store, token=TOKEN, stream_max_seconds=1.0)) as c:
+        body = flat(c.get("/panel/errors", headers=auth()).text)
+    assert "Against the" not in body
+    assert "27662" not in body
 
 
 def test_the_errors_panel_refuses_to_imply_a_per_class_delta(
@@ -167,6 +193,7 @@ def test_api_errors_flags_the_baseline_as_unclassified(client: httpx.Client) -> 
     assert payload["unclassified"] == 1
     # A consumer must not be able to mistake the baseline for a breakdown.
     assert payload["baseline"]["classified"] is False
+    assert payload["baseline"]["total"] == BASELINE.total
 
 
 def test_an_unknown_window_is_refused(client: httpx.Client) -> None:
@@ -255,6 +282,6 @@ def test_the_quota_panel_says_why_spend_is_absent_not_just_that_it_is(
     """An empty box reads as zero spend. The panel has to distinguish
     'not built yet' from 'the endpoint the plan assumed does not exist'."""
     body = flat(client.get("/panel/quota", headers=auth()).text)
-    assert "not merely unimplemented" in body
-    assert "404" in body
+    assert "Not available" in body
+    assert "404" in body  # a concrete, checked example, not a shrug
     assert "after the fact" in body

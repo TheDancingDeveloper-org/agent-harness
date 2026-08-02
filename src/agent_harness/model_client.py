@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import providers as P
+from .pricing import PriceTable, load_price_table, usage_fields
 from .providers import Classification, Provider
 
 
@@ -158,6 +159,7 @@ class ModelClient:
         transport: Transport,
         policy: RetryPolicy | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
+        prices: PriceTable | None = None,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], float] = time.time,
         jitter: Callable[[], float] = random.random,
@@ -174,6 +176,10 @@ class ModelClient:
         self.transport = transport
         self.policy = policy or RetryPolicy()
         self.on_event = on_event
+        # Loaded once. Unknown models stay unpriced rather than free -- the
+        # cost lands as null and the API counts it separately, which is the
+        # only way an incomplete total can announce itself.
+        self.prices = prices if prices is not None else load_price_table()
         self.sleep = sleep
         self.now = now
         self.jitter = jitter
@@ -233,7 +239,15 @@ class ModelClient:
             latency = self.now() - started
 
             if 200 <= response.status < 300:
-                self._emit(role, route, "ok", None, attempt=attempt, latency=latency)
+                self._emit(
+                    role,
+                    route,
+                    "ok",
+                    None,
+                    attempt=attempt,
+                    latency=latency,
+                    usage=usage_fields(response.body, route.model, self.prices),
+                )
                 return response
 
             verdict = route.provider.classify(response.status, response.headers, response.body)
@@ -278,6 +292,7 @@ class ModelClient:
         attempt: int,
         latency: float | None = None,
         detail: str | None = None,
+        usage: Mapping[str, Any] | None = None,
     ) -> None:
         """Append one structured outcome.
 
@@ -303,5 +318,9 @@ class ModelClient:
                     "attempt": attempt,
                     "latency_s": None if latency is None else round(latency, 3),
                     "detail": detail or (verdict.message if verdict else None),
+                    # Absent, not zeroed, when the provider reported no usage.
+                    # An event carrying zeros is a claim that the call was
+                    # free; an event with no usage keys is honestly silent.
+                    **(dict(usage) if usage else {}),
                 }
             )

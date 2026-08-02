@@ -1,4 +1,4 @@
-"""MyDevEnv2 client tests. HTTP is faked at the opener; no server, no network."""
+"""Session-host client tests. HTTP is faked at the opener; no server, no network."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ from typing import Any
 
 import pytest
 
-from agent_harness.mydevenv2 import (
+from agent_harness.session_host import (
     IDLE,
     RUNNING,
     WAITING,
-    MyDevEnv2,
-    MyDevEnv2Error,
+    HttpSessionHost,
     Session,
+    SessionHostError,
 )
 
 
@@ -52,8 +52,8 @@ class FakeHTTP:
         return Ctx()
 
 
-def client(http: FakeHTTP) -> MyDevEnv2:
-    return MyDevEnv2("https://dev.example/", token="tok", opener=http)
+def client(http: FakeHTTP) -> HttpSessionHost:
+    return HttpSessionHost("https://dev.example/", token="tok", opener=http)
 
 
 SUMMARY = {"id": "abc", "name": "W1", "activity": RUNNING, "cwd": "/w"}
@@ -164,12 +164,12 @@ def test_an_http_error_carries_the_server_message() -> None:
         None,  # type: ignore[arg-type]
         io.BytesIO(b'{"error":"bad token"}'),
     )
-    with pytest.raises(MyDevEnv2Error, match="bad token"):
+    with pytest.raises(SessionHostError, match="bad token"):
         client(FakeHTTP(error)).create_session("W1", ["true"], "/w")
 
 
 def test_a_connection_failure_is_wrapped_not_leaked() -> None:
-    with pytest.raises(MyDevEnv2Error):
+    with pytest.raises(SessionHostError):
         client(FakeHTTP(OSError("connection refused"))).list_sessions()
 
 

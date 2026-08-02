@@ -319,7 +319,9 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run", action="store_true", help="show what would run, call nothing, change nothing"
     )
 
-    p_serve = sub.add_parser("serve", help="serve the JSON API (no GUI — see MyDevEnv2)")
+    p_serve = sub.add_parser(
+        "serve", help="serve the JSON API (headless — the GUI is the session host's)"
+    )
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8099)
 

@@ -1,4 +1,4 @@
-"""Run a work item as a CLI agent in a MyDevEnv2 terminal session.
+"""Run a work item as a CLI agent in a hosted terminal session.
 
 The difference from calling a model API directly is not implementation
 detail — it is the product. An agent running in a PTY session is one you can
@@ -36,7 +36,7 @@ from typing import Any
 
 from .executor import APPROVED, REJECTED, Checks, Outcome, run_git
 from .model_client import CapExhausted, ModelClient, RequestRefused
-from .mydevenv2 import Session, SessionHost
+from .session_host import Session, SessionHost
 from .work import DONE, FAILED, PENDING, WorkQueue, WorkRecord, worker_identity
 
 #: The default agent. `-p` takes the prompt; the harness supplies it as a
@@ -109,7 +109,7 @@ class AgentSpec:
 
 
 class SessionExecutor:
-    """Executes work items as attachable MyDevEnv2 sessions."""
+    """Executes work items as attachable hosted terminal sessions."""
 
     def __init__(
         self,

@@ -181,7 +181,12 @@ def create_api(
     # ---------------------------------------------------------------- work
 
     @app.get("/api/work", tags=["work"], summary="The whole backlog", response_model=WorkList)
-    def work(_: None = Depends(require_token)) -> WorkList:
+    def work(
+        project_id: str | None = Query(
+            None, description="Limit to one project. Omit for every project."
+        ),
+        _: None = Depends(require_token),
+    ) -> WorkList:
         """Items, counts and stale claims in ONE call.
 
         Deliberately not three endpoints: a client on a flaky connection
@@ -196,9 +201,11 @@ def create_api(
         latest = _latest_by_item(store)
         return WorkList(
             configured=True,
-            counts=queue.counts(),
-            stale=[r.item_id for r in queue.stale()],
-            items=[_item_model(r, latest.get(r.item_id)) for r in queue.all()],
+            counts=queue.counts(project_id=project_id),
+            stale=[r.item_id for r in queue.stale(project_id=project_id)],
+            items=[
+                _item_model(r, latest.get(r.item_id)) for r in queue.items(project_id=project_id)
+            ],
         )
 
     @app.get(
@@ -210,9 +217,10 @@ def create_api(
     )
     def work_item(
         item_id: str = PathParam(description="Plan id, e.g. `T4`."),
+        project_id: str = Query("default", description="Which project the item is in."),
         _: None = Depends(require_token),
     ) -> WorkItem:
-        record = need_queue().get(item_id)
+        record = need_queue().get(item_id, project_id=project_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
         return _item_model(record, _latest_by_item(store).get(item_id))
@@ -243,9 +251,10 @@ def create_api(
                     depends_on=list(item.depends_on),
                 )
                 for item in request.items
-            ]
+            ],
+            project_id=request.project_id,
         )
-        return AddItemsResult(added=added, total=len(queue.all()))
+        return AddItemsResult(added=added, total=len(queue.items(project_id=request.project_id)))
 
     @app.post(
         "/api/work/{item_id}/retry",
@@ -259,6 +268,7 @@ def create_api(
     )
     def retry(
         item_id: str = PathParam(description="Plan id, e.g. `T4`."),
+        project_id: str = Query("default", description="Which project the item is in."),
         _: None = Depends(require_token),
     ) -> RetryResult:
         """Put a finished or failed item back to `pending`.
@@ -269,7 +279,7 @@ def create_api(
         without anyone intervening.
         """
         queue = need_queue()
-        record = queue.get(item_id)
+        record = queue.get(item_id, project_id=project_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
         if record.state == CLAIMED and record.lease_until > time.time():
@@ -278,7 +288,7 @@ def create_api(
                 detail=f"{item_id} is claimed by {record.owner} and its lease is live; "
                 "wait for the lease to expire rather than racing it",
             )
-        queue.release(item_id, PENDING, error=None)
+        queue.release(item_id, PENDING, error=None, project_id=project_id)
         return RetryResult(ok=True, item_id=item_id, state="pending")
 
     # ------------------------------------------------------------- control

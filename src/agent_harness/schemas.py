@@ -86,6 +86,12 @@ class NewWorkItem(BaseModel):
 
 
 class AddItemsRequest(BaseModel):
+    project_id: str = Field(
+        "default",
+        description="Which project these items belong to. Items are keyed by "
+        "(project_id, item_id), so two projects may each have a `T1` -- and without "
+        "this they would be the same row.",
+    )
     items: list[NewWorkItem] = Field(
         description="Items to add. Existing ids are refreshed, "
         "never reset — re-adding cannot un-finish work."

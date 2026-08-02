@@ -360,3 +360,68 @@ def test_the_overview_says_what_a_project_was_doing_before_it_stopped(client) ->
     assert payload["control"]["state"] == STOPPED
     assert payload["previous_state"] == RUNNING
     assert "process started" in payload["control"]["reason"]
+
+
+def test_adding_work_through_the_api_respects_the_project(client) -> None:  # type: ignore[no-untyped-def]
+    """Phase 1's definition of done, and the gap it caught.
+
+    The queue was project-scoped while POST /api/work was not, so both
+    projects' items landed in `default` and the second overwrote the first --
+    the original defect, intact, one layer up. Scoping the storage is not the
+    same as scoping the door into it.
+    """
+    for pid in ("ngms", "harness"):
+        client.post("/api/projects", headers=hdr(), json={"project_id": pid, "name": pid})
+        client.post(
+            "/api/work",
+            headers=hdr(),
+            json={
+                "project_id": pid,
+                "items": [
+                    {"item_id": "T1", "title": f"{pid} first"},
+                    {"item_id": "T2", "title": f"{pid} second"},
+                ],
+            },
+        )
+
+    rows = client.queue.items()
+    assert len(rows) == 4, "items from two projects collapsed onto each other"
+    assert {(r.project_id, r.item_id) for r in rows} == {
+        ("ngms", "T1"),
+        ("ngms", "T2"),
+        ("harness", "T1"),
+        ("harness", "T2"),
+    }
+    assert client.queue.get("T1", project_id="ngms").title == "ngms first"  # type: ignore[union-attr]
+
+
+def test_the_backlog_can_be_filtered_to_one_project(client) -> None:  # type: ignore[no-untyped-def]
+    for pid in ("a", "b"):
+        client.post("/api/projects", headers=hdr(), json={"project_id": pid, "name": pid})
+        client.post(
+            "/api/work",
+            headers=hdr(),
+            json={"project_id": pid, "items": [{"item_id": "T1", "title": pid}]},
+        )
+
+    scoped = client.get("/api/work?project_id=a", headers=hdr()).json()
+    assert [i["item_id"] for i in scoped["items"]] == ["T1"]
+    assert scoped["counts"] == {PENDING: 1}
+
+    everything = client.get("/api/work", headers=hdr()).json()
+    assert len(everything["items"]) == 2, "the cross-project view should still work"
+
+
+def test_retry_cannot_reach_into_another_project(client) -> None:  # type: ignore[no-untyped-def]
+    """Same id, two projects: retrying one must not touch the other."""
+    for pid in ("a", "b"):
+        client.post("/api/projects", headers=hdr(), json={"project_id": pid, "name": pid})
+        client.queue.add([rec("T1")], project_id=pid)
+        client.queue.set_control(RUNNING, project_id=pid)
+        client.queue.claim(f"w-{pid}", project_id=pid)
+        client.queue.release("T1", DONE, owner=f"w-{pid}", project_id=pid)
+
+    client.post("/api/work/T1/retry?project_id=a", headers=hdr())
+
+    assert client.queue.get("T1", project_id="a").state == PENDING  # type: ignore[union-attr]
+    assert client.queue.get("T1", project_id="b").state == DONE  # type: ignore[union-attr]

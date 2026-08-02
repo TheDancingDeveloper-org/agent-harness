@@ -247,3 +247,14 @@ def test_times_are_rendered_for_humans_not_as_epochs(client: httpx.Client) -> No
     assert _ago(1000.0, now=1000.0 + 600) == "10m ago"
     assert _ago(1000.0, now=1000.0 + 7200) == "2h ago"
     assert _ago(1000.0, now=1000.0 + 3 * 86400) == "3d ago"
+
+
+def test_the_quota_panel_says_why_spend_is_absent_not_just_that_it_is(
+    client: httpx.Client,
+) -> None:
+    """An empty box reads as zero spend. The panel has to distinguish
+    'not built yet' from 'the endpoint the plan assumed does not exist'."""
+    body = flat(client.get("/panel/quota", headers=auth()).text)
+    assert "not merely unimplemented" in body
+    assert "404" in body
+    assert "after the fact" in body

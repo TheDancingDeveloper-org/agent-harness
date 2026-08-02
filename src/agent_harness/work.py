@@ -89,6 +89,19 @@ INSERT OR IGNORE INTO control (id, state) VALUES (1, 'running');
 """
 
 
+class ClaimLost(Exception):
+    """This worker no longer owns the item it is working on.
+
+    Raised when a heartbeat is refused: the lease expired while the work was
+    still running and someone else re-claimed the row. Continuing past this
+    point spends tokens on work that will be thrown away, and finishing would
+    overwrite the new owner's claim.
+
+    The correct response is to stop and release NOTHING -- the item is not
+    ours to release.
+    """
+
+
 def worker_identity() -> str:
     """Who holds a claim. Host and pid, so a stale claim can be traced to a
     specific process rather than to an anonymous 'someone'."""
@@ -312,17 +325,41 @@ class WorkQueue:
         error: str | None = None,
         branch: str | None = None,
         pr_url: str | None = None,
-    ) -> None:
+        owner: str | None = None,
+    ) -> bool:
         """Finish with an item. `state` is done, failed, blocked or pending
-        (pending puts it back for another attempt)."""
+        (pending puts it back for another attempt).
+
+        Returns True if the item was actually updated.
+
+        **A worker must pass its `owner`.** A worker that stalled past its
+        lease is not dead, only slow: it will surface eventually and report a
+        result for an item that now belongs to someone else. Accepting that
+        late report marks the item finished from work the new owner never did,
+        and leaves the new owner running with nothing left to release. The
+        guard makes the late report a no-op, which is what it is.
+
+        `heartbeat` has always guarded on owner. Without the same guard here,
+        the lease only held against the half of the race that asked politely.
+
+        Omitting `owner` is an **administrative override** — the operator
+        retrying a stuck item through the API has no worker identity, and
+        guarding that would remove the one lever a human has over a wedged
+        row.
+        """
         conn = self._connect()
         try:
-            conn.execute(
+            sql = (
                 "UPDATE work SET state = ?, owner = NULL, lease_until = 0, "
                 "last_error = ?, branch = COALESCE(?, branch), "
-                "pr_url = COALESCE(?, pr_url), updated_at = ? WHERE item_id = ?",
-                (state, error, branch, pr_url, self.now(), item_id),
+                "pr_url = COALESCE(?, pr_url), updated_at = ? WHERE item_id = ?"
             )
+            params: list[Any] = [state, error, branch, pr_url, self.now(), item_id]
+            if owner is not None:
+                sql += " AND owner = ?"
+                params.append(owner)
+            cursor = conn.execute(sql, params)
+            return cursor.rowcount > 0
         finally:
             conn.close()
 

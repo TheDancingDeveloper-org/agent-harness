@@ -41,7 +41,15 @@ from pathlib import Path
 from typing import Any
 
 from .model_client import CapExhausted, ModelClient, RequestRefused
-from .work import DONE, FAILED, PENDING, WorkQueue, WorkRecord, worker_identity
+from .work import (
+    DONE,
+    FAILED,
+    PENDING,
+    ClaimLost,
+    WorkQueue,
+    WorkRecord,
+    worker_identity,
+)
 
 PLANNER = "planner"
 IMPLEMENTER = "implementer"
@@ -310,15 +318,21 @@ class Executor:
             return None
         try:
             outcome = self._execute(record)
+        except ClaimLost as exc:
+            # Deliberately no release: the item is not ours to finish. The
+            # new owner is working on it right now, and reporting anything
+            # here would overwrite a live claim.
+            self._emit(record, "claim_lost", detail=str(exc))
+            return None
         except CapExhausted as exc:
             # Out of budget. Hand the item back untouched rather than
             # burning an attempt on something that was never tried.
             self._emit(record, "budget_exhausted", detail=str(exc))
-            self.queue.release(record.item_id, PENDING, error=f"budget: {exc}")
+            self.queue.release(record.item_id, PENDING, error=f"budget: {exc}", owner=self.owner)
             raise
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
-            self.queue.release(record.item_id, FAILED, error=str(exc))
+            self.queue.release(record.item_id, FAILED, error=str(exc), owner=self.owner)
             return Outcome(record.item_id, FAILED, reason=str(exc))
         self.queue.release(
             record.item_id,
@@ -326,6 +340,7 @@ class Executor:
             error=outcome.reason or None,
             branch=outcome.branch,
             pr_url=outcome.pr_url,
+            owner=self.owner,
         )
         return outcome
 
@@ -345,6 +360,20 @@ class Executor:
 
     # ------------------------------------------------------------ the loop
 
+    def _keepalive(self, record: WorkRecord) -> None:
+        """Extend the lease, and stop if it is no longer ours.
+
+        The heartbeat has always returned whether the claim survived; nothing
+        read it, so a worker that lost its claim carried on regardless and
+        then reported a result for someone else's item. Reading the answer is
+        the whole point of asking.
+        """
+        if not self.queue.heartbeat(record.item_id, self.owner):
+            raise ClaimLost(
+                f"{record.item_id} is no longer owned by {self.owner}; "
+                "its lease expired and another worker re-claimed it"
+            )
+
     def _execute(self, record: WorkRecord) -> Outcome:
         outcome = Outcome(record.item_id, FAILED)
         self._emit(record, "started")
@@ -352,7 +381,7 @@ class Executor:
         # 1. Plan. Cheap, once per item, and the highest-leverage call.
         plan = self._call(record, PLANNER, PLAN_PROMPT.format(brief=record.brief))
         outcome.stages.append("plan")
-        self.queue.heartbeat(record.item_id, self.owner)
+        self._keepalive(record)
 
         # 2. Implement.
         reply = self._call(
@@ -388,7 +417,7 @@ class Executor:
             self._abandon_branch(branch)
             return outcome
         self._emit(record, "applied", detail=how)
-        self.queue.heartbeat(record.item_id, self.owner)
+        self._keepalive(record)
 
         # 4. Cheap checks BEFORE the expensive reviewer call. Paying a model
         #    to tell us the build is broken is paying the dearest gate to
@@ -401,7 +430,7 @@ class Executor:
             self._abandon_branch(branch)
             return outcome
         self._emit(record, "checks_passed")
-        self.queue.heartbeat(record.item_id, self.owner)
+        self._keepalive(record)
 
         # 5. Review, by a different role (and ideally a different vendor).
         verdict_text = self._call(

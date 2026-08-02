@@ -37,7 +37,15 @@ from typing import Any
 from .executor import APPROVED, REJECTED, Checks, Outcome, run_git
 from .model_client import CapExhausted, ModelClient, RequestRefused
 from .session_host import Session, SessionHost
-from .work import DONE, FAILED, PENDING, WorkQueue, WorkRecord, worker_identity
+from .work import (
+    DONE,
+    FAILED,
+    PENDING,
+    ClaimLost,
+    WorkQueue,
+    WorkRecord,
+    worker_identity,
+)
 
 #: The default agent. `-p` takes the prompt; the harness supplies it as a
 #: file so a long brief is not mangled by shell quoting, and so the exact
@@ -153,13 +161,19 @@ class SessionExecutor:
             return None
         try:
             outcome = self._execute(record)
+        except ClaimLost as exc:
+            # Deliberately no release: the item is not ours to finish. The
+            # new owner is working on it right now, and reporting anything
+            # here would overwrite a live claim.
+            self._emit(record, "claim_lost", detail=str(exc))
+            return None
         except CapExhausted as exc:
             self._emit(record, "budget_exhausted", detail=str(exc))
-            self.queue.release(record.item_id, PENDING, error=f"budget: {exc}")
+            self.queue.release(record.item_id, PENDING, error=f"budget: {exc}", owner=self.owner)
             raise
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
-            self.queue.release(record.item_id, FAILED, error=str(exc))
+            self.queue.release(record.item_id, FAILED, error=str(exc), owner=self.owner)
             return Outcome(record.item_id, FAILED, reason=str(exc))
         self.queue.release(
             record.item_id,
@@ -167,6 +181,7 @@ class SessionExecutor:
             error=outcome.reason or None,
             branch=outcome.branch,
             pr_url=outcome.pr_url,
+            owner=self.owner,
         )
         return outcome
 
@@ -183,6 +198,20 @@ class SessionExecutor:
         return outcomes
 
     # ------------------------------------------------------------ the loop
+
+    def _keepalive(self, record: WorkRecord) -> None:
+        """Extend the lease, and stop if it is no longer ours.
+
+        The heartbeat has always returned whether the claim survived; nothing
+        read it, so a worker that lost its claim carried on regardless and
+        then reported a result for someone else's item. Reading the answer is
+        the whole point of asking.
+        """
+        if not self.queue.heartbeat(record.item_id, self.owner):
+            raise ClaimLost(
+                f"{record.item_id} is no longer owned by {self.owner}; "
+                "its lease expired and another worker re-claimed it"
+            )
 
     def _execute(self, record: WorkRecord) -> Outcome:
         outcome = Outcome(record.item_id, FAILED)
@@ -262,7 +291,7 @@ class SessionExecutor:
                 self._emit(record, "checks_failed", detail=failure[:2000], session_id=session.id)
                 return outcome
             self._emit(record, "checks_passed", session_id=session.id)
-            self.queue.heartbeat(record.item_id, self.owner)
+            self._keepalive(record)
 
             verdict_text = self._review(record, tree, passed, failure)
             outcome.stages.append("review")
@@ -307,7 +336,7 @@ class SessionExecutor:
         work is genuinely alive, and the event carries the session id so the
         UI can put a human straight into the terminal that is asking.
         """
-        self.queue.heartbeat(record.item_id, self.owner)
+        self._keepalive(record)
         self._emit(
             record,
             "waiting_for_input",

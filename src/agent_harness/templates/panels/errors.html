@@ -61,30 +61,34 @@
   {% endif %}
 </div>
 
+{% if baseline %}
 <div class="card">
-  <h2>Against the baseline</h2>
+  <h2>Against the {{ baseline.label }}</h2>
   <table>
     <tr>
-      <td>Baseline</td>
-      <td class="n big">{{ baseline_total }}</td>
-      <td>429s over {{ baseline_days }} days ({{ baseline_window }})<br>
-        <span class="note">= {{ (baseline_total / baseline_days)|round|int }}/day,
-        <strong>unclassified</strong></span></td>
+      <td>{{ baseline.label|capitalize }}</td>
+      <td class="n big">{{ baseline.total }}</td>
+      <td>rate limits over {{ baseline.days }} days ({{ baseline.window }})<br>
+        <span class="note">= {{ baseline.per_day|round|int }}/day,
+        <strong>{{ "classified" if baseline.classified else "unclassified" }}</strong></span></td>
     </tr>
     <tr>
       <td>Observed</td>
       <td class="n big">{{ total_classified }}</td>
-      <td>classified 429s in this window
+      <td>classified rate limits in this window
         {% if per_day %}<br><span class="note">= {{ per_day|round|int }}/day</span>{% endif %}</td>
     </tr>
   </table>
+  {% if not baseline.classified %}
   <p class="note warn">
-    The <em>totals</em> are comparable. The <em>classes</em> are not: the
-    baseline has no per-class value to compare against, because the harness
-    that produced it never read the discriminator. Do not report a per-class
+    The <em>totals</em> are comparable. The <em>classes</em> are not: this
+    baseline has no per-class value to compare against, because whatever
+    produced it never recorded the discriminator. Do not report a per-class
     delta.
   </p>
+  {% endif %}
 </div>
+{% endif %}
 
 {% macro group(title, rows) %}
 <div class="card">

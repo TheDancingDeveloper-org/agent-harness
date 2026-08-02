@@ -13,9 +13,9 @@
   {% set rejected = applies.get('rejected', 0) %}
   {% if applied + rejected %}
     <p class="note">Apply rate <strong>{{ (100 * applied / (applied + rejected))|round(1) }}%</strong>
-    over {{ applied + rejected }} settled attempts. Baseline is 25–80%, model-dependent
-    (plan §2.5). Attempts with an unrecorded outcome are excluded from the denominator
-    rather than counted as failures.</p>
+    over {{ applied + rejected }} settled attempts. Attempts whose outcome was never
+    recorded are excluded from the denominator rather than counted as failures — an
+    unsettled attempt is not a failed one.</p>
   {% endif %}
   {% else %}<p class="empty">No patch-apply records in this window.</p>{% endif %}
 </div>

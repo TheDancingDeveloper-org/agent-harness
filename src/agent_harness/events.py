@@ -19,6 +19,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import providers
+
 # Event kinds. Deliberately coarse: a kind names *what happened*, and the
 # detail lives in `data`. Adding a field to `data` never needs a migration;
 # adding a kind is a deliberate act.
@@ -28,33 +30,34 @@ LESSON = "lesson"  # one semantic outcome (review verdict, gap closed)
 
 KINDS = (MODEL_CALL, PATCH_APPLY, LESSON)
 
-# Error classes the P1 worker emits. Mirrored rather than imported -- this
-# service must be able to ingest a log written by a worker newer than
-# itself, so an unrecognised class is stored verbatim and surfaced, never
-# coerced into a known one or dropped.
-RPM = "rpm"
-WINDOW_CAP = "window_cap"
-TERMINAL_CAP = "terminal_cap"
+# Error classes. Defined once, in `providers`, because the classifier and
+# the store must never disagree about what a class is called -- two
+# definitions of one fact drift, and the drift shows up as a panel silently
+# counting nothing.
+RPM = providers.RPM
+WINDOW_CAP = providers.WINDOW_CAP
+TERMINAL_CAP = providers.TERMINAL_CAP
 RATE_LIMIT_CLASSES = (RPM, WINDOW_CAP, TERMINAL_CAP)
+RATE_LIMIT_MEANING = {k: providers.MEANING[k] for k in RATE_LIMIT_CLASSES}
 
-RATE_LIMIT_MEANING = {
-    RPM: "going too fast — retried locally with jitter",
-    WINDOW_CAP: "5h cost budget spent — not retried, endpoint parked",
-    TERMINAL_CAP: "weekly budget spent or key rejected — not retried, endpoint parked",
-}
-
-# The class given to a 429 from a log written before the harness read the
-# gateway's discriminator. It is a statement that the answer is unknowable,
-# not a category of rate limit -- so it is deliberately NOT in
-# RATE_LIMIT_CLASSES, and equally not "unknown": we know exactly what it is.
-# It lives here rather than in ingest.py so that every consumer classifying
-# a class agrees about it without importing the ingester.
+# The class given to a rate limit recorded before anything classified it --
+# by an older build, or by a tool that never read the provider's
+# discriminator. It is a statement that the answer is unknowable, not a
+# category of rate limit, so it is deliberately NOT in RATE_LIMIT_CLASSES
+# and equally not "unknown": we know exactly what it is.
 UNCLASSIFIED = "unclassified"
 
-# Classes that are errors but not rate limits. Kept explicit so a class this
-# build has genuinely never seen is reported as unknown rather than quietly
-# filed alongside them.
-KNOWN_OTHER_CLASSES = ("connection", "deadline", "empty_reply")
+# Errors that are not rate limits. Kept explicit so a class this build has
+# genuinely never seen is reported as unknown rather than quietly filed
+# alongside them.
+KNOWN_OTHER_CLASSES = (
+    providers.TRANSIENT,
+    providers.NON_RETRYABLE,
+    providers.FATAL,
+    "connection",
+    "deadline",
+    "empty_reply",
+)
 
 
 def is_rate_limit(error_class: str | None) -> bool:

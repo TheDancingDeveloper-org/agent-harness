@@ -22,6 +22,36 @@ asserts a defect, the evidence is cited. Re-derive rather than trust.
 
 ---
 
+## 0.1 SUPERSEDED IN PART — the harness is generic (owner ruling, 2026-08-02)
+
+**Read this before anything else in this document.**
+
+This plan was written on the assumption that one specific repository is the harness's only
+consumer until a late "generalise" phase, and that the model-layer work would be applied
+*inside* that repository. The owner has ruled otherwise:
+
+> "this framework should be generic and not be tied/targeted at any work"
+> "this is meant to go into its own repo; not tied to oxidex"
+
+What that changes:
+
+| The plan says | Now |
+|---|---|
+| P1 edits `swack-tools/oxidex` in place | The model client lives **here**, provider-agnostic: `providers.py` + `model_client.py`. The oxidex change survives only as a bug fix for that repo, not as this project's home. |
+| One consumer until P4; "not generalising before P4" | Generic **from the start**. No workload-specific knowledge in the core; anything format-specific is an opt-in adapter. |
+| §2 evidence and §7 exit criteria are stated in one workload's numbers | Those numbers are *evidence for the design*, not targets this repo asserts. A baseline is supplied by whoever runs the harness; there is no built-in one. |
+| Gates 1–13, `cargo build`, ExifTool comparison, tag gaps | Not this project's concern. The harness routes model calls, records what happened, and shows it. What the agents *do* is the caller's. |
+
+**What survives unchanged, and is the valuable part:** the failure model (§2.2, §5.1), the
+locality principle (§3.3), durability-before-expense (§3.4), events-as-spine (§3.5), and
+every correction in §2.6 and §5.3 — all of which came from measurement rather than
+argument.
+
+Phase numbering (P0–P4) is kept only so existing issues and milestones still resolve. Do
+not treat the phase *order* as current: P4's "generalise" happened first, by ruling.
+
+---
+
 ## 0. Execution handoff
 
 **Read this section first. It is written for the agent that will execute the plan.**

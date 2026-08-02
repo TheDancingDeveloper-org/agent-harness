@@ -18,8 +18,8 @@ import pytest
 from agent_harness import providers as P
 from agent_harness.executor import Checks
 from agent_harness.model_client import ModelClient, Response, Route
-from agent_harness.mydevenv2 import IDLE, RUNNING, WAITING, Session
 from agent_harness.session_executor import AgentSpec, SessionExecutor
+from agent_harness.session_host import IDLE, RUNNING, WAITING, Session
 from agent_harness.work import DONE, FAILED, WorkQueue, WorkRecord
 
 

@@ -1,13 +1,13 @@
 """The harness's JSON API. No HTML, no templates, no GUI.
 
-The GUI lives in MyDevEnv2, which already owns tabs, auth, push notifications,
-mobile and the terminal sessions the agents run in. A second web UI here would
-mean a second URL, a second login, no notifications and no phone story — worse,
-for the same work.
+The GUI lives in the session host — AIDevEnv is the reference one — which
+already owns tabs, auth, push notifications, mobile and the terminal sessions
+the agents run in. A second web UI here would mean a second URL, a second
+login, no notifications and no phone story: worse, for the same work.
 
-So this is the seam: MyDevEnv2's server proxies these routes, holding the
+So this is the seam. The host's server proxies these routes, holding the
 harness token so the browser never sees it, and renders the result as a Work
-tab. Everything here is JSON a Solid component can consume directly.
+tab. Everything here is JSON a UI can consume directly.
 
 Auth is a bearer token, and the service **fails closed** — with none
 configured every route refuses, because coming up open is not an acceptable
@@ -59,8 +59,8 @@ def create_api(
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:
-        """Unauthenticated and cheap, like MyDevEnv2's own. A deploy check
-        must not depend on the store being populated."""
+        """Unauthenticated and cheap. A deploy check must not depend on the
+        store being populated."""
         return JSONResponse(
             {
                 "ok": True,

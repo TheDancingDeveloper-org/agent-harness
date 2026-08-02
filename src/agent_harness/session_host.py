@@ -1,9 +1,10 @@
-"""Client for a MyDevEnv2 server's session API.
+"""Client for a session host: something that owns PTY sessions over HTTP.
 
-MyDevEnv2 owns PTY sessions: it creates them, keeps their scrollback, streams
-them to every attached client, and tracks whether one is idle, running,
-waiting for input, or errored. It also already has the shell around
-them — tabs, push notifications, an Android PWA, Tailscale auth.
+A session host creates PTY sessions, keeps their scrollback, streams them to
+every attached client, and tracks whether one is idle, running, waiting for
+input, or errored. AIDevEnv (and its private ancestor MyDevEnv2) is the
+reference implementation, and the wire format here matches it — but nothing
+in the harness depends on that particular server, only on this shape.
 
 So the harness does not run agents itself. It asks MyDevEnv2 to, and gets
 back a session id. That id is the whole point: it is a **deep link**. An item
@@ -35,7 +36,7 @@ WAITING = "waiting-for-input"
 ERRORED = "errored"
 
 
-class MyDevEnv2Error(RuntimeError):
+class SessionHostError(RuntimeError):
     pass
 
 
@@ -66,7 +67,7 @@ class Session:
         return self.activity == WAITING
 
     def tab_url(self, base: str) -> str:
-        """Where a human opens this session in the MyDevEnv2 UI."""
+        """Where a human opens this session in the host's UI."""
         return f"{base.rstrip('/')}/t/{self.id}"
 
 
@@ -97,7 +98,7 @@ class SessionHost(Protocol):
     ) -> Session: ...
 
 
-class MyDevEnv2:
+class HttpSessionHost:
     """Minimal client. Only the session endpoints the harness needs."""
 
     def __init__(
@@ -128,15 +129,15 @@ class MyDevEnv2:
                 body = response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:500]
-            raise MyDevEnv2Error(f"{method} {path} -> {exc.code}: {detail}") from exc
+            raise SessionHostError(f"{method} {path} -> {exc.code}: {detail}") from exc
         except OSError as exc:
-            raise MyDevEnv2Error(f"{method} {path}: {exc}") from exc
+            raise SessionHostError(f"{method} {path}: {exc}") from exc
         if not body:
             return None
         try:
             return json.loads(body)
         except ValueError as exc:
-            raise MyDevEnv2Error(f"{method} {path}: response was not JSON") from exc
+            raise SessionHostError(f"{method} {path}: response was not JSON") from exc
 
     # ------------------------------------------------------------ sessions
 

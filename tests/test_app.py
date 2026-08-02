@@ -285,3 +285,56 @@ def test_the_quota_panel_says_why_spend_is_absent_not_just_that_it_is(
     assert "Not available" in body
     assert "404" in body  # a concrete, checked example, not a shrug
     assert "after the fact" in body
+
+
+def test_the_work_panel_says_so_when_no_queue_is_attached(client: httpx.Client) -> None:
+    """A dashboard with no queue can show what happened but not what is
+    outstanding. Rendering an empty table would read as 'no work left'."""
+    body = flat(client.get("/panel/work", headers=auth()).text)
+    assert "No queue attached" in body
+
+
+def test_the_work_panel_shows_items_and_their_current_stage(
+    store: EventStore, tmp_path: Path
+) -> None:
+    import time as _time
+
+    from agent_harness.events import Event
+    from agent_harness.work import WorkQueue, WorkRecord
+
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue.add([WorkRecord(item_id="T1", title="Do the thing", brief="b")])
+    queue.claim("worker-a")
+    # The queue knows "claimed"; the event stream is what knows *doing what*.
+    store.append(
+        [
+            Event(
+                ts=_time.time(),
+                kind="work",
+                source="events.jsonl",
+                worker="worker-a",
+                outcome="checks_passed",
+                data={"item_id": "T1"},
+            ),
+        ]
+    )
+    with TestClient(create_app(store, token=TOKEN, queue=queue, stream_max_seconds=1.0)) as c:
+        body = flat(c.get("/panel/work", headers=auth()).text)
+    assert "T1" in body
+    assert "claimed" in body
+    assert "checks_passed" in body
+
+
+def test_the_work_panel_surfaces_stale_claims(store: EventStore, tmp_path: Path) -> None:
+    """A rising stale count means something is killing workers — invisible
+    unless the panel says it."""
+    from agent_harness.work import WorkQueue, WorkRecord
+
+    clock = [1000.0]
+    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=10.0, now=lambda: clock[0])
+    queue.add([WorkRecord(item_id="T1", title="t", brief="b")])
+    queue.claim("gone")
+    clock[0] += 100
+    with TestClient(create_app(store, token=TOKEN, queue=queue, stream_max_seconds=1.0)) as c:
+        body = flat(c.get("/panel/work", headers=auth()).text)
+    assert "stale claim" in body

@@ -1,0 +1,59 @@
+{# Work: what each item is doing, and what it did last. #}
+{% extends "base.html" %}
+{% block content %}
+{% if items is none %}
+<div class="card">
+  <h2>Work</h2>
+  <p class="note warn"><strong>No queue attached.</strong> This dashboard is
+  reading an event stream but was not given a work queue, so it can show what
+  happened but not what is outstanding. Start the service with a queue to see
+  the backlog.</p>
+</div>
+{% else %}
+<div class="card">
+  <h2>Work — {{ counts.values()|sum }} items</h2>
+  <table>
+    {% for state, n in counts.items() %}
+    <tr><td><code>{{ state }}</code></td><td class="n big">{{ n }}</td></tr>
+    {% endfor %}
+  </table>
+  {% if stale %}
+  <p class="note warn"><strong>{{ stale|length }} stale claim(s).</strong>
+  A lease expired without the work finishing — the worker holding it is gone.
+  These are re-claimable and will be picked up automatically; they are shown
+  because a rising count means something is killing workers.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Items</h2>
+  <div class="scroll">
+  <table>
+    <tr><th>Item</th><th>State</th><th>Doing</th><th class="n">Tries</th>
+        <th>Branch</th><th>Last update</th></tr>
+    {% for item in items %}
+    <tr>
+      <td><code>{{ item.item_id }}</code><br><span class="note">{{ item.title[:60] }}</span></td>
+      <td><code>{{ item.state }}</code>
+        {% if item.owner %}<br><span class="note">{{ item.owner }}</span>{% endif %}</td>
+      <td>
+        {% set event = latest.get(item.item_id) %}
+        {% if event %}<code>{{ event.outcome }}</code>
+          {% if event.detail %}<br><span class="note">{{ event.detail[:70] }}</span>{% endif %}
+        {% else %}<span class="empty">—</span>{% endif %}
+      </td>
+      <td class="n">{{ item.attempts }}</td>
+      <td>{% if item.pr_url %}<a href="{{ item.pr_url }}">PR</a>
+          {% elif item.branch %}<code>{{ item.branch }}</code>
+          {% else %}—{% endif %}</td>
+      <td>{{ item.updated_at | ago }}</td>
+    </tr>
+    {% if item.last_error %}
+    <tr><td colspan="6" class="note">{{ item.last_error[:300] }}</td></tr>
+    {% endif %}
+    {% endfor %}
+  </table>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

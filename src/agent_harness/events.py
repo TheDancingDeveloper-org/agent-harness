@@ -27,8 +27,9 @@ from . import providers
 MODEL_CALL = "model_call"  # one attempt against a model endpoint
 PATCH_APPLY = "patch_apply"  # one git-apply of a candidate diff
 LESSON = "lesson"  # one semantic outcome (review verdict, gap closed)
+WORK = "work"  # one stage transition of a work item (claimed, applied, reviewed…)
 
-KINDS = (MODEL_CALL, PATCH_APPLY, LESSON)
+KINDS = (MODEL_CALL, PATCH_APPLY, LESSON, WORK)
 
 # Error classes. Defined once, in `providers`, because the classifier and
 # the store must never disagree about what a class is called -- two

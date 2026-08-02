@@ -1,6 +1,9 @@
 # agent-harness: Comprehensive Plan
 
-**Status:** P0 complete (2026-08-02). P1 is next and blocks everything else — see §0.3.
+**Status:** P0 complete (2026-08-02). P1's code is written and under review as
+`swack-tools/oxidex#417`; P1's *deliverable* — the 72-hour measurement — has not been run,
+so P1 is **not** complete and P2 is not unblocked. See §2.6 for what P1 found wrong with
+this document.
 **Date:** 2026-08-02
 **Owner:** TheDancingDeveloper-org
 **Repository:** `TheDancingDeveloper-org/agent-harness` (private)
@@ -205,6 +208,56 @@ These are the numbers against which P1's role split must be judged. If routing
 implementation to a cheaper model drops the apply rate to the bottom of that band, the
 extra repair rounds may consume the saving — and §7 P1's exit criteria require that to be
 measured, not assumed.
+
+### 2.6 Corrections — what P1 found when it read the code
+
+Recorded per §0.4 rule 7. The §2.1 and §2.3 evidence held up. Three claims did not, and
+one method note is worth carrying forward. **Re-derive the rest rather than trusting it.**
+
+**(a) §2.2(b) is wrong: `max_retries` is not pinned at 1, it is 1000.**
+`DEFAULT_MAX_RETRIES = 1000`, and `config.example.toml` sets 1000 under both `[worker]` and
+`[reviewer]`, with a test asserting it is high-but-not-unlimited. The *reasoning* in §2.2(b)
+still held — a long ladder was dangerous because it fed the global governor — so removing
+the governor's cooldown leaves the value needing no change. Task T12 was closed as
+not-applicable.
+
+**(b) §2.4 overstates the absence of role separation.** A phase split already exists and is
+already shipped in the example config:
+
+- `models_for_phase(models, phase)` filters the pool by a per-entry `phase` tag, and
+  `attempt_build` re-selects per phase on every turn — `explore` (cheap tier, medium effort)
+  for investigation, `patch` (strong tier, max effort) for diffs.
+- `[reviewer]` is its own table with its own pool, `base_url` and `api_key`; any `models[]`
+  entry may override `base_url`/`api_key`, so one pool can mix providers. The shipped example
+  reviewer pool is already disjoint from the worker pool.
+- `scripts/model_rotator.py` manages `worker`, `reviewer` and `table_job` as distinct pools.
+
+`random.choice` survives, but it draws *within* a phase-filtered tier, not over one
+undifferentiated fleet-wide pool. Making that draw deterministic is a real change with a real
+trade-off — it removes the pool-is-the-retry failover the config relies on — and §0.4 rule 1
+says measure first. Deferred to P2.
+
+Consequently §2.4's "there is also no plan stage at all: gate 3 asks for a unified diff cold"
+is not what the code does; the `explore` phase is that reasoning step. T14 was **not** built:
+adding a second planner in front of an existing one would cost a call per attempt and
+confound the very measurement P1 exists to produce.
+
+**(c) §7 P1 puts the global governor in the wrong file.** It is in
+`scripts/model_fix_loop.py` (`governor_report`, plus `cooldown_until`/`consecutive_limited`
+in the flock-guarded state), not `parallel_model_fix_loop.py`. The dispatcher contains no
+rate-limit code at all.
+
+**(d) Method note: the 27,662 baseline is not decomposable.** §2.1 already said the harness
+cannot say how many were rpm versus cost caps. That is permanent for the historical data —
+nothing recorded the discriminator, so it cannot be recovered. P1's `model-calls.jsonl`
+makes the *successor* number decomposable, which means P2's error panel compares a total
+against a breakdown, not like against like. Say so on the panel rather than implying a
+clean delta.
+
+**(e) `ModelClient` landed as a change to `call_model`, not a new class.** §5.1's sketch
+assumes an `openai`-SDK client; the worker uses `urllib` directly. A parallel abstraction
+beside it would have meant two retry paths, which is exactly the kind of scaffolding §3.1
+warns about. All five §5.1 responsibilities are present in the one function.
 
 ---
 
@@ -420,16 +473,20 @@ from `backlog.json`.
 The cheapest, highest-ratio work in the project. It is also the prerequisite for P2 being
 worth looking at.
 
+**Read §2.6 before starting — several of the tasks below rest on claims that turned out to
+be stale.** Code status: `swack-tools/oxidex#417`, open. Measurement status: not run.
+
 | Task | Detail |
 |---|---|
-| Delete the global governor | Remove the fleet-wide cooldown and its 30/60/120/240/300 ladder from `parallel_model_fix_loop.py`. This is the §2.2(a) fix. |
-| Add `ModelClient` | §5.1. Per-worker retry, `theclawbayError` classification, `retry-after`, jitter, per-endpoint cooldown. |
-| Un-pin `max_retries` | It existed only to protect the governor (§2.2b). |
-| Role table | `pick_model_fn` random draw → `ROLE_MODEL[role]`; `model=role` at the call site. |
-| **Add the plan stage** | New. A planner call ahead of gate 3, whose output feeds the implementer prompt. The only behavioural addition in P1. |
-| Reviewer independence | Gate 12 on a different vendor via `/anthropic`. D9 governs whether it sees the plan. |
-| Structured emission | Every call outcome appended with role, model, endpoint, error class, latency. Superset of today's `manifest.log`; P2 depends on it. |
-| Tests | §6.1, red-first, in the existing test files. |
+| Delete the global governor | Remove the fleet-wide cooldown and its 30/60/120/240/300 ladder from **`model_fix_loop.py`** (§2.6c corrects the file). This is the §2.2(a) fix. **Done in #417.** |
+| Add `ModelClient` | §5.1. Per-worker retry, `theclawbayError` classification, `retry-after`, jitter, per-endpoint cooldown. **Done in #417**, as a change to `call_model` rather than a new class — §2.6e. |
+| ~~Un-pin `max_retries`~~ | **Not applicable** — it is 1000, not 1 (§2.6a). |
+| Role table | **Largely already exists** (§2.6b). Deferred to P2, where the delta is measurable per role. |
+| ~~Add the plan stage~~ | **Not built** — the `explore` phase already is one (§2.6b). Re-scoped to P2 as an A/B against it. |
+| Reviewer independence | Mechanism already exists and the example config already uses a different vendor (§2.6b). **Unverified against the live fleet config**, which is gitignored — needs host access. |
+| Structured emission | Every call outcome appended with role, model, endpoint, error class, latency. Superset of today's `manifest.log`; P2 depends on it. **Done in #417** — `~/.oxidex/logs/model-calls.jsonl`, one record per *attempt*. |
+| Tests | §6.1, red-first, in the existing test files. **Done in #417** — 713 pass. |
+| **Measure** | The actual deliverable (§9). **Not run.** |
 
 **Exit:**
 - No code path pauses more than one worker.

@@ -98,11 +98,13 @@ class AddItemsResult(BaseModel):
 
 
 class FleetControl(BaseModel):
-    state: Literal["running", "paused", "draining"] = Field(
+    state: Literal["running", "paused", "draining", "stopped"] = Field(
         description="`running` claims freely. `paused` and `draining` both stop new "
         "claims; neither interrupts work in flight, because killing an agent mid-item "
         "destroys its context and leaves a half-finished worktree. The difference is "
-        "what the operator meant."
+        "what the operator meant. `stopped` means no workers exist for this project "
+        "at all -- it is what every project is set to on boot, and only an explicit "
+        "start leaves it."
     )
     reason: str | None = Field(
         None,
@@ -113,7 +115,7 @@ class FleetControl(BaseModel):
 
 
 class SetFleetControl(BaseModel):
-    state: Literal["running", "paused", "draining"]
+    state: Literal["running", "paused", "draining", "stopped"]
     reason: str | None = None
 
 
@@ -134,6 +136,49 @@ class RoleMap(BaseModel):
         "call: the call site names a ROLE, never a model, which is what makes the map "
         "changeable without a redeploy."
     )
+
+
+class ProjectSpec(BaseModel):
+    """A project as it is registered. Persisted, so nothing here has to be
+    supplied again after a restart -- every field was previously a CLI flag
+    with nowhere to be written down."""
+
+    project_id: str = Field(description="Stable id, used to scope every other call.")
+    name: str
+    repo: str | None = Field(None, description="GitHub repo as `owner/name`.")
+    work_dir: str | None = Field(None, description="Checkout the worktrees branch from.")
+    base_branch: str = "main"
+    checks: list[str] = Field(
+        default_factory=list, description="Commands run before the reviewer, cheapest first."
+    )
+    plan_path: str | None = None
+    roles: dict[str, RoleRoute] | None = Field(
+        None, description="Role overrides for this project. Null uses the global map."
+    )
+    max_workers: int = Field(
+        1,
+        description="Concurrency budget. Its purpose is that one project cannot "
+        "starve another, so it is per project rather than per fleet.",
+    )
+
+
+class ProjectSummary(BaseModel):
+    """A project plus enough state for the overview screen."""
+
+    project: ProjectSpec
+    counts: dict[str, int] = Field(default_factory=dict)
+    control: FleetControl
+    previous_state: str | None = Field(
+        None,
+        description="What it was doing before the process last stopped it. This is what "
+        "keeps 'was running' distinguishable from 'was drained because we were deploying' "
+        "across a restart -- the operator's intent is otherwise what a restart destroys.",
+    )
+    stale: int = 0
+
+
+class ProjectList(BaseModel):
+    projects: list[ProjectSummary]
 
 
 # --------------------------------------------------------------------- plan

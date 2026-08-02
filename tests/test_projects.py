@@ -270,3 +270,93 @@ def test_counts_are_per_project(queue: WorkQueue) -> None:
     assert queue.counts(project_id="a") == {PENDING: 2}
     assert queue.counts(project_id="b") == {PENDING: 1}
     assert queue.counts() == {PENDING: 3}, "the cross-project rollup should still work"
+
+
+# ------------------------------------------------------------------- API
+
+
+@pytest.fixture
+def client(tmp_path: Path):  # type: ignore[no-untyped-def]
+    from fastapi.testclient import TestClient
+
+    from agent_harness.api import create_api
+    from agent_harness.store import EventStore
+
+    q = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    store = EventStore(tmp_path / "e.sqlite")
+    with TestClient(create_api(store, queue=q, token="tok")) as c:  # noqa: S106
+        c.queue = q  # type: ignore[attr-defined]
+        yield c
+
+
+def hdr() -> dict[str, str]:
+    return {"Authorization": "Bearer tok"}
+
+
+def test_registering_a_project_leaves_it_stopped(client) -> None:  # type: ignore[no-untyped-def]
+    """Registering must never begin spending money."""
+    response = client.post(
+        "/api/projects",
+        headers=hdr(),
+        json={"project_id": "ngms", "name": "NGMS", "repo": "org/NGMS", "max_workers": 2},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["control"]["state"] == STOPPED
+    assert body["project"]["max_workers"] == 2
+
+
+def test_start_is_the_only_thing_that_lets_a_project_claim(client) -> None:  # type: ignore[no-untyped-def]
+    client.post("/api/projects", headers=hdr(), json={"project_id": "a", "name": "A"})
+    client.queue.add([rec("T1")], project_id="a")
+
+    assert client.queue.claim("w", project_id="a") is None
+
+    response = client.post("/api/projects/a/start", headers=hdr())
+    assert response.status_code == 200
+    assert response.json()["control"]["state"] == RUNNING
+    assert client.queue.claim("w", project_id="a") is not None
+
+
+def test_stopping_one_project_leaves_the_others_running(client) -> None:  # type: ignore[no-untyped-def]
+    for pid in ("a", "b"):
+        client.post("/api/projects", headers=hdr(), json={"project_id": pid, "name": pid})
+        client.post(f"/api/projects/{pid}/start", headers=hdr())
+        client.queue.add([rec("T1")], project_id=pid)
+
+    client.post(
+        "/api/projects/a/stop", headers=hdr(), json={"state": "stopped", "reason": "deploying"}
+    )
+
+    assert client.queue.claim("w", project_id="a") is None
+    assert client.queue.claim("w", project_id="b") is not None
+
+
+def test_starting_an_unknown_project_is_a_404_not_a_silent_no_op(client) -> None:  # type: ignore[no-untyped-def]
+    """A typo in a project id must not look like success."""
+    assert client.post("/api/projects/nope/start", headers=hdr()).status_code == 404
+
+
+def test_the_overview_is_one_call(client) -> None:  # type: ignore[no-untyped-def]
+    """The first screen a user sees must not depend on N successful requests."""
+    for pid in ("a", "b"):
+        client.post("/api/projects", headers=hdr(), json={"project_id": pid, "name": pid})
+        client.queue.add([rec("T1"), rec("T2")], project_id=pid)
+
+    payload = client.get("/api/projects", headers=hdr()).json()
+    assert {p["project"]["project_id"] for p in payload["projects"]} == {"a", "b"}
+    assert all(p["counts"] == {PENDING: 2} for p in payload["projects"])
+    assert all(p["control"]["state"] == STOPPED for p in payload["projects"])
+
+
+def test_the_overview_says_what_a_project_was_doing_before_it_stopped(client) -> None:  # type: ignore[no-untyped-def]
+    """'Was running' and 'was drained for a deploy' must stay distinguishable,
+    or the restart destroys the operator's intent."""
+    client.post("/api/projects", headers=hdr(), json={"project_id": "a", "name": "A"})
+    client.post("/api/projects/a/start", headers=hdr())
+    client.queue.stop_all_on_boot(reason="process started")
+
+    payload = client.get("/api/projects/a", headers=hdr()).json()
+    assert payload["control"]["state"] == STOPPED
+    assert payload["previous_state"] == RUNNING
+    assert "process started" in payload["control"]["reason"]

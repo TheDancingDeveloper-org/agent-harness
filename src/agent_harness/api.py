@@ -47,6 +47,9 @@ from .schemas import (
     PlanParseResult,
     PlanSyncRequest,
     PlanSyncResult,
+    ProjectList,
+    ProjectSpec,
+    ProjectSummary,
     RateLimits,
     RetryResult,
     RoleMap,
@@ -58,7 +61,17 @@ from .schemas import (
     WorkList,
 )
 from .store import EventStore
-from .work import CLAIMED, DONE, FAILED, PENDING, WorkQueue, WorkRecord
+from .work import (
+    CLAIMED,
+    DONE,
+    FAILED,
+    PENDING,
+    RUNNING,
+    STOPPED,
+    Project,
+    WorkQueue,
+    WorkRecord,
+)
 
 WINDOWS = {"1h": 3600, "24h": 86400, "72h": 3 * 86400, "7d": 7 * 86400, "all": None}
 
@@ -279,6 +292,121 @@ def create_api(
     def get_control(_: None = Depends(require_token)) -> FleetControl:
         state, reason = need_queue().control()
         return FleetControl(state=state, reason=reason)
+
+    # -------------------------------------------------------------- projects
+
+    @app.get(
+        "/api/projects",
+        tags=["work"],
+        summary="Every project, with counts and control state",
+        response_model=ProjectList,
+    )
+    def list_projects(_: None = Depends(require_token)) -> ProjectList:
+        """One call for the overview screen. A per-project fan-out would make
+        the first thing a user sees depend on N successful requests."""
+        queue = need_queue()
+        out = []
+        for project in queue.projects():
+            state, reason, previous = queue.control_detail(project.project_id)
+            out.append(
+                ProjectSummary(
+                    project=_project_spec(project),
+                    counts=queue.counts(project_id=project.project_id),
+                    control=FleetControl(state=state, reason=reason),
+                    previous_state=previous,
+                    stale=len(queue.stale(project_id=project.project_id)),
+                )
+            )
+        return ProjectList(projects=out)
+
+    @app.post(
+        "/api/projects",
+        tags=["work"],
+        summary="Register a project",
+        response_model=ProjectSummary,
+    )
+    def create_project(
+        spec: ProjectSpec,
+        _: None = Depends(require_token),
+    ) -> ProjectSummary:
+        """Register or update a project, durably.
+
+        It starts **stopped**. Registering a project must not begin spending
+        money on it, and nothing here starts a worker -- only an explicit
+        start does.
+        """
+        queue = need_queue()
+        queue.add_project(
+            Project(
+                project_id=spec.project_id,
+                name=spec.name,
+                repo=spec.repo,
+                work_dir=spec.work_dir,
+                base_branch=spec.base_branch,
+                checks=list(spec.checks),
+                plan_path=spec.plan_path,
+                roles={k: v.model_dump() for k, v in spec.roles.items()} if spec.roles else None,
+                max_workers=spec.max_workers,
+            )
+        )
+        return _project_summary(queue, spec.project_id)
+
+    @app.get(
+        "/api/projects/{project_id}",
+        tags=["work"],
+        summary="One project",
+        response_model=ProjectSummary,
+    )
+    def get_project(
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> ProjectSummary:
+        return _project_summary(need_queue(), project_id)
+
+    @app.post(
+        "/api/projects/{project_id}/start",
+        tags=["control"],
+        summary="Continue execution for one project",
+        response_model=ProjectSummary,
+    )
+    def start_project(
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> ProjectSummary:
+        """The only thing that lets a project claim work.
+
+        Nothing calls this on boot. An auto-resuming fleet turns a routine
+        restart into unattended spend against a stack nobody has looked at
+        yet, and a crash-looping deploy would restart the fleet on every loop.
+        Resuming is a decision, so it is a request.
+        """
+        queue = need_queue()
+        if queue.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+        queue.set_control(RUNNING, reason=None, project_id=project_id)
+        return _project_summary(queue, project_id)
+
+    @app.post(
+        "/api/projects/{project_id}/stop",
+        tags=["control"],
+        summary="Stop claiming for one project",
+        response_model=ProjectSummary,
+    )
+    def stop_project(
+        request: SetFleetControl | None = None,
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> ProjectSummary:
+        """Stop taking new work. **Nothing in flight is interrupted.**"""
+        queue = need_queue()
+        if queue.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+        queue.set_control(
+            STOPPED,
+            reason=request.reason if request else None,
+            project_id=project_id,
+        )
+        return _project_summary(queue, project_id)
 
     @app.post(
         "/api/control",
@@ -532,6 +660,34 @@ def _latest_by_item(store: EventStore) -> dict[str, dict[str, Any]]:
         if item_id and item_id not in latest:
             latest[item_id] = event
     return latest
+
+
+def _project_spec(project: Project) -> ProjectSpec:
+    return ProjectSpec(
+        project_id=project.project_id,
+        name=project.name,
+        repo=project.repo,
+        work_dir=project.work_dir,
+        base_branch=project.base_branch,
+        checks=list(project.checks),
+        plan_path=project.plan_path,
+        roles={k: RoleRoute(**v) for k, v in project.roles.items()} if project.roles else None,
+        max_workers=project.max_workers,
+    )
+
+
+def _project_summary(queue: WorkQueue, project_id: str) -> ProjectSummary:
+    project = queue.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    state, reason, previous = queue.control_detail(project_id)
+    return ProjectSummary(
+        project=_project_spec(project),
+        counts=queue.counts(project_id=project_id),
+        control=FleetControl(state=state, reason=reason),
+        previous_state=previous,
+        stale=len(queue.stale(project_id=project_id)),
+    )
 
 
 def _item_model(record: WorkRecord, event: dict[str, Any] | None) -> WorkItem:

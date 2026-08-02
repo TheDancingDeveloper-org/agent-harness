@@ -103,7 +103,127 @@ Boot never starts a worker. Only an explicit API call does.
 
 ---
 
-## 2. Phase 1 — project as a scope
+## 2. Phase 0 — correctness, and actually running unattended
+
+Found by reviewing the code, not by it failing. Ordered by what breaks first.
+
+### 2.1 The runner is not a daemon
+
+```python
+outcome = self.run_once()
+if outcome is None:
+    break            # queue empty -> return -> process exits
+```
+
+`--watch` exists, but only for `ingest`. The executor drains the backlog and
+terminates. Add an item an hour later and nothing claims it.
+
+This also breaks the *Continue execution* model in §4: starting a project
+cannot mean launching a process that exits ten minutes later. Needs an idle
+poll with backoff, re-reading control state each pass so a pause takes effect
+without a restart.
+
+### 2.2 Nothing ever gives up
+
+`attempts` is incremented on claim and used **only** for `ORDER BY`. A clean
+failure is terminal, so that path is safe. But an item that *kills its worker*
+— OOM on a large repo, a pod restart mid-item — is never released; its lease
+expires, it is re-claimed, forever. It sinks to the back of the queue and
+returns every cycle, spending real tokens each time.
+
+That is the seven-day failure mode, and it is invisible: a cycling item looks
+identical to a busy one.
+
+Needs `max_attempts` per project and a terminal dead-letter state, surfaced as
+"gave up after N attempts" rather than silently recycling.
+
+### 2.3 Abandoned sessions accumulate without bound
+
+Leaving a timed-out session alive is correct — it holds the agent's context,
+and killing it destroys the one thing that makes the item resumable by a
+human. The missing half is that nothing ever cleans them up: `kill_session`
+and `delete_session` exist on the client and are **never called**.
+
+Twenty timeouts is twenty live PTYs, each possibly still holding an agent
+spending tokens, with nothing counting them. After a week, "preserved
+deliberately" and "leaked" are indistinguishable.
+
+Needs an age-based reaper and a visible count — not the removal of the
+behaviour.
+
+### 2.4 The load-bearing invariant is untested
+
+242 tests pass. `grep -rE "threading|multiprocessing" tests/` returns nothing.
+
+So this, the claim the whole queue rests on, is asserted in a docstring and
+never exercised:
+
+> the whole selection and claim happens inside one IMMEDIATE transaction, so
+> two workers racing cannot both win
+
+Same for lost-claim detection and lease expiry under contention. Everything
+else in the codebase has tests; the one invariant whose failure silently
+corrupts work does not.
+
+**Do this first.** Two threads, one queue, assert every item is claimed
+exactly once. Then the same for a heartbeat losing its claim mid-flight.
+
+### 2.5 API surface audit
+
+Every route we define is exercised. 17 of 18, and the exception is
+`/docs/oauth2-redirect`, which FastAPI mounts for Swagger and we do not write.
+
+Authentication is a different story:
+
+| | |
+|---|---|
+| Protected routes | 13 |
+| Proven to reject an anonymous request | **10** |
+| Untested | `POST /api/plan/parse`, `POST /api/plan/sync`, `GET /api/work/{item_id}` |
+
+`POST /api/plan/sync` is the route that creates GitHub issues.
+
+The cause is a test whose name stops you looking:
+
+```python
+@pytest.mark.parametrize("path", ["/api/work", "/api/errors", "/api/events", "/api/summary"])
+def test_every_other_route_requires_a_token(client, path): ...
+```
+
+It covers four paths. Replace the hardcoded list with one derived from
+`app.routes`, so a route added later is covered by construction and cannot be
+forgotten — the failure here was not an oversight but a list that does not
+grow with the thing it describes.
+
+### 2.6 Smaller
+
+- **`claim()` reads the whole eligible backlog** — `SELECT *` and `fetchall()`
+  with no `LIMIT`, inside the write transaction, on every claim. Fine at 89
+  items; O(backlog) per claim as it grows, holding the write lock throughout.
+- **An unknown dependency is silently not a blocker.** `unresolved_dependencies()`
+  catches typos at parse time, but `POST /api/work` bypasses it — an item added
+  via the API with a mistyped `depends_on` runs immediately instead of waiting,
+  the exact opposite of the intent.
+- **`POST /api/plan/sync` takes an arbitrary filesystem path.** No escalation,
+  since the same token already grants PTY sessions — but once projects exist it
+  should be bounded to the project's work directory.
+
+### 2.7 What not to change
+
+Auth is correct: `secrets.compare_digest`, and it fails closed with 503 when
+no token is configured. The rate-limit classification and the leases-not-locks
+model are the strongest parts of the codebase and their reasoning is properly
+recorded. `Outcome` defaults to `FAILED`, so a timeout is terminal — I
+suspected an infinite retry there and was wrong.
+
+### 2.8 Overlap with later phases
+
+2.1, 2.2 and 2.6's first item land naturally inside Phases 1-2 (daemon loop,
+per-project `max_attempts`, project-scoped claims) and should be done there
+rather than twice. 2.3, 2.4 and 2.5 are independent and can be done now.
+
+
+## 3. Phase 1 — project as a scope
 
 **Schema.** A `projects` table holding everything currently passed as a flag:
 
@@ -137,7 +257,7 @@ endpoints keep a cross-project view for the overview screen.
 **Definition of done:** register two projects that both contain `T1`, sync
 both, and confirm four distinct rows and two independent control states.
 
-## 3. Phase 2 — separate streams, explicitly resumed
+## 4. Phase 2 — separate streams, explicitly resumed
 
 Per-project worker pools honouring `max_workers`, so one project cannot starve
 another. `POST /api/projects/{id}/start` and `/stop` — start is the only thing
@@ -150,7 +270,7 @@ backup.
 its previous state intact; no agent runs until a human clicks; clicking
 resumes exactly one project.
 
-## 4. Phase 3 — the GUI worth having
+## 5. Phase 3 — the GUI worth having
 
 Board and item detail and live events, per the decision above:
 
@@ -166,14 +286,14 @@ Then, in order: fleet controls, plan-import wizard (parse → show what it could
 import wizard shares its tail — approve, sync, load — with Phase 4 inception;
 the difference is only whether a human or a model wrote the plan.
 
-## 5. Phase 4 — project inception
+## 6. Phase 4 — project inception
 
 Today the pipeline starts at "you already wrote a PLAN.md". This phase adds
 the front of it: describe a project in a paragraph, have a model propose a
 scope, argue with it, and on approval let it create the repository and the
 backlog.
 
-### 5.1 The flow
+### 6.1 The flow
 
 ```
 draft ──▶ scoping ──▶ proposed ──▶ approved ──▶ initialised ──▶ (stopped)
@@ -187,12 +307,12 @@ draft ──▶ scoping ──▶ proposed ──▶ approved ──▶ initiali
 | 1 | `POST /api/projects` | `{name, overview}` — a paragraph, not a plan. State `draft`. |
 | 2 | `POST /api/projects/{id}/scope` | A model returns a **proposal**: restated goal, assumptions, non-goals, risks, phase outline, first cut of work items, and open questions. State `proposed`. |
 | 3 | `POST /api/projects/{id}/scope` again, with `feedback` | Revises the previous proposal rather than starting over. Repeat until it is right. |
-| 3b | `POST /api/projects/{id}/questions/{q}/answer` or `/defer` | Resolve open questions. Blocking ones must be answered; deferrable ones may be deferred with a reason. See §5.3. |
+| 3b | `POST /api/projects/{id}/questions/{q}/answer` or `/defer` | Resolve open questions. Blocking ones must be answered; deferrable ones may be deferred with a reason. See §6.3. |
 | 4 | `POST /api/projects/{id}/approve` | The human gate. Refused while a **blocking** question is unanswered. **Nothing external happens before this.** |
 | 5 | `POST /api/projects/{id}/init` | Creates or adopts the repo, commits `docs/PLAN.md`, ensures labels and milestones, syncs issues, loads the queue. Dry-run by default. |
 | 6 | *Continue execution* | Unchanged from §1.1 — still a separate, deliberate act. |
 
-### 5.2 The proposal is a PLAN.md, not database rows
+### 6.2 The proposal is a PLAN.md, not database rows
 
 The scoper's output is written as a real plan document and committed to the
 repository. It is not injected straight into the queue.
@@ -208,7 +328,7 @@ It also means the generated plan is subject to the same parser that reports
 what it could *not* read — so a proposal the harness cannot actually consume
 is caught at once, rather than after it has created issues.
 
-### 5.3 The scoper must say what it does not know
+### 6.3 The scoper must say what it does not know
 
 A scoping model that quietly invents constraints is worse than one that asks,
 because the invention is indistinguishable from a decision you made. The
@@ -259,7 +379,7 @@ Revisions are **append-only**. Every proposal version, question, answer and
 deferral is kept, so scope drift between "what I asked for" and "what got
 built" is visible rather than overwritten.
 
-### 5.4 Two irreversible actions, both gated
+### 6.4 Two irreversible actions, both gated
 
 `init` performs the only steps that touch the outside world:
 
@@ -273,7 +393,7 @@ common case, not the exception — NGMS is exactly this: a repo that exists, wit
 issues already in it, part-way through a plan. Adoption must reconcile against
 what is already there rather than assume an empty slate.
 
-### 5.5 Roles
+### 6.5 Roles
 
 Scoping runs as a distinct `scoper` role through the existing `ModelClient`,
 so it inherits routing, per-worker jittered retry, failure classification and
@@ -281,7 +401,7 @@ the event log for free. It is deliberately separate from `planner` — which
 plans a single work item — because the two want very different models, and
 naming a role rather than a model is what makes that a data change.
 
-### 5.6 Definition of done
+### 6.6 Definition of done
 
 Give it a paragraph describing a project that does not exist. Argue with the
 proposal twice. Answer its blocking questions, defer one deferrable question
@@ -291,13 +411,13 @@ have been willing to write yourself, a synced backlog, and a queue in
 `stopped` — having typed no plan and no CLI flags, and with nothing having
 executed until you said so.
 
-## 6. Phase 5 — operational depth
+## 7. Phase 5 — operational depth
 
 Per-project attempt and cost metrics, baseline comparison, failure triage.
 
 ---
 
-## 7. What this deliberately does not do
+## 8. What this deliberately does not do
 
 - **No physical isolation between projects.** One process, one file. A
   corrupted DB affects everything. Accepted because cross-project views are

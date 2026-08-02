@@ -384,3 +384,82 @@ def test_sync_defaults_to_a_dry_run(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     prop = schema["components"]["schemas"]["PlanSyncRequest"]["properties"]["dry_run"]
     assert prop["default"] is True
+
+
+# --------------------------------------------------------------- control
+
+
+def test_control_reports_running_by_default(client: TestClient) -> None:
+    payload = client.get("/api/control", headers=auth()).json()
+    assert payload["state"] == "running"
+
+
+def test_the_fleet_can_be_paused_and_resumed(client: TestClient, queue: WorkQueue) -> None:
+    response = client.post(
+        "/api/control", headers=auth(), json={"state": "paused", "reason": "deploying"}
+    )
+    assert response.status_code == 200
+    assert response.json()["reason"] == "deploying"
+    assert queue.claim("w") is None  # takes effect immediately
+
+    client.post("/api/control", headers=auth(), json={"state": "running"})
+    assert queue.claim("w") is not None
+
+
+def test_pausing_does_not_disturb_work_in_flight(client: TestClient, queue: WorkQueue) -> None:
+    """The guarantee that makes pause safe to press."""
+    claimed = queue.claim("worker-a")
+    assert claimed is not None
+    client.post("/api/control", headers=auth(), json={"state": "paused"})
+    record = queue.get(claimed.item_id)
+    assert record is not None
+    assert record.state == CLAIMED
+    assert record.owner == "worker-a"
+
+
+def test_an_unknown_control_state_is_rejected_by_the_schema(
+    client: TestClient,
+) -> None:
+    assert client.post("/api/control", headers=auth(), json={"state": "halt"}).status_code == 422
+
+
+def test_control_requires_a_token(client: TestClient) -> None:
+    assert client.get("/api/control").status_code == 401
+    assert client.post("/api/control", json={"state": "paused"}).status_code == 401
+
+
+# ----------------------------------------------------------------- roles
+
+
+def test_the_role_map_can_be_read_and_changed(client: TestClient) -> None:
+    assert client.get("/api/roles", headers=auth()).json()["roles"] == {}
+    body = {
+        "roles": {
+            "implementer": {"model": "cheap", "endpoint": "https://a", "provider": "claw-bay"},
+            "reviewer": {"model": "other-vendor", "endpoint": "https://a", "provider": "claw-bay"},
+        }
+    }
+    assert client.put("/api/roles", headers=auth(), json=body).status_code == 200
+    stored = client.get("/api/roles", headers=auth()).json()["roles"]
+    assert stored["implementer"]["model"] == "cheap"
+    assert stored["reviewer"]["model"] == "other-vendor"
+
+
+def test_the_role_map_persists_for_a_worker_in_another_process(
+    client: TestClient, queue: WorkQueue
+) -> None:
+    """The API and the worker are different processes — the map has to live
+    somewhere both can see."""
+    client.put(
+        "/api/roles",
+        headers=auth(),
+        json={"roles": {"reviewer": {"model": "m", "endpoint": "https://a"}}},
+    )
+    stored = queue.get_setting("role_map")
+    assert stored is not None
+    assert stored["reviewer"]["model"] == "m"
+
+
+def test_roles_require_a_token(client: TestClient) -> None:
+    assert client.get("/api/roles").status_code == 401
+    assert client.put("/api/roles", json={"roles": {}}).status_code == 401

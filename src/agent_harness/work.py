@@ -39,6 +39,22 @@ DONE = "done"
 FAILED = "failed"
 BLOCKED = "blocked"
 
+# Fleet control. Deliberately only three states, and none of them kill
+# anything: stopping work mid-item destroys an agent's context and leaves a
+# half-finished worktree, which is worse than waiting for it to finish.
+#
+#   running   claim freely
+#   paused    stop claiming; in-flight work continues to completion
+#   draining  same as paused, and the intent is to stop once it is quiet
+#
+# `paused` and `draining` behave identically to a worker. The difference is
+# what the operator meant, which matters when someone else looks at the fleet
+# and has to decide whether to resume it.
+RUNNING = "running"
+PAUSED = "paused"
+DRAINING = "draining"
+CONTROL_STATES = (RUNNING, PAUSED, DRAINING)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS work (
     item_id     TEXT PRIMARY KEY,
@@ -56,6 +72,20 @@ CREATE TABLE IF NOT EXISTS work (
     updated_at  REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS work_state ON work (state, lease_until);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS control (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    state   TEXT NOT NULL DEFAULT 'running',
+    reason  TEXT,
+    changed_at REAL NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO control (id, state) VALUES (1, 'running');
 """
 
 
@@ -152,6 +182,60 @@ class WorkQueue:
         conn.close()
         return added
 
+    # ------------------------------------------------------------ control
+
+    def control(self) -> tuple[str, str | None]:
+        """Current fleet control state and why it was set."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT state, reason FROM control WHERE id = 1").fetchone()
+            return (row["state"], row["reason"]) if row else (RUNNING, None)
+        finally:
+            conn.close()
+
+    def set_control(self, state: str, reason: str | None = None) -> None:
+        """Pause, drain or resume the fleet.
+
+        Takes effect at the next claim. Nothing in flight is interrupted:
+        killing an agent mid-item destroys its context and leaves a
+        half-finished worktree, which is worse than waiting.
+        """
+        if state not in CONTROL_STATES:
+            raise ValueError(f"unknown control state {state!r}; expected {CONTROL_STATES}")
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE control SET state = ?, reason = ?, changed_at = ? WHERE id = 1",
+                (state, reason, self.now()),
+            )
+        finally:
+            conn.close()
+
+    # ----------------------------------------------------------- settings
+
+    def get_setting(self, key: str) -> Any | None:
+        """Read a shared setting. Shared because the API process and the
+        worker process are different processes: an in-memory value could
+        never be changed from outside the loop that uses it."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            return json.loads(row["value"]) if row else None
+        finally:
+            conn.close()
+
+    def set_setting(self, key: str, value: Any) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (key, json.dumps(value), self.now()),
+            )
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------- claims
 
     def claim(self, owner: str | None = None) -> WorkRecord | None:
@@ -163,6 +247,10 @@ class WorkQueue:
         loser sees the row already claimed and picks something else.
         """
         owner = owner or worker_identity()
+        # Checked before anything is taken, so a pause stops the fleet at the
+        # next item boundary rather than part-way through one.
+        if self.control()[0] != RUNNING:
+            return None
         now = self.now()
         conn = self._connect()
         try:

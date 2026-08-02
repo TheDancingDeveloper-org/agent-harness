@@ -40,6 +40,7 @@ from .schemas import (
     AddItemsResult,
     Event,
     EventPage,
+    FleetControl,
     Health,
     LatestEvent,
     PlanItem,
@@ -48,6 +49,9 @@ from .schemas import (
     PlanSyncResult,
     RateLimits,
     RetryResult,
+    RoleMap,
+    RoleRoute,
+    SetFleetControl,
     Summary,
     WaitingItem,
     WorkItem,
@@ -57,6 +61,10 @@ from .store import EventStore
 from .work import CLAIMED, DONE, FAILED, PENDING, WorkQueue, WorkRecord
 
 WINDOWS = {"1h": 3600, "24h": 86400, "72h": 3 * 86400, "7d": 7 * 86400, "all": None}
+
+#: Where the live role map is stored. Shared through the queue's database
+#: because the API and the worker are different processes.
+ROLE_MAP_KEY = "role_map"
 
 DESCRIPTION = """\
 Plans work, claims it, runs it as an agent in a terminal session, and records
@@ -82,6 +90,7 @@ easy to get wrong and expensive when you do:
 TAGS = [
     {"name": "work", "description": "The backlog: what needs doing, and what is happening to it."},
     {"name": "plan", "description": "Turning a plan document into a backlog."},
+    {"name": "control", "description": "Starting and stopping the fleet."},
     {"name": "observability", "description": "What the fleet did, and why anything failed."},
     {"name": "meta", "description": "Health and version."},
 ]
@@ -258,6 +267,78 @@ def create_api(
             )
         queue.release(item_id, PENDING, error=None)
         return RetryResult(ok=True, item_id=item_id, state="pending")
+
+    # ------------------------------------------------------------- control
+
+    @app.get(
+        "/api/control",
+        tags=["control"],
+        summary="Is the fleet claiming work?",
+        response_model=FleetControl,
+    )
+    def get_control(_: None = Depends(require_token)) -> FleetControl:
+        state, reason = need_queue().control()
+        return FleetControl(state=state, reason=reason)
+
+    @app.post(
+        "/api/control",
+        tags=["control"],
+        summary="Pause, drain or resume the fleet",
+        response_model=FleetControl,
+    )
+    def set_control(
+        request: SetFleetControl,
+        _: None = Depends(require_token),
+    ) -> FleetControl:
+        """Stop or resume claiming, at the next item boundary.
+
+        **Nothing in flight is interrupted.** Killing an agent mid-item
+        destroys the context that makes its work resumable and leaves a
+        half-finished worktree behind; waiting for it to finish is strictly
+        better. `drain` and `pause` behave identically to a worker — the
+        difference is what you meant, which matters to whoever finds the fleet
+        stopped and has to decide whether to resume it.
+        """
+        queue = need_queue()
+        queue.set_control(request.state, request.reason)
+        state, reason = queue.control()
+        return FleetControl(state=state, reason=reason)
+
+    @app.get(
+        "/api/roles",
+        tags=["control"],
+        summary="Where each role's calls go",
+        response_model=RoleMap,
+    )
+    def get_roles(_: None = Depends(require_token)) -> RoleMap:
+        stored = need_queue().get_setting(ROLE_MAP_KEY) or {}
+        return RoleMap(roles={name: RoleRoute(**route) for name, route in stored.items()})
+
+    @app.put(
+        "/api/roles",
+        tags=["control"],
+        summary="Change the role map without a redeploy",
+        response_model=RoleMap,
+    )
+    def set_roles(request: RoleMap, _: None = Depends(require_token)) -> RoleMap:
+        """Takes effect on the next model call.
+
+        This is possible only because a call site names a **role**, never a
+        model. Routing a role somewhere else is then a data change rather than
+        a code change — which is what lets you move the implementer to a
+        cheaper tier, or the reviewer to a different vendor, while the fleet
+        is running.
+
+        A reviewer on the same vendor as the implementer means some share of
+        reviews is a model grading its own work. Nothing here enforces that;
+        it is your call, and it is worth making deliberately.
+        """
+        queue = need_queue()
+        queue.set_setting(
+            ROLE_MAP_KEY,
+            {name: route.model_dump() for name, route in request.roles.items()},
+        )
+        return request
 
     # ---------------------------------------------------------------- plan
 

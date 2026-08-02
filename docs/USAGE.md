@@ -192,6 +192,48 @@ automatically. A *rising* count means something is killing workers.
 
 ---
 
+## 4b. Stop it without breaking anything
+
+```bash
+# Stop taking new work. Anything in flight finishes.
+curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/control \
+     -H 'content-type: application/json' \
+     -d '{"state":"paused","reason":"deploying"}'
+
+curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/control \
+     -d '{"state":"running"}' -H 'content-type: application/json'
+```
+
+**Nothing in flight is ever interrupted.** Killing an agent mid-item destroys
+the context that makes its work resumable and leaves a half-finished worktree
+behind; stopping at the next item boundary is strictly better.
+
+`draining` behaves identically to `paused` for a worker. The difference is
+what you meant, which matters to whoever finds the fleet stopped and has to
+decide whether to resume it — so set a `reason`.
+
+## 4c. Re-route a role while it runs
+
+```bash
+curl -sH "Authorization: Bearer $TOKEN" -X PUT localhost:8099/api/roles \
+  -H 'content-type: application/json' -d '{
+    "roles": {
+      "implementer": {"model": "a-cheaper-tier", "endpoint": "https://api.example"},
+      "reviewer":    {"model": "a-different-vendor", "endpoint": "https://api.example"}
+    }
+  }'
+```
+
+Takes effect on the next call, no restart. This is possible only because a
+call site names a **role**, never a model — so re-routing one is a data change
+rather than a code change.
+
+Worth doing deliberately: a reviewer on the same vendor as the implementer
+means some share of reviews is a model grading its own work. Nothing enforces
+that; it is your call.
+
+---
+
 ## 5. Drive it from the API
 
 The harness serves a full OpenAPI document with Swagger UI. Inside a session
@@ -218,6 +260,10 @@ POST /api/plan/sync         plan → GitHub issues, dry-run by default
 GET  /api/errors            rate limits by class
 GET  /api/events            paged by row id, not timestamp
 GET  /api/summary           enough for a status line
+GET  /api/control           is the fleet claiming work?
+POST /api/control           pause, drain or resume — never interrupts work
+GET  /api/roles             where each role's calls go
+PUT  /api/roles             re-route a role, live
 GET  /healthz               open, cheap, needs no credential
 ```
 

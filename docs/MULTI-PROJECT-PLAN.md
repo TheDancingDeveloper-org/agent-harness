@@ -162,20 +162,111 @@ Board and item detail and live events, per the decision above:
 - **Continue execution** — per project, showing what it was doing before
 
 Then, in order: fleet controls, plan-import wizard (parse → show what it could
-*not* read → dry-run → sync), role-routing editor, rate-limit dashboard.
+*not* read → dry-run → sync), role-routing editor, rate-limit dashboard. The
+import wizard shares its tail — approve, sync, load — with Phase 4 inception;
+the difference is only whether a human or a model wrote the plan.
 
-## 5. Phase 4 — operational depth
+## 5. Phase 4 — project inception
+
+Today the pipeline starts at "you already wrote a PLAN.md". This phase adds
+the front of it: describe a project in a paragraph, have a model propose a
+scope, argue with it, and on approval let it create the repository and the
+backlog.
+
+### 5.1 The flow
+
+```
+draft ──▶ scoping ──▶ proposed ──▶ approved ──▶ initialised ──▶ (stopped)
+             ▲            │
+             └── revise ◀─┘        execution still needs an explicit
+                                   "Continue execution" per §1.1
+```
+
+| Step | Call | What happens |
+|---|---|---|
+| 1 | `POST /api/projects` | `{name, overview}` — a paragraph, not a plan. State `draft`. |
+| 2 | `POST /api/projects/{id}/scope` | A model returns a **proposal**: restated goal, assumptions, non-goals, risks, phase outline, first cut of work items, and open questions. State `proposed`. |
+| 3 | `POST /api/projects/{id}/scope` again, with `feedback` | Revises the previous proposal rather than starting over. Repeat until it is right. |
+| 4 | `POST /api/projects/{id}/approve` | The human gate. **Nothing external happens before this.** |
+| 5 | `POST /api/projects/{id}/init` | Creates or adopts the repo, commits `docs/PLAN.md`, ensures labels and milestones, syncs issues, loads the queue. Dry-run by default. |
+| 6 | *Continue execution* | Unchanged from §1.1 — still a separate, deliberate act. |
+
+### 5.2 The proposal is a PLAN.md, not database rows
+
+The scoper's output is written as a real plan document and committed to the
+repository. It is not injected straight into the queue.
+
+This matters more than it looks. Writing to the queue directly would fork the
+pipeline in two: a generated path and a hand-written path, diverging forever.
+Emitting a `PLAN.md` means the existing parse → sync → queue machinery runs
+**unchanged**, the plan is diffable and reviewable in a PR, a human can edit it
+by hand at any point, and re-running the scoper produces a diff rather than a
+mystery.
+
+It also means the generated plan is subject to the same parser that reports
+what it could *not* read — so a proposal the harness cannot actually consume
+is caught at once, rather than after it has created issues.
+
+### 5.3 The scoper must say what it does not know
+
+A scoping model that quietly invents constraints is worse than one that asks,
+because the invention is indistinguishable from a decision you made. The
+proposal therefore carries an explicit `open_questions` list, and approval
+warns while any are unanswered.
+
+This mirrors the parser's existing contract: what it could not determine is
+part of the answer, reported rather than guessed. The same reasoning that
+makes `skipped` headings a first-class field applies here.
+
+Revisions are **append-only**. Every proposal version is kept, so scope drift
+between "what I asked for" and "what got built" is visible rather than
+overwritten.
+
+### 5.4 Two irreversible actions, both gated
+
+`init` performs the only steps that touch the outside world:
+
+| Action | Guard |
+|---|---|
+| **Create a GitHub repository** | Explicit, dry-run by default, name echoed for confirmation. A repo created under the org with a typo'd name cannot be cleanly un-created, and may be public. |
+| **Create issues** | Already dry-run by default in `plan sync`; unchanged. |
+
+**Adopting an existing repository is first-class, not a fallback.** It is the
+common case, not the exception — NGMS is exactly this: a repo that exists, with
+issues already in it, part-way through a plan. Adoption must reconcile against
+what is already there rather than assume an empty slate.
+
+### 5.5 Roles
+
+Scoping runs as a distinct `scoper` role through the existing `ModelClient`,
+so it inherits routing, per-worker jittered retry, failure classification and
+the event log for free. It is deliberately separate from `planner` — which
+plans a single work item — because the two want very different models, and
+naming a role rather than a model is what makes that a data change.
+
+### 5.6 Definition of done
+
+Give it a paragraph describing a project that does not exist. Argue with the
+proposal twice. Approve it. Get a repository containing a `PLAN.md` you would
+have been willing to write yourself, a synced backlog, and a queue in
+`stopped` — having typed no plan and no CLI flags, and with nothing having
+executed until you said so.
+
+## 6. Phase 5 — operational depth
 
 Per-project attempt and cost metrics, baseline comparison, failure triage.
 
 ---
 
-## 6. What this deliberately does not do
+## 7. What this deliberately does not do
 
 - **No physical isolation between projects.** One process, one file. A
   corrupted DB affects everything. Accepted because cross-project views are
   the point of the overview screen, and N processes means N ports, N
   supervisors and N tokens.
-- **No auto-resume**, per §1.1 — including after a crash.
+- **No auto-resume**, per §1.1 — including after a crash, and including a
+  project the scoper has just finished initialising.
+- **No unattended repo creation.** Inception proposes; a human approves before
+  anything is created.
 - **No second web UI.** The session host keeps owning tabs, auth and
   terminals. The harness serves JSON.

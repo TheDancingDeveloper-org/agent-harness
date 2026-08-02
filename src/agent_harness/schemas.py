@@ -268,6 +268,99 @@ class RateLimits(BaseModel):
     by_role: list[dict[str, Any]] = Field(default_factory=list)
 
 
+# -------------------------------------------------------------------- audit
+
+
+class AuditHealth(BaseModel):
+    """Whether history is actually being recorded.
+
+    Its own field because a degraded audit store is invisible otherwise: a
+    fleet running unaudited looks exactly like a fleet running audited, and
+    the difference is only discovered when someone asks a question months
+    later and the answer is empty.
+    """
+
+    configured: bool = Field(description="False when no audit store is attached.")
+    degraded: bool = Field(
+        description="True when the store could not be opened and writes are being "
+        "dropped. The harness keeps working on purpose -- observation failing must "
+        "not stop delivery -- so this is the only signal that it is happening."
+    )
+    path: str | None = Field(None, description="Where the audit database lives.")
+    events: int = 0
+    oldest: float | None = Field(None, description="Unix time of the earliest event.")
+    newest: float | None = None
+    schema_version: int | None = None
+
+
+class AuditCostRow(BaseModel):
+    project_id: str | None = None
+    role: str | None = None
+    model: str | None = None
+    calls: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float | None = Field(
+        None, description="Null when no call in this group carried a known price."
+    )
+    unpriced: int = Field(
+        0,
+        description="Calls whose price was unknown, counted SEPARATELY and never "
+        "folded into the total. A sum that silently omits them reads as complete "
+        "and is not.",
+    )
+
+
+class AuditCost(BaseModel):
+    window: str
+    rows: list[AuditCostRow] = Field(default_factory=list)
+    total_cost_usd: float | None = None
+    total_unpriced: int = 0
+    partial: bool = Field(
+        False,
+        description="True when the requested window starts before the earliest "
+        "recorded event, so the answer covers less than it was asked for.",
+    )
+
+
+class AuditDeliveryRow(BaseModel):
+    project_id: str | None = None
+    outcome: str | None = None
+    n: int = 0
+    items: int = Field(0, description="Distinct items, not events.")
+
+
+class AuditDelivery(BaseModel):
+    window: str
+    rows: list[AuditDeliveryRow] = Field(default_factory=list)
+    partial: bool = False
+
+
+class Baseline(BaseModel):
+    baseline_id: str
+    project_id: str
+    recorded_at: float
+    label: str
+    window_days: int
+    items_done: int | None = None
+    cost_usd: float | None = None
+    notes: str | None = None
+
+
+class BaselineList(BaseModel):
+    baselines: list[Baseline] = Field(default_factory=list)
+
+
+class NewBaseline(BaseModel):
+    baseline_id: str = Field(description="Stable id. Recording twice under one id is refused.")
+    project_id: str
+    label: str = Field(description="What was measured, in words.")
+    window_days: int
+    items_done: int | None = None
+    cost_usd: float | None = None
+    notes: str | None = None
+
+
 # ------------------------------------------------------------------- events
 
 

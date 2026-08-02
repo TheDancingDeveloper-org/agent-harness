@@ -393,6 +393,13 @@ def main(argv: list[str] | None = None) -> int:
     p_serve = sub.add_parser(
         "serve", help="serve the JSON API (headless — the GUI is the session host's)"
     )
+    p_serve.add_argument(
+        "--audit-db",
+        default="",
+        help="Audit database. Defaults to audit.sqlite beside --db, or "
+        "HARNESS_AUDIT_DB. Put it on a different volume to stop history "
+        "sharing a fate with the queue.",
+    )
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8099)
     p_serve.add_argument(
@@ -437,10 +444,43 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     from .api import create_api
+    from .audit import open_audit_store
     from .work import WorkQueue
 
+    # A separate file, deliberately. History must not share a fate with the
+    # queue: the queue is migrated in place and is a reasonable thing to
+    # delete and rebuild from the plan, and anything in that file goes with it.
+    #
+    # Defaults to sitting beside the queue so a single-file deployment still
+    # works; point HARNESS_AUDIT_DB at a different volume to make the
+    # separation physical as well as logical.
+    audit_path = (
+        args.audit_db
+        or os.environ.get("HARNESS_AUDIT_DB")
+        or (str(Path(args.db).with_name("audit.sqlite")))
+    )
+    audit = open_audit_store(
+        audit_path,
+        required=os.environ.get("HARNESS_AUDIT_REQUIRED", "").lower() in {"1", "true", "yes"},
+        adopt_from=args.db,
+    )
+    if audit.degraded:
+        print(
+            f"WARNING: audit store at {audit_path} is DEGRADED; history is NOT "
+            "being recorded. The harness will keep working.",
+            file=sys.stderr,
+        )
+    else:
+        print(f"audit: {audit_path} ({audit.count()} events)")
+
     uvicorn.run(
-        create_api(store, queue=WorkQueue(args.db), token=token, root_path=args.root_path),
+        create_api(
+            store,
+            queue=WorkQueue(args.db),
+            token=token,
+            root_path=args.root_path,
+            audit=audit,
+        ),
         host=args.host,
         port=args.port,
         log_level="info",

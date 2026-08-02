@@ -23,6 +23,7 @@ default for something reachable over a network.
 
 from __future__ import annotations
 
+import json
 import secrets
 import time
 from pathlib import Path
@@ -33,16 +34,25 @@ from fastapi import Path as PathParam
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import __version__
+from .audit import AuditStore
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
 from .providers import MEANING
 from .schemas import (
     AddItemsRequest,
     AddItemsResult,
+    AuditCost,
+    AuditCostRow,
+    AuditDelivery,
+    AuditDeliveryRow,
+    AuditHealth,
+    Baseline,
+    BaselineList,
     Event,
     EventPage,
     FleetControl,
     Health,
     LatestEvent,
+    NewBaseline,
     PlanItem,
     PlanParseResult,
     PlanSyncRequest,
@@ -116,6 +126,7 @@ def create_api(
     queue: WorkQueue | None = None,
     token: str | None = None,
     root_path: str = "",
+    audit: AuditStore | None = None,
 ) -> FastAPI:
     """Build the API.
 
@@ -136,6 +147,7 @@ def create_api(
     )
     app.state.store = store
     app.state.queue = queue
+    app.state.audit = audit
     app.state.token = token
 
     def require_token(
@@ -302,6 +314,176 @@ def create_api(
     def get_control(_: None = Depends(require_token)) -> FleetControl:
         state, reason = need_queue().control()
         return FleetControl(state=state, reason=reason)
+
+    # ----------------------------------------------------------------- audit
+
+    def audit_store() -> AuditStore:
+        store_: AuditStore | None = app.state.audit
+        if store_ is None:
+            raise HTTPException(status_code=409, detail="no audit store is attached")
+        return store_
+
+    def audit_window(window: str) -> tuple[float | None, bool]:
+        """Window start, and whether history actually covers it.
+
+        The second value is the honest part. A chart labelled "last 30 days"
+        drawn from three days of history is not wrong about the data, it is
+        wrong about the question -- and nothing in the numbers reveals it.
+        """
+        since = since_for(window)
+        oldest, _ = audit_store().span()
+        partial = bool(since is not None and oldest is not None and oldest > since)
+        return since, partial
+
+    @app.get(
+        "/api/audit/health",
+        tags=["observability"],
+        summary="Is history actually being recorded?",
+        response_model=AuditHealth,
+    )
+    def audit_health(_: None = Depends(require_token)) -> AuditHealth:
+        """Whether the audit store is attached, writable, and how much it holds.
+
+        Worth checking deliberately: writes are dropped rather than raised
+        when the store is degraded, precisely so observation cannot stop
+        work — which means nothing else will tell you.
+        """
+        store_: AuditStore | None = app.state.audit
+        if store_ is None:
+            return AuditHealth(configured=False, degraded=True)
+        oldest, newest = store_.span()
+        return AuditHealth(
+            configured=True,
+            degraded=store_.degraded,
+            path=str(store_.path),
+            events=store_.count(),
+            oldest=oldest,
+            newest=newest,
+            schema_version=AuditStore.SCHEMA_VERSION,
+        )
+
+    @app.get(
+        "/api/audit/events",
+        tags=["observability"],
+        summary="Raw history, paged by row id",
+        response_model=EventPage,
+    )
+    def audit_events(
+        since_id: int = Query(0, description="Exclusive. Pass back the previous `cursor`."),
+        limit: int = Query(200, le=1000),
+        _: None = Depends(require_token),
+    ) -> EventPage:
+        """Paged by id rather than timestamp: two events in the same
+        millisecond must still have a total order, or a page boundary can
+        silently skip one."""
+        rows = audit_store().since_id(since_id, limit=limit)
+        return EventPage(
+            events=[Event(**_audit_event_fields(r)) for r in rows],
+            cursor=rows[-1]["id"] if rows else since_id,
+        )
+
+    @app.get(
+        "/api/audit/cost",
+        tags=["observability"],
+        summary="Spend by project, role and model",
+        response_model=AuditCost,
+    )
+    def audit_cost(
+        window: str = Query("7d", description=f"One of {sorted(WINDOWS)}."),
+        project_id: str | None = Query(None),
+        _: None = Depends(require_token),
+    ) -> AuditCost:
+        """What it cost, computed from the prices recorded at the time.
+
+        Calls whose price was unknown are counted in `unpriced` and never
+        folded into the total — a sum that quietly omits them reads as
+        complete and is not.
+        """
+        since, partial = audit_window(window)
+        rows = audit_store().cost(since=since, project_id=project_id)
+        priced = [r["cost_usd"] for r in rows if r["cost_usd"] is not None]
+        return AuditCost(
+            window=window,
+            rows=[AuditCostRow(**r) for r in rows],
+            total_cost_usd=sum(priced) if priced else None,
+            total_unpriced=sum(r["unpriced"] or 0 for r in rows),
+            partial=partial,
+        )
+
+    @app.get(
+        "/api/audit/delivery",
+        tags=["observability"],
+        summary="What was delivered, by project and outcome",
+        response_model=AuditDelivery,
+    )
+    def audit_delivery(
+        window: str = Query("7d", description=f"One of {sorted(WINDOWS)}."),
+        project_id: str | None = Query(None),
+        _: None = Depends(require_token),
+    ) -> AuditDelivery:
+        since, partial = audit_window(window)
+        rows = audit_store().delivery(since=since, project_id=project_id)
+        return AuditDelivery(
+            window=window,
+            rows=[AuditDeliveryRow(**r) for r in rows],
+            partial=partial,
+        )
+
+    @app.get(
+        "/api/audit/baselines",
+        tags=["observability"],
+        summary="Recorded baselines",
+        response_model=BaselineList,
+    )
+    def list_baselines(
+        project_id: str | None = Query(None),
+        _: None = Depends(require_token),
+    ) -> BaselineList:
+        """Without a baseline, "better than before" has no before."""
+        return BaselineList(
+            baselines=[Baseline(**b) for b in audit_store().baselines(project_id=project_id)]
+        )
+
+    @app.post(
+        "/api/audit/baselines",
+        tags=["observability"],
+        summary="Record a baseline",
+        response_model=Baseline,
+        responses={409: {"description": "That baseline id already exists"}},
+    )
+    def create_baseline(
+        request: NewBaseline,
+        _: None = Depends(require_token),
+    ) -> Baseline:
+        """Record a dated measurement to compare against.
+
+        Immutable: re-recording under an existing id is refused rather than
+        overwritten. A baseline that can be edited is not a baseline, it is a
+        target that moves to wherever the current numbers are.
+        """
+        store_ = audit_store()
+        created = store_.record_baseline(
+            request.baseline_id,
+            request.project_id,
+            label=request.label,
+            window_days=request.window_days,
+            recorded_at=time.time(),
+            items_done=request.items_done,
+            cost_usd=request.cost_usd,
+            notes=request.notes,
+        )
+        if not created:
+            raise HTTPException(
+                status_code=409,
+                detail=f"baseline {request.baseline_id!r} already exists; "
+                "baselines are immutable, so record a new one rather than replacing it",
+            )
+        match = [
+            b
+            for b in store_.baselines(project_id=request.project_id)
+            if b["baseline_id"] == request.baseline_id
+        ]
+        return Baseline(**match[0])
 
     # -------------------------------------------------------------- projects
 
@@ -670,6 +852,29 @@ def _latest_by_item(store: EventStore) -> dict[str, dict[str, Any]]:
         if item_id and item_id not in latest:
             latest[item_id] = event
     return latest
+
+
+def _audit_event_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """An audit row as the wire Event model.
+
+    The audit table has columns the event model does not (cost, tokens,
+    prices); they travel in `data`, where they already are, rather than
+    widening the public event shape for every consumer.
+    """
+    return {
+        "id": row["id"],
+        "ts": row["ts"],
+        "kind": row["kind"],
+        "source": row["source"],
+        "worker": row["worker"],
+        "role": row["role"],
+        "model": row["model"],
+        "endpoint": row["endpoint"],
+        "outcome": row["outcome"],
+        "error_class": row["error_class"],
+        "latency_s": row["latency_s"],
+        "data": json.loads(row["data"] or "{}"),
+    }
 
 
 def _project_spec(project: Project) -> ProjectSpec:

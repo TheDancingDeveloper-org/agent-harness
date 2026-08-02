@@ -75,17 +75,17 @@ from agent_harness.model_client import ModelClient, Route
 
 client = ModelClient(
     roles={
-        "planner":     Route("a-strong-model", "https://api.example", providers.CLAW_BAY),
+        "planner": Route("a-strong-model", "https://api.example", providers.CLAW_BAY),
         "implementer": Route("a-cheaper-model", "https://api.example", providers.CLAW_BAY),
         # Reviewer independence: a different vendor, so a model is not
         # grading its own work.
-        "reviewer":    Route("another-vendor", "https://api.example", providers.CLAW_BAY),
+        "reviewer": Route("another-vendor", "https://api.example", providers.CLAW_BAY),
     },
-    transport=my_http_call,          # you own the HTTP; this owns the policy
+    transport=my_http_call,  # you own the HTTP; this owns the policy
     on_event=lambda e: log.write(json.dumps(e) + "\n"),
 )
 
-client.call("implementer", messages)   # names a ROLE, never a model
+client.call("implementer", messages)  # names a ROLE, never a model
 ```
 
 `transport` is injected rather than imported, so the retry logic is testable without a

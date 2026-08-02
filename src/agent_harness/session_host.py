@@ -2,11 +2,11 @@
 
 A session host creates PTY sessions, keeps their scrollback, streams them to
 every attached client, and tracks whether one is idle, running, waiting for
-input, or errored. AIDevEnv (and its private ancestor MyDevEnv2) is the
-reference implementation, and the wire format here matches it — but nothing
-in the harness depends on that particular server, only on this shape.
+input, or errored. AIDevEnv is the reference implementation and the wire
+format here matches it — but nothing in the harness depends on that
+particular server, only on this shape.
 
-So the harness does not run agents itself. It asks MyDevEnv2 to, and gets
+So the harness does not run agents itself. It asks the host to, and gets
 back a session id. That id is the whole point: it is a **deep link**. An item
 the harness is working can be opened as a terminal tab in the same UI, on any
 device, with full scrollback — and an agent stuck on an approval prompt shows
@@ -27,7 +27,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-#: Activity states MyDevEnv2 reports. `waiting-for-input` is the one that
+#: Activity states the host reports. `waiting-for-input` is the one that
 #: matters most: the agent has stopped to ask something, and treating it as
 #: "finished" or "hung" are both wrong.
 IDLE = "idle"
@@ -75,7 +75,7 @@ class SessionHost(Protocol):
     """What the executor actually needs from a session host.
 
     Narrower than the client on purpose: the executor does not care whether
-    sessions come from MyDevEnv2, and depending on the concrete class would
+    sessions come from the host, and depending on the concrete class would
     make it untestable without a server and unusable with anything else.
     """
 

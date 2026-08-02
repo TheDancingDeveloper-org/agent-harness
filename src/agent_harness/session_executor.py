@@ -9,13 +9,13 @@ that; you get a result or you get nothing.
     claim item
       -> git worktree for the item, branch off its base
       -> write the brief to a prompt file
-      -> ask MyDevEnv2 to run `claude -p @prompt.md` (or codex, or anything)
+      -> ask the session host to run `claude -p @prompt.md` (or codex, or …)
       -> WAIT, surfacing `waiting-for-input` rather than treating it as done
       -> checks -> review -> commit -> push -> PR
 
-Two things this design gets from MyDevEnv2 for free, which are the reason for
+Two things this design gets from the host for free, which are the reason for
 it: the session id deep-links to a terminal tab in the UI the user already
-has open, and MyDevEnv2's own push notifications fire when an agent stops to
+has open, and the host's own push notifications fire when an agent stops to
 ask something.
 
 Each item gets its own **git worktree**. Two agents editing one working tree

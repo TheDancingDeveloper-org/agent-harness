@@ -319,7 +319,13 @@ D1–D6 are resolved (§0.2b). These are open and each blocks a phase.
 
 ### D7 — Where does the service run? *(blocks P2)*
 
-Options: its own Komodo stack on Node B; or inside the existing dev pod. The service is
+> **RESOLVED, then superseded.** First ruled "its own stack"; that is no longer
+> the shape. The harness now ships **inside the session host's image** and is
+> reached on loopback, so there is no second stack, no second port on the
+> tailnet, and no second thing to deploy. The host proxies its API and holds
+> its token, so the browser never sees either.
+
+~~Options: its own stack; or inside the existing dev pod. The service is
 long-lived, holds SQLite state and serves a GUI, which argues for its own stack with its own
 port and its own blast radius. Deciding this is a prerequisite for P2's deploy task, not for
 its code.

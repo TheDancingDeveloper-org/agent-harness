@@ -63,7 +63,8 @@ def test_no_token_configured_fails_closed(store: EventStore) -> None:
 
 
 def test_there_is_no_html_anywhere(client: TestClient) -> None:
-    """The GUI is MyDevEnv2's. If HTML creeps back in, so does a second UI."""
+    """The GUI belongs to the session host. If HTML creeps back in here, so
+    does a second UI."""
     response = client.get("/api/work", headers=auth())
     assert response.headers["content-type"].startswith("application/json")
     assert client.get("/").status_code == 404

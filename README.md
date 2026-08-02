@@ -18,7 +18,7 @@ against something real.
 | `providers` | Classifies a provider's failures — burst limit vs spent window vs spent cap vs refused | done |
 | `model_client` | Routes roles to models; per-worker jittered retry; per-endpoint parking; event emission | done |
 | `store` / `ingest` | Append-only SQLite event store; idempotent ingest from any source | done |
-| `api` | Headless JSON API — no GUI; MyDevEnv2 renders it as a Work tab | done |
+| `api` | Headless JSON API — no GUI; the session host renders it as a Work tab | done |
 | `adapters` | Opt-in readers for other tools' logs | one example |
 | Dispatch (queue, claims, worker supervision) | — | not started |
 | Gates / work definition | — | not started; deliberately not designed before there is a real workload |
@@ -96,10 +96,13 @@ it cannot tell a spend cap from a burst limit, because nothing in HTTP can.
 
 ### The API
 
-There is **no GUI here on purpose.** MyDevEnv2 already owns tabs, auth, push
-notifications, mobile and the terminal sessions agents run in; a second web UI
-would mean a second URL and a second login to do the same job worse. The
-harness serves JSON and MyDevEnv2 renders it.
+There is **no GUI here on purpose.** The session host already owns tabs, auth,
+push notifications, mobile and the terminal sessions agents run in; a second
+web UI would mean a second URL and a second login to do the same job worse.
+The harness serves JSON and the host renders it.
+
+[AIDevEnv](https://github.com/TheDancingDeveloper-org/aidevenv) is the
+reference host and ships a Work tab that consumes this API.
 
 ```bash
 uv sync --all-extras

@@ -1,9 +1,14 @@
 # agent-harness: Comprehensive Plan
 
-**Status:** P0 complete (2026-08-02). P1's code is written and under review as
-`swack-tools/oxidex#417`; P1's *deliverable* — the 72-hour measurement — has not been run,
-so P1 is **not** complete and P2 is not unblocked. See §2.6 for what P1 found wrong with
-this document.
+**Status (2026-08-02).** P0 complete. P1's code is written and under review as
+`swack-tools/oxidex#417`; its *deliverable* — the 72-hour measurement — has not been run.
+P2's code is merged and the dashboard runs, but it has never seen live traffic, is not
+deployed (D7), and has no soak. **Neither P1 nor P2 has met its exit criteria, and P3 has
+not been started.** See §2.6 for what P1 found wrong with this document and §7 P2 for what
+P2 found.
+
+Everything now outstanding needs either the fleet host or a human decision. Nothing further
+is buildable from a dev machine.
 **Date:** 2026-08-02
 **Owner:** TheDancingDeveloper-org
 **Repository:** `TheDancingDeveloper-org/agent-harness` (private)
@@ -529,6 +534,28 @@ Panels:
 - The error panel reproduces the §2.1 baseline from historical data **and** shows the P1
   delta.
 - 48 hours against live fleet traffic with no ingester restarts.
+
+**Code merged 2026-08-02; exit criteria NOT met.** Token auth, ingest and all five panels
+work against synthetic logs. Deploy is blocked on D7; the 8-day reproduction and the 48-hour
+soak both need the fleet host.
+
+One exit criterion is **unachievable as written**, and this is the plan's error rather than
+the implementation's: *"shows the P1 delta"* presumes the baseline can be broken down. It
+cannot. The 27,662 is a total, and nothing recorded the discriminator, so there is no
+per-class value to compare a P1 number against. The panel therefore compares **totals**,
+reports historical rate limits as `unclassified` in their own bucket, and states on the page
+that a per-class delta must not be read from it. Amend the criterion to: *reproduces the
+§2.1 total from historical data, and shows the post-P1 breakdown alongside it, labelled as
+not like-for-like.*
+
+Two smaller findings:
+
+- **Gate-by-gate pipeline rows are not buildable from today's logs.** Nothing emits a
+  per-gate event, so "each in-flight candidate as a row of gates" has nothing to project.
+  That is a worker change, not a dashboard one, and it belongs with P3 or a P1 follow-up.
+- **Spend is not observable without the gateway key**, which the service should not hold
+  before D7. The quota panel shows cap *hits* and says plainly that spend is unavailable,
+  rather than rendering an empty chart that reads as zero.
 
 ---
 

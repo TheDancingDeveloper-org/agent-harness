@@ -186,3 +186,52 @@ def test_deduplication_unions_metadata_from_both_statements() -> None:
 
 def test_a_plan_with_no_duplicates_reports_none() -> None:
     assert parse_plan(PLAN).duplicate_ids() == {}
+
+
+def test_dotted_sub_items_are_distinct_from_their_parent() -> None:
+    """A phase and the items nested under it are separate work.
+
+    Plans in the wild nest work under a phase heading. Without dotted-id
+    support every sub-item collapses onto its parent's id, so five real
+    items become one -- and the sync then refuses the plan for stating
+    the same id five times. Both symptoms, one cause.
+    """
+    plan = parse_plan(
+        """
+### P0 — Repository and guardrails
+
+Set the repository up.
+
+#### P0.1 — Repository
+
+Configure metadata.
+
+#### P0.2 — Documentation set
+
+Write the docs.
+
+#### P0.10 — Tenth item
+
+Two digits after the dot must not truncate to one.
+"""
+    )
+    assert [i.id for i in plan.items] == ["P0", "P0.1", "P0.2", "P0.10"]
+    assert plan.duplicate_ids() == {}
+    assert plan.items[1].title == "Repository"
+
+
+def test_a_dotted_dependency_resolves_to_the_sub_item() -> None:
+    """`depends on: P0.1` must not be read as a dependency on `P0`."""
+    plan = parse_plan(
+        """
+#### P0.1 — Repository
+
+Configure metadata.
+
+#### P0.2 — Documentation set
+
+depends on: P0.1
+"""
+    )
+    assert plan.items[1].depends_on == ["P0.1"]
+    assert plan.unresolved_dependencies() == {}

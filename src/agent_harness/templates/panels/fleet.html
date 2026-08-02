@@ -1,0 +1,27 @@
+{# Fleet: who is alive, doing what, and how long since we last heard. #}
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Fleet — {{ window }}</h2>
+  {% if workers %}
+  <div class="scroll">
+  <table>
+    <tr><th>Worker</th><th class="n">Calls</th><th class="n">Errors</th><th class="n">Error rate</th><th class="n">Last seen</th></tr>
+    {% for w in workers %}
+    <tr>
+      <td><code>{{ w.worker }}</code></td>
+      <td class="n">{{ w.calls }}</td>
+      <td class="n">{{ w.errors or 0 }}</td>
+      {# Both terms come from the same rows over the same window, so this
+         division is always defined -- never a rate built from two sources. #}
+      <td class="n">{{ (100 * (w.errors or 0) / w.calls)|round(1) }}%</td>
+      <td class="n">{{ w.last_seen | ago }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  <p class="note">"Last seen" is the newest event from that worker, not a
+  heartbeat: a worker mid-way through a long build is silent but healthy.</p>
+  {% else %}<p class="empty">No worker activity in this window.</p>{% endif %}
+</div>
+{% endblock %}

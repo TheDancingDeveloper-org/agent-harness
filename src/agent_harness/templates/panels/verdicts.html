@@ -1,0 +1,42 @@
+{# Diffs & verdicts: the semantic outcomes, incl. the review_rejected rate D9 needs. #}
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Semantic outcomes — {{ window }}</h2>
+  {% if outcomes %}
+  <table>
+    {% for outcome, n in outcomes.items() %}
+    <tr><td><code>{{ outcome }}</code></td><td class="n">{{ n }}</td></tr>
+    {% endfor %}
+  </table>
+  {% set total = outcomes.values() | sum %}
+  {% set rejected = outcomes.get('review_rejected', 0) %}
+  {% if total %}
+  <p class="note">Review rejection rate <strong>{{ (100 * rejected / total)|round(2) }}%</strong>
+  of {{ total }} outcomes. The 8-day baseline was 360/14,546 = 2.5%. Plan §2.4 flags
+  self-review as a live hypothesis for why it is that low; D9's A/B is what settles it,
+  and it needs this number split by reviewer configuration.</p>
+  {% endif %}
+  {% else %}<p class="empty">No lessons in this window.</p>{% endif %}
+</div>
+
+<div class="card">
+  <h2>Recent verdicts</h2>
+  {% if recent %}
+  <div class="scroll">
+  <table>
+    <tr><th>When</th><th>Model</th><th>Outcome</th><th>Tag</th><th>Reason</th></tr>
+    {% for r in recent %}
+    <tr>
+      <td>{{ r.ts | when }}</td>
+      <td>{{ r.model or '—' }}</td>
+      <td><code>{{ r.outcome or '—' }}</code></td>
+      <td>{{ r.data.get('tag', '—') }}</td>
+      <td>{{ (r.data.get('reason') or '')[:120] }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% else %}<p class="empty">Nothing in this window.</p>{% endif %}
+</div>
+{% endblock %}

@@ -38,7 +38,10 @@ trade and it is rejected.
 |---|---|
 | The plan | `docs/HARNESS-PLAN.md` |
 | Backlog manifest (seeds GitHub issues) | `docs/backlog.json` |
-| Event schema | `src/agent_harness/events.py` — **not yet written** (P2, issue T21). Until it exists, the append-only `events` table in the plan §5 is the only specification. |
+| Event schema | `src/agent_harness/events.py` |
+| Event store (append-only) | `src/agent_harness/store.py` |
+| Log readers | `src/agent_harness/ingest.py` |
+| Dashboard | `src/agent_harness/app.py` + `templates/` |
 | The worker and its 13 gates | `swack-tools/oxidex` — `scripts/model_fix_loop.py` |
 | The dispatcher (until P3 retires it) | `swack-tools/oxidex` — `scripts/parallel_model_fix_loop.py` |
 
@@ -47,26 +50,33 @@ the model client until P3 relocates dispatch into the service.
 
 ## Running the service locally
 
-There is no service yet (pre-alpha; see `README.md`). When P2 lands, this section states
-the command. Do not describe unbuilt behaviour in the present tense — §0.4 rule 6 applies
-to documentation.
-
-Toolchain, available now:
-
 ```bash
 uv sync --all-extras
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy .
-uv run pytest
+uv run agent-harness --db harness.sqlite ingest --logs ~/.oxidex/logs
+HARNESS_TOKEN=dev uv run agent-harness --db harness.sqlite serve --port 8099
 ```
+
+It has never run against a real fleet — see `README.md`. Do not describe it as proven.
+
+## Two invariants the dashboard must keep
+
+1. **It is read-only, in both directions.** It never writes to the harness's logs, and
+   nothing but the ingester writes to `events`. There is no UPDATE and no DELETE anywhere
+   in `store.py`, and a test enforces that against the source (risk R3). If a change needs
+   to mutate an event, it has to delete that test first — which is the point.
+2. **It never fabricates the number P1 exists to produce.** Rate limits from the
+   pre-classification logs are `unclassified`, counted separately, and never folded into
+   `rpm` / `window_cap` / `terminal_cap`. The baseline is a total; the successor is a
+   breakdown; the panel says so. Removing that caveat to make the page tidier would be
+   presenting a delta that does not exist.
 
 ## Engineering practice
 
 - **Red-first** for the retry classifier and anything else that decides whether the fleet
   stalls. **No sleeping in tests** — inject the sleep function.
-- Service tests use `pytest` + `httpx.ASGITransport` against the FastAPI app, with a temp
-  SQLite file per test.
+- Service tests run in-process over ASGI via `fastapi.testclient.TestClient`, with a temp
+  SQLite file per test. (The plan says `httpx.ASGITransport`; that transport is async-only
+  in the pinned httpx, so the sync `TestClient` wraps it. Same thing, no ports.)
 - `main` is protected: PR required, `lint` and `test` must pass, linear history.
 - Events are append-only. Views are projections over them, never a second source of truth,
   never written back (§3.5).

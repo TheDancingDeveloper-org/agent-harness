@@ -1,0 +1,41 @@
+{# Quota & spend. Honest about what it cannot show yet. #}
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Cost caps hit — {{ window }}</h2>
+  <table>
+    <tr><td><span class="swatch window_cap"></span><code>window_cap</code> (5h budget)</td>
+        <td class="n big">{{ caps.window_cap }}</td></tr>
+    <tr><td><span class="swatch terminal_cap"></span><code>terminal_cap</code> (weekly / key)</td>
+        <td class="n big">{{ caps.terminal_cap }}</td></tr>
+  </table>
+  <p class="note">Each of these parked one endpoint in one worker and was
+  <strong>not</strong> retried. A non-zero count here means budget, not throughput,
+  is the constraint.</p>
+</div>
+
+<div class="card">
+  <h2>Call volume by role</h2>
+  {% if by_role %}
+  <div class="scroll">
+  <table>
+    <tr><th>Role</th><th>Class</th><th class="n">Count</th></tr>
+    {% for row in by_role %}
+    <tr><td>{{ row.key or '—' }}</td>
+        <td>{% if row.error_class %}<code>{{ row.error_class }}</code>{% else %}<span class="note">ok</span>{% endif %}</td>
+        <td class="n">{{ row.n }}</td></tr>
+    {% endfor %}
+  </table>
+  </div>
+  {% else %}<p class="empty">Nothing in this window.</p>{% endif %}
+</div>
+
+<div class="card">
+  <h2>Spend</h2>
+  <p class="note warn"><strong>Not available.</strong> Per-role spend and remaining
+  headroom come from the gateway's <code>/quota</code> endpoint, which needs the API
+  key. This service does not hold one and does not want one until D7 settles where it
+  runs. This box says so rather than rendering an empty chart that reads as zero
+  spend.</p>
+</div>
+{% endblock %}

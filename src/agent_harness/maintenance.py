@@ -38,21 +38,71 @@ DEFAULT_INTERVAL_SECONDS = 3600.0
 DEFAULT_RETENTION_DAYS = 90
 
 
+#: How often merge and revert outcomes are pulled from GitHub. Far less often
+#: than rollups: a merged pull request stays merged, and a revert next week is
+#: still a revert when found tomorrow. Hammering the API to learn nothing is
+#: how a token gets rate limited for no benefit.
+DEFAULT_RECONCILE_EVERY = 6
+
+
 @dataclass
 class MaintenanceReport:
     rolled_up: int = 0
     thinned: int = 0
+    reconciled: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
     def __str__(self) -> str:
         parts = [f"rolled up {self.rolled_up}", f"thinned {self.thinned}"]
+        if self.reconciled:
+            parts.append("reconciled " + ", ".join(f"{k}={v}" for k, v in self.reconciled.items()))
         if self.errors:
             parts.append(f"errors {len(self.errors)}")
         return ", ".join(parts)
 
 
+def reconcile_projects(audit: AuditStore, queue: Any) -> tuple[dict[str, int], list[str]]:
+    """Pull GitHub outcomes for every project that names a repository.
+
+    Per project, because a repo is a project's property -- reconciling one
+    repo for a fleet running three would attribute other projects' pull
+    requests to nothing, or worse, to the wrong item.
+    """
+    from .reconcile import GitHubReconciler, items_by_pr
+
+    counts: dict[str, int] = {}
+    errors: list[str] = []
+    try:
+        projects = queue.projects()
+    except Exception as exc:  # noqa: BLE001
+        return counts, [f"projects: {exc}"]
+
+    mapping = items_by_pr(queue)
+    for project in projects:
+        if not project.repo:
+            continue
+        scoped = {
+            pr: attribution
+            for pr, attribution in mapping.items()
+            if attribution.get("project_id") == project.project_id
+        }
+        try:
+            report = GitHubReconciler(project.repo, audit).reconcile(scoped)
+        except Exception as exc:  # noqa: BLE001 - one repo must not stop the others
+            errors.append(f"reconcile {project.repo}: {exc}")
+            continue
+        errors.extend(report.errors)
+        recorded = report.merged + report.closed_unmerged + report.reverted
+        if recorded:
+            counts[project.project_id] = recorded
+    return counts, errors
+
+
 def run_maintenance(
-    audit: AuditStore, *, retention_days: int = DEFAULT_RETENTION_DAYS
+    audit: AuditStore,
+    *,
+    retention_days: int = DEFAULT_RETENTION_DAYS,
+    queue: Any = None,
 ) -> MaintenanceReport:
     """One maintenance pass: aggregate, then thin what is now covered.
 
@@ -76,7 +126,11 @@ def run_maintenance(
     except Exception as exc:  # noqa: BLE001
         report.errors.append(f"thin: {exc}")
         log.warning("audit maintenance: thin failed: %s", exc)
-    if report.rolled_up or report.thinned:
+    if queue is not None:
+        counts, errors = reconcile_projects(audit, queue)
+        report.reconciled = counts
+        report.errors.extend(errors)
+    if report.rolled_up or report.thinned or report.reconciled:
         log.info("audit maintenance: %s", report)
     return report
 
@@ -95,12 +149,17 @@ class MaintenanceLoop:
         *,
         interval: float = DEFAULT_INTERVAL_SECONDS,
         retention_days: int = DEFAULT_RETENTION_DAYS,
+        queue: Any = None,
+        reconcile_every: int = DEFAULT_RECONCILE_EVERY,
         on_pass: Callable[[MaintenanceReport], Any] | None = None,
     ) -> None:
         self.audit = audit
         self.interval = interval
         self.retention_days = retention_days
+        self.queue = queue
+        self.reconcile_every = max(1, reconcile_every)
         self.on_pass = on_pass
+        self._passes = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -127,7 +186,15 @@ class MaintenanceLoop:
         # Runs once immediately: after a restart the first useful thing to
         # know is whether yesterday closed, not to wait an hour to find out.
         while True:
-            report = run_maintenance(self.audit, retention_days=self.retention_days)
+            # Reconciliation runs on a slower cadence than rollups: it costs a
+            # GitHub API call per project and the answers rarely change.
+            due = self._passes % self.reconcile_every == 0
+            self._passes += 1
+            report = run_maintenance(
+                self.audit,
+                retention_days=self.retention_days,
+                queue=self.queue if due else None,
+            )
             if self.on_pass is not None:
                 with_suppressed_errors(self.on_pass, report)
             if self._stop.wait(self.interval):

@@ -477,16 +477,20 @@ def main(argv: list[str] | None = None) -> int:
     # Started here rather than left to cron: retention that depends on an
     # external scheduler silently stops when nobody installs it, and the
     # symptom is a database that grows for months before anyone notices.
+    queue_for_serve = WorkQueue(args.db)
     maintenance = MaintenanceLoop(
         audit,
         retention_days=int(os.environ.get("HARNESS_AUDIT_RETENTION_DAYS", DEFAULT_RETENTION_DAYS)),
+        # Reconciliation needs the queue: a pull request is only attributable
+        # to an item because the queue recorded its URL.
+        queue=queue_for_serve,
     )
     maintenance.start()
 
     uvicorn.run(
         create_api(
             store,
-            queue=WorkQueue(args.db),
+            queue=queue_for_serve,
             token=token,
             root_path=args.root_path,
             audit=audit,

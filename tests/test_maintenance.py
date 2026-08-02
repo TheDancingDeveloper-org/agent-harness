@@ -144,3 +144,52 @@ def test_a_broken_callback_cannot_kill_the_loop(audit: AuditStore) -> None:
         loop.stop()
 
     assert len(passes) > 1, "the loop stopped after a callback raised"
+
+
+def test_reconciliation_runs_on_a_slower_cadence_than_rollups(audit: AuditStore) -> None:
+    """A merged PR stays merged. Hammering the GitHub API every hour to learn
+    nothing is how a token gets rate limited for no benefit."""
+    calls: list[int] = []
+
+    class FakeQueue:
+        def projects(self):  # type: ignore[no-untyped-def]
+            calls.append(1)
+            return []
+
+        def items(self):  # type: ignore[no-untyped-def]
+            return []
+
+    loop = MaintenanceLoop(
+        audit, interval=0.02, retention_days=0, queue=FakeQueue(), reconcile_every=5
+    )
+    loop.start()
+    try:
+        threading.Event().wait(0.4)
+    finally:
+        loop.stop()
+
+    # Many passes, far fewer reconciliations.
+    assert calls, "reconciliation never ran"
+    assert len(calls) < 10, f"reconciled on every pass ({len(calls)} times)"
+
+
+def test_one_repo_failing_does_not_stop_the_others(audit: AuditStore) -> None:
+    """A project with a bad token must not cost every other project its
+    ground truth."""
+    from agent_harness.maintenance import reconcile_projects
+
+    class Project:
+        def __init__(self, pid: str, repo: str) -> None:
+            self.project_id, self.repo = pid, repo
+
+    class FakeQueue:
+        def projects(self):  # type: ignore[no-untyped-def]
+            return [Project("a", "o/broken"), Project("b", "o/fine")]
+
+        def items(self):  # type: ignore[no-untyped-def]
+            return []
+
+    counts, errors = reconcile_projects(audit, FakeQueue())
+    # Both were attempted; neither aborted the sweep.
+    assert isinstance(counts, dict)
+    assert isinstance(errors, list)

@@ -369,6 +369,29 @@ class MaintenanceResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class ReconcileResult(BaseModel):
+    """What GitHub said happened to the work."""
+
+    merged: int = 0
+    closed_unmerged: int = Field(
+        0,
+        description="Rejected outright -- from inside the harness this looks identical "
+        "to a pull request still waiting.",
+    )
+    reverted: int = Field(
+        0,
+        description="Merged and then undone. The only honest quality metric here: "
+        "approval rate says a reviewer agreed, revert rate says whether they should have.",
+    )
+    skipped: int = Field(
+        0,
+        description="Pull requests the harness did not create -- dependabot, humans. "
+        "Counted, never attributed: an outcome belonging to no item inflates every "
+        "rate it appears in.",
+    )
+    errors: list[str] = Field(default_factory=list)
+
+
 class Baseline(BaseModel):
     baseline_id: str
     project_id: str

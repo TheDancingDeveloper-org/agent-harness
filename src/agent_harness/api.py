@@ -38,6 +38,7 @@ from .audit import AuditStore
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
 from .maintenance import DEFAULT_RETENTION_DAYS, run_maintenance
 from .providers import MEANING
+from .reconcile import GitHubReconciler, items_by_pr
 from .schemas import (
     AddItemsRequest,
     AddItemsResult,
@@ -65,6 +66,7 @@ from .schemas import (
     ProjectSpec,
     ProjectSummary,
     RateLimits,
+    ReconcileResult,
     RetryResult,
     RoleMap,
     RoleRoute,
@@ -431,6 +433,37 @@ def create_api(
             window=window,
             rows=[AuditDeliveryRow(**r) for r in rows],
             partial=partial,
+        )
+
+    @app.post(
+        "/api/audit/reconcile",
+        tags=["observability"],
+        summary="Pull merge and revert outcomes from GitHub",
+        response_model=ReconcileResult,
+    )
+    def audit_reconcile(
+        repo: str = Query(description="GitHub repo as `owner/name`."),
+        _: None = Depends(require_token),
+    ) -> ReconcileResult:
+        """Record what the world did with the work.
+
+        Everything the harness knows about quality is a proxy: a reviewer
+        approved it, the checks passed. Whether it was merged, rejected or
+        reverted happens outside the harness and has to be fetched.
+
+        Append-only: a pull request merged today and reverted next week
+        produces two facts, in order, both true when recorded — not one fact
+        that changes its mind.
+        """
+        queue = app.state.queue
+        mapping = items_by_pr(queue) if queue is not None else {}
+        report = GitHubReconciler(repo, audit_store()).reconcile(mapping)
+        return ReconcileResult(
+            merged=report.merged,
+            closed_unmerged=report.closed_unmerged,
+            reverted=report.reverted,
+            skipped=report.skipped,
+            errors=report.errors,
         )
 
     @app.post(

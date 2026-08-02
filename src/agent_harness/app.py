@@ -90,6 +90,7 @@ def create_app(
     store: EventStore,
     token: str | None = None,
     baseline: Baseline | None = None,
+    queue: Any = None,
     stream_max_seconds: float = 300.0,
     stream_poll_seconds: float = 1.0,
 ) -> FastAPI:
@@ -109,6 +110,9 @@ def create_app(
     app.state.store = store
     app.state.token = token
     app.state.baseline = baseline
+    # Optional: the work queue, when this dashboard is watching a fleet that
+    # has one. Without it the work panel says so rather than showing zero.
+    app.state.queue = queue
     app.state.stream_max_seconds = stream_max_seconds
     app.state.stream_poll_seconds = stream_poll_seconds
 
@@ -222,6 +226,38 @@ def create_app(
             request,
             "panels/errors.html",
             {"window": window, "windows": list(WINDOWS), **_errors_context(window)},
+        )
+
+    @app.get("/panel/work", response_class=HTMLResponse)
+    def panel_work(
+        request: Request, window: str = Query("24h"), _: None = Depends(require_token)
+    ) -> HTMLResponse:
+        """What each item is doing, and what it did last.
+
+        Work state comes from the queue; the *stage* comes from the event
+        stream, because the queue only knows "claimed" while the interesting
+        question is "claimed, doing what?".
+        """
+        store: EventStore = app.state.store
+        queue = app.state.queue
+        since = window_seconds(window)
+        latest: dict[str, dict[str, Any]] = {}
+        for event in store.recent(kind="work", limit=2000, since=since):
+            item = event["data"].get("item_id") or event.get("worker")
+            if item and item not in latest:
+                latest[item] = event
+        return templates.TemplateResponse(
+            request,
+            "panels/work.html",
+            {
+                "window": window,
+                "windows": list(WINDOWS),
+                "items": queue.all() if queue is not None else None,
+                "counts": queue.counts() if queue is not None else {},
+                "stale": queue.stale() if queue is not None else [],
+                "latest": latest,
+                "now": time.time(),
+            },
         )
 
     @app.get("/panel/fleet", response_class=HTMLResponse)

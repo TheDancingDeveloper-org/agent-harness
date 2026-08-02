@@ -216,6 +216,25 @@ class GitHub:
             ["gh", "issue", "comment", str(number), "-R", self.repo, "--body-file", "-"], stdin=text
         )
 
+    def create_pr(self, *, title: str, body: str, head: str, base: str) -> str:
+        return self._run(
+            [
+                "gh",
+                "pr",
+                "create",
+                "-R",
+                self.repo,
+                "--title",
+                title,
+                "--body",
+                body,
+                "--head",
+                head,
+                "--base",
+                base,
+            ]
+        ).strip()
+
     def close(self, number: int, comment: str | None = None) -> None:
         args = ["gh", "issue", "close", str(number), "-R", self.repo]
         if comment:

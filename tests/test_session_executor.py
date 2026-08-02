@@ -1,6 +1,6 @@
-"""Tests for running work as attachable MyDevEnv2 sessions.
+"""Tests for running work as attachable hosted terminal sessions.
 
-The MyDevEnv2 server is faked at the HTTP boundary; git and the checks are
+The session host is faked at the HTTP boundary; git and the checks are
 real, against a real temporary repository. The agent is simulated by a
 callback that edits the worktree — which is exactly what a CLI agent does.
 """
@@ -46,7 +46,7 @@ def repo(tmp_path: Path) -> Path:
 
 
 class FakeDevEnv:
-    """A MyDevEnv2 whose sessions do whatever the test says.
+    """A session host whose sessions do whatever the test says.
 
     `agent` is called with the session's cwd when the session is created —
     standing in for the CLI agent editing the worktree.
@@ -65,7 +65,7 @@ class FakeDevEnv:
         self.polls = 0
         self.killed: list[str] = []
 
-    # -- the MyDevEnv2 surface the executor uses -----------------------
+    # -- the session-host surface the executor uses ---------------------
 
     def create_session(
         self,
@@ -144,7 +144,7 @@ def build(
         reviewer=reviewer(verdict),
         github=github,
         worktrees=tmp_path / "trees",
-        ui_base_url="https://mydevenv2.example",
+        ui_base_url="https://devenv.example",
         on_event=(events.append if events is not None else None),
         push=False,
     )
@@ -228,7 +228,7 @@ def test_each_item_gets_its_own_worktree_and_it_is_cleaned_up(repo: Path, tmp_pa
 
 
 def test_the_session_id_is_emitted_so_a_human_can_attach(repo: Path, tmp_path: Path) -> None:
-    """The whole reason for running agents as MyDevEnv2 sessions."""
+    """The whole reason for running agents as hosted sessions."""
     events: list[dict[str, Any]] = []
     devenv = FakeDevEnv(agent=add_multiply)
     executor, queue = build(repo, tmp_path, devenv, events=events)
@@ -236,7 +236,7 @@ def test_the_session_id_is_emitted_so_a_human_can_attach(repo: Path, tmp_path: P
     executor.run_once()
     started = next(e for e in events if e["outcome"] == "agent_started")
     assert started["session_id"] == "sess-1"
-    assert started["session_url"] == "https://mydevenv2.example/t/sess-1"
+    assert started["session_url"] == "https://devenv.example/t/sess-1"
 
 
 def test_waiting_for_input_is_surfaced_and_extends_the_lease(repo: Path, tmp_path: Path) -> None:

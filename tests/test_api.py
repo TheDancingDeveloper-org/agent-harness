@@ -15,6 +15,7 @@ from agent_harness.api import create_api
 from agent_harness.events import MODEL_CALL, UNCLASSIFIED, WORK, Event
 from agent_harness.store import EventStore
 from agent_harness.work import CLAIMED, DONE, PENDING, WorkQueue, WorkRecord
+from conftest import make_queue
 
 TOKEN = "test-token"  # noqa: S105 - a fixture, not a credential
 
@@ -26,7 +27,7 @@ def store(tmp_path: Path) -> EventStore:
 
 @pytest.fixture
 def queue(tmp_path: Path) -> WorkQueue:
-    q = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    q = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
     q.add(
         [
             WorkRecord(item_id="W1", title="First", brief="do the first thing", issue=1),
@@ -199,7 +200,7 @@ def test_retry_refuses_an_item_with_a_live_claim(client: TestClient, queue: Work
 def test_retry_allows_an_item_whose_lease_expired(tmp_path: Path, store: EventStore) -> None:
     """A stale claim means the worker is gone; it needs no ceremony."""
     clock = [1000.0]
-    q = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=10.0, now=lambda: clock[0])
+    q = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=10.0, now=lambda: clock[0])
     q.add([WorkRecord(item_id="W1", title="t", brief="b")])
     q.claim("gone")
     clock[0] += 100

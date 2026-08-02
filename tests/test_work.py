@@ -14,6 +14,7 @@ from agent_harness.work import (
     WorkQueue,
     WorkRecord,
 )
+from conftest import make_queue
 
 
 @pytest.fixture
@@ -23,7 +24,7 @@ def clock() -> list[float]:
 
 @pytest.fixture
 def queue(tmp_path: Path, clock: list[float]) -> WorkQueue:
-    return WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
+    return make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
 
 
 def rec(item_id: str, **kw: object) -> WorkRecord:
@@ -171,12 +172,12 @@ def test_counts_projection(queue: WorkQueue) -> None:
 def test_state_survives_a_new_queue_object(tmp_path: Path) -> None:
     """Resume, in one assertion: claims are rows, not process memory."""
     path = str(tmp_path / "w.sqlite")
-    first = WorkQueue(path, lease_seconds=100.0, now=lambda: 1000.0)
+    first = make_queue(path, lease_seconds=100.0, now=lambda: 1000.0)
     first.add([rec("T1"), rec("T2")])
     first.claim("a")
     first.release("T1", DONE)
 
-    resumed = WorkQueue(path, lease_seconds=100.0, now=lambda: 1000.0)
+    resumed = make_queue(path, lease_seconds=100.0, now=lambda: 1000.0)
     assert resumed.get("T1").state == DONE  # type: ignore[union-attr]
     nxt = resumed.claim("b")
     assert nxt is not None and nxt.item_id == "T2"
@@ -232,6 +233,8 @@ def test_an_unknown_control_state_is_refused(queue: WorkQueue) -> None:
 
 
 def test_control_survives_a_restart(tmp_path: Path) -> None:
+    """Deliberately not `make_queue`: that sets the project running on
+    construction, which is exactly what this test needs NOT to happen."""
     path = str(tmp_path / "w.sqlite")
     WorkQueue(path).set_control("paused", "overnight")
     assert WorkQueue(path).control() == ("paused", "overnight")
@@ -244,8 +247,8 @@ def test_settings_are_shared_across_processes(tmp_path: Path) -> None:
     """The API and the worker are different processes; an in-memory value
     could never be changed from outside the loop using it."""
     path = str(tmp_path / "w.sqlite")
-    WorkQueue(path).set_setting("role_map", {"reviewer": {"model": "m"}})
-    assert WorkQueue(path).get_setting("role_map") == {"reviewer": {"model": "m"}}
+    make_queue(path).set_setting("role_map", {"reviewer": {"model": "m"}})
+    assert make_queue(path).get_setting("role_map") == {"reviewer": {"model": "m"}}
 
 
 def test_an_unset_setting_is_none_not_an_error(queue: WorkQueue) -> None:

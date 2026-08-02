@@ -8,6 +8,7 @@ import pytest
 
 from agent_harness.reaper import DEFAULT_MAX_AGE_SECONDS, reap_abandoned_sessions
 from agent_harness.work import WorkQueue, WorkRecord
+from conftest import make_queue
 
 
 class FakeHost:
@@ -34,7 +35,7 @@ def clock() -> list[float]:
 
 @pytest.fixture
 def queue(tmp_path: Path, clock: list[float]) -> WorkQueue:
-    q = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
+    q = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
     q.add([WorkRecord(item_id="T1", title="t", brief="b")])
     return q
 
@@ -108,7 +109,7 @@ def test_the_count_is_visible_in_the_summary(tmp_path: Path) -> None:
     from agent_harness.api import create_api
     from agent_harness.store import EventStore
 
-    q = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    q = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
     q.add([WorkRecord(item_id="T1", title="t", brief="b")])
     q.record_abandoned_session("s-1", "T1", reason="timed out")
     store = EventStore(tmp_path / "e.sqlite")
@@ -129,7 +130,7 @@ def test_the_executor_reaps_before_it_claims(tmp_path: Path) -> None:
     from agent_harness.session_executor import SessionExecutor
 
     clock = [1000.0]
-    q = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
+    q = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
     q.record_abandoned_session("s-old", "T1")
     clock[0] += DEFAULT_MAX_AGE_SECONDS + 1
 
@@ -148,7 +149,7 @@ def test_a_host_that_cannot_reap_is_not_an_error(tmp_path: Path) -> None:
     class MinimalHost:
         pass
 
-    q = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    q = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
     executor = SessionExecutor(q, MinimalHost(), tmp_path)  # type: ignore[arg-type]
 
     assert executor.reap() is None

@@ -28,6 +28,7 @@ from agent_harness.work import (
     WorkQueue,
     WorkRecord,
 )
+from conftest import make_queue
 
 
 def rec(item_id: str) -> WorkRecord:
@@ -50,7 +51,7 @@ def test_racing_workers_never_claim_the_same_item_twice(tmp_path: Path) -> None:
     A barrier starts every thread at once, so they contend on the same
     BEGIN IMMEDIATE rather than politely following each other.
     """
-    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=1000.0)
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=1000.0)
     items = [f"T{i}" for i in range(200)]
     queue.add(rec(i) for i in items)
 
@@ -80,7 +81,7 @@ def test_an_expired_lease_is_re_claimed_by_exactly_one_racer(tmp_path: Path) -> 
     becomes duplicated work rather than resumed work.
     """
     clock = [1000.0]
-    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
     queue.add([rec("T1")])
 
     first = queue.claim("worker-dead")
@@ -109,7 +110,7 @@ def test_an_expired_lease_is_re_claimed_by_exactly_one_racer(tmp_path: Path) -> 
 def test_a_heartbeat_reports_that_the_claim_was_lost(tmp_path: Path) -> None:
     """The signal a slow worker needs to stop before it does damage."""
     clock = [1000.0]
-    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
     queue.add([rec("T1")])
 
     queue.claim("worker-slow")
@@ -136,7 +137,7 @@ def test_a_zombie_worker_cannot_finish_an_item_someone_else_now_owns(tmp_path: P
     the half of the race that asks politely.
     """
     clock = [1000.0]
-    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
     queue.add([rec("T1")])
 
     queue.claim("worker-stalled")
@@ -155,7 +156,7 @@ def test_a_zombie_worker_cannot_finish_an_item_someone_else_now_owns(tmp_path: P
 
 def test_the_live_owner_can_still_finish_normally(tmp_path: Path) -> None:
     """The guard must not break the ordinary path it is protecting."""
-    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
     queue.add([rec("T1")])
 
     claimed = queue.claim("worker-1")
@@ -173,7 +174,7 @@ def test_an_unowned_release_is_an_administrative_override(tmp_path: Path) -> Non
     operator, deliberately. Guarding that would break the one control a human
     has over a stuck item.
     """
-    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
     queue.add([rec("T1")])
     queue.claim("worker-1")
 
@@ -188,7 +189,7 @@ def test_an_unowned_release_is_an_administrative_override(tmp_path: Path) -> Non
 def test_concurrent_releases_do_not_resurrect_finished_work(tmp_path: Path) -> None:
     """Whatever the interleaving, an item ends in exactly one terminal state."""
     clock = [1000.0]
-    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
     queue.add([rec(f"T{i}") for i in range(50)])
 
     # claim() hands out the next available item, which is not necessarily the
@@ -224,7 +225,7 @@ def test_concurrent_releases_do_not_resurrect_finished_work(tmp_path: Path) -> N
 @pytest.mark.parametrize("workers", [2, 16])
 def test_a_paused_fleet_grants_no_claims_under_contention(tmp_path: Path, workers: int) -> None:
     """Pausing must hold when many workers ask at once, not just one."""
-    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=1000.0)
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=1000.0)
     queue.add([rec(f"T{i}") for i in range(20)])
     queue.set_control("paused", reason="test")
 
@@ -253,7 +254,7 @@ def test_a_worker_that_lost_its_claim_stops_instead_of_reporting(tmp_path: Path)
     fail the same way: both look correct in isolation.
     """
     clock = [1000.0]
-    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
     queue.add([rec("T1")])
 
     stalled = queue.claim("worker-stalled")

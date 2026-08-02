@@ -397,10 +397,35 @@ Enumerate `/models` against the live key before pinning identifiers. The gateway
 documentation lists `gpt-5.5`, `gpt-5.4` and `gpt-5.4-mini` as the reasoning-capable set and
 explicitly instructs callers not to hardcode availability.
 
+**Enumerated 2026-08-02** (42 models). The reasoning-capable OpenAI tier is wider than the
+documentation says: `gpt-5.6`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`,
+`gpt-5.4`, `gpt-5.4-mini`. More importantly, **cross-vendor models are reachable on the same
+key and the same OpenAI-compatible route** — `claude-opus-4-8`, `claude-sonnet-4-6`,
+`claude-haiku-4-5`, `gemini-3.1-pro-preview`, `glm-5.2`, `kimi-k2.7-code`,
+`deepseek-v4-pro`. So reviewer independence needs no `/anthropic` route and no second
+integration: it is a model name. The instruction not to hardcode availability stands — this
+list is evidence of what was true on one day, not a constant.
+
 ### 5.3 Quota awareness
 
-The gateway exposes `/quota` over 5-hour and weekly windows. Poll it, cache it, and check
-before dispatching a *round* — not mid-attempt.
+> **CORRECTED 2026-08-02 — `/quota` does not exist.** Probed live against
+> `api.theclawbay.com`: `/quota`, `/v1/quota` and `/api/quota` all return 404. `GET
+> /v1/usage` does exist, but returns `{aggregation_timestamp, n_context_tokens_total,
+> n_generated_tokens_total}` — **token counts, not cost windows and not remaining
+> headroom**. There is currently no way to ask the gateway how much budget is left.
+>
+> This invalidates the mechanism below, not the goal. Everything in this section that says
+> "poll `/quota`" has to become inference from the event stream instead: the only signal
+> that a window is spent is the `5h_cost_limit_reached` / `weekly_cost_limit_reached` 429
+> itself, **after the fact**. That is a materially weaker instrument — it detects
+> exhaustion rather than predicting it — and P3's T35 (quota-gated admission with reviewer
+> headroom) is the task that has to absorb the difference. Re-probe before designing it;
+> the gateway may grow the endpoint.
+>
+> What survives unchanged: the *reason* for reserving headroom, below.
+
+~~The gateway exposes `/quota` over 5-hour and weekly windows. Poll it, cache it, and check
+before dispatching a *round* — not mid-attempt.~~
 
 **Reserve headroom for the reviewer.** If implementers exhaust the weekly window, the fleet
 holds patches that passed every gate but cannot be reviewed or merged — which is §2.3's

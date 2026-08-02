@@ -32,10 +32,16 @@
 
 <div class="card">
   <h2>Spend</h2>
-  <p class="note warn"><strong>Not available.</strong> Per-role spend and remaining
-  headroom come from the gateway's <code>/quota</code> endpoint, which needs the API
-  key. This service does not hold one and does not want one until D7 settles where it
-  runs. This box says so rather than rendering an empty chart that reads as zero
-  spend.</p>
+  <p class="note warn"><strong>Not available, and not merely unimplemented.</strong>
+  The plan assumed a <code>/quota</code> endpoint over 5-hour and weekly windows.
+  Probed live on 2026-08-02: <code>/quota</code>, <code>/v1/quota</code> and
+  <code>/api/quota</code> all 404. <code>/v1/usage</code> exists but returns token
+  counts — not cost windows, not remaining headroom.</p>
+  <p class="note">So there is currently <em>no</em> way to ask how much budget is left.
+  The counts above are the only budget signal there is, and they are
+  <strong>after the fact</strong>: a cap is detected when it is hit, not predicted before
+  it. Anything that needs to reserve headroom in advance (plan §5.3, P3's quota-gated
+  admission) has to absorb that gap. This box says so rather than rendering an empty
+  chart that reads as zero spend.</p>
 </div>
 {% endblock %}

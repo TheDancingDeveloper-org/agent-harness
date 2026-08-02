@@ -211,13 +211,36 @@ def _run(args: argparse.Namespace) -> int:
         with events_path.open("a") as handle:
             handle.write(_json.dumps(event) + "\n")
 
+    from .api import ROLE_MAP_KEY
+
+    # Seed the shared map from the command line, then read it back per call so
+    # `PUT /api/roles` takes effect without a restart.
+    if not queue.get_setting(ROLE_MAP_KEY):
+        queue.set_setting(
+            ROLE_MAP_KEY,
+            {
+                name: {"model": model, "endpoint": args.endpoint, "provider": "claw-bay"}
+                for name, model in roles.items()
+            },
+        )
+
+    def live_routes() -> dict[str, Route]:
+        stored = queue.get_setting(ROLE_MAP_KEY) or {}
+        return {
+            name: Route(
+                route["model"],
+                route["endpoint"],
+                providers.PROVIDERS.get(route.get("provider", ""), providers.CLAW_BAY),
+                api_key=api_key,
+            )
+            for name, route in stored.items()
+        }
+
     client = ModelClient(
-        roles={
-            name: Route(model, args.endpoint, providers.CLAW_BAY, api_key=api_key)
-            for name, model in roles.items()
-        },
+        roles=live_routes(),
         transport=_http_transport(api_key),
         on_event=emit,
+        routes_provider=live_routes,
     )
 
     executor: Any

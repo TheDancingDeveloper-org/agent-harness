@@ -179,6 +179,10 @@ POST /api/plan/sync         plan -> GitHub issues, dry-run by default
 GET  /api/errors            rate limits by class
 GET  /api/events            paged by row id, not timestamp
 GET  /api/summary           enough for a status line
+GET  /api/control           is the fleet claiming work?
+POST /api/control           pause, drain or resume — never interrupts work
+GET  /api/roles             where each role's calls go
+PUT  /api/roles             re-route a role, live
 GET  /healthz               open, cheap, needs no credential
 ```
 

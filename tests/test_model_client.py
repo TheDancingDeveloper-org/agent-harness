@@ -386,3 +386,33 @@ def test_two_clients_do_not_share_a_run_id() -> None:
     a = build(Recorder(ok()))
     b = build(Recorder(ok()))
     assert a.run_id != b.run_id
+
+
+def test_the_role_map_can_be_changed_while_running() -> None:
+    """The call site names a ROLE, never a model — which is exactly what
+    makes re-routing it a data change rather than a redeploy."""
+    live = {"implementer": Route("v1", "https://a")}
+    transport = Recorder(ok(), ok())
+    client = ModelClient(
+        roles=dict(live),
+        transport=transport,
+        sleep=lambda _s: None,
+        routes_provider=lambda: live,
+    )
+    client.call("implementer", MESSAGES)
+    live["implementer"] = Route("v2", "https://a")  # changed from elsewhere
+    client.call("implementer", MESSAGES)
+    assert [c.model for c in transport.calls] == ["v1", "v2"]
+
+
+def test_an_empty_live_map_keeps_the_last_known_routes() -> None:
+    """A provider that briefly returns nothing — a half-written setting, a
+    racing writer — must not take the fleet down with it."""
+    transport = Recorder(ok())
+    client = ModelClient(
+        roles={"implementer": Route("m", "https://a")},
+        transport=transport,
+        sleep=lambda _s: None,
+        routes_provider=dict,
+    )
+    assert client.call("implementer", MESSAGES).status == 200

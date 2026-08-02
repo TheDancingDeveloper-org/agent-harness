@@ -97,6 +97,45 @@ class AddItemsResult(BaseModel):
     total: int = Field(description="Items in the queue afterwards.")
 
 
+class FleetControl(BaseModel):
+    state: Literal["running", "paused", "draining"] = Field(
+        description="`running` claims freely. `paused` and `draining` both stop new "
+        "claims; neither interrupts work in flight, because killing an agent mid-item "
+        "destroys its context and leaves a half-finished worktree. The difference is "
+        "what the operator meant."
+    )
+    reason: str | None = Field(
+        None,
+        description="Why it was set. Shown to whoever finds "
+        "the fleet stopped and has to decide "
+        "whether to resume it.",
+    )
+
+
+class SetFleetControl(BaseModel):
+    state: Literal["running", "paused", "draining"]
+    reason: str | None = None
+
+
+class RoleRoute(BaseModel):
+    model: str = Field(description="Model identifier as the provider names it.")
+    endpoint: str = Field(description="Base URL of the provider API.")
+    provider: str = Field(
+        "claw-bay",
+        description="Failure classifier to use: `generic` "
+        "cannot tell a spend cap from a burst "
+        "limit, because nothing in HTTP can.",
+    )
+
+
+class RoleMap(BaseModel):
+    roles: dict[str, RoleRoute] = Field(
+        description="role -> where its calls go. Changing this takes effect on the next "
+        "call: the call site names a ROLE, never a model, which is what makes the map "
+        "changeable without a redeploy."
+    )
+
+
 # --------------------------------------------------------------------- plan
 
 

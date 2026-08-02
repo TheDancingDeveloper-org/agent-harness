@@ -184,3 +184,69 @@ def test_state_survives_a_new_queue_object(tmp_path: Path) -> None:
 
 def test_an_empty_queue_claims_nothing_rather_than_erroring(queue: WorkQueue) -> None:
     assert queue.claim("a") is None
+
+
+# ------------------------------------------------------------- fleet control
+
+
+def test_pausing_stops_new_claims_but_not_work_in_flight(queue: WorkQueue) -> None:
+    """Killing an agent mid-item destroys the context that makes its work
+    resumable. Stopping at the next boundary is strictly better."""
+    queue.add([rec("T1"), rec("T2")])
+    in_flight = queue.claim("a")
+    assert in_flight is not None
+
+    queue.set_control("paused", "deploying")
+    assert queue.claim("b") is None
+    # The item already claimed is untouched — its lease still stands.
+    record = queue.get(in_flight.item_id)
+    assert record is not None
+    assert record.state == CLAIMED
+    assert record.owner == "a"
+
+
+def test_resuming_claims_again(queue: WorkQueue) -> None:
+    queue.add([rec("T1")])
+    queue.set_control("paused")
+    assert queue.claim("a") is None
+    queue.set_control("running")
+    assert queue.claim("a") is not None
+
+
+def test_draining_behaves_like_paused_but_records_the_intent(queue: WorkQueue) -> None:
+    """The difference matters to whoever finds the fleet stopped and has to
+    decide whether to resume it."""
+    queue.add([rec("T1")])
+    queue.set_control("draining", "rolling out a new image")
+    assert queue.claim("a") is None
+    assert queue.control() == ("draining", "rolling out a new image")
+
+
+def test_control_defaults_to_running(queue: WorkQueue) -> None:
+    assert queue.control() == ("running", None)
+
+
+def test_an_unknown_control_state_is_refused(queue: WorkQueue) -> None:
+    with pytest.raises(ValueError, match="unknown control state"):
+        queue.set_control("halt")
+
+
+def test_control_survives_a_restart(tmp_path: Path) -> None:
+    path = str(tmp_path / "w.sqlite")
+    WorkQueue(path).set_control("paused", "overnight")
+    assert WorkQueue(path).control() == ("paused", "overnight")
+
+
+# ---------------------------------------------------------------- settings
+
+
+def test_settings_are_shared_across_processes(tmp_path: Path) -> None:
+    """The API and the worker are different processes; an in-memory value
+    could never be changed from outside the loop using it."""
+    path = str(tmp_path / "w.sqlite")
+    WorkQueue(path).set_setting("role_map", {"reviewer": {"model": "m"}})
+    assert WorkQueue(path).get_setting("role_map") == {"reviewer": {"model": "m"}}
+
+
+def test_an_unset_setting_is_none_not_an_error(queue: WorkQueue) -> None:
+    assert queue.get_setting("nope") is None

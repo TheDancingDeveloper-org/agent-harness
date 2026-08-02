@@ -163,8 +163,14 @@ class ModelClient:
         jitter: Callable[[], float] = random.random,
         parks: EndpointParks | None = None,
         run_id: str | None = None,
+        routes_provider: Callable[[], Mapping[str, Route]] | None = None,
     ) -> None:
         self.roles = dict(roles)
+        # Consulted per call when set, so the role -> model map can be changed
+        # while the fleet is running. The call site names a ROLE and never a
+        # model, which is the whole reason that is possible; a provider lets
+        # the new value come from somewhere outside this process.
+        self.routes_provider = routes_provider
         self.transport = transport
         self.policy = policy or RetryPolicy()
         self.on_event = on_event
@@ -182,6 +188,10 @@ class ModelClient:
         self._seq = itertools.count()
 
     def route_for(self, role: str) -> Route:
+        if self.routes_provider is not None:
+            live = self.routes_provider()
+            if live:
+                self.roles = dict(live)
         try:
             return self.roles[role]
         except KeyError:

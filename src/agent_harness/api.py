@@ -36,6 +36,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from . import __version__
 from .audit import AuditStore
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
+from .maintenance import DEFAULT_RETENTION_DAYS, run_maintenance
 from .providers import MEANING
 from .schemas import (
     AddItemsRequest,
@@ -54,6 +55,7 @@ from .schemas import (
     FleetControl,
     Health,
     LatestEvent,
+    MaintenanceResult,
     NewBaseline,
     PlanItem,
     PlanParseResult,
@@ -429,6 +431,29 @@ def create_api(
             window=window,
             rows=[AuditDeliveryRow(**r) for r in rows],
             partial=partial,
+        )
+
+    @app.post(
+        "/api/audit/maintenance",
+        tags=["observability"],
+        summary="Roll up and thin now",
+        response_model=MaintenanceResult,
+    )
+    def audit_maintenance(
+        retention_days: int = Query(
+            DEFAULT_RETENTION_DAYS, ge=0, description="Raw events older than this may be thinned."
+        ),
+        _: None = Depends(require_token),
+    ) -> MaintenanceResult:
+        """Run a maintenance pass immediately.
+
+        This also happens hourly in the background; the manual trigger exists
+        so an operator does not have to wait an hour to see whether retention
+        is working, which is exactly when they are most likely to want to know.
+        """
+        report = run_maintenance(audit_store(), retention_days=retention_days)
+        return MaintenanceResult(
+            rolled_up=report.rolled_up, thinned=report.thinned, errors=report.errors
         )
 
     @app.get(

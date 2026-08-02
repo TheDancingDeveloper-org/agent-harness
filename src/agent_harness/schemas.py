@@ -359,6 +359,16 @@ class AuditRollups(BaseModel):
     )
 
 
+class MaintenanceResult(BaseModel):
+    rolled_up: int = Field(
+        description="Daily rows written. Zero is normal once today is the only uncovered day."
+    )
+    thinned: int = Field(
+        description="Raw events removed. Only ever events whose day a rollup already covers."
+    )
+    errors: list[str] = Field(default_factory=list)
+
+
 class Baseline(BaseModel):
     baseline_id: str
     project_id: str

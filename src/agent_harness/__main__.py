@@ -445,6 +445,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from .api import create_api
     from .audit import open_audit_store
+    from .maintenance import DEFAULT_RETENTION_DAYS, MaintenanceLoop
     from .work import WorkQueue
 
     # A separate file, deliberately. History must not share a fate with the
@@ -472,6 +473,15 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         print(f"audit: {audit_path} ({audit.count()} events)")
+
+    # Started here rather than left to cron: retention that depends on an
+    # external scheduler silently stops when nobody installs it, and the
+    # symptom is a database that grows for months before anyone notices.
+    maintenance = MaintenanceLoop(
+        audit,
+        retention_days=int(os.environ.get("HARNESS_AUDIT_RETENTION_DAYS", DEFAULT_RETENTION_DAYS)),
+    )
+    maintenance.start()
 
     uvicorn.run(
         create_api(

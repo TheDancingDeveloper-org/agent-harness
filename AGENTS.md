@@ -59,7 +59,9 @@ trade and it is rejected.
 | Event schema | `src/agent_harness/events.py` |
 | Event store (append-only) | `src/agent_harness/store.py` |
 | Log readers | `src/agent_harness/ingest.py` |
-| Dashboard | `src/agent_harness/app.py` + `templates/` |
+| JSON API (no GUI) | `src/agent_harness/api.py` |
+| Session host client | `src/agent_harness/mydevenv2.py` |
+| Agent loop | `src/agent_harness/session_executor.py` |
 | The worker and its 13 gates | `swack-tools/oxidex` — `scripts/model_fix_loop.py` |
 | The dispatcher (until P3 retires it) | `swack-tools/oxidex` — `scripts/parallel_model_fix_loop.py` |
 
@@ -76,7 +78,15 @@ HARNESS_TOKEN=dev uv run agent-harness --db harness.sqlite serve --port 8099
 
 It has never run against a real fleet — see `README.md`. Do not describe it as proven.
 
-## Two invariants the dashboard must keep
+## Do not add a GUI here
+
+The GUI is MyDevEnv2's. It already has tabs, Tailscale auth, push
+notifications, an Android PWA, and the PTY sessions the agents run in. A web
+UI in this repo means a second URL, a second login, no notifications and no
+phone story — worse, for the same work. This service serves JSON; MyDevEnv2
+renders it as a Work tab.
+
+## Two invariants the store must keep
 
 1. **It is read-only, in both directions.** It never writes to the harness's logs, and
    nothing but the ingester writes to `events`. There is no UPDATE and no DELETE anywhere

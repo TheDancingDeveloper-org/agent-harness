@@ -71,6 +71,10 @@ class Outcome:
     #: What the branch was cut from. Not always the default branch: work
     #: that depends on other work is stacked on it.
     base: str | None = None
+    #: The MyDevEnv2 session the agent ran in, when it ran as one. This is
+    #: a deep link: it is how a human attaches to the terminal doing the
+    #: work, from any device.
+    session_id: str | None = None
     pr_url: str | None = None
     verdict: str | None = None
     stages: list[str] = field(default_factory=list)

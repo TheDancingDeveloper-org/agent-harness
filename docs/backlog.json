@@ -1,0 +1,400 @@
+[
+  {
+    "id": "D1",
+    "title": "D1: Repo identity and visibility",
+    "milestone": "P0",
+    "labels": ["type:decision", "area:ci"],
+    "body": "**RESOLVED 2026-08-02:** `TheDancingDeveloper-org/agent-harness`, private. GitHub is the sole source of truth for code, issues and CI. No second remote, no mirror.\n\n**Acceptance:** decision recorded here; §0.2b of `docs/HARNESS-PLAN.md` reflects it."
+  },
+  {
+    "id": "D2",
+    "title": "D2: Implementation language",
+    "milestone": "P0",
+    "labels": ["type:decision", "area:dispatch"],
+    "body": "**RESOLVED 2026-08-02: Python.**\n\nThe harness is already ~11,000 lines of Python (`model_fix_loop.py` ~8,200, `parallel_model_fix_loop.py` ~2,960). The workload is HTTP, JSON, subprocess supervision and SQLite — nothing hot. The parts that need speed (`cargo build`, test suites) are subprocesses regardless of host language.\n\nRewriting in Rust would turn P3 from an import into an IPC boundary, and would put a compile step in the layer that churns most (prompts, gate definitions, routing policy).\n\n**Acceptance:** decision recorded; no Rust in the service path."
+  },
+  {
+    "id": "D3",
+    "title": "D3: Gateway architecture — no second proxy",
+    "milestone": "P0",
+    "labels": ["type:decision", "area:model-client"],
+    "body": "**RESOLVED 2026-08-02: no LiteLLM, no second gateway.**\n\nThe Claw Bay already unifies GPT, Codex, Claude, Gemini and DeepSeek behind OpenAI-, Anthropic- and Gemini-compatible routes. A second gateway in front of a gateway is redundant.\n\nMore importantly, the failures that actually hurt are not expressible in a router config:\n\n- cost-window caps (`5h_cost_limit_reached`, `weekly_cost_limit_reached`) are spend limits, not request rates; a proxy's short per-deployment cooldown retries into a cap with days left on it\n- `/quota` is the signal that solves the problem, and no off-the-shelf router reads it\n- role routing is a dictionary lookup, not a service\n\nThe fix is an in-process `ModelClient` — see §5.1.\n\n**Revisit if:** several accounts across several providers AND multiple independent consumers competing for them. Not the case today.\n\n**Acceptance:** decision recorded; no proxy service in the deploy."
+  },
+  {
+    "id": "D4",
+    "title": "D4: Forge — GitHub only",
+    "milestone": "P0",
+    "labels": ["type:decision", "area:github"],
+    "body": "**RESOLVED 2026-08-02: GitHub only.**\n\nThe P4 dispatcher binds directly to the GitHub API. No forge abstraction layer, no second tracker.\n\n**Acceptance:** decision recorded; P4 tasks assume `gh` / GitHub REST throughout."
+  },
+  {
+    "id": "D5",
+    "title": "D5: GUI stack",
+    "milestone": "P0",
+    "labels": ["type:decision", "area:gui"],
+    "body": "**RESOLVED 2026-08-02: HTMX + SSE + Jinja, server-rendered.**\n\nNo node build step in the iteration loop. A dashboard that is mostly live-updating tables and log tails is what HTMX is good at.\n\nRevisitable in P4 if the control surface outgrows it — grafting an SPA on later loses nothing, whereas starting with one costs build tooling from day one.\n\n**Acceptance:** decision recorded; no bundler in the P2 deliverable."
+  },
+  {
+    "id": "D6",
+    "title": "D6: State store",
+    "milestone": "P0",
+    "labels": ["type:decision", "area:store"],
+    "body": "**RESOLVED 2026-08-02: SQLite with WAL, single file.**\n\nAn append-only `events` table is the spine; every view is a projection over it. No separate database service.\n\nThis also makes the P2 ingester replayable: the existing 8 days of `~/.oxidex/logs/*` JSONL can be re-ingested from scratch at any time.\n\n**Acceptance:** decision recorded; `events` is append-only and never written back to by a view."
+  },
+  {
+    "id": "D7",
+    "title": "D7: Where does the service run?",
+    "milestone": "P2",
+    "labels": ["type:decision", "area:ci", "blocked"],
+    "body": "**OPEN. Blocks T29 (P2 deploy).**\n\nOptions:\n\n1. **Its own Komodo stack on Node B**, own port, own blast radius. Preferred on the argument that a harness crash must not take down anything else.\n2. Inside the existing dev pod. Simpler, but couples lifecycles.\n\nThe service is long-lived, holds SQLite state and serves a GUI over Tailscale.\n\nThis blocks the deploy task only — P2's code can be written before it is settled.\n\n**Acceptance:** ruling recorded here; §4 D7 of the plan updated; T29 unblocked."
+  },
+  {
+    "id": "D8",
+    "title": "D8: Gate plugin interface",
+    "milestone": "P4",
+    "labels": ["type:decision", "area:dispatch", "blocked", "risk:high"],
+    "body": "**OPEN. Blocks all of P4.**\n\nGates 5, 9 and 13 (`cargo build`, targeted tests, full workspace suite) are things any repo has and are expressible as the repo's own required checks. Gates 6, 7 and 8 (ExifTool comparison, structural validation, gap-count) are wholly oxidex-specific.\n\nP4 needs a boundary between the two. Candidate shapes: a Python entry-point plugin, a subprocess contract, or declarative config.\n\n**Explicitly do not guess this before P3 has shown what the dispatcher actually needs.** Designing the abstraction ahead of its first two consumers is risk R4 in the register.\n\n**Acceptance:** interface specified with at least two concrete implementations sketched (oxidex + one other repo) before any P4 code lands."
+  },
+  {
+    "id": "D9",
+    "title": "D9: Does the reviewer see the plan?",
+    "milestone": "P1",
+    "labels": ["type:decision", "area:model-client"],
+    "body": "**OPEN. Blocks T15.**\n\nFeeding the planner's rationale into the review prompt risks anchoring — the reviewer approves by construction because it has already read the justification. Withholding it risks the reviewer lacking context to judge intent.\n\n**Recommendation:** withhold in P1. Treat it as an A/B once P2 can measure `review_rejected` rate per configuration. Do not settle by argument.\n\nContext: 360 `review_rejected` out of 14,546 semantic outcomes is 2.5%, low enough that reviewer weakness is already a live hypothesis (§2.4).\n\n**Acceptance:** ruling recorded; if deferred to A/B, the experiment is a P2 follow-up issue."
+  },
+
+  {
+    "id": "E0",
+    "title": "P0 — Repository and guardrails",
+    "milestone": "P0",
+    "labels": ["type:epic", "area:ci"],
+    "body": "No functional code. Stand up where the work is tracked and the guardrails that keep it honest.\n\n**Exit:** repo exists with green CI; branch protection active; all backlog items created, labelled, milestoned and on the board."
+  },
+  {
+    "id": "E1",
+    "title": "P1 — Fix the model layer",
+    "milestone": "P1",
+    "labels": ["type:epic", "area:model-client"],
+    "body": "Executed in `swack-tools/oxidex`, not this repo. ~half a day of code, then 72 hours of measurement.\n\nThe cheapest, highest-ratio work in the project, and the prerequisite for P2's dashboard showing something other than a wall of undifferentiated 429s.\n\n**Exit:** see §7 P1. The measurement is the deliverable, not the code."
+  },
+  {
+    "id": "E2",
+    "title": "P2 — Read-only dashboard",
+    "milestone": "P2",
+    "labels": ["type:epic", "area:gui"],
+    "body": "FastAPI + SQLite + HTMX/SSE, ingesting the P1 event stream and existing `~/.oxidex/logs/*` JSONL. Zero changes to the harness — if the dashboard crashes, the fleet does not notice.\n\n**Exit:** see §7 P2."
+  },
+  {
+    "id": "E3",
+    "title": "P3 — Service owns dispatch",
+    "milestone": "P3",
+    "labels": ["type:epic", "area:dispatch"],
+    "body": "Queue, claims, role→model map and retry policy move into the service. `parallel_model_fix_loop.py` retires into it; `model_fix_loop.py` survives as the gate runner.\n\nStays cheap because of D2 — moving functions between modules, not crossing a language boundary.\n\n**Exit:** see §7 P3."
+  },
+  {
+    "id": "E4",
+    "title": "P4 — Generalise",
+    "milestone": "P4",
+    "labels": ["type:epic", "area:github", "blocked"],
+    "body": "Claims become GitHub issue assignments; gates become the target repo's required checks; the checkpoint becomes a draft PR.\n\nBlocked on D8.\n\n**Exit:** see §7 P4."
+  },
+
+  {
+    "id": "T1",
+    "title": "T1: Create the repository",
+    "milestone": "P0",
+    "labels": ["type:task", "area:ci"],
+    "body": "Create `TheDancingDeveloper-org/agent-harness`, **private**, GitHub Actions enabled, issues enabled, wiki and projects-classic disabled.\n\n**Acceptance:** `gh repo view TheDancingDeveloper-org/agent-harness` succeeds and reports private."
+  },
+  {
+    "id": "T2",
+    "title": "T2: Create labels",
+    "milestone": "P0",
+    "labels": ["type:task", "area:ci"],
+    "body": "Create the 13 labels used by this backlog:\n\n```\narea:model-client area:dispatch area:gui area:store area:github area:ci area:docs\ntype:epic type:task type:decision type:spike\nrisk:high blocked\n```\n\nNo `phase:*` labels — milestones `P0`–`P4` already carry phase, and two parallel encodings of the same fact drift. `type:spike` is created for future use though nothing in the initial manifest uses it.\n\n**Acceptance:** `gh label list -R $R` shows all 13; T9 issue creation succeeds with no unknown-label errors."
+  },
+  {
+    "id": "T3",
+    "title": "T3: Create milestones",
+    "milestone": "P0",
+    "labels": ["type:task", "area:ci"],
+    "body": "Create milestones `P0` through `P4` with descriptions matching §7 of `docs/HARNESS-PLAN.md`.\n\n**Acceptance:** five milestones exist; descriptions match the plan."
+  },
+  {
+    "id": "T4",
+    "title": "T4: README with honest status",
+    "milestone": "P0",
+    "labels": ["type:task", "area:docs"],
+    "body": "`README.md`: what it is, **honest pre-alpha status (not usable yet)**, the Appendix A definition of done as a public checklist, and a pointer to `docs/HARNESS-PLAN.md`.\n\nDo not describe unbuilt phases in the present tense. §0.4 rule 6 applies to documentation.\n\n**Acceptance:** README exists; every capability claim is true of `main` at time of writing."
+  },
+  {
+    "id": "T5",
+    "title": "T5: AGENTS.md for this repo",
+    "milestone": "P0",
+    "labels": ["type:task", "area:docs"],
+    "body": "Project-specific agent guidance: the §0.4 rules of engagement as binding policy, how to run the service locally, where the event schema lives, and the standing instruction that gates are never weakened to simplify scaffolding (§3.1).\n\n`CLAUDE.md` is a pointer to this file only.\n\n**Acceptance:** `AGENTS.md` exists and §0.4 is reproduced as binding."
+  },
+  {
+    "id": "T6",
+    "title": "T6: CI workflow",
+    "milestone": "P0",
+    "labels": ["type:task", "area:ci"],
+    "body": "`.github/workflows/ci.yml`: `ruff check`, `ruff format --check`, `mypy`, `pytest`. Runs on push and PR. `uv` for dependency resolution.\n\n**Acceptance:** green run on `main`."
+  },
+  {
+    "id": "T7",
+    "title": "T7: Branch protection",
+    "milestone": "P0",
+    "labels": ["type:task", "area:ci"],
+    "body": "Protect `main`: no direct push, PR required, required checks `lint` and `test`, linear history.\n\nThis is what makes the P4 draft-PR checkpoint meaningful — a required check the agent cannot bypass.\n\n**Acceptance:** a direct push to `main` is rejected."
+  },
+  {
+    "id": "T8",
+    "title": "T8: Projects v2 board",
+    "milestone": "P0",
+    "labels": ["type:task", "area:ci"],
+    "body": "Create the board with custom fields `Phase`, `Area`, `Size` (XS–XL), `Risk`. Add all issues.\n\n**Acceptance:** every backlog item is on the board with `Phase` set."
+  },
+  {
+    "id": "T9",
+    "title": "T9: Create issues from backlog.json",
+    "milestone": "P0",
+    "labels": ["type:task", "area:ci"],
+    "body": "Run the Appendix B creation script once, from a fresh clone, after T2 and T3.\n\n**Acceptance:** `gh issue list -R $R --limit 100 | wc -l` matches the manifest length."
+  },
+
+  {
+    "id": "T10",
+    "title": "T10: Delete the global rate-limit governor",
+    "milestone": "P1",
+    "labels": ["type:task", "area:model-client", "risk:high"],
+    "body": "In `swack-tools/oxidex:scripts/parallel_model_fix_loop.py`, remove the fleet-wide cooldown and its 30/60/120/240/300s ladder.\n\n**Why:** it does not merely stall the fleet, it phase-locks it. All workers are released at the same instant, emit a synchronised burst, trip the rpm limit together and park together — the exact shape a rate limiter is designed to reject. Against a weekly cost cap a 300s ceiling is futile regardless. See §2.2(a).\n\n**Acceptance:** no code path pauses more than the worker that experienced the error. Verified by grep and by a test that asserts worker B proceeds while worker A is sleeping."
+  },
+  {
+    "id": "T11",
+    "title": "T11: Implement ModelClient",
+    "milestone": "P1",
+    "labels": ["type:task", "area:model-client", "risk:high"],
+    "body": "Per §5.1. Five responsibilities: role table, `theclawbayError` classification, per-worker retry with jitter honouring `retry-after`, per-endpoint cooldown across Claw Bay plus one direct account, structured emission.\n\n`CapExhausted` propagates to the worker, which exits cleanly. It is **not** caught inside the gate pipeline.\n\n**Acceptance:** classifier covers rpm 429, `5h_cost_limit_reached`, `weekly_cost_limit_reached`, `invalid_api_key`, non-429; cost caps are never retried; T18 tests green."
+  },
+  {
+    "id": "T12",
+    "title": "T12: Un-pin max_retries",
+    "milestone": "P1",
+    "labels": ["type:task", "area:model-client"],
+    "body": "`max_retries` is pinned at 1 because \"at 3, a single 429 ladder fires four limited reports and parks the entire fleet near the cap\" — a workaround for the global governor, not a policy.\n\nDepends on T10. Once the governor is local, retries cost only the sleeping worker.\n\n**Acceptance:** pin removed; default raised; no fleet-level effect observable in a 2-worker test."
+  },
+  {
+    "id": "T13",
+    "title": "T13: Role table replaces random model draw",
+    "milestone": "P1",
+    "labels": ["type:task", "area:model-client"],
+    "body": "`pick_model_fn` currently defaults to `random.choice` over one pool, with a fresh uniform pick before every call. That conflates load spreading with model selection and makes roles inexpressible (§2.4).\n\nReplace with `ROLE_MODEL[role]`, deterministic, and pass `model=role` at the call site.\n\n**Acceptance:** no random draw remains in the model-selection path; planner, implementer and reviewer resolve to distinct configured models."
+  },
+  {
+    "id": "T14",
+    "title": "T14: Add the plan stage",
+    "milestone": "P1",
+    "labels": ["type:task", "area:model-client"],
+    "body": "The only behavioural addition in P1. Today gate 3 asks for a unified diff cold, with no preceding reasoning step.\n\nAdd a planner call ahead of gate 3 whose output feeds the implementer prompt. Emit the plan into the event stream so P2 can render it alongside the diff.\n\n**Acceptance:** every attempt records a plan; the implementer prompt contains it; gate 3 onwards is unchanged."
+  },
+  {
+    "id": "T15",
+    "title": "T15: Reviewer independence",
+    "milestone": "P1",
+    "labels": ["type:task", "area:model-client"],
+    "body": "Gate 12 currently uses \"the same pool mechanism\" with no documented dedicated configuration — so some fraction of reviews may be a model grading its own patch.\n\nRoute the reviewer to a **different vendor** via Claw Bay's `/anthropic` or `/v1beta` route. Same key, zero integration cost, strongest available form of independence.\n\nBlocked on D9 for whether the reviewer sees the planner's rationale.\n\n**Acceptance:** reviewer model is never the implementer model for the same attempt; `review_rejected` rate recorded before and after against the 2.5% baseline."
+  },
+  {
+    "id": "T16",
+    "title": "T16: Structured event emission",
+    "milestone": "P1",
+    "labels": ["type:task", "area:model-client", "area:store"],
+    "body": "Every call outcome appended with: timestamp, worker, format, attempt, role, model, endpoint, http status, `theclawbayError` class, latency, token counts.\n\nSuperset of today's `manifest.log`. P2 depends entirely on this — the dashboard is a projection over it.\n\n**Acceptance:** schema documented in this repo; a 1-hour run produces a well-formed stream that the T22 ingester consumes without loss."
+  },
+  {
+    "id": "T17",
+    "title": "T17: Enumerate /models and pin role models",
+    "milestone": "P1",
+    "labels": ["type:task", "area:model-client"],
+    "body": "The gateway documentation instructs callers to enumerate `/models` rather than hardcode availability, and lists `gpt-5.5`, `gpt-5.4` and `gpt-5.4-mini` as the reasoning-capable set.\n\nEnumerate against the live key, record what is actually available, and pin planner/implementer/reviewer accordingly. Do not assume a model exists because it was named in conversation.\n\n**Acceptance:** the available catalogue is recorded in this issue; §5.2 of the plan updated with the real identifiers."
+  },
+  {
+    "id": "T18",
+    "title": "T18: Tests for retry classification",
+    "milestone": "P1",
+    "labels": ["type:task", "area:model-client", "risk:high"],
+    "body": "Red-first, per §6.1. This logic decides whether the fleet stalls for a week, and it is trivially testable with a fake response and a table of payloads.\n\nBranches: rpm 429; `5h_cost_limit_reached`; `weekly_cost_limit_reached`; `invalid_api_key`; non-429 error; `retry-after` present; `retry-after` absent; attempt exhaustion; and the locality assertion from T10.\n\n**No sleeping in tests** — inject the sleep function.\n\nHome: `scripts/test_model_fix_loop.py`, `scripts/test_parallel_model_fix_loop.py`.\n\n**Acceptance:** every branch covered; suite runs in under a second."
+  },
+  {
+    "id": "T19",
+    "title": "T19: 72-hour measurement run",
+    "milestone": "P1",
+    "labels": ["type:task", "area:model-client", "risk:high"],
+    "body": "**The P1 deliverable is this measurement, not the code.**\n\nRun the fleet 72 hours post-change and record, against the §2.1 and §2.5 baselines:\n\n- rate-limit error count, **broken down by class** (baseline: 27,662 undifferentiated over 8 days)\n- delivery rate (baseline: 56%)\n- patch-apply rate (baseline: 25–80%, model-dependent)\n- `review_rejected` rate (baseline: 2.5%)\n\n**If the apply rate falls to the bottom of the band, that is a finding, not a failure.** Record it and re-evaluate the implementer tier before P3 hardcodes the role map. Extra repair rounds can consume the cost saving.\n\n**Acceptance:** numbers posted in this issue; §2 of the plan updated; explicit go/no-go on the implementer tier."
+  },
+
+  {
+    "id": "T20",
+    "title": "T20: FastAPI service skeleton",
+    "milestone": "P2",
+    "labels": ["type:task", "area:gui"],
+    "body": "FastAPI + uvicorn, token auth (bearer, single token plus optional scoped list), health endpoint, Jinja templates, static assets served from the app. No bundler (D5).\n\n**Acceptance:** `GET /health` returns 200; an unauthenticated request to any other route returns 401; `pytest` covers both via `httpx.ASGITransport`."
+  },
+  {
+    "id": "T21",
+    "title": "T21: Event store schema",
+    "milestone": "P2",
+    "labels": ["type:task", "area:store"],
+    "body": "SQLite with WAL. Append-only `events` table per D6, indexed for the five P2 panels. Views are projections and **never write back** (risk R3).\n\n**Acceptance:** schema committed with migrations; a test asserts no code path updates or deletes from `events`."
+  },
+  {
+    "id": "T22",
+    "title": "T22: Ingester",
+    "milestone": "P2",
+    "labels": ["type:task", "area:store"],
+    "body": "Tail the T16 event stream and the existing `~/.oxidex/logs/model-fix-requests/manifest.log`, `model-fix-diffs/manifest.log` and `lessons.jsonl` into `events`.\n\nMust be **idempotent and replayable** — re-ingesting the full 8-day history from scratch produces an identical store.\n\n**Acceptance:** full historical ingest completes with zero dropped records; re-running produces no duplicates."
+  },
+  {
+    "id": "T23",
+    "title": "T23: Errors panel",
+    "milestone": "P2",
+    "labels": ["type:task", "area:gui", "risk:high"],
+    "body": "**The highest-value panel.** 429s broken out by class — rpm vs `5h_cost_limit_reached` vs `weekly_cost_limit_reached` — over time, by worker, by endpoint.\n\nThis is the view that would have surfaced the 27,662-error problem in a day rather than eight.\n\n**Acceptance:** reproduces the §2.1 baseline from historical data, and shows the P1 delta side by side."
+  },
+  {
+    "id": "T24",
+    "title": "T24: Fleet panel",
+    "milestone": "P2",
+    "labels": ["type:task", "area:gui"],
+    "body": "Live worker list: role, current stage, model, elapsed, what it is claimed on, last event.\n\n**Acceptance:** reflects worker state within 2s of an event."
+  },
+  {
+    "id": "T25",
+    "title": "T25: Pipeline panel",
+    "milestone": "P2",
+    "labels": ["type:task", "area:gui"],
+    "body": "Each in-flight candidate as a row of gates, so it is visible **where** things die — apply ladder, build, reviewer, full suite.\n\n**Acceptance:** a completed attempt shows its terminal gate; aggregate view ranks gates by failure count."
+  },
+  {
+    "id": "T26",
+    "title": "T26: Quota and spend panel",
+    "milestone": "P2",
+    "labels": ["type:task", "area:gui", "area:model-client"],
+    "body": "Poll the gateway `/quota` endpoint (5-hour and weekly windows), cache it, and render alongside per-role spend and remaining headroom.\n\nThis is the signal that makes P3's quota-gated admission possible — P2 only displays it.\n\n**Acceptance:** headroom for both windows visible and refreshed; per-role spend attributable from T16 events."
+  },
+  {
+    "id": "T27",
+    "title": "T27: Diffs and verdicts panel",
+    "milestone": "P2",
+    "labels": ["type:task", "area:gui"],
+    "body": "Every logged diff (`~/.oxidex/logs/model-fix-diffs/`) rendered with its apply outcome, the plan that produced it (T14), and the reviewer's APPROVE/REJECT/UNVERIFIABLE with reasoning.\n\n**Acceptance:** a rejected patch can be diagnosed end to end from the GUI without opening a log file — Appendix A criterion 2."
+  },
+  {
+    "id": "T28",
+    "title": "T28: SSE live updates",
+    "milestone": "P2",
+    "labels": ["type:task", "area:gui"],
+    "body": "Server-sent events driving HTMX swaps on all five panels. Reconnect with last-event-id.\n\n**Acceptance:** a worker event appears in the browser within 2s; killing and restarting the browser tab resumes without gaps."
+  },
+  {
+    "id": "T29",
+    "title": "T29: Deploy",
+    "milestone": "P2",
+    "labels": ["type:task", "area:ci", "blocked"],
+    "body": "Blocked on D7. Dockerfile, stack definition, Tailscale-reachable, token in the secret store, SQLite on a persistent volume.\n\n**Acceptance:** service reachable over Tailscale; survives a container restart with its store intact."
+  },
+  {
+    "id": "T30",
+    "title": "T30: 48-hour soak",
+    "milestone": "P2",
+    "labels": ["type:task", "area:gui"],
+    "body": "Run against live fleet traffic for 48 hours.\n\n**Acceptance:** no ingester restarts; no dropped events; store size growth within expectation; all five panels correct at the end of the window."
+  },
+
+  {
+    "id": "T31",
+    "title": "T31: Queue and claims in the service",
+    "milestone": "P3",
+    "labels": ["type:task", "area:dispatch"],
+    "body": "Move work allocation and claiming out of `flock` and into SQLite rows.\n\nToday a claim is a `flock` holder that \"goes stale after two hours and becomes re-claimable\" — a crude lease with no audit trail. Rows survive a service restart and are inspectable from the GUI.\n\n**Acceptance:** claims survive a service restart; a stale claim is reclaimed deterministically, not by timeout guess."
+  },
+  {
+    "id": "T32",
+    "title": "T32: Worker supervision",
+    "milestone": "P3",
+    "labels": ["type:task", "area:dispatch"],
+    "body": "The service spawns and supervises workers as **separate processes** (§5). The existing worker is synchronous and subprocess-heavy; running it as an asyncio task would stall the loop, and process isolation is already the crash boundary.\n\n**Acceptance:** worker crash is detected and reported without affecting siblings; the service restarts cleanly with workers running."
+  },
+  {
+    "id": "T33",
+    "title": "T33: Live role→model map",
+    "milestone": "P3",
+    "labels": ["type:task", "area:dispatch", "area:gui"],
+    "body": "Edit the role→model mapping from the GUI, taking effect on the next call without a redeploy. Changes are events (D6) so the mapping in force at any past moment is recoverable.\n\n**Acceptance:** Appendix A criterion 7 — map changed without redeploy; the change is attributable in the event stream."
+  },
+  {
+    "id": "T34",
+    "title": "T34: Fleet controls",
+    "milestone": "P3",
+    "labels": ["type:task", "area:dispatch", "area:gui"],
+    "body": "Pause, drain, kill-worker, requeue.\n\n**Drain must not kill a worker mid-gate** — that is exactly the durability loss of §2.3.\n\n**Acceptance:** drain completes with every in-flight attempt either finished or cleanly abandoned at a gate boundary."
+  },
+  {
+    "id": "T35",
+    "title": "T35: Quota-gated admission with reviewer headroom",
+    "milestone": "P3",
+    "labels": ["type:task", "area:dispatch", "risk:high"],
+    "body": "Check cached `/quota` before dispatching a **round**, not mid-attempt.\n\n**Reserve headroom for the reviewer.** If implementers exhaust the weekly window, the fleet holds patches that passed every gate but cannot be reviewed or merged — §2.3's durability loss reproduced at the budget layer. Cap implementer spend at a configured fraction and ringfence planner/reviewer allocation.\n\n**Acceptance:** with the implementer budget deliberately exhausted in a test, reviewer calls still succeed and in-flight work still reaches a verdict."
+  },
+  {
+    "id": "T36",
+    "title": "T36: Retire parallel_model_fix_loop.py",
+    "milestone": "P3",
+    "labels": ["type:task", "area:dispatch"],
+    "body": "Once T31–T35 are green, delete the standalone dispatcher. `model_fix_loop.py` survives as the gate runner, invoked by the service with a work item.\n\n**Acceptance:** file deleted from `swack-tools/oxidex`; the service is the only dispatcher; no orphaned imports."
+  },
+  {
+    "id": "T37",
+    "title": "T37: 7-day unattended run",
+    "milestone": "P3",
+    "labels": ["type:task", "area:dispatch", "risk:high"],
+    "body": "Appendix A criterion 1.\n\n**Acceptance:** 7 days with no manual restart and no human intervention; every failure in the window diagnosable from the GUI alone; delivery rate no worse than the §2.5 baseline of 56%."
+  },
+
+  {
+    "id": "T38",
+    "title": "T38: Gate plugin interface",
+    "milestone": "P4",
+    "labels": ["type:task", "area:dispatch", "blocked", "risk:high"],
+    "body": "Blocked on D8. Separate \"gates any repo has\" (build, lint, test — the repo's own required checks) from \"gates this repo has\" (ExifTool comparison, structural, gap-count).\n\n**Acceptance:** oxidex's domain gates run through the plugin path with no behaviour change, verified against a known-good historical attempt."
+  },
+  {
+    "id": "T39",
+    "title": "T39: GitHub issues as the work queue",
+    "milestone": "P4",
+    "labels": ["type:task", "area:github", "blocked"],
+    "body": "Claim = assign issue + apply a running label. Release = unassign. Blockers become `type:decision` issues that block their dependents, matching the pattern this backlog itself uses.\n\n**Acceptance:** a worker claiming an issue is visible in GitHub; a crashed worker's claim is reclaimable; no second tracker exists."
+  },
+  {
+    "id": "T40",
+    "title": "T40: Draft-PR checkpoint",
+    "milestone": "P4",
+    "labels": ["type:task", "area:github", "blocked", "risk:high"],
+    "body": "**The §2.3 fix.** A candidate that has passed the cheap gates is pushed as a branch with its evidence trailers and opened as a draft PR. The expensive suite runs as a required check off the worker.\n\nThis makes §0.4 rule 6 (\"report honestly\") mechanically enforced rather than instructed: the required check cannot be bypassed by a model deciding it passed.\n\n**Acceptance:** Appendix A criterion 5 — a worker killed during the full suite loses no reviewer-approved work; the draft PR is still there on restart."
+  },
+  {
+    "id": "T41",
+    "title": "T41: Reviewer verdict as a PR review",
+    "milestone": "P4",
+    "labels": ["type:task", "area:github", "blocked"],
+    "body": "Gate 12's APPROVE/REJECT/UNVERIFIABLE posted as a GitHub PR review with its reasoning, rather than only into the event stream.\n\n**Acceptance:** verdict and reasoning visible on the PR; REJECT blocks merge."
+  },
+  {
+    "id": "T42",
+    "title": "T42: Second-repository validation",
+    "milestone": "P4",
+    "labels": ["type:task", "area:github", "blocked"],
+    "body": "Run the harness against a repository other than oxidex, using only the repo's own required checks plus whatever domain gates it declares.\n\nThis is the test of whether P4 actually generalised anything.\n\n**Acceptance:** a full attempt completes end to end with **no oxidex-specific code on the path** — verified by grep, not by assertion."
+  }
+]

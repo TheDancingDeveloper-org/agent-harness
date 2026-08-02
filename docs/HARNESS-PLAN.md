@@ -1,6 +1,6 @@
 # agent-harness: Comprehensive Plan
 
-**Status:** Not started
+**Status:** P0 complete (2026-08-02). P1 is next and blocks everything else — see §0.3.
 **Date:** 2026-08-02
 **Owner:** TheDancingDeveloper-org
 **Repository:** `TheDancingDeveloper-org/agent-harness` (private)
@@ -400,6 +400,18 @@ No functional code. Stand up where the work is tracked.
 
 **Exit:** repo exists with green CI; branch protection active; all backlog items created,
 labelled, milestoned and on the board.
+
+**Met 2026-08-02.** Two things the plan did not anticipate, recorded per §0.4 rule 7:
+
+- The org runs Actions with `enabled_repositories: selected`, so a new repository has
+  Actions **disabled** regardless of its own settings. Enabling it requires adding the repo
+  to the org allowlist (`PUT /orgs/{org}/actions/permissions/repositories/{id}`), not
+  `gh repo edit`. Expect the same for any future repo in this org.
+- The 13 labels coexist with GitHub's 9 defaults, which are unused. The plan's "13" is the
+  set this backlog uses, not the total.
+
+`Size` on the board is deliberately unset: it is a judgement per item and is not derivable
+from `backlog.json`.
 
 ---
 

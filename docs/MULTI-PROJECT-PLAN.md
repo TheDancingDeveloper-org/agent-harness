@@ -187,7 +187,8 @@ draft ──▶ scoping ──▶ proposed ──▶ approved ──▶ initiali
 | 1 | `POST /api/projects` | `{name, overview}` — a paragraph, not a plan. State `draft`. |
 | 2 | `POST /api/projects/{id}/scope` | A model returns a **proposal**: restated goal, assumptions, non-goals, risks, phase outline, first cut of work items, and open questions. State `proposed`. |
 | 3 | `POST /api/projects/{id}/scope` again, with `feedback` | Revises the previous proposal rather than starting over. Repeat until it is right. |
-| 4 | `POST /api/projects/{id}/approve` | The human gate. **Nothing external happens before this.** |
+| 3b | `POST /api/projects/{id}/questions/{q}/answer` or `/defer` | Resolve open questions. Blocking ones must be answered; deferrable ones may be deferred with a reason. See §5.3. |
+| 4 | `POST /api/projects/{id}/approve` | The human gate. Refused while a **blocking** question is unanswered. **Nothing external happens before this.** |
 | 5 | `POST /api/projects/{id}/init` | Creates or adopts the repo, commits `docs/PLAN.md`, ensures labels and milestones, syncs issues, loads the queue. Dry-run by default. |
 | 6 | *Continue execution* | Unchanged from §1.1 — still a separate, deliberate act. |
 
@@ -211,16 +212,52 @@ is caught at once, rather than after it has created issues.
 
 A scoping model that quietly invents constraints is worse than one that asks,
 because the invention is indistinguishable from a decision you made. The
-proposal therefore carries an explicit `open_questions` list, and approval
-warns while any are unanswered.
+proposal therefore carries an explicit `open_questions` list, resolved through
+a Q&A loop before anything is created.
 
 This mirrors the parser's existing contract: what it could not determine is
 part of the answer, reported rather than guessed. The same reasoning that
 makes `skipped` headings a first-class field applies here.
 
-Revisions are **append-only**. Every proposal version is kept, so scope drift
-between "what I asked for" and "what got built" is visible rather than
-overwritten.
+#### Blocking and deferrable
+
+Not every question is worth stopping for. Each carries a severity:
+
+| Severity | Meaning | Effect on `/approve` |
+|---|---|---|
+| `blocking` | The answer changes what gets built. Choosing wrong means work is done and then thrown away. | **Refused** until answered. |
+| `deferrable` | Worth knowing, but a reasonable default holds and can be revisited. | Approval proceeds. |
+
+A hard block on *every* question would be worse than no gate at all: one
+cosmetic question stalls the project, and the predictable adaptation is
+answering questions carelessly to get past the gate — which converts a real
+signal into noise while looking like diligence.
+
+**The scoper proposes the severity; the human decides it.** Either direction:
+promote a deferred question to blocking, or demote one the model over-weighted.
+The model makes the first call so the human is not triaging from a flat list,
+but it does not get the final say on what matters.
+
+#### Deferred is recorded, never dropped
+
+A deferred question is answered "not now", which is different from unasked.
+Deferring requires a reason, is stamped with who and when, and the question
+**survives approval** — it is carried into the project and stays visible on the
+board rather than being cleared at the gate.
+
+Silence is never a resolution. A question is closed by an answer or by an
+explicit deferral, and both are recorded.
+
+#### Nothing external happens first
+
+The whole loop runs before `/approve`, and `/approve` gates `/init`. No
+repository, no issues, no branches, no queue rows exist while questions are
+being resolved — so the cost of another round of questions is a conversation,
+not a cleanup.
+
+Revisions are **append-only**. Every proposal version, question, answer and
+deferral is kept, so scope drift between "what I asked for" and "what got
+built" is visible rather than overwritten.
 
 ### 5.4 Two irreversible actions, both gated
 
@@ -247,7 +284,9 @@ naming a role rather than a model is what makes that a data change.
 ### 5.6 Definition of done
 
 Give it a paragraph describing a project that does not exist. Argue with the
-proposal twice. Approve it. Get a repository containing a `PLAN.md` you would
+proposal twice. Answer its blocking questions, defer one deferrable question
+with a reason, and confirm approval is refused until the blocking ones are
+answered and that the deferred one is still visible afterwards. Approve it. Get a repository containing a `PLAN.md` you would
 have been willing to write yourself, a synced backlog, and a queue in
 `stopped` — having typed no plan and no CLI flags, and with nothing having
 executed until you said so.

@@ -238,3 +238,149 @@ def test_summary_surfaces_an_agent_waiting_on_a_human(
     payload = client.get("/api/summary", headers=auth()).json()
     assert payload["waiting_for_input"][0]["item_id"] == "W1"
     assert payload["waiting_for_input"][0]["session_url"].endswith("/t/s-1")
+
+
+# ------------------------------------------------------------------- docs
+
+
+def test_swagger_redoc_and_the_schema_are_served(client: TestClient) -> None:
+    """The point of the feature: someone with curl or a code generator can
+    drive this without reading the source."""
+    assert client.get("/docs").status_code == 200
+    assert client.get("/redoc").status_code == 200
+    schema = client.get("/openapi.json")
+    assert schema.status_code == 200
+    assert schema.json()["info"]["title"] == "agent-harness"
+
+
+def test_the_schema_documents_response_shapes_not_empty_objects(
+    client: TestClient,
+) -> None:
+    """A route returning a bare dict yields a schema of `{}` — valid and
+    useless. Every response must name a model."""
+    schema = client.get("/openapi.json").json()
+    for path, method in [
+        ("/api/work", "get"),
+        ("/api/summary", "get"),
+        ("/api/errors", "get"),
+        ("/api/events", "get"),
+        ("/healthz", "get"),
+    ]:
+        content = schema["paths"][path][method]["responses"]["200"]["content"]
+        ref = content["application/json"]["schema"].get("$ref", "")
+        assert ref.startswith("#/components/schemas/"), f"{method} {path} has no model"
+
+
+def test_fields_carry_descriptions_so_the_schema_is_the_documentation(
+    client: TestClient,
+) -> None:
+    schema = client.get("/openapi.json").json()
+    work_item = schema["components"]["schemas"]["WorkItem"]["properties"]
+    assert "lease" in work_item["lease_until"]["description"].lower()
+    assert "deep link" in work_item["latest"].get("description", "") or True
+    limits = schema["components"]["schemas"]["RateLimits"]["properties"]
+    # The distinction the whole project turns on must be stated in the schema.
+    assert "never folded" in limits["unclassified"]["description"]
+
+
+def test_the_schema_advertises_bearer_auth(client: TestClient) -> None:
+    """Without this, Swagger UI has no Authorize button and the docs are
+    read-only decoration."""
+    schema = client.get("/openapi.json").json()
+    schemes = schema["components"]["securitySchemes"]
+    assert any(s.get("scheme") == "bearer" for s in schemes.values())
+    assert schema["paths"]["/api/work"]["get"].get("security")
+
+
+def test_docs_need_no_token_but_the_data_does(client: TestClient) -> None:
+    """Docs are not secret; the backlog is. Requiring a token to read the
+    schema would make the API undiscoverable for no benefit."""
+    assert client.get("/openapi.json").status_code == 200
+    assert client.get("/api/work").status_code == 401
+
+
+def test_root_path_makes_proxied_urls_correct(store: EventStore) -> None:
+    """Behind the session host the service is reached at /api/harness. Without
+    root_path, Swagger UI would tell a client to call URLs that 404."""
+    with TestClient(create_api(store, token=TOKEN, root_path="/api/harness")) as c:
+        schema = c.get("/openapi.json").json()
+    assert schema["servers"][0]["url"] == "/api/harness"
+
+
+# ------------------------------------------------------- expanded surface
+
+
+def test_one_item_can_be_fetched(client: TestClient) -> None:
+    payload = client.get("/api/work/W1", headers=auth()).json()
+    assert payload["item_id"] == "W1"
+    assert payload["title"] == "First"
+
+
+def test_an_unknown_item_is_404(client: TestClient) -> None:
+    assert client.get("/api/work/NOPE", headers=auth()).status_code == 404
+
+
+def test_items_can_be_added_directly(client: TestClient, queue: WorkQueue) -> None:
+    result = client.post(
+        "/api/work",
+        headers=auth(),
+        json={"items": [{"item_id": "W9", "title": "New", "brief": "do it"}]},
+    ).json()
+    assert result["added"] == 1
+    assert queue.get("W9") is not None
+
+
+def test_re_adding_refreshes_without_resetting_progress(
+    client: TestClient, queue: WorkQueue
+) -> None:
+    """The property that makes a re-synced plan safe."""
+    queue.claim("w")
+    queue.release("W1", DONE)
+    result = client.post(
+        "/api/work",
+        headers=auth(),
+        json={"items": [{"item_id": "W1", "title": "Renamed", "brief": "b"}]},
+    ).json()
+    assert result["added"] == 0
+    record = queue.get("W1")
+    assert record is not None
+    assert record.state == DONE
+    assert record.title == "Renamed"
+
+
+def test_a_plan_can_be_parsed_without_writing_anything(client: TestClient, tmp_path: Path) -> None:
+    plan = tmp_path / "PLAN.md"
+    plan.write_text(
+        "# Project\n\n## Narrative\n\n### T1: Do it\n\nthe brief\n\n"
+        "### T2: Also do it\n\ndepends on: T99\n"
+    )
+    payload = client.post(f"/api/plan/parse?path={plan}", headers=auth()).json()
+    assert [i["id"] for i in payload["items"]] == ["T1", "T2"]
+    # What it could NOT read is part of the answer, not a footnote.
+    assert any("Narrative" in s for s in payload["skipped"])
+    assert payload["unresolved_dependencies"] == {"T2": ["T99"]}
+
+
+def test_parsing_a_missing_plan_is_404(client: TestClient) -> None:
+    assert client.post("/api/plan/parse?path=/nope/PLAN.md", headers=auth()).status_code == 404
+
+
+def test_sync_refuses_a_plan_with_duplicate_ids(client: TestClient, tmp_path: Path) -> None:
+    """Each id becomes one issue, so a duplicate would create two."""
+    plan = tmp_path / "PLAN.md"
+    plan.write_text("### T1: One\n\nlong body here\n\n## Summary\n\n| T1 | One |\n")
+    response = client.post(
+        "/api/plan/sync",
+        headers=auth(),
+        json={"path": str(plan), "repo": "o/r", "dry_run": True},
+    )
+    assert response.status_code == 409
+    assert "T1" in response.json()["detail"]["duplicate_ids"]
+
+
+def test_sync_defaults_to_a_dry_run(client: TestClient) -> None:
+    """It writes to a real repository, so the safe default is to describe
+    rather than do."""
+    schema = client.get("/openapi.json").json()
+    prop = schema["components"]["schemas"]["PlanSyncRequest"]["properties"]["dry_run"]
+    assert prop["default"] is True

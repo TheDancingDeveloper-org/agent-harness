@@ -324,6 +324,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8099)
+    p_serve.add_argument(
+        "--root-path",
+        default=os.environ.get("HARNESS_ROOT_PATH", ""),
+        metavar="PREFIX",
+        help="prefix this service is reached under when behind a proxy, e.g. "
+        "/api/harness. Without it, Swagger UI tells clients to call URLs that 404.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -362,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     from .work import WorkQueue
 
     uvicorn.run(
-        create_api(store, queue=WorkQueue(args.db), token=token),
+        create_api(store, queue=WorkQueue(args.db), token=token, root_path=args.root_path),
         host=args.host,
         port=args.port,
         log_level="info",

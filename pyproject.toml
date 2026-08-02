@@ -37,8 +37,17 @@ extend-exclude = ["docs"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+# B008 forbids calls in argument defaults. FastAPI's dependency injection IS
+# that pattern, and the alternative (Annotated[...]) does not resolve under
+# `from __future__ import annotations` for closure-scoped dependencies.
+"src/agent_harness/api.py" = ["B008"]
+
 [tool.mypy]
 python_version = "3.12"
+# Pydantic models drive the OpenAPI schema; without its plugin mypy cannot see
+# which fields have defaults and reports every construction as missing args.
+plugins = ["pydantic.mypy"]
 files = ["src", "tests"]
 strict = true
 

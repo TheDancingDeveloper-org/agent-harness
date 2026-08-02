@@ -1,131 +1,252 @@
-"""The harness's JSON API. No HTML, no templates, no GUI.
+"""The harness's HTTP API. Headless — no HTML, no templates, no GUI.
 
-The GUI lives in the session host — AIDevEnv is the reference one — which
+The GUI lives in the session host (AIDevEnv is the reference one), which
 already owns tabs, auth, push notifications, mobile and the terminal sessions
-the agents run in. A second web UI here would mean a second URL, a second
-login, no notifications and no phone story: worse, for the same work.
+the agents run in. A second web UI here would mean a second URL and a second
+login to do the same job worse.
 
-So this is the seam. The host's server proxies these routes, holding the
-harness token so the browser never sees it, and renders the result as a Work
-tab. Everything here is JSON a UI can consume directly.
+What this DOES own is a documented API. Every route is typed, every field has
+a description, and the OpenAPI document is served alongside Swagger UI — so a
+person with `curl`, an agent with a shell, or a generated client can all drive
+the harness without reading its source.
 
-Auth is a bearer token, and the service **fails closed** — with none
-configured every route refuses, because coming up open is not an acceptable
-default for something on a network, even a private one.
+Auth is a bearer token. Deployed inside a session host it is the SAME token
+that reaches the GUI: one credential, one thing to rotate, and no second
+secret to keep track of. The service fails closed — with no token configured
+every authenticated route refuses, because coming up open is not an acceptable
+default for something reachable over a network.
+
+    /docs          Swagger UI, with an Authorize button
+    /redoc         ReDoc
+    /openapi.json  the schema itself
 """
 
 from __future__ import annotations
 
-import dataclasses
 import secrets
 import time
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi import Path as PathParam
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from . import __version__
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
 from .providers import MEANING
+from .schemas import (
+    AddItemsRequest,
+    AddItemsResult,
+    Event,
+    EventPage,
+    Health,
+    LatestEvent,
+    PlanItem,
+    PlanParseResult,
+    PlanSyncRequest,
+    PlanSyncResult,
+    RateLimits,
+    RetryResult,
+    Summary,
+    WaitingItem,
+    WorkItem,
+    WorkList,
+)
 from .store import EventStore
-from .work import CLAIMED, DONE, FAILED, PENDING, WorkQueue
+from .work import CLAIMED, DONE, FAILED, PENDING, WorkQueue, WorkRecord
 
 WINDOWS = {"1h": 3600, "24h": 86400, "72h": 3 * 86400, "7d": 7 * 86400, "all": None}
+
+DESCRIPTION = """\
+Plans work, claims it, runs it as an agent in a terminal session, and records
+what happened.
+
+**Auth** — every route except `/healthz` needs `Authorization: Bearer <token>`.
+Deployed inside a session host this is the same token that reaches the GUI.
+Use **Authorize** above to try these against a live instance.
+
+**Reading the numbers.** Two things this API is careful about, because both are
+easy to get wrong and expensive when you do:
+
+* Rate limits are *classified*. `rpm` means you are going too fast, and is
+  retried. `window_cap` and `terminal_cap` mean a spend budget is exhausted and
+  are never retried, because retrying cannot make budget appear. Anything
+  recorded before classification existed is reported as `unclassified` and is
+  never folded into a class — that breakdown does not exist and cannot be
+  recovered by re-parsing.
+* A claim is a **lease**, not a lock. A worker that dies releases its item by
+  doing nothing at all; `lease_until` is when that happens.
+"""
+
+TAGS = [
+    {"name": "work", "description": "The backlog: what needs doing, and what is happening to it."},
+    {"name": "plan", "description": "Turning a plan document into a backlog."},
+    {"name": "observability", "description": "What the fleet did, and why anything failed."},
+    {"name": "meta", "description": "Health and version."},
+]
+
+bearer = HTTPBearer(auto_error=False, description="The session host's API token.")
 
 
 def create_api(
     store: EventStore,
     queue: WorkQueue | None = None,
     token: str | None = None,
+    root_path: str = "",
 ) -> FastAPI:
-    app = FastAPI(title="agent-harness", docs_url=None, redoc_url=None)
+    """Build the API.
+
+    `root_path` is the prefix this service is reached under when it sits
+    behind a proxy (the session host mounts it at `/api/harness`). Setting it
+    makes the OpenAPI document and Swagger UI emit URLs the *client* can
+    actually call, rather than the ones the app sees internally.
+    """
+    app = FastAPI(
+        title="agent-harness",
+        version=__version__,
+        description=DESCRIPTION,
+        openapi_tags=TAGS,
+        root_path=root_path,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+    )
     app.state.store = store
     app.state.queue = queue
     app.state.token = token
 
-    def require_token(request: Request) -> None:
+    def require_token(
+        request: Request,
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    ) -> None:
         expected = request.app.state.token
         if not expected:
             raise HTTPException(status_code=503, detail="no auth token configured")
-        header = request.headers.get("authorization", "")
-        supplied = header[7:] if header.lower().startswith("bearer ") else ""
-        if not secrets.compare_digest(supplied, expected):
+        supplied = credentials.credentials if credentials else ""
+        if not supplied or not secrets.compare_digest(supplied, expected):
             raise HTTPException(status_code=401, detail="unauthorized")
 
     def since_for(window: str) -> float | None:
         if window not in WINDOWS:
-            raise HTTPException(status_code=400, detail=f"unknown window {window!r}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown window {window!r}; expected one of {sorted(WINDOWS)}",
+            )
         span = WINDOWS[window]
         return None if span is None else time.time() - span
 
-    @app.get("/healthz")
-    def healthz() -> JSONResponse:
-        """Unauthenticated and cheap. A deploy check must not depend on the
-        store being populated."""
-        return JSONResponse(
-            {
-                "ok": True,
-                "events": store.count(),
-                "queue": queue is not None,
-                "authenticated": bool(app.state.token),
-            }
+    def need_queue() -> WorkQueue:
+        queue: WorkQueue | None = app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=409, detail="no work queue is attached")
+        return queue
+
+    # ---------------------------------------------------------------- meta
+
+    @app.get("/healthz", tags=["meta"], summary="Liveness and wiring", response_model=Health)
+    def healthz() -> Health:
+        """Unauthenticated and cheap — a deploy check must not depend on the
+        store being populated, or on holding a credential."""
+        return Health(
+            ok=True,
+            events=store.count(),
+            queue=app.state.queue is not None,
+            authenticated=bool(app.state.token),
+            version=__version__,
         )
 
     # ---------------------------------------------------------------- work
 
-    @app.get("/api/work")
-    def work(_: None = Depends(require_token)) -> JSONResponse:
-        """Everything the Work tab renders in one call.
+    @app.get("/api/work", tags=["work"], summary="The whole backlog", response_model=WorkList)
+    def work(_: None = Depends(require_token)) -> WorkList:
+        """Items, counts and stale claims in ONE call.
 
-        One request rather than three: a phone on a flaky connection should
-        not need a successful fan-out to show anything.
+        Deliberately not three endpoints: a client on a flaky connection
+        should not need a successful fan-out to show anything at all.
         """
-        queue = app.state.queue
+        queue: WorkQueue | None = app.state.queue
         if queue is None:
-            return JSONResponse(
-                {
-                    "configured": False,
-                    "reason": "no work queue is attached to this harness",
-                    "items": [],
-                    "counts": {},
-                    "stale": [],
-                }
+            return WorkList(
+                configured=False,
+                reason="no work queue is attached to this harness",
             )
-        latest: dict[str, dict[str, Any]] = {}
-        for event in store.recent(kind="work", limit=2000):
-            item_id = event["data"].get("item_id")
-            if item_id and item_id not in latest:
-                latest[item_id] = {
-                    "outcome": event["outcome"],
-                    "detail": event["data"].get("detail"),
-                    "ts": event["ts"],
-                    # The deep link: which terminal is doing this work.
-                    "session_id": event["data"].get("session_id"),
-                    "session_url": event["data"].get("session_url"),
-                }
-        return JSONResponse(
-            {
-                "configured": True,
-                "counts": queue.counts(),
-                "stale": [r.item_id for r in queue.stale()],
-                "items": [
-                    {**dataclasses.asdict(record), "latest": latest.get(record.item_id)}
-                    for record in queue.all()
-                ],
-            }
+        latest = _latest_by_item(store)
+        return WorkList(
+            configured=True,
+            counts=queue.counts(),
+            stale=[r.item_id for r in queue.stale()],
+            items=[_item_model(r, latest.get(r.item_id)) for r in queue.all()],
         )
 
-    @app.post("/api/work/{item_id}/retry")
-    def retry(item_id: str, _: None = Depends(require_token)) -> JSONResponse:
-        """Put a finished-or-failed item back in the queue.
+    @app.get(
+        "/api/work/{item_id}",
+        tags=["work"],
+        summary="One item",
+        response_model=WorkItem,
+        responses={404: {"description": "No such item"}},
+    )
+    def work_item(
+        item_id: str = PathParam(description="Plan id, e.g. `T4`."),
+        _: None = Depends(require_token),
+    ) -> WorkItem:
+        record = need_queue().get(item_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
+        return _item_model(record, _latest_by_item(store).get(item_id))
 
-        Refuses to touch a CLAIMED item: something may still be working on
-        it, and yanking it out from under a live agent produces two workers
-        on one item, which is worse than a stuck one. A stale claim expires
-        on its own and becomes retryable without anyone intervening.
+    @app.post(
+        "/api/work",
+        tags=["work"],
+        summary="Add items to the queue",
+        response_model=AddItemsResult,
+    )
+    def add_items(
+        request: AddItemsRequest,
+        _: None = Depends(require_token),
+    ) -> AddItemsResult:
+        """Add work directly, without going through a plan document.
+
+        Existing ids are refreshed, never reset: re-adding cannot un-finish
+        work that is already done.
         """
-        queue = app.state.queue
-        if queue is None:
-            raise HTTPException(status_code=409, detail="no work queue attached")
+        queue = need_queue()
+        added = queue.add(
+            [
+                WorkRecord(
+                    item_id=item.item_id,
+                    title=item.title,
+                    brief=item.brief,
+                    issue=item.issue,
+                    depends_on=list(item.depends_on),
+                )
+                for item in request.items
+            ]
+        )
+        return AddItemsResult(added=added, total=len(queue.all()))
+
+    @app.post(
+        "/api/work/{item_id}/retry",
+        tags=["work"],
+        summary="Re-queue an item",
+        response_model=RetryResult,
+        responses={
+            404: {"description": "No such item"},
+            409: {"description": "The item's claim is still live"},
+        },
+    )
+    def retry(
+        item_id: str = PathParam(description="Plan id, e.g. `T4`."),
+        _: None = Depends(require_token),
+    ) -> RetryResult:
+        """Put a finished or failed item back to `pending`.
+
+        Refuses while a claim is live: yanking an item out from under a
+        running agent produces two workers on one item, which is worse than
+        one stuck item. A stale lease expires on its own and is retryable
+        without anyone intervening.
+        """
+        queue = need_queue()
         record = queue.get(item_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
@@ -136,82 +257,225 @@ def create_api(
                 "wait for the lease to expire rather than racing it",
             )
         queue.release(item_id, PENDING, error=None)
-        return JSONResponse({"ok": True, "item_id": item_id, "state": PENDING})
+        return RetryResult(ok=True, item_id=item_id, state="pending")
 
-    # -------------------------------------------------------------- errors
+    # ---------------------------------------------------------------- plan
 
-    @app.get("/api/errors")
-    def errors(window: str = Query("24h"), _: None = Depends(require_token)) -> JSONResponse:
-        """Rate limits by class.
+    @app.post(
+        "/api/plan/parse",
+        tags=["plan"],
+        summary="Parse a plan without writing anything",
+        response_model=PlanParseResult,
+        responses={404: {"description": "No such file"}},
+    )
+    def plan_parse(
+        path: str = Query(..., description="Path to the plan markdown."),
+        _: None = Depends(require_token),
+    ) -> PlanParseResult:
+        """Read a plan and report what it contains — including what it could
+        NOT read.
 
-        `unclassified` is reported separately and never folded into a class:
-        it means the record predates classification, and inventing a class
-        for it would fabricate the measurement.
+        Parsing prose is lossy, so skipped headings and duplicate ids are part
+        of the answer rather than a footnote: a parser that quietly finds
+        three items in a fifty-item plan looks like it worked.
         """
+        from .plan import parse_plan_file
+
+        target = Path(path)
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail=f"no plan at {path!r}")
+        parsed = parse_plan_file(target)
+        return PlanParseResult(
+            items=[
+                PlanItem(
+                    id=i.id,
+                    title=i.title,
+                    body=i.body,
+                    labels=i.labels,
+                    milestone=i.milestone,
+                    depends_on=i.depends_on,
+                    done=i.done,
+                    line=i.line,
+                )
+                for i in parsed.items
+            ],
+            skipped=[f"line {n}: {title}" for n, title in parsed.skipped],
+            duplicate_ids=parsed.duplicate_ids(),
+            unresolved_dependencies=parsed.unresolved_dependencies(),
+        )
+
+    @app.post(
+        "/api/plan/sync",
+        tags=["plan"],
+        summary="Sync a plan to GitHub issues",
+        response_model=PlanSyncResult,
+        responses={
+            404: {"description": "No such file"},
+            409: {"description": "The plan states an id more than once"},
+            502: {"description": "GitHub rejected the request"},
+        },
+    )
+    def plan_sync(
+        request: PlanSyncRequest,
+        _: None = Depends(require_token),
+    ) -> PlanSyncResult:
+        """Create or update one issue per work item.
+
+        Defaults to `dry_run=true`, because this writes to a real repository.
+        Never closes, reopens or deletes: an item vanishing from a document is
+        usually an edit, sometimes a mistake, and never grounds for the
+        harness to decide work stopped mattering.
+        """
+        from .github import GitHub, GitHubError, sync
+        from .plan import parse_plan_file
+
+        target = Path(request.path)
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail=f"no plan at {request.path!r}")
+        parsed = parse_plan_file(target)
+        duplicates = parsed.duplicate_ids()
+        if duplicates and not request.allow_duplicates:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": "the plan states these ids more than once; each becomes one issue",
+                    "duplicate_ids": duplicates,
+                },
+            )
+        try:
+            report = sync(GitHub(request.repo), parsed.deduplicated(), dry_run=request.dry_run)
+        except GitHubError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return PlanSyncResult(
+            created=report.created,
+            updated=report.updated,
+            unchanged=report.unchanged,
+            orphaned=report.orphaned,
+            labels_created=report.labels_created,
+            milestones_created=report.milestones_created,
+            dry_run=request.dry_run,
+        )
+
+    # ------------------------------------------------------- observability
+
+    @app.get(
+        "/api/errors",
+        tags=["observability"],
+        summary="Rate limits by class",
+        response_model=RateLimits,
+    )
+    def errors(
+        window: str = Query("24h", description="One of 1h, 24h, 72h, 7d, all."),
+        _: None = Depends(require_token),
+    ) -> RateLimits:
+        """The question a fleet operator most often cannot answer: of all those
+        429s, how many meant *slow down* and how many meant *your budget is
+        gone*?"""
         since = since_for(window)
         by_class = store.rate_limits_by_class(since)
         classified = {c: by_class.get(c, 0) for c in RATE_LIMIT_CLASSES}
-        return JSONResponse(
-            {
-                "window": window,
-                "classified": classified,
-                "meaning": {c: MEANING[c] for c in RATE_LIMIT_CLASSES},
-                "unclassified": by_class.get(UNCLASSIFIED, 0),
-                "total": sum(classified.values()),
-                "by_worker": store.group_counts("worker", since),
-                "by_endpoint": store.group_counts("endpoint", since),
-                "by_role": store.group_counts("role", since),
-            }
+        return RateLimits(
+            window=window,
+            classified=classified,
+            meaning={c: MEANING[c] for c in RATE_LIMIT_CLASSES},
+            unclassified=by_class.get(UNCLASSIFIED, 0),
+            total=sum(classified.values()),
+            by_worker=store.group_counts("worker", since),
+            by_endpoint=store.group_counts("endpoint", since),
+            by_role=store.group_counts("role", since),
         )
 
-    @app.get("/api/events")
+    @app.get(
+        "/api/events",
+        tags=["observability"],
+        summary="Event stream, paged",
+        response_model=EventPage,
+    )
     def events(
-        since_id: int = Query(0), limit: int = Query(200), _: None = Depends(require_token)
-    ) -> JSONResponse:
-        """Events after `since_id`, oldest first.
+        since_id: int = Query(0, description="Cursor from the previous page."),
+        limit: int = Query(200, ge=1, le=1000),
+        _: None = Depends(require_token),
+    ) -> EventPage:
+        """Append-only history, oldest first.
 
-        Cursor is the row id, not a timestamp: two events in the same
-        millisecond must still have a total order or a poll silently drops
+        Paged by row id rather than timestamp: two events in the same
+        millisecond must still have a total order, or a poll silently drops
         one.
         """
-        rows = store.since_id(since_id, limit=min(limit, 1000))
-        return JSONResponse(
-            {
-                "events": rows,
-                "cursor": rows[-1]["id"] if rows else since_id,
-            }
+        rows = store.since_id(since_id, limit=limit)
+        return EventPage(
+            events=[Event(**row) for row in rows],
+            cursor=rows[-1]["id"] if rows else since_id,
         )
 
-    @app.get("/api/summary")
-    def summary(_: None = Depends(require_token)) -> JSONResponse:
-        """The one-line answer for a tab badge: is anything running, is
-        anything stuck, is anything waiting on me."""
-        queue = app.state.queue
+    @app.get(
+        "/api/summary",
+        tags=["observability"],
+        summary="One-glance status",
+        response_model=Summary,
+    )
+    def summary(_: None = Depends(require_token)) -> Summary:
+        """Enough for a tab badge or a status line."""
+        queue: WorkQueue | None = app.state.queue
         counts = queue.counts() if queue else {}
-        stale = len(queue.stale()) if queue else 0
         waiting = [
             event
             for event in store.recent(kind="work", limit=200)
             if event["outcome"] == "waiting_for_input"
         ]
-        return JSONResponse(
-            {
-                "running": counts.get(CLAIMED, 0),
-                "pending": counts.get(PENDING, 0),
-                "done": counts.get(DONE, 0),
-                "failed": counts.get(FAILED, 0),
-                "stale": stale,
-                # An agent asking a question is the one thing that genuinely
-                # needs a human, so it gets its own field rather than being
-                # buried in a count.
-                "waiting_for_input": [
-                    {
-                        "item_id": e["data"].get("item_id"),
-                        "session_url": e["data"].get("session_url"),
-                    }
-                    for e in waiting[:5]
-                ],
-            }
+        return Summary(
+            running=counts.get(CLAIMED, 0),
+            pending=counts.get(PENDING, 0),
+            done=counts.get(DONE, 0),
+            failed=counts.get(FAILED, 0),
+            stale=len(queue.stale()) if queue else 0,
+            waiting_for_input=[
+                WaitingItem(
+                    item_id=e["data"].get("item_id"),
+                    session_url=e["data"].get("session_url"),
+                )
+                for e in waiting[:5]
+            ],
         )
 
     return app
+
+
+def _latest_by_item(store: EventStore) -> dict[str, dict[str, Any]]:
+    """Newest event per work item. One scan — doing it per item would be a
+    query per row."""
+    latest: dict[str, dict[str, Any]] = {}
+    for event in store.recent(kind="work", limit=2000):
+        item_id = event["data"].get("item_id")
+        if item_id and item_id not in latest:
+            latest[item_id] = event
+    return latest
+
+
+def _item_model(record: WorkRecord, event: dict[str, Any] | None) -> WorkItem:
+    return WorkItem(
+        item_id=record.item_id,
+        title=record.title,
+        brief=record.brief,
+        issue=record.issue,
+        depends_on=list(record.depends_on),
+        state=record.state,
+        owner=record.owner,
+        lease_until=record.lease_until,
+        attempts=record.attempts,
+        last_error=record.last_error,
+        branch=record.branch,
+        pr_url=record.pr_url,
+        updated_at=record.updated_at,
+        latest=(
+            LatestEvent(
+                outcome=event["outcome"] or "",
+                detail=event["data"].get("detail"),
+                ts=event["ts"],
+                session_id=event["data"].get("session_id"),
+                session_url=event["data"].get("session_url"),
+            )
+            if event
+            else None
+        ),
+    )

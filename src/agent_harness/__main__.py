@@ -1,5 +1,6 @@
-"""CLI: ingest event streams, then serve the dashboard.
+"""CLI.
 
+    agent-harness plan   PLAN.md --repo owner/name   # plan -> GitHub backlog
     agent-harness ingest --events ./run/events.jsonl
     agent-harness serve  --port 8099
 
@@ -41,6 +42,68 @@ def resolve_sources(args: argparse.Namespace) -> list[Source]:
     return sources
 
 
+def _plan(args: argparse.Namespace) -> int:
+    """Parse a plan and sync it to GitHub, refusing on anything ambiguous.
+
+    Refusing beats guessing here: a bad sync creates real issues in a real
+    repository, and cleaning that up by hand is far more expensive than
+    being told to fix the plan first.
+    """
+    from .github import GitHub, GitHubError, sync
+    from .plan import parse_plan_file
+
+    plan = parse_plan_file(args.path)
+    if not plan.items:
+        print(f"{args.path}: no work items found.", file=sys.stderr)
+        print(
+            "Items are recognised as '### T1: Title' headings, '- [ ] T1 Title' "
+            "checkboxes, or table rows with an id column.",
+            file=sys.stderr,
+        )
+        return 1
+
+    duplicates = plan.duplicate_ids()
+    if duplicates and not args.allow_duplicates:
+        print(f"{args.path}: these ids appear more than once:", file=sys.stderr)
+        for item_id, lines in sorted(duplicates.items()):
+            print(f"  {item_id} on lines {', '.join(str(n) for n in lines)}", file=sys.stderr)
+        print(
+            "Each id becomes one issue, so fix the plan or pass "
+            "--allow-duplicates to keep the richest description of each.",
+            file=sys.stderr,
+        )
+        return 2
+
+    items = plan.deduplicated()
+    unresolved = plan.unresolved_dependencies()
+    if unresolved:
+        # Not fatal: a dependency on work tracked elsewhere is legitimate.
+        # Silence is not, because a typo would block an item forever.
+        print("warning: dependencies naming unknown items:", file=sys.stderr)
+        for item_id, missing in sorted(unresolved.items()):
+            print(f"  {item_id} -> {', '.join(missing)}", file=sys.stderr)
+
+    print(f"{len(items)} work items, {len(plan.skipped)} headings skipped as narrative")
+    try:
+        report = sync(GitHub(args.repo), items, dry_run=args.dry_run)
+    except GitHubError as exc:
+        # A stack trace here tells the user nothing they can act on; the
+        # gh error does.
+        print(f"github: {exc}", file=sys.stderr)
+        return 3
+    for kind, names in (("label", report.labels_created), ("milestone", report.milestones_created)):
+        if names:
+            verb = "would create" if args.dry_run else "created"
+            print(f"{verb} missing {kind}s: {', '.join(names)}")
+    print(("would sync: " if args.dry_run else "synced: ") + str(report))
+    if report.orphaned:
+        print(
+            "orphaned (in the backlog, no longer in the plan; left alone): "
+            + ", ".join(report.orphaned)
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agent-harness", description=__doc__)
     parser.add_argument(
@@ -73,6 +136,18 @@ def main(argv: list[str] | None = None) -> int:
         help="re-ingest every SECONDS instead of exiting",
     )
 
+    p_plan = sub.add_parser("plan", help="sync a plan .md into a GitHub backlog")
+    p_plan.add_argument("path", type=Path, help="the plan markdown file")
+    p_plan.add_argument("--repo", required=True, metavar="OWNER/NAME")
+    p_plan.add_argument(
+        "--dry-run", action="store_true", help="report what would change without writing"
+    )
+    p_plan.add_argument(
+        "--allow-duplicates",
+        action="store_true",
+        help="sync anyway when the plan states an id twice (the richest description wins)",
+    )
+
     p_serve = sub.add_parser("serve", help="run the dashboard")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8099)
@@ -90,6 +165,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    if args.command == "plan":
+        return _plan(args)
+
     store = EventStore(args.db)
 
     if args.command == "ingest":

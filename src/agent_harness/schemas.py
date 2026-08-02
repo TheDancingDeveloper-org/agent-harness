@@ -257,6 +257,13 @@ class Summary(BaseModel):
     done: int
     failed: int
     stale: int
+    abandoned_sessions: int = Field(
+        0,
+        description="Terminal sessions kept alive after an agent timed out. They hold "
+        "the agent's context so a human can pick the item up, and each may still hold "
+        "an agent spending tokens. A rising count nobody returns to is waste, not "
+        "resilience -- the reaper collects them past a max age.",
+    )
     waiting_for_input: list[WaitingItem] = Field(
         description="Agents that have stopped to ask a human something. Its own field "
         "rather than a count, because it is the one state that needs a person."

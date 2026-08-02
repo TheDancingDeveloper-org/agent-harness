@@ -26,6 +26,7 @@ rather than a bad harness — which is the worst kind of bug to chase.
 from __future__ import annotations
 
 import contextlib
+import logging
 import shlex
 import shutil
 import time
@@ -36,6 +37,7 @@ from typing import Any
 
 from .executor import APPROVED, REJECTED, Checks, Outcome, run_git
 from .model_client import CapExhausted, ModelClient, RequestRefused
+from .reaper import DEFAULT_MAX_AGE_SECONDS, ReapReport, reap_abandoned_sessions
 from .session_host import Session, SessionHost
 from .work import (
     DONE,
@@ -46,6 +48,8 @@ from .work import (
     WorkRecord,
     worker_identity,
 )
+
+log = logging.getLogger(__name__)
 
 #: The default agent. `-p` takes the prompt; the harness supplies it as a
 #: file so a long brief is not mangled by shell quoting, and so the exact
@@ -133,6 +137,7 @@ class SessionExecutor:
         branch_prefix: str = "harness/",
         worktrees: Path | None = None,
         ui_base_url: str = "",
+        session_max_age: float = DEFAULT_MAX_AGE_SECONDS,
         on_event: Callable[[dict[str, Any]], None] | None = None,
         push: bool = True,
         now: Callable[[], float] = time.time,
@@ -148,6 +153,7 @@ class SessionExecutor:
         self.branch_prefix = branch_prefix
         self.worktrees = Path(worktrees) if worktrees else self.repo.parent / ".harness-work"
         self.ui_base_url = ui_base_url
+        self.session_max_age = session_max_age
         self.on_event = on_event
         self.push = push
         self.now = now
@@ -185,8 +191,31 @@ class SessionExecutor:
         )
         return outcome
 
+    def reap(self) -> ReapReport | None:
+        """Collect sessions kept alive after a timeout that nobody returned to.
+
+        Returns None when the host cannot reap -- the executor's `SessionHost`
+        protocol deliberately does not include killing sessions, so a host
+        that only creates and waits is a legitimate configuration, not an
+        error.
+        """
+        if not (hasattr(self.devenv, "kill_session") and hasattr(self.devenv, "delete_session")):
+            return None
+        report = reap_abandoned_sessions(
+            self.queue,
+            self.devenv,  # type: ignore[arg-type]
+            max_age=self.session_max_age,
+            on_event=self.on_event,
+        )
+        if report.reaped or report.failed:
+            log.info("session reaper: %s", report)
+        return report
+
     def run(self, limit: int | None = None) -> list[Outcome]:
         outcomes: list[Outcome] = []
+        # Before claiming, not after: a run that exits early still leaves the
+        # previous run's survivors collected.
+        self.reap()
         while limit is None or len(outcomes) < limit:
             try:
                 outcome = self.run_once()
@@ -266,6 +295,15 @@ class SessionExecutor:
                     f"(activity={finished.activity}); session {session.id} left running"
                 )
                 self._emit(record, "agent_timeout", detail=outcome.reason, session_id=session.id)
+                # Kept alive on purpose -- and recorded, so it is owned rather
+                # than merely surviving. The reaper collects it if nobody
+                # comes back to it.
+                self.queue.record_abandoned_session(
+                    session.id,
+                    record.item_id,
+                    reason=outcome.reason,
+                    session_url=session.tab_url(self.ui_base_url) if self.ui_base_url else None,
+                )
                 return outcome
             if finished.exit_code != 0:
                 outcome.reason = f"agent exited {finished.exit_code}"

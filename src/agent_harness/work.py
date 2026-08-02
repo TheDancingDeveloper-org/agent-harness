@@ -86,6 +86,19 @@ CREATE TABLE IF NOT EXISTS control (
     changed_at REAL NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO control (id, state) VALUES (1, 'running');
+
+-- Sessions left running on purpose when an agent timed out. Killing one
+-- destroys the context that makes the item resumable by a human, so they are
+-- kept -- but kept means owned, not forgotten. Without this table nothing
+-- knows they exist, and "preserved deliberately" and "leaked" become the
+-- same thing after a week.
+CREATE TABLE IF NOT EXISTS abandoned_sessions (
+    session_id  TEXT PRIMARY KEY,
+    item_id     TEXT NOT NULL,
+    reason      TEXT,
+    session_url TEXT,
+    abandoned_at REAL NOT NULL
+);
 """
 
 
@@ -389,6 +402,59 @@ class WorkQueue:
                 r["state"]: r["n"]
                 for r in conn.execute("SELECT state, COUNT(*) AS n FROM work GROUP BY state")
             }
+        finally:
+            conn.close()
+
+    # ------------------------------------------------- abandoned sessions
+
+    def record_abandoned_session(
+        self,
+        session_id: str,
+        item_id: str,
+        *,
+        reason: str | None = None,
+        session_url: str | None = None,
+    ) -> None:
+        """Remember a session left alive after a timeout.
+
+        Recording it is what makes the decision to keep it a decision. An
+        unrecorded survivor is indistinguishable from a leak, and each one may
+        still hold an agent spending tokens.
+        """
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO abandoned_sessions "
+                "(session_id, item_id, reason, session_url, abandoned_at) VALUES (?, ?, ?, ?, ?)",
+                (session_id, item_id, reason, session_url, self.now()),
+            )
+        finally:
+            conn.close()
+
+    def abandoned_sessions(self, older_than: float | None = None) -> list[dict[str, Any]]:
+        """Sessions kept alive after a timeout, oldest first.
+
+        `older_than` is an age in seconds, not a timestamp -- callers care
+        that a session has been sitting for an hour, not what the clock said
+        when it started.
+        """
+        conn = self._connect()
+        try:
+            sql = "SELECT * FROM abandoned_sessions"
+            params: list[Any] = []
+            if older_than is not None:
+                sql += " WHERE abandoned_at <= ?"
+                params.append(self.now() - older_than)
+            sql += " ORDER BY abandoned_at"
+            return [dict(row) for row in conn.execute(sql, params)]
+        finally:
+            conn.close()
+
+    def forget_abandoned_session(self, session_id: str) -> None:
+        """Drop the record once the session is actually gone."""
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM abandoned_sessions WHERE session_id = ?", (session_id,))
         finally:
             conn.close()
 

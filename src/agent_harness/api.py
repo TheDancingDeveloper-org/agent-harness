@@ -510,6 +510,7 @@ def create_api(
             done=counts.get(DONE, 0),
             failed=counts.get(FAILED, 0),
             stale=len(queue.stale()) if queue else 0,
+            abandoned_sessions=len(queue.abandoned_sessions()) if queue else 0,
             waiting_for_input=[
                 WaitingItem(
                     item_id=e["data"].get("item_id"),

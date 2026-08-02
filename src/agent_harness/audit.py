@@ -34,6 +34,7 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -331,6 +332,122 @@ class AuditStore:
             ),
         )
         return bool(cursor.rowcount)
+
+    # ----------------------------------------------------- rollup & retention
+
+    def rollup(self, until: float | None = None) -> int:
+        """Aggregate complete days into immutable rows. Returns rows written.
+
+        Only whole days in the past are rolled up. A rollup is immutable, so
+        writing one for a day still in progress would freeze a partial day as
+        though it were the whole of it -- and nothing downstream could tell.
+
+        A day already rolled up is never rewritten, even if events for it
+        arrive later. If a published number could change, every historical
+        figure is provisional forever and no report can be reproduced. Late
+        events stay in the raw table and are visible there; they simply do not
+        retroactively edit a closed day.
+        """
+        if self.degraded:
+            return 0
+        conn = self._connect()
+        # Midnight UTC of the current day: everything strictly before it is a
+        # complete day.
+        boundary = until if until is not None else time.time()
+        cutoff = (boundary // 86400) * 86400
+        rows = conn.execute(
+            "SELECT date(ts, 'unixepoch') AS day, "
+            "COALESCE(project_id, '') AS project_id, "
+            "COALESCE(role, '') AS role, COALESCE(model, '') AS model, "
+            "COALESCE(outcome, '') AS outcome, "
+            "COUNT(*) AS events, "
+            "SUM(COALESCE(tokens_in, 0)) AS tokens_in, "
+            "SUM(COALESCE(tokens_out, 0)) AS tokens_out, "
+            "SUM(cost_usd) AS cost_usd, "
+            "AVG(latency_s) AS latency_p50 "
+            "FROM events WHERE ts < ? "
+            "GROUP BY day, project_id, role, model, outcome",
+            (cutoff,),
+        ).fetchall()
+
+        written = 0
+        for row in rows:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO rollup_daily (day, project_id, role, model, outcome, "
+                "events, tokens_in, tokens_out, cost_usd, latency_p50, schema_version) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    row["day"],
+                    row["project_id"],
+                    row["role"],
+                    row["model"],
+                    row["outcome"],
+                    row["events"],
+                    row["tokens_in"],
+                    row["tokens_out"],
+                    row["cost_usd"],
+                    row["latency_p50"],
+                    SCHEMA_VERSION,
+                ),
+            )
+            written += cursor.rowcount or 0
+        return written
+
+    def rollups(
+        self, project_id: str | None = None, since_day: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Daily aggregates, oldest first. This is the long series."""
+        if self.degraded:
+            return []
+        sql = "SELECT * FROM rollup_daily"
+        clauses, params = [], []
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        if since_day is not None:
+            clauses.append("day >= ?")
+            params.append(since_day)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY day, project_id, role, model"
+        return [dict(r) for r in self._connect().execute(sql, params)]
+
+    def rolled_up_through(self) -> str | None:
+        """The last day covered by a rollup, or None."""
+        if self.degraded:
+            return None
+        row = self._connect().execute("SELECT MAX(day) FROM rollup_daily").fetchone()
+        return row[0] if row else None
+
+    def thin(self, older_than_days: int = 90, now: float | None = None) -> int:
+        """Remove raw events that a rollup already covers. Returns rows removed.
+
+        The only deletion in this class, and it is fenced twice: an event is
+        removed only if it is older than the retention window AND its day has
+        already been aggregated.
+
+        That ordering is the whole discipline. Thinning before aggregating is
+        silent data loss that leaves a tidy-looking database -- the rows are
+        gone, the series has a hole, and nothing reports it.
+        """
+        if self.degraded:
+            return 0
+        covered = self.rolled_up_through()
+        if covered is None:
+            # Nothing has been aggregated, so nothing may be removed however
+            # old it is.
+            return 0
+        moment = now if now is not None else time.time()
+        cutoff = moment - older_than_days * 86400
+        conn = self._connect()
+        cursor = conn.execute(
+            "DELETE FROM events WHERE ts < ? AND date(ts, 'unixepoch') <= ?",
+            (cutoff, covered),
+        )
+        removed = cursor.rowcount or 0
+        if removed:
+            log.info("audit: thinned %d raw events already covered by rollups", removed)
+        return removed
 
     # ------------------------------------------------------------- reading
 

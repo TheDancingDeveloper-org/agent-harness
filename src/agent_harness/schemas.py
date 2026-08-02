@@ -336,6 +336,29 @@ class AuditDelivery(BaseModel):
     partial: bool = False
 
 
+class AuditRollupRow(BaseModel):
+    day: str
+    project_id: str | None = None
+    role: str | None = None
+    model: str | None = None
+    outcome: str | None = None
+    events: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float | None = None
+    latency_p50: float | None = None
+
+
+class AuditRollups(BaseModel):
+    rows: list[AuditRollupRow] = Field(default_factory=list)
+    rolled_up_through: str | None = Field(
+        None,
+        description="Last day covered. Raw events are only ever thinned once their day "
+        "appears here -- thinning first would leave a hole in the series that nothing "
+        "reports.",
+    )
+
+
 class Baseline(BaseModel):
     baseline_id: str
     project_id: str

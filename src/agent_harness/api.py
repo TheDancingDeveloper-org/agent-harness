@@ -45,6 +45,8 @@ from .schemas import (
     AuditDelivery,
     AuditDeliveryRow,
     AuditHealth,
+    AuditRollupRow,
+    AuditRollups,
     Baseline,
     BaselineList,
     Event,
@@ -427,6 +429,33 @@ def create_api(
             window=window,
             rows=[AuditDeliveryRow(**r) for r in rows],
             partial=partial,
+        )
+
+    @app.get(
+        "/api/audit/rollups",
+        tags=["observability"],
+        summary="Daily aggregates -- the long series",
+        response_model=AuditRollups,
+    )
+    def audit_rollups(
+        project_id: str | None = Query(None),
+        since_day: str | None = Query(None, description="ISO date, inclusive."),
+        _: None = Depends(require_token),
+    ) -> AuditRollups:
+        """Immutable daily rows, kept forever.
+
+        Raw events are thinned after ~90 days, so anything older than that
+        lives only here. A day is never rewritten once published: if it could
+        be, every historical figure would be provisional and no report could
+        be reproduced.
+        """
+        store_ = audit_store()
+        return AuditRollups(
+            rows=[
+                AuditRollupRow(**r)
+                for r in store_.rollups(project_id=project_id, since_day=since_day)
+            ],
+            rolled_up_through=store_.rolled_up_through(),
         )
 
     @app.get(

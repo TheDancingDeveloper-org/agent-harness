@@ -92,12 +92,31 @@ def test_a_required_audit_store_refuses_to_start_silently(tmp_path: Path) -> Non
 # ------------------------------------------------------- append-only
 
 
-def test_the_audit_store_exposes_no_way_to_change_a_row(tmp_path: Path) -> None:
-    """Append-only is a property, not an intention. If the class offers an
-    update or a delete, someone will eventually call it during an incident."""
-    forbidden = {"update", "delete", "remove", "purge", "clear", "set", "edit"}
+def test_the_audit_store_exposes_no_general_purpose_mutation(tmp_path: Path) -> None:
+    """Append-only is a property, not an intention. A method that exists gets
+    called during an incident by someone with a good reason.
+
+    `thin` is the one sanctioned deletion and is named here deliberately
+    rather than quietly excluded: it removes only raw events whose day a
+    rollup already covers, so the series survives what it removes. Naming it
+    keeps this test honest -- a test called "no way to change a row" that
+    silently tolerates a delete is worse than no test, because the name is
+    what stops anyone looking.
+    """
+    forbidden = {"update", "delete", "remove", "purge", "clear", "set", "edit", "truncate"}
     offered = {name for name in dir(AuditStore) if not name.startswith("_")}
     assert not (offered & forbidden), f"AuditStore exposes mutation: {offered & forbidden}"
+    assert "thin" in offered, "the sanctioned deletion vanished; this test now proves less"
+
+
+def test_thin_is_the_only_deletion_and_it_is_fenced(tmp_path: Path) -> None:
+    """Guarding the guard: thin must refuse when nothing has been rolled up,
+    whatever the retention window says."""
+    audit = AuditStore(tmp_path / "audit.sqlite")
+    audit.append([ev(ts=1_700_000_000.0, outcome="done", data={"run_id": "r", "seq": 1})])
+
+    assert audit.thin(older_than_days=0, now=1_700_000_000.0 + 86400 * 999) == 0
+    assert audit.count() == 1
 
 
 def test_replaying_the_same_event_does_not_duplicate_or_amend_it(tmp_path: Path) -> None:

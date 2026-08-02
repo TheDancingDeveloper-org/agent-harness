@@ -54,7 +54,9 @@ trade and it is rejected.
 
 | Thing | Location |
 |---|---|
-| The plan | `docs/HARNESS-PLAN.md` |
+| How to use it | `docs/USAGE.md` — worked example, real output |
+| Sample plan | `examples/PLAN.md` |
+| The original plan | `docs/HARNESS-PLAN.md` (superseded in part) |
 | Backlog manifest (seeds GitHub issues) | `docs/backlog.json` |
 | Event schema | `src/agent_harness/events.py` |
 | Event store (append-only) | `src/agent_harness/store.py` |
@@ -77,6 +79,23 @@ HARNESS_TOKEN=dev uv run agent-harness --db harness.sqlite serve --port 8099
 ```
 
 It has never run against a real fleet — see `README.md`. Do not describe it as proven.
+
+## The API is a public surface
+
+`src/agent_harness/api.py` + `schemas.py` serve a documented OpenAPI document
+with Swagger UI. Treat it as a contract:
+
+- Every route names a response model. A route returning a bare dict produces a
+  schema of `{}` — valid, and useless to anyone generating a client.
+- Every field carries a description. **The schema is the documentation.**
+- Docs (`/docs`, `/redoc`, `/openapi.json`) need no token; the data does.
+  Requiring a credential to read a schema makes an API undiscoverable for no
+  benefit.
+- Behind a proxy, `--root-path` must be set, or the schema advertises URLs the
+  client cannot call.
+
+Tests assert these properties, not just status codes — see
+`tests/test_api.py`.
 
 ## Do not add a GUI here
 

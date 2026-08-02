@@ -1,29 +1,40 @@
 # agent-harness
 
-A generic harness for running fleets of coding agents: role-routed models, a failure model
-that can tell a burst limit from a spent budget, and a dashboard that makes both visible.
+Turns a plan you wrote in markdown into work that coding agents actually do, and tells you
+honestly what happened.
 
-It is **not tied to any particular project, language or workload.** You supply the roles,
-the provider, and what the agents do; the harness supplies routing, a retry policy that
-does not take the fleet down with it, and the measurement.
+```
+PLAN.md ──▶ GitHub issues ──▶ claim ──▶ agent in a terminal ──▶ checks ──▶ review ──▶ PR
+                                          │
+                                          └── you can attach to it, on any device
+```
 
-## Status: pre-alpha — runs locally, not deployed, not yet proven against a live fleet
+It is **not tied to any particular project, language or workload.** You supply the plan, the
+provider and the checks; the harness supplies the queue, the claims, the failure model and
+the record of what happened.
 
-The model client and the dashboard both run. Neither has been pointed at a real workload:
-every number seen so far came from synthetic traffic. Nothing here is proven until it runs
-against something real.
+## Status: pre-alpha — every path is tested, none is proven against a real workload
 
-| Piece | What it does | State |
-|---|---|---|
-| `providers` | Classifies a provider's failures — burst limit vs spent window vs spent cap vs refused | done |
-| `model_client` | Routes roles to models; per-worker jittered retry; per-endpoint parking; event emission | done |
-| `store` / `ingest` | Append-only SQLite event store; idempotent ingest from any source | done |
-| `api` | Headless JSON API — no GUI; the session host renders it as a Work tab | done |
-| `adapters` | Opt-in readers for other tools' logs | one example |
-| Dispatch (queue, claims, worker supervision) | — | not started |
-| Gates / work definition | — | not started; deliberately not designed before there is a real workload |
+It runs, it is deployed inside [AIDevEnv](https://github.com/TheDancingDeveloper-org/aidevenv),
+and every stage has been driven end to end against a real git repository with a scripted
+model. **It has never executed a real agent against a real provider.** Nothing here is
+proven until it does.
 
-### The one idea worth stealing
+| Module | What it does |
+|---|---|
+| `plan` | Parses a markdown plan into work items, reporting what it could **not** read |
+| `github` | Syncs those items to issues, idempotently — re-running an edited plan updates rather than duplicates |
+| `work` | The queue. Claims are **leases**, so a dead worker releases its item by doing nothing |
+| `session_executor` | Runs an item as a CLI agent in a terminal session you can attach to |
+| `executor` | The same loop for direct API calls, plus the diff-apply tolerance ladder and checks |
+| `session_host` | Client for whatever owns the PTY sessions (AIDevEnv is the reference) |
+| `providers` | Classifies failures — burst limit vs spent window vs spent cap vs refused |
+| `model_client` | Routes roles to models; per-worker jittered retry; per-endpoint parking |
+| `store` / `ingest` / `sources` | Append-only SQLite event store, idempotent ingest |
+| `api` | Documented HTTP API + Swagger. No GUI — the session host renders it |
+| `adapters` | Opt-in readers for other tools' logs |
+
+### Two ideas worth stealing
 
 **A rate limit is not one thing.** `429` covers "slow down" (retry in a moment), "your
 5-hour budget is gone" (hours), "your weekly budget is gone" (days) and "we refuse this"
@@ -38,7 +49,14 @@ limiter exists to reject.
 
 So: classify first, never retry a cap, keep all reaction per-worker and per-endpoint, and
 jitter the backoff. See `providers.py` and `model_client.py` — the reasoning is in the
-docstrings, with the live evidence that corrected it.
+docstrings, with the live evidence that corrected it twice.
+
+**A claim is a lease, not a lock.** A lock held by a process that died is a lock nobody can
+release, and the usual workaround — a human clearing stale state — is exactly the
+unattended-operation failure the queue exists to prevent. A lease expires on its own, so a
+worker killed mid-item releases it by doing nothing. A heartbeat keeps genuinely-slow work
+alive, because "slow" and "dead" look identical from outside and only a live process can
+keep stamping one.
 
 ## Definition of done for v1
 
@@ -56,6 +74,10 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
 
 ## Documentation
 
+- **[`docs/USAGE.md`](docs/USAGE.md) — start here.** A worked example end to end, with
+  real output: write a plan, sync it, execute it, resume it, drive it from the API, and
+  read the failures.
+- [`examples/PLAN.md`](examples/PLAN.md) — the sample plan that walkthrough uses.
 - [`docs/HARNESS-PLAN.md`](docs/HARNESS-PLAN.md) — the original plan. **Superseded in
   part:** it was written assuming one specific consumer, and the harness is now generic.
   Read it for the evidence and the reasoning, not the phase order, and see §0.1 for what
@@ -65,9 +87,52 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
 - [`AGENTS.md`](AGENTS.md) — binding rules of engagement for anyone, human or agent,
   working in this repository.
 
-## Running it
+## Using it
 
-### Calling models
+A five-minute tour. The full walkthrough, with real output, is in
+[`docs/USAGE.md`](docs/USAGE.md).
+
+### 1. Write a plan, get a backlog
+
+Keep writing plans the way you already do. Items are recognised as `### T1: Title`
+headings, `- [ ] T1 Title` checkboxes, or table rows with an id column; `labels:`,
+`milestone:` and `depends on:` lines in the prose become metadata.
+
+```bash
+agent-harness plan PLAN.md --repo owner/name --dry-run   # see what it would do
+agent-harness plan PLAN.md --repo owner/name
+```
+
+Re-run it after editing the plan and it **updates** those issues rather than duplicating
+them — matching is by a marker in the issue body, not by title, so improving the wording of
+an item does not fork it into two.
+
+It refuses a plan that states an id twice, because each id becomes one issue. It never
+closes or reopens anything: the plan says what work *is*, the issue says where it *got to*.
+
+### 2. Execute it
+
+```bash
+agent-harness run --repo owner/name --work ./target \
+    --plan PLAN.md --check 'pytest -q' \
+    --planner MODEL --implementer MODEL --reviewer A-DIFFERENT-VENDOR
+```
+
+Each item gets its own git worktree, an agent, then checks, then a review, then a pull
+request. **Cheap checks run before the reviewer** — paying a model to tell you the build is
+broken is paying the dearest gate to catch what the cheapest one already did. Nothing is
+ever committed to your default branch.
+
+Kill it at any point and re-run: claims are leases, so whatever was in flight comes back on
+its own.
+
+### 3. Watch it
+
+The session executor runs each agent as a terminal session in the host, so an item in
+flight deep-links to the terminal doing the work — with scrollback, from a phone — and an
+agent that stops to ask something surfaces as `waiting_for_input` rather than looking hung.
+
+### Calling models directly
 
 ```python
 from agent_harness import providers
@@ -103,6 +168,19 @@ The harness serves JSON and the host renders it.
 
 What it does own is a **documented API**: every route typed, every field
 described, and the schema served next to it.
+
+```
+GET  /api/work              backlog, counts and stale claims in one call
+GET  /api/work/{id}         one item
+POST /api/work              add items directly
+POST /api/work/{id}/retry   re-queue; refuses while a claim is live
+POST /api/plan/parse        parse a plan, reporting what it could NOT read
+POST /api/plan/sync         plan -> GitHub issues, dry-run by default
+GET  /api/errors            rate limits by class
+GET  /api/events            paged by row id, not timestamp
+GET  /api/summary           enough for a status line
+GET  /healthz               open, cheap, needs no credential
+```
 
 | | |
 |---|---|

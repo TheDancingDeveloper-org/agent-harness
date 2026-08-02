@@ -101,6 +101,27 @@ push notifications, mobile and the terminal sessions agents run in; a second
 web UI would mean a second URL and a second login to do the same job worse.
 The harness serves JSON and the host renders it.
 
+What it does own is a **documented API**: every route typed, every field
+described, and the schema served next to it.
+
+| | |
+|---|---|
+| `/docs` | Swagger UI, with an Authorize button |
+| `/redoc` | ReDoc |
+| `/openapi.json` | the schema — generate a client from it |
+
+Auth is a bearer token, and inside a session host it is the **same token that
+reaches the GUI**: one credential, one thing to rotate.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" localhost:8099/api/work
+curl -H "Authorization: Bearer $TOKEN" localhost:8099/api/summary
+curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/work/T4/retry
+```
+
+Behind a proxy, pass `--root-path /api/harness` so the schema advertises URLs
+a client can actually call.
+
 [AIDevEnv](https://github.com/TheDancingDeveloper-org/aidevenv) is the
 reference host and ships a Work tab that consumes this API.
 

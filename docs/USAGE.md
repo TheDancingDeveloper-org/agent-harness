@@ -412,6 +412,10 @@ in-flight items are joined rather than killed.
 Monitoring-only deployments stay supported — a dashboard over someone else's
 harness should not need a session host, a model key or a checkout.
 
+The full deployment contract for both modes, including what the *agent's*
+environment must hold and a non-destructive post-deploy smoke test, is in
+[`DEPLOYMENT.md`](DEPLOYMENT.md).
+
 ---
 
 ## 5. Drive it from the API
@@ -602,11 +606,11 @@ is the lever.
 |---|---|---|
 | `HARNESS_TOKEN` | `serve` | Bearer token for the API. Without it every authenticated route refuses. |
 | `HARNESS_DB` | all | SQLite path. Default `./harness.sqlite`. |
-| `HARNESS_API_KEY` | `run` | Key for the model provider. |
-| `HARNESS_ENDPOINT` | `run` | Model API base URL. |
+| `HARNESS_API_KEY` | `run`, `serve` | Key for the model provider. In `serve` it is the reviewer's. |
+| `HARNESS_ENDPOINT` | `run`, `serve` | Model API base URL. |
 | `HARNESS_ROOT_PATH` | `serve` | Prefix when behind a proxy, e.g. `/api/harness`. |
-| `AIDEVENV_URL` | `run` | Session host, enabling attachable agents. |
-| `AIDEVENV_TOKEN` | `run` | Session host token. |
+| `AIDEVENV_URL` | `run`, `serve` | Session host, enabling attachable agents. In `serve` it is what makes the deployment supervised rather than monitoring-only. |
+| `AIDEVENV_TOKEN` | `run`, `serve` | Session host token. |
 | `HARNESS_AUDIT_DB` | `serve` | Audit database. Put it on a different volume so history does not share a fate with the queue. Defaults to `audit.sqlite` beside `--db`. |
 | `HARNESS_AUDIT_REQUIRED` | `serve` | `1` refuses to start without a writable audit store. Off by default, because observation failing must not stop work. |
 | `HARNESS_AUDIT_RETENTION_DAYS` | `serve` | How long raw events are kept once a rollup covers them. Default 90. |

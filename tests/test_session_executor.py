@@ -425,7 +425,7 @@ def test_a_worker_killed_during_review_loses_no_work(repo: Path, tmp_path: Path)
         queue,
         devenv,
         repo,
-        reviewer=DyingReviewer(),
+        reviewer=DyingReviewer(),  # type: ignore[arg-type]
         worktrees=tmp_path / "trees",
         push=False,
     )

@@ -165,3 +165,72 @@ misconfigured one it tells you less than the line above.
 Warnings do not block a start and are still worth reading: `checks` means
 nothing verifies a diff before the reviewer sees it, and `reviewer
 independence` means some share of reviews is a model grading its own work.
+
+---
+
+## Telling a thinking agent from a stuck one
+
+A CLI agent can stay alive and work for many minutes without writing a
+single byte to its PTY: thinking, waiting on a provider, or writing to its
+own transcript instead of the terminal. The session host correctly reports
+that session as `activity: idle`, often with `scrollback_bytes: 0`.
+
+PTY output was the only liveness signal the harness had, so three different
+situations produced one indistinguishable answer:
+
+- an agent legitimately working in silence;
+- an agent hung before it produced any output;
+- an agent whose output goes somewhere other than the terminal.
+
+Marking all three `idle` makes the Work tab misleading and any timeout
+decision built on it a guess.
+
+### The contract
+
+A deployment supplies a **progress probe**: a callable given the `Session`,
+returning `Progress(marker=..., detail=...)` or `None`.
+
+```python
+from agent_harness.session_executor import AgentSpec, Progress
+
+def transcript_probe(session):
+    """Whatever this deployment's agent actually writes."""
+    log = Path(session.cwd) / ".agent" / "transcript.jsonl"
+    if not log.exists():
+        return None                      # cannot tell -- NOT "no progress"
+    return Progress(marker=str(log.stat().st_size), detail="transcript is growing")
+
+AgentSpec(command=..., progress_probe=transcript_probe, silence_seconds=300)
+```
+
+`marker` is **opaque** and compared only for equality — a file size, an
+mtime, a task counter, a heartbeat the agent wrapper writes. The harness
+never looks at it, because the core cannot know what any particular agent
+product writes or where; that knowledge belongs to the deployment or to an
+adapter.
+
+### What it reports
+
+| State | Meaning |
+|---|---|
+| `working` | The PTY produced output, or the host's activity changed. |
+| `working-silently` | No PTY output, but the probe's marker advanced. This is the state that previously had no name. |
+| `no-progress` | A probe is configured and nothing — activity, PTY, marker — has changed for `silence_seconds`. |
+| `unknown-silent` | Silent, and no probe is configured (or it returned `None`). The harness **says it cannot tell** rather than guessing. |
+
+Two rules this deliberately follows:
+
+- **Process liveness is never treated as progress.** A wedged agent is a live
+  process, so "the session exists" proves nothing and is not a signal here.
+- **Without a probe, silence is reported as unknown, never as a hang.** With
+  only the PTY watched, a working agent and a hung one are genuinely
+  indistinguishable, and claiming otherwise would invent a fact.
+
+`silence_seconds` decides when quiet becomes worth *reporting*. It is not a
+kill switch: `AgentSpec.timeout_seconds` is still the only thing that ends an
+attempt, so a genuinely stuck agent still reaches the same diagnostic timeout
+it always did — with a reason that now says which of the three cases it was.
+
+A probe is deployment-supplied code touching a filesystem. One that raises is
+logged and treated as `None`; it can never fail an item that is otherwise
+fine.

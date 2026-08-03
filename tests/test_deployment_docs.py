@@ -65,7 +65,9 @@ def test_every_readiness_field_the_document_shows_is_in_the_schema() -> None:
 def test_every_blocker_the_document_tells_you_to_fix_can_actually_occur() -> None:
     """A remedy table naming a check that no longer exists sends an operator
     looking for something they will never see."""
-    table = DOC.split("## When readiness says no", 1)[1]
+    # Bounded to its own section: the split used to run to the end of the
+    # file, so any later table's first column was read as a blocker name.
+    table = DOC.split("## When readiness says no", 1)[1].split("\n## ", 1)[0]
     documented = set(re.findall(r"^\| `([a-z ]+)` \|", table, re.MULTILINE))
     assert documented, "the remedy table stopped being extractable"
 

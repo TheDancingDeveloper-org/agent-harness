@@ -95,6 +95,7 @@ class SessionHost(Protocol):
         timeout: float = ...,
         poll_seconds: float = ...,
         on_waiting: Callable[[Session], None] | None = ...,
+        on_poll: Callable[[Session], None] | None = ...,
     ) -> Session: ...
 
 
@@ -188,6 +189,7 @@ class HttpSessionHost:
         timeout: float = 3600.0,
         poll_seconds: float = 5.0,
         on_waiting: Callable[[Session], None] | None = None,
+        on_poll: Callable[[Session], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], float] = time.monotonic,
     ) -> Session:
@@ -198,6 +200,12 @@ class HttpSessionHost:
         gets told so it can notify, extend a lease, or give up deliberately
         rather than silently timing out on a question nobody saw.
 
+        `on_poll` fires on every observation, finished or not. It exists
+        because PTY output is not the only evidence an agent is working: a
+        CLI can think, call a provider, or write to its own transcript for
+        minutes without printing anything, and this loop is the only place
+        that sees the session often enough to tell that apart from a hang.
+
         A timeout returns the session as it stands rather than raising: the
         caller has a claim to release and a partial result to record, and an
         exception here would discard both.
@@ -206,6 +214,8 @@ class HttpSessionHost:
         warned = False
         while True:
             session = self.get_session(session_id)
+            if on_poll is not None:
+                on_poll(session)
             if session.finished:
                 return session
             if session.waiting_for_input and not warned and on_waiting:

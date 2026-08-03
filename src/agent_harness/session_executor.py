@@ -53,6 +53,11 @@ from .work import (
 
 log = logging.getLogger(__name__)
 
+#: How long a session may go with no change on ANY signal before the harness
+#: reports it. Generous: an agent thinking hard about a hard problem is the
+#: normal case this must not slander.
+DEFAULT_SILENCE_SECONDS = 300.0
+
 #: The default agent. `-p` takes the prompt; the harness supplies it as a
 #: file so a long brief is not mangled by shell quoting, and so the exact
 #: prompt an agent was given stays on disk next to its result.
@@ -136,9 +141,128 @@ class AgentSpec:
     #: is more expensive than waiting.
     timeout_seconds: float = 3600.0
     poll_seconds: float = 5.0
+    #: How long a session may show no change at all before the harness says
+    #: so. Not a kill switch -- `timeout_seconds` is still what ends an
+    #: attempt. This only decides when silence becomes worth reporting.
+    silence_seconds: float = DEFAULT_SILENCE_SECONDS
+    #: Supplied by a deployment that can see its agent's own progress signal
+    #: -- a transcript, a heartbeat file, a task counter. Without one the
+    #: harness says it cannot tell, rather than guessing.
+    progress_probe: ProgressProbe | None = None
 
     def render(self, prompt_file: Path, item_id: str) -> list[str]:
         return [part.format(prompt_file=str(prompt_file), item_id=item_id) for part in self.command]
+
+
+#: How an agent is judged to be alive, in the order of how much they prove.
+#: A CLI can think, wait on a provider, or write to its own transcript for
+#: minutes without printing to its PTY -- so treating "no output" as "hung"
+#: kills honest work, and treating a live process as progress lets a wedged
+#: one run to the timeout looking healthy.
+WORKING = "working"
+#: No PTY output, but an independent signal advanced. The state the harness
+#: previously could not name, and reported as `idle`.
+WORKING_SILENTLY = "working-silently"
+#: A progress probe is configured and has not moved for the silence window.
+#: The strongest statement available, and still not proof: it says nothing
+#: the deployment agreed to watch has changed.
+NO_PROGRESS = "no-progress"
+#: Silent, and nothing is watching anything but the PTY. Deliberately NOT
+#: reported as a hang: without a probe the two are genuinely
+#: indistinguishable, and saying otherwise would be inventing a fact.
+UNKNOWN = "unknown-silent"
+
+
+@dataclass(frozen=True)
+class Progress:
+    """Evidence of work, from outside the PTY.
+
+    `marker` is opaque and compared only for equality: a transcript's size,
+    a heartbeat file's mtime, a task counter. The core must not know what any
+    particular agent writes or where, so it does not look -- a deployment
+    supplies a probe and this is all it has to return.
+    """
+
+    marker: str
+    detail: str = ""
+
+
+#: Supplied by a deployment, never by the core. Returning None means the
+#: probe could not tell, which is different from "no progress".
+ProgressProbe = Callable[[Session], "Progress | None"]
+
+
+class ProgressMonitor:
+    """Classifies one session's liveness from every signal available.
+
+    Three inputs, none of which is sufficient alone: what the host says the
+    session is doing, how much the PTY has emitted, and whatever the
+    deployment's probe reports. Any of them changing is progress; the
+    silence window is only consulted once none of them has.
+    """
+
+    def __init__(
+        self,
+        *,
+        probe: ProgressProbe | None = None,
+        silence_seconds: float = DEFAULT_SILENCE_SECONDS,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.probe = probe
+        self.silence_seconds = silence_seconds
+        self.now = now
+        self.state = WORKING
+        self.detail = ""
+        self._signals: tuple[Any, ...] | None = None
+        self._changed_at = now()
+
+    def observe(self, session: Session) -> str:
+        """Record one observation and return the current classification."""
+
+        progress = None
+        if self.probe is not None:
+            try:
+                progress = self.probe(session)
+            except Exception as exc:  # noqa: BLE001 - a probe is third-party code
+                log.warning("progress probe failed: %s", exc)
+        signals = (
+            session.activity,
+            session.raw.get("scrollback_bytes"),
+            progress.marker if progress else None,
+        )
+        if self._signals is None or signals != self._signals:
+            pty_moved = self._signals is None or signals[:2] != self._signals[:2]
+            self._signals = signals
+            self._changed_at = self.now()
+            # The distinction the whole thing exists for: something advanced,
+            # and it was not the terminal. Reporting that as `idle` is what
+            # made an agent thinking hard indistinguishable from a hung one.
+            self.state = WORKING if pty_moved else WORKING_SILENTLY
+            self.detail = progress.detail if progress else ""
+            return self.state
+
+        silent_for = self.now() - self._changed_at
+        if silent_for < self.silence_seconds:
+            # Still inside the window. Quiet is not yet a claim about anything.
+            return self.state
+        if self.probe is None:
+            self.state = UNKNOWN
+            self.detail = (
+                f"silent for {silent_for:.0f}s, and only its PTY is being watched; "
+                "a working agent and a hung one look identical from here"
+            )
+        elif progress is None:
+            self.state = UNKNOWN
+            self.detail = f"silent for {silent_for:.0f}s; the progress probe could not tell"
+        else:
+            self.state = NO_PROGRESS
+            self.detail = f"nothing has changed for {silent_for:.0f}s"
+        return self.state
+
+    def note(self) -> str:
+        """The classification and why, for a log line or a timeout reason."""
+
+        return f"{self.state}: {self.detail}" if self.detail else self.state
 
 
 class SessionExecutor:
@@ -400,20 +524,29 @@ class SessionExecutor:
                 url=session.tab_url(self.ui_base_url) if self.ui_base_url else None,
             )
 
+            monitor = ProgressMonitor(
+                probe=self.agent.progress_probe,
+                silence_seconds=self.agent.silence_seconds,
+            )
             finished = self.devenv.wait_for_exit(
                 session.id,
                 timeout=self.agent.timeout_seconds,
                 poll_seconds=self.agent.poll_seconds,
                 on_waiting=lambda s: self._on_waiting(record, s),
+                on_poll=lambda s: self._on_progress(record, monitor, s),
             )
             if not finished.finished:
                 # A timeout, or a prompt nobody answered. The session is left
                 # alive on purpose: it holds the agent's context, and killing
                 # it would destroy the one thing that makes the item
                 # resumable by a human.
+                # The classification, not just `activity`. "idle" was the
+                # answer for an agent thinking, an agent hung, and an agent
+                # whose output goes somewhere other than its PTY -- which is
+                # exactly the three cases somebody reading this needs apart.
                 outcome.reason = (
                     f"agent did not finish within {self.agent.timeout_seconds:.0f}s "
-                    f"(activity={finished.activity}); session {session.id} left running"
+                    f"({monitor.note()}); session {session.id} left running"
                 )
                 self._emit(record, "agent_timeout", detail=outcome.reason, session_id=session.id)
                 # Kept alive on purpose -- and recorded, so it is owned rather
@@ -513,6 +646,23 @@ class SessionExecutor:
         if not self.checks.commands:
             return "- No automated checks are configured for this repository."
         return "\n".join(f"- `{shlex.join(list(c))}` must pass" for c in self.checks.commands)
+
+    def _on_progress(self, record: WorkRecord, monitor: ProgressMonitor, session: Session) -> None:
+        """Report a change of liveness, and only a change.
+
+        Emitting every poll would bury the transition in noise at exactly the
+        rate that makes it unreadable; emitting nothing is what left an
+        operator with `idle` and no way to act on it.
+        """
+        before = monitor.state
+        after = monitor.observe(session)
+        if after != before and after in (WORKING_SILENTLY, NO_PROGRESS, UNKNOWN):
+            self._emit(
+                record,
+                f"agent_{after.replace('-', '_')}",
+                detail=monitor.detail,
+                session_id=session.id,
+            )
 
     def _on_waiting(self, record: WorkRecord, session: Session) -> None:
         """The agent is asking a human something.

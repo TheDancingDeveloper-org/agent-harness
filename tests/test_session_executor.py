@@ -94,6 +94,7 @@ class FakeDevEnv:
         timeout: float = 3600.0,
         poll_seconds: float = 5.0,
         on_waiting: Callable[[Session], None] | None = None,
+        on_poll: Callable[[Session], None] | None = None,
     ) -> Session:
         for state in self.activity_script:
             if state == WAITING and on_waiting:
@@ -568,3 +569,162 @@ def test_a_failure_before_any_session_records_nothing(repo: Path, tmp_path: Path
     add_item(queue)
     executor.run_once()
     assert queue.abandoned_sessions() == []
+
+
+# ------------------------------------- telling silent work apart from a hang
+
+
+def monitor_for(probe: Any = None, silence: float = 10.0, clock: list[float] | None = None) -> Any:
+    from agent_harness.session_executor import ProgressMonitor
+
+    clock = clock if clock is not None else [0.0]
+    return ProgressMonitor(probe=probe, silence_seconds=silence, now=lambda: clock[0]), clock
+
+
+def silent(scrollback: int = 0, **raw: Any) -> Session:
+    """A session producing nothing on its PTY, as a thinking agent does."""
+    return Session(id="s-1", name="s", activity=IDLE, raw={"scrollback_bytes": scrollback, **raw})
+
+
+def test_a_silent_agent_with_a_moving_probe_is_working_not_idle(tmp_path: Path) -> None:
+    """The whole point. Before this, an agent writing to its own transcript
+    for ten minutes reported `idle` and looked exactly like a hang."""
+    from agent_harness.session_executor import WORKING_SILENTLY, Progress
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("one\n")
+
+    def probe(_session: Session) -> Progress:
+        return Progress(marker=str(transcript.stat().st_size), detail="transcript is growing")
+
+    monitor, clock = monitor_for(probe)
+    monitor.observe(silent())
+
+    clock[0] += 60  # well past the silence window, PTY still silent
+    transcript.write_text("one\ntwo\n")
+    assert monitor.observe(silent()) == WORKING_SILENTLY
+    assert "transcript" in monitor.detail
+
+
+def test_a_truly_stuck_agent_reaches_no_progress(tmp_path: Path) -> None:
+    """A probe that is configured and never moves is the strongest statement
+    available -- and the test that a live process is not treated as proof."""
+    from agent_harness.session_executor import NO_PROGRESS, Progress
+
+    monitor, clock = monitor_for(lambda _s: Progress(marker="frozen"))
+    monitor.observe(silent())
+
+    clock[0] += 5  # inside the window: silence is not yet a claim
+    assert monitor.observe(silent()) != NO_PROGRESS
+
+    clock[0] += 20
+    assert monitor.observe(silent()) == NO_PROGRESS
+    assert "nothing has changed" in monitor.detail
+
+
+def test_without_a_probe_it_says_it_cannot_tell(tmp_path: Path) -> None:
+    """Refusing to guess. With only the PTY watched, a working agent and a
+    hung one are genuinely indistinguishable, and claiming otherwise would
+    be inventing a fact."""
+    from agent_harness.session_executor import NO_PROGRESS, UNKNOWN
+
+    monitor, clock = monitor_for(None)
+    monitor.observe(silent())
+    clock[0] += 60
+    state = monitor.observe(silent())
+    assert state == UNKNOWN
+    assert state != NO_PROGRESS
+    assert "identical" in monitor.detail
+
+
+def test_pty_output_alone_still_counts_as_working(tmp_path: Path) -> None:
+    from agent_harness.session_executor import WORKING
+
+    monitor, clock = monitor_for(None)
+    monitor.observe(silent(scrollback=10))
+    clock[0] += 60
+    assert monitor.observe(silent(scrollback=4096)) == WORKING
+
+
+def test_a_probe_that_raises_does_not_stop_the_wait(tmp_path: Path) -> None:
+    """A probe is deployment-supplied code watching a filesystem. It must not
+    be able to fail an item that is otherwise fine."""
+    from agent_harness.session_executor import UNKNOWN
+
+    def explode(_session: Session) -> Any:
+        raise OSError("the transcript volume went away")
+
+    monitor, clock = monitor_for(explode)
+    monitor.observe(silent())
+    clock[0] += 60
+    assert monitor.observe(silent()) == UNKNOWN
+
+
+def test_the_executor_reports_silent_work_and_says_so_on_timeout(
+    repo: Path, tmp_path: Path
+) -> None:
+    """End to end, with a deterministic agent that stays alive, prints
+    nothing, and advances a separate signal."""
+    from agent_harness.session_executor import Progress
+
+    ticks = {"n": 0}
+
+    class SilentHost:
+        """Never exits. Its PTY never grows."""
+
+        def __init__(self) -> None:
+            self.polls = 0
+
+        def create_session(self, name: str, command: Any, cwd: str, **_: Any) -> Session:
+            return Session(id="s-1", name=name, activity=RUNNING)
+
+        def get_session(self, session_id: str, with_scrollback: bool = False) -> Session:
+            return Session(id=session_id, name="s", activity=RUNNING, raw={"scrollback_bytes": 0})
+
+        def wait_for_exit(
+            self,
+            session_id: str,
+            *,
+            timeout: float = 3600.0,
+            poll_seconds: float = 5.0,
+            on_waiting: Any = None,
+            on_poll: Any = None,
+        ) -> Session:
+            for _ in range(4):
+                self.polls += 1
+                ticks["n"] += 1
+                if on_poll:
+                    on_poll(self.get_session(session_id))
+            return self.get_session(session_id)  # never finished
+
+        def kill_session(self, session_id: str) -> None: ...
+
+        def delete_session(self, session_id: str) -> None: ...
+
+    events: list[dict[str, Any]] = []
+    clock = [0.0]
+
+    def probe(_session: Session) -> Progress:
+        # Advances every poll: the agent IS working, silently.
+        return Progress(marker=str(ticks["n"]), detail="the agent's own log advanced")
+
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    executor = SessionExecutor(
+        queue,
+        SilentHost(),
+        repo,
+        agent=AgentSpec(
+            command=("true",), timeout_seconds=1.0, progress_probe=probe, silence_seconds=1.0
+        ),
+        reviewer=None,
+        on_event=events.append,
+        push=False,
+        now=lambda: clock[0],
+    )
+    add_item(queue)
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    # It timed out, and the reason names what it observed rather than `idle`.
+    assert "working-silently" in (outcome.reason or ""), outcome.reason
+    assert [e for e in events if e["outcome"] == "agent_working_silently"]

@@ -84,6 +84,7 @@ class FakeHost:
         timeout: float = 3600.0,
         poll_seconds: float = 5.0,
         on_waiting: Callable[[Session], None] | None = None,
+        on_poll: Callable[[Session], None] | None = None,
     ) -> Session:
         return Session(id=session_id, name="s", activity=IDLE, exit_code=0)
 

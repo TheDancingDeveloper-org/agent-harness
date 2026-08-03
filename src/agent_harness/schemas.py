@@ -137,6 +137,14 @@ class RoleRoute(BaseModel):
 
 
 class RoleMap(BaseModel):
+    reviewer_independent: bool = Field(
+        True,
+        description="False when the reviewer is the same model, or the same vendor, as "
+        "the implementer -- some share of reviews is then a model grading its own work. "
+        "Reported rather than refused: running one model is a legitimate deliberate "
+        "choice, but it must not be a surprise.",
+    )
+    reviewer_note: str = Field("", description="Why, in words.")
     roles: dict[str, RoleRoute] = Field(
         description="role -> where its calls go. Changing this takes effect on the next "
         "call: the call site names a ROLE, never a model, which is what makes the map "

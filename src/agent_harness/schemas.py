@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 # --------------------------------------------------------------------- work
 
@@ -54,6 +54,17 @@ class WorkItem(BaseModel):
     pr_url: str | None = None
     updated_at: float = 0.0
     latest: LatestEvent | None = None
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description="The same identifier as `item_id`, under the name most clients "
+        "look for. Emitted because a list whose rows cannot be addressed is a list "
+        "you can render and not act on: every action route takes this value."
+    )
+    @property
+    def id(self) -> str:
+        # Derived, never stored. Two independent fields holding one identifier
+        # is two chances to serialize one of them as null.
+        return self.item_id
 
 
 class WorkList(BaseModel):

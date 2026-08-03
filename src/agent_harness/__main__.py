@@ -219,24 +219,29 @@ def _run(args: argparse.Namespace) -> int:
         name: {"model": model, "endpoint": args.endpoint, "provider": "claw-bay"}
         for name, model in roles.items()
     }
-    stored_map = queue.get_setting(ROLE_MAP_KEY)
-    if not stored_map:
-        queue.set_setting(ROLE_MAP_KEY, from_cli)
-    elif stored_map != from_cli:
-        # The stored map wins, because re-routing a role live is the point of
-        # storing it -- but silently ignoring flags the operator just typed is
-        # its own kind of lie. Say which one is in force.
-        differing = sorted(
-            name
-            for name in set(stored_map) | set(from_cli)
-            if stored_map.get(name, {}).get("model") != from_cli.get(name, {}).get("model")
+    stored_map = queue.get_setting(ROLE_MAP_KEY) or {}
+    # MERGED, per role, not chosen wholesale. A stored route wins for the role
+    # it names, because re-routing a role live is the point of storing it --
+    # but a map holding only `reviewer` used to suppress the planner and
+    # implementer the operator had just typed, and the run then failed its
+    # first item with `no route for role 'planner'` after claiming it.
+    merged = {**from_cli, **stored_map}
+    if merged != stored_map:
+        queue.set_setting(ROLE_MAP_KEY, merged)
+    overridden = sorted(
+        name
+        for name in from_cli
+        if name in stored_map and stored_map[name].get("model") != from_cli[name]["model"]
+    )
+    if overridden:
+        print(
+            "note: a stored role map is in force and overrides the command line "
+            f"for: {', '.join(overridden)}. "
+            "PUT /api/roles to change it, or delete the database to reseed."
         )
-        if differing:
-            print(
-                "note: a stored role map is in force and overrides the command line "
-                f"for: {', '.join(differing)}. "
-                "PUT /api/roles to change it, or delete the database to reseed."
-            )
+    filled = sorted(set(from_cli) - set(stored_map))
+    if stored_map and filled:
+        print(f"note: the stored role map had no route for {', '.join(filled)}; used the flags.")
 
     def live_routes() -> dict[str, Route]:
         stored = queue.get_setting(ROLE_MAP_KEY) or {}
@@ -249,6 +254,24 @@ def _run(args: argparse.Namespace) -> int:
             )
             for name, route in stored.items()
         }
+
+    # Nothing claims work until every role this run needs can be routed. The
+    # alternative is finding out on the first model call -- after the project
+    # is running and the item is claimed, so the failure costs an attempt and
+    # leaves failed work in the queue.
+    unroutable = [
+        name
+        for name in roles
+        if not (merged.get(name, {}).get("model") and merged.get(name, {}).get("endpoint"))
+    ]
+    if unroutable:
+        print(f"no usable route for role(s): {', '.join(unroutable)}", file=sys.stderr)
+        print(
+            "The stored role map is incomplete and the command line did not fill it. "
+            "PUT /api/roles to set them, or pass the flags for those roles.",
+            file=sys.stderr,
+        )
+        return 2
 
     client = ModelClient(
         roles=live_routes(),

@@ -783,6 +783,21 @@ class Executor:
         self._emit(record, "checks_passed")
         self._keepalive(record)
 
+        # The graph is re-checked here, at the last cheap point before review
+        # spends money and commit makes anything durable. `claim` checked it
+        # once, minutes ago; correcting a plan while work is in flight is a
+        # normal thing for an operator to do, and an item that is no longer
+        # eligible must not land on the strength of a stale check.
+        unmet = self.queue.unmet_dependencies(record.item_id, project_id=self.project_id)
+        if unmet:
+            outcome.reason = (
+                f"{record.item_id} now depends on {', '.join(unmet)}, which "
+                "is not done; the work is kept on its branch and the item goes back to pending"
+            )
+            self._emit(record, "dependency_invalidated", detail=outcome.reason)
+            outcome.state = PENDING
+            return outcome
+
         # 6. Review, by a different role -- and ideally a different vendor,
         #    which `ModelClient.reviewer_independence()` now reports on rather
         #    than leaving to a comment nobody reads.

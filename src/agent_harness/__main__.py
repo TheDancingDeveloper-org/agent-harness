@@ -110,6 +110,20 @@ def _plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _describe(event: dict[str, Any]) -> str:
+    """One event as a line a human can follow a run by.
+
+    Deliberately not the JSON. The point is that someone watching a terminal
+    can tell "thinking", "waiting on a rate limit" and "wedged" apart, and
+    raw event dicts do not read that way at a glance.
+    """
+    who = event.get("item_id") or event.get("role") or "-"
+    outcome = event.get("outcome") or "?"
+    detail = str(event.get("detail") or "").strip().splitlines()
+    first = detail[0][:160] if detail else ""
+    return f"{who} {outcome}" + (f" — {first}" if first else "")
+
+
 def _http_transport(api_key: str) -> Any:
     """A real transport, built only when `run` needs one.
 
@@ -171,6 +185,14 @@ def _run(args: argparse.Namespace) -> int:
     if not args.endpoint:
         print("no --endpoint (or $HARNESS_ENDPOINT) for the model API", file=sys.stderr)
         return 2
+    if not args.repo and not args.no_push:
+        print("no --repo, so there is nowhere to push or open a pull request", file=sys.stderr)
+        print(
+            "Pass --repo OWNER/NAME, or --no-push to work entirely locally: "
+            "the branch and its commits are still there to inspect.",
+            file=sys.stderr,
+        )
+        return 2
 
     api_key = os.environ.get("HARNESS_API_KEY", "")
     if not api_key and not args.dry_run:
@@ -221,6 +243,11 @@ def _run(args: argparse.Namespace) -> int:
     def emit(event: dict[str, Any]) -> None:
         with events_path.open("a") as handle:
             handle.write(_json.dumps(event) + "\n")
+        # Also say it out loud. Every stage transition used to go only to the
+        # JSONL file, so a run printed a header and then nothing at all --
+        # and a legitimate 210-second backoff after a gateway error looked
+        # exactly like a wedged process to the person watching.
+        log.info("%s", _describe(event))
 
     from .api import ROLE_MAP_KEY
 
@@ -311,7 +338,7 @@ def _run(args: argparse.Namespace) -> int:
             agent=AgentSpec(command=tuple(shlex.split(args.agent))),
             checks=checks,
             reviewer=client,
-            github=GitHub(args.repo),
+            github=GitHub(args.repo) if args.repo else None,
             base_branch=args.base,
             ui_base_url=args.session_host,
             on_event=emit,
@@ -323,7 +350,7 @@ def _run(args: argparse.Namespace) -> int:
             client,
             args.work,
             checks=checks,
-            github=GitHub(args.repo),
+            github=GitHub(args.repo) if args.repo else None,
             base_branch=args.base,
             on_event=emit,
             push=not args.no_push,
@@ -369,6 +396,14 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("HARNESS_DB", "harness.sqlite"),
         help="SQLite path (default: $HARNESS_DB or ./harness.sqlite)",
     )
+    parser.add_argument(
+        "--log-level",
+        default=os.environ.get("HARNESS_LOG_LEVEL", "info"),
+        choices=("debug", "info", "warning", "error"),
+        help="How much the harness says about what it is doing (or "
+        "$HARNESS_LOG_LEVEL). Defaults to info: this process spends money "
+        "unattended, and silence is not a safe default for that.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_ingest = sub.add_parser("ingest", help="read event streams into the store")
@@ -409,9 +444,11 @@ def main(argv: list[str] | None = None) -> int:
     p_run = sub.add_parser("run", help="execute claimed work items")
     p_run.add_argument(
         "--repo",
-        required=True,
+        default="",
         metavar="OWNER/NAME",
-        help="GitHub repo for issues and pull requests",
+        help="GitHub repo for issues and pull requests. Required unless "
+        "--no-push: with nothing to push, there is nothing to open a pull "
+        "request against, and demanding a repo would mean inventing one.",
     )
     p_run.add_argument(
         "--work", type=Path, default=Path("."), help="the git working tree the agents change"
@@ -559,6 +596,17 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    # Once, here, before anything can want to log. Without this every
+    # `log.info`/`log.warning` in the package went to a root logger with no
+    # handler and was discarded -- including the lines that exist to explain
+    # a lost claim, a drained project or a discarded result.
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
 
     if args.command == "plan":
         return _plan(args)

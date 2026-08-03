@@ -384,6 +384,36 @@ that; it is your call.
 
 ---
 
+## 4d. Serve the API *and* the workers
+
+`serve` on its own is monitoring only — it exposes the API and has no workers,
+so starting a project is refused rather than marking it running with nothing
+able to claim. Give it a session host and it owns both:
+
+```bash
+HARNESS_TOKEN=… HARNESS_API_KEY=… AIDEVENV_TOKEN=… \
+agent-harness --db harness.sqlite serve --port 8099 \
+    --session-host https://your-devenv.example \
+    --agent 'claude -p {prompt_file}' \
+    --reviewer claude-sonnet-4-6 \
+    --endpoint https://api.your-gateway.example
+```
+
+Everything project-shaped — the checkout, the repo, the checks, the base
+branch — comes from the **registered project**, not from a flag, because one
+deployment serves several projects and cannot have one checkout on its command
+line. Register them with `POST /api/projects`.
+
+**Nothing starts on its own.** Booting registers no workers and resumes no
+project; `POST /api/projects/{id}/start` is the only thing that creates a
+worker, and only after preflight passes. Stopping drains: no new claims, and
+in-flight items are joined rather than killed.
+
+Monitoring-only deployments stay supported — a dashboard over someone else's
+harness should not need a session host, a model key or a checkout.
+
+---
+
 ## 5. Drive it from the API
 
 The harness serves a full OpenAPI document with Swagger UI. Inside a session

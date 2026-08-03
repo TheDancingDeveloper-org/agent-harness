@@ -268,7 +268,17 @@ uv run agent-harness --db harness.sqlite ingest --events ./run/events.jsonl
 # rather than coming up open.
 HARNESS_TOKEN=$(openssl rand -hex 16) \
   uv run agent-harness --db harness.sqlite serve --port 8099
+
+# Supervised: the same API, plus a worker pool it can actually start.
+# Still nothing runs until someone starts a project through the API.
+HARNESS_TOKEN=$(openssl rand -hex 16) HARNESS_API_KEY=… \
+  uv run agent-harness --db harness.sqlite serve --port 8099 \
+    --session-host https://your-devenv.example \
+    --reviewer claude-sonnet-4-6 --endpoint https://api.your-gateway.example
 ```
+
+Without `--session-host` the service is **monitoring only**: everything reads,
+and starting a project is refused rather than setting a flag no worker acts on.
 
 Keep it fed with `ingest --watch 30`. Optionally pass `--baseline TOTAL:DAYS:LABEL` to
 compare against a prior measurement — there is no built-in number, because a baseline

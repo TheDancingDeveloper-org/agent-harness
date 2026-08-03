@@ -127,6 +127,127 @@ def _ensure_trailing_newline(text: str) -> str:
     return text if text.endswith("\n") else text + "\n"
 
 
+_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+#: Lines that legitimately sit between hunks: file headers and git metadata.
+_BETWEEN_HUNKS = ("diff --git ", "--- ", "+++ ", "index ", "old mode ", "new mode ")
+
+
+@dataclass(frozen=True)
+class PatchProblem:
+    """Something structurally wrong with a model's diff.
+
+    `fatal` separates damage no rung of the ladder can repair -- a truncated
+    or mis-prefixed hunk, which is what `git apply` reports as "corrupt patch
+    at line N" -- from damage that IS routinely repaired, notably hunk headers
+    whose line counts are wrong. Only the first kind is worth refusing over;
+    refusing the second would throw away work `--unidiff-zero` rescues every
+    day.
+    """
+
+    line: int
+    detail: str
+    fatal: bool = True
+
+    def __str__(self) -> str:
+        return f"line {self.line}: {self.detail}"
+
+
+def validate_diff(diff: str) -> list[PatchProblem]:
+    """Structural problems in a unified diff, cheapest possible check.
+
+    Not a re-implementation of `git apply` — it says nothing about whether the
+    patch matches the tree, which is the *repository's* business. It answers
+    the different question the failure log could not: was the model's output
+    even a diff? A patch that fails because it was truncated mid-hunk and one
+    that fails because it was written against a different base look identical
+    in `git apply: error: corrupt patch at line 549`, and the fix for them is
+    not the same.
+    """
+    problems: list[PatchProblem] = []
+    lines = diff.splitlines()
+    if not any(_HUNK_HEADER.match(line) for line in lines):
+        return [PatchProblem(1, "no hunk header (`@@ -a,b +c,d @@`) anywhere in the reply")]
+
+    old_left = new_left = 0
+    hunk_line = 0
+    counting = False
+    for number, line in enumerate(lines, start=1):
+        header = _HUNK_HEADER.match(line)
+        if header:
+            if counting and (old_left or new_left):
+                problems.append(
+                    PatchProblem(
+                        hunk_line,
+                        f"hunk ends {old_left} source and {new_left} result line(s) "
+                        "short of what its header declares",
+                    )
+                )
+            old_left = int(header.group(2) or 1)
+            new_left = int(header.group(4) or 1)
+            hunk_line, counting = number, True
+            continue
+        if not counting:
+            continue
+        if not (old_left or new_left):
+            # The hunk is complete. Anything after it is commentary or the
+            # next file's header, and neither is this hunk's problem.
+            counting = False
+            continue
+        if line.startswith("\\"):  # "\ No newline at end of file"
+            continue
+        if line.startswith(" ") or line == "":
+            old_left, new_left = max(0, old_left - 1), max(0, new_left - 1)
+        elif line.startswith("-"):
+            old_left = max(0, old_left - 1)
+        elif line.startswith("+"):
+            new_left = max(0, new_left - 1)
+        elif line.startswith(_BETWEEN_HUNKS):
+            # The next file starts while this hunk is unfinished: the header
+            # claimed more lines than the hunk contains.
+            problems.append(
+                PatchProblem(
+                    hunk_line,
+                    f"hunk header declares {old_left} more source and {new_left} more "
+                    "result line(s) than the hunk contains",
+                )
+            )
+            counting = False
+        else:
+            problems.append(
+                PatchProblem(
+                    number,
+                    "line inside a hunk starts with "
+                    f"{line[:1]!r}, not ' ', '+' or '-': {line[:60]!r}",
+                )
+            )
+            counting = False
+    if counting and (old_left or new_left):
+        problems.append(
+            PatchProblem(hunk_line, "the patch ends mid-hunk — the reply was truncated")
+        )
+    return problems
+
+
+#: How much of a damaged patch goes into the event, and how much of it around
+#: the first problem. Bounded on purpose: the event store is a record of what
+#: happened, not a place to put a four-thousand-line diff, and the damage
+#: starts where the first problem is.
+DIAGNOSTIC_CONTEXT_LINES = 3
+MAX_DIAGNOSTIC_CHARS = 2000
+
+
+def _bounded(problems: list[PatchProblem], diff: str) -> str:
+    """The findings, plus the few lines where the patch went wrong."""
+    lines = diff.splitlines()
+    anchor = next((p for p in problems if p.fatal), problems[0])
+    low = max(1, anchor.line - DIAGNOSTIC_CONTEXT_LINES)
+    high = min(len(lines), anchor.line + DIAGNOSTIC_CONTEXT_LINES)
+    excerpt = "\n".join(f"{n:>5}| {lines[n - 1][:200]}" for n in range(low, high + 1))
+    findings = "\n".join(str(p) for p in problems[:5])
+    return f"{findings}\n\n{excerpt}"[:MAX_DIAGNOSTIC_CHARS]
+
+
 #: The tolerance ladder, in the order it is tried.
 #:
 #: MEASURED, not assumed. Against seven realistic ways a model damages a
@@ -312,6 +433,7 @@ class Executor:
         push: bool = True,
         now: Callable[[], float] = time.time,
         context_provider: Callable[[WorkRecord], str] | None = None,
+        artifacts: Path | None = None,
     ) -> None:
         self.queue = queue
         self.client = client
@@ -325,6 +447,11 @@ class Executor:
         self.push = push
         self.now = now
         self.context_provider = context_provider or (lambda _record: "")
+        # Where a patch that could not be applied is kept. Supplied, never
+        # guessed: the core owns no directory layout. Without it the reply is
+        # gone the moment the item fails, and the only way to see what the
+        # model actually produced is to pay for it again.
+        self.artifacts = Path(artifacts) if artifacts is not None else None
         self.owner = worker_identity()
 
     # ------------------------------------------------------------- driving
@@ -419,7 +546,30 @@ class Executor:
             outcome.reason = "the implementer returned no diff"
             return outcome
 
-        # 3. Apply, on a branch of its own, based on whatever this item
+        # 3. Parse the patch BEFORE touching git. A reply that is not a
+        #    well-formed diff is a model failure, and it is worth saying so:
+        #    it looks identical to a patch written against the wrong base once
+        #    it reaches `git apply: error: corrupt patch at line 549`, and the
+        #    two are fixed in completely different places.
+        problems = validate_diff(diff)
+        fatal = [p for p in problems if p.fatal]
+        if problems:
+            self._emit(
+                record,
+                "patch_malformed" if fatal else "patch_suspect",
+                detail=_bounded(problems, diff),
+            )
+        if fatal:
+            kept = self._preserve_patch(record, diff)
+            outcome.stages.append("parse")
+            outcome.reason = (
+                "the implementer did not produce a usable diff — "
+                + "; ".join(str(p) for p in fatal[:3])
+                + (f" (patch kept at {kept})" if kept else "")
+            )
+            return outcome
+
+        # 4. Apply, on a branch of its own, based on whatever this item
         #    actually depends on.
         branch = f"{self.branch_prefix}{record.item_id.lower()}"
         base, stacked_on = self._base_for(record)
@@ -431,14 +581,25 @@ class Executor:
         applied, how = apply_diff(self.repo, diff, allow_fuzzy=self.allow_fuzzy_apply)
         outcome.stages.append("apply")
         if not applied:
-            self._emit(record, "apply_failed", detail=how)
-            outcome.reason = f"the diff did not apply: {how}"
+            # The patch parsed, so this is the repository disagreeing with it,
+            # not damaged model output. Keep it anyway: whoever diagnoses this
+            # needs the diff that failed, and re-generating it costs a call
+            # and produces a different patch.
+            kept = self._preserve_patch(record, diff)
+            self._emit(
+                record,
+                "apply_failed",
+                detail=how + (f"\npatch kept at {kept}" if kept else ""),
+            )
+            outcome.reason = f"the diff did not apply to {base}: {how}" + (
+                f" (patch kept at {kept})" if kept else ""
+            )
             self._abandon_branch(branch)
             return outcome
         self._emit(record, "applied", detail=how)
         self._keepalive(record)
 
-        # 4. Cheap checks BEFORE the expensive reviewer call. Paying a model
+        # 5. Cheap checks BEFORE the expensive reviewer call. Paying a model
         #    to tell us the build is broken is paying the dearest gate to
         #    catch what the cheapest one already did.
         passed, failure = self.checks.run(self.repo)
@@ -451,7 +612,7 @@ class Executor:
         self._emit(record, "checks_passed")
         self._keepalive(record)
 
-        # 5. Review, by a different role -- and ideally a different vendor,
+        # 6. Review, by a different role -- and ideally a different vendor,
         #    which `ModelClient.reviewer_independence()` now reports on rather
         #    than leaving to a comment nobody reads.
         verdict_text = self._call(
@@ -472,7 +633,7 @@ class Executor:
             self._abandon_branch(branch)
             return outcome
 
-        # 6. Commit, and make it durable before anything else can lose it.
+        # 7. Commit, and make it durable before anything else can lose it.
         self._commit(record, verdict_text)
         outcome.stages.append("commit")
         if self.push:
@@ -480,7 +641,7 @@ class Executor:
             outcome.stages.append("push")
             self._emit(record, "pushed", detail=branch)
 
-        # 7. Propose. Never land: a wrong answer must stay reviewable.
+        # 8. Propose. Never land: a wrong answer must stay reviewable.
         if self.github is not None and record.issue:
             outcome.pr_url = self._open_pr(record, branch, verdict_text, base)
             outcome.stages.append("pr")
@@ -577,6 +738,27 @@ class Executor:
         except Exception as exc:  # noqa: BLE001 - a PR failure must not lose the work
             self._emit(record, "pr_failed", detail=str(exc))
             return None
+
+    def _preserve_patch(self, record: WorkRecord, diff: str) -> str | None:
+        """Keep a patch that failed, and return where it went.
+
+        Returns None when no artifact directory was configured — the harness
+        does not invent one, because it owns no directory layout. The bounded
+        diagnostic in the event is written either way, so a deployment without
+        artifacts still knows what happened; it just cannot replay it.
+        """
+        if self.artifacts is None:
+            return None
+        try:
+            self.artifacts.mkdir(parents=True, exist_ok=True)
+            path = self.artifacts / f"{record.item_id}-{int(self.now())}.patch"
+            path.write_text(diff)
+        except OSError as exc:
+            # Diagnostics are never load-bearing. Losing the artifact must not
+            # turn a failed item into a crashed worker.
+            self._emit(record, "patch_not_kept", detail=str(exc))
+            return None
+        return str(path)
 
     def _emit(self, record: WorkRecord, stage: str, detail: str | None = None) -> None:
         if self.on_event is None:

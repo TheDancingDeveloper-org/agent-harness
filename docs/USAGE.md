@@ -267,6 +267,12 @@ agent-harness run --repo owner/name --work ./target-repo \
   applied to a tree missing the very change it assumes.
 - **No reviewer configured is a rejection, not an approval.** Unreviewed work
   never passes as reviewed.
+- **A patch that fails is kept.** The implementer's diff is parsed before git
+  sees it, so a truncated or mis-prefixed reply is reported as a *model*
+  failure rather than as `corrupt patch at line 549` — and the patch itself is
+  written to `--artifacts` (an `artifacts/` directory beside `--events` by
+  default) so it can be read instead of paid for again. Pass `--artifacts ''`
+  to keep nothing.
 
 ---
 

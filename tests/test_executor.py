@@ -24,6 +24,7 @@ from agent_harness.executor import (
     Executor,
     apply_diff,
     extract_diff,
+    validate_diff,
 )
 from agent_harness.model_client import ModelClient, Response, RetryPolicy, Route
 from agent_harness.work import DONE, FAILED, WorkQueue, WorkRecord
@@ -86,6 +87,7 @@ def build(
     checks: Checks | None = None,
     events: list[dict[str, Any]] | None = None,
     github: Any = None,
+    artifacts: Path | None = None,
 ) -> tuple[Executor, WorkQueue, ScriptedModel]:
     queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
     transport = ScriptedModel(replies)
@@ -106,6 +108,7 @@ def build(
         github=github,
         on_event=(events.append if events is not None else None),
         push=False,
+        artifacts=artifacts,
     )
     return executor, queue, transport
 
@@ -654,3 +657,174 @@ def test_fuzzy_application_can_be_opted_into(multiline_repo: Path) -> None:
     applied, how = apply_diff(multiline_repo, damaged, allow_fuzzy=True)
     if applied:
         assert "patch" in how  # and the caller is told which rung
+
+
+# ------------------------------------------- malformed output vs bad base
+
+#: Truncated mid-hunk: the header promises three lines of each side and the
+#: patch stops after two. This is the shape behind `git apply: error: corrupt
+#: patch at line N` -- the model's reply was cut off, and nothing about the
+#: repository can fix it.
+TRUNCATED_DIFF = """\
+diff --git a/m.py b/m.py
+--- a/m.py
++++ b/m.py
+@@ -1,3 +1,3 @@
+ def f():
+-    return 1
+"""
+
+#: A body line with no prefix at all. `git apply` calls this corrupt too, and
+#: no rung of the ladder rescues it.
+MISPREFIXED_DIFF = """\
+diff --git a/m.py b/m.py
+--- a/m.py
++++ b/m.py
+@@ -1,2 +1,2 @@
+def f():
+-    return 1
++    return 99
+"""
+
+#: Structurally perfect, and about a file that is not there. Nothing is wrong
+#: with the model's output; the patch and the tree simply disagree.
+ABSENT_FILE_DIFF = """\
+diff --git a/absent.txt b/absent.txt
+--- a/absent.txt
++++ b/absent.txt
+@@ -1 +1 @@
+-before
++after
+"""
+
+
+def test_a_good_diff_has_nothing_to_report() -> None:
+    assert validate_diff(DIFF) == []
+
+
+def test_the_most_commonly_rescued_damage_is_not_called_fatal() -> None:
+    """The validator must never refuse what the ladder repairs. A hand-written
+    hunk header is the single most common model error and `--unidiff-zero`
+    forgives it; rejecting it here would throw away real work to be tidy."""
+    assert not [p for p in validate_diff(MINIMAL_HEADER_DIFF) if p.fatal]
+
+
+def test_a_truncated_patch_is_recognised_as_truncated() -> None:
+    problems = validate_diff(TRUNCATED_DIFF)
+    assert problems and problems[0].fatal
+    assert "truncated" in problems[0].detail
+
+
+def test_a_line_with_no_diff_prefix_is_recognised() -> None:
+    problems = validate_diff(MISPREFIXED_DIFF)
+    assert problems and problems[0].fatal
+    assert problems[0].line == 5  # points AT the damage, not at the file
+
+
+def test_git_agrees_these_are_corrupt(repo: Path) -> None:
+    """Guards the two fixtures above: if `git apply` accepted either, the
+    validator would be refusing patches that work."""
+    for damaged in (TRUNCATED_DIFF, MISPREFIXED_DIFF):
+        applied, _how = apply_diff(repo, damaged, allow_fuzzy=True)
+        assert not applied
+
+
+def test_malformed_output_never_reaches_git(multiline_repo: Path, tmp_path: Path) -> None:
+    """The item fails as a MODEL failure, before a branch exists. Previously
+    this reached `git apply`, and the outcome said only `corrupt patch at line
+    549` -- which reads like the repository's fault."""
+    events: list[dict[str, Any]] = []
+    executor, queue, model = build(
+        multiline_repo,
+        tmp_path,
+        {"implementer": f"```diff\n{TRUNCATED_DIFF}```", "reviewer": "APPROVED"},
+        events=events,
+    )
+    add_item(queue)
+    outcome = executor.run_once()
+    assert outcome is not None
+    assert outcome.state == FAILED
+    assert "did not produce a usable diff" in outcome.reason
+    assert "apply" not in outcome.stages
+    assert "reviewer" not in model.roles  # never paid for
+    assert git(multiline_repo, "branch", "--list", "harness/t1").strip() == ""
+    stages = [e["outcome"] for e in events]
+    assert "patch_malformed" in stages
+
+
+def test_the_event_carries_the_lines_that_broke_it(multiline_repo: Path, tmp_path: Path) -> None:
+    """A bounded excerpt, not the whole patch: enough to see the damage
+    without turning the event store into a diff archive."""
+    events: list[dict[str, Any]] = []
+    executor, queue, _ = build(
+        multiline_repo,
+        tmp_path,
+        {"implementer": f"```diff\n{MISPREFIXED_DIFF}```"},
+        events=events,
+    )
+    add_item(queue)
+    executor.run_once()
+    detail = next(e["detail"] for e in events if e["outcome"] == "patch_malformed")
+    assert "def f():" in detail  # the offending line itself
+    assert len(detail) <= 2000
+
+
+def test_a_malformed_patch_is_kept_for_inspection(multiline_repo: Path, tmp_path: Path) -> None:
+    """Regenerating it costs another call and produces a different patch, so
+    the failed one is the only copy of what actually happened."""
+    artifacts = tmp_path / "artifacts"
+    executor, queue, _ = build(
+        multiline_repo,
+        tmp_path,
+        {"implementer": f"```diff\n{TRUNCATED_DIFF}```"},
+        artifacts=artifacts,
+    )
+    add_item(queue)
+    outcome = executor.run_once()
+    assert outcome is not None
+    kept = list(artifacts.glob("T1-*.patch"))
+    assert len(kept) == 1
+    assert kept[0].read_text() == TRUNCATED_DIFF
+    assert str(kept[0]) in outcome.reason
+
+
+def test_a_patch_that_will_not_apply_is_kept_and_blamed_on_the_tree(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The other half: this patch is well-formed, so the disagreement is with
+    the repository. Different diagnosis, different fix -- and the patch is
+    preserved either way."""
+    artifacts = tmp_path / "artifacts"
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"implementer": f"```diff\n{ABSENT_FILE_DIFF}```"},
+        artifacts=artifacts,
+    )
+    add_item(queue)
+    outcome = executor.run_once()
+    assert outcome is not None
+    assert outcome.state == FAILED
+    assert "the diff did not apply" in outcome.reason
+    assert "did not produce a usable diff" not in outcome.reason
+    assert len(list(artifacts.glob("T1-*.patch"))) == 1
+
+
+def test_with_nowhere_to_keep_it_the_item_still_fails_cleanly(
+    multiline_repo: Path, tmp_path: Path
+) -> None:
+    """No artifact directory is a legitimate deployment -- the harness owns no
+    directory layout and will not invent one. The diagnostic still gets out."""
+    events: list[dict[str, Any]] = []
+    executor, queue, _ = build(
+        multiline_repo,
+        tmp_path,
+        {"implementer": f"```diff\n{TRUNCATED_DIFF}```"},
+        events=events,
+        artifacts=None,
+    )
+    add_item(queue)
+    outcome = executor.run_once()
+    assert outcome is not None and outcome.state == FAILED
+    assert "patch kept at" not in outcome.reason
+    assert any(e["outcome"] == "patch_malformed" for e in events)

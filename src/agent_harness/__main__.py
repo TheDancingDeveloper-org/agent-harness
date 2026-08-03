@@ -206,6 +206,13 @@ def _run(args: argparse.Namespace) -> int:
 
     events_path = args.events
     events_path.parent.mkdir(parents=True, exist_ok=True)
+    # A failed patch is otherwise gone the moment the item fails, and the only
+    # way to see what the model produced is to pay for it again.
+    artifacts = (
+        events_path.parent / "artifacts"
+        if args.artifacts is None
+        else (args.artifacts if str(args.artifacts) else None)
+    )
 
     def emit(event: dict[str, Any]) -> None:
         with events_path.open("a") as handle:
@@ -316,6 +323,7 @@ def _run(args: argparse.Namespace) -> int:
             base_branch=args.base,
             on_event=emit,
             push=not args.no_push,
+            artifacts=artifacts,
         )
     # Typing `agent-harness run` IS the human deciding to start this project.
     # A project starts `stopped` so a restart never resumes on its own, but
@@ -409,6 +417,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_run.add_argument(
         "--events", type=Path, default=Path("events.jsonl"), help="where to append the event stream"
+    )
+    p_run.add_argument(
+        "--artifacts",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="where to keep a patch that could not be applied, for inspection "
+        "or replay. Defaults to an `artifacts` directory beside --events; "
+        "pass an empty string to keep nothing.",
     )
     p_run.add_argument(
         "--check",

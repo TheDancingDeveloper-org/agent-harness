@@ -23,6 +23,11 @@ proven until it does.
 | Module | What it does |
 |---|---|
 | `plan` | Parses a markdown plan into work items, reporting what it could **not** read |
+| `fleet` | One worker pool per project, so no project starves another |
+| `audit` | Append-only history in its **own** database, with no mutation surface |
+| `pricing` | Token usage and the price applied to it — unknown is never zero |
+| `maintenance` | Rolls up complete days, then thins only what a rollup covers |
+| `reconcile` | Merged / closed / reverted, fetched from GitHub |
 | `github` | Syncs those items to issues, idempotently — re-running an edited plan updates rather than duplicates |
 | `work` | The queue. Claims are **leases**, so a dead worker releases its item by doing nothing |
 | `session_executor` | Runs an item as a CLI agent in a terminal session you can attach to |
@@ -69,6 +74,8 @@ Expressed as observed behaviour, not internal completeness.
 - [ ] Reviewer-approved work survives a killed worker.
 - [ ] Delivery rate is no worse than the workload's own pre-harness baseline, at lower cost.
 - [ ] The role→model map can be changed without a redeploy.
+- [ ] Two projects run concurrently without either starving the other.
+- [ ] Deleting `harness.sqlite` changes no audited answer.
 
 If all seven hold, v1 is done regardless of what remains unimplemented.
 
@@ -178,21 +185,47 @@ What it does own is a **documented API**: every route typed, every field
 described, and the schema served next to it.
 
 ```
-GET  /api/work              backlog, counts and stale claims in one call
-GET  /api/work/{id}         one item
-POST /api/work              add items directly
-POST /api/work/{id}/retry   re-queue; refuses while a claim is live
-POST /api/plan/parse        parse a plan, reporting what it could NOT read
-POST /api/plan/sync         plan -> GitHub issues, dry-run by default
-GET  /api/errors            rate limits by class
-GET  /api/events            paged by row id, not timestamp
-GET  /api/summary           enough for a status line
-GET  /api/control           is the fleet claiming work?
-POST /api/control           pause, drain or resume — never interrupts work
-GET  /api/roles             where each role's calls go
-PUT  /api/roles             re-route a role, live
-GET  /healthz               open, cheap, needs no credential
+# Projects — separate streams, no co-mingling
+GET  /api/projects                    every project, counts and control, one call
+POST /api/projects                    register one; it starts STOPPED
+GET  /api/projects/{id}
+POST /api/projects/{id}/start         the only thing that creates workers
+POST /api/projects/{id}/stop          never interrupts work in flight
+
+# Work
+GET  /api/work                        backlog, counts and stale claims in one call
+GET  /api/work/{id}                   one item
+POST /api/work                        add items directly
+POST /api/work/{id}/retry             re-queue; refuses while a claim is live
+POST /api/plan/parse                  parse a plan, reporting what it could NOT read
+POST /api/plan/sync                   plan -> GitHub issues, dry-run by default
+
+# Audit — history that outlives the queue
+GET  /api/audit/health                IS anything being recorded? (see below)
+GET  /api/audit/cost                  spend by project, role and model
+GET  /api/audit/delivery              what was delivered
+GET  /api/audit/rollups               the long series, kept forever
+GET  /api/audit/events                raw history, paged by row id
+GET  /api/audit/baselines             what "better than before" is measured against
+POST /api/audit/baselines             record one; immutable
+POST /api/audit/reconcile             pull merged/reverted from GitHub
+POST /api/audit/maintenance           roll up and thin now
+
+# Live view and control
+GET  /api/errors                      rate limits by class
+GET  /api/events                      paged by row id, not timestamp
+GET  /api/summary                     enough for a status line
+GET  /api/control                     is the fleet claiming work?
+POST /api/control                     pause, drain or resume
+GET  /api/roles                       where each role's calls go
+PUT  /api/roles                       re-route a role, live
+GET  /healthz                         open, cheap, needs no credential
 ```
+
+**`/api/audit/health` is worth checking deliberately.** Audit writes are
+dropped rather than raised when the store cannot be opened — observation must
+never stop work — which means nothing else will tell you that history is not
+being kept. A fleet running unaudited looks exactly like one running audited.
 
 | | |
 |---|---|

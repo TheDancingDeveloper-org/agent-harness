@@ -148,7 +148,7 @@ def test_transient_retry_exhaustion_returns_an_item_to_pending(repo: Path, tmp_p
             model="model-planner",
         )
 
-    executor.client.call = exhausted  # type: ignore[method-assign]
+    executor.client.call = exhausted  # type: ignore[assignment]
     add_item(queue)
 
     outcome = executor.run_once()

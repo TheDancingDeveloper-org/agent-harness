@@ -55,6 +55,7 @@ trade and it is rejected.
 | Thing | Location |
 |---|---|
 | How to use it | `docs/USAGE.md` — worked example, real output |
+| How to deploy it | `docs/DEPLOYMENT.md` — the two serve modes, and a non-destructive smoke test |
 | Sample plan | `examples/PLAN.md` |
 | The original plan | `docs/HARNESS-PLAN.md` (superseded in part) |
 | Backlog manifest (seeds GitHub issues) | `docs/backlog.json` |
@@ -81,7 +82,9 @@ HARNESS_TOKEN=dev uv run agent-harness --db harness.sqlite serve --port 8099
 Adding `--session-host URL` makes it **supervised**: the same API, plus a
 worker pool the API's start action can use. Without it, `serve` is
 monitoring-only and starting a project is refused — both modes are supported,
-and neither starts anything on its own.
+and neither starts anything on its own. The deployment contract for each, and
+the read-only smoke test that tells them apart, is
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 It has never run against a real fleet — see `README.md`. Do not describe it as proven.
 

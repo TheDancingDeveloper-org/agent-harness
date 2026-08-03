@@ -91,6 +91,9 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
 - **[`docs/USAGE.md`](docs/USAGE.md) — start here.** A worked example end to end, with
   real output: write a plan, sync it, execute it, resume it, drive it from the API, and
   read the failures.
+- **[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — running it as a service.** The two
+  `serve` modes, what a supervised deployment must provide, and a non-destructive smoke
+  test that distinguishes "healthy" from "able to run anything".
 - [`examples/PLAN.md`](examples/PLAN.md) — the sample plan that walkthrough uses.
 - [`docs/HARNESS-PLAN.md`](docs/HARNESS-PLAN.md) — the original plan. **Superseded in
   part:** it was written assuming one specific consumer, and the harness is now generic.
@@ -279,6 +282,8 @@ HARNESS_TOKEN=$(openssl rand -hex 16) HARNESS_API_KEY=… \
 
 Without `--session-host` the service is **monitoring only**: everything reads,
 and starting a project is refused rather than setting a flag no worker acts on.
+Both modes, and the read-only check that tells them apart after a deploy, are
+in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 Keep it fed with `ingest --watch 30`. Optionally pass `--baseline TOTAL:DAYS:LABEL` to
 compare against a prior measurement — there is no built-in number, because a baseline

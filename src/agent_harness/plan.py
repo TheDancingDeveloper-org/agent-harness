@@ -29,10 +29,19 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-#: An id looks like T1, D9, E0, ITEM-3 -- letters then digits, optionally
-#: hyphenated. Deliberately narrow: a heading like "## 5. Architecture" is
-#: NOT an item, and treating it as one would fill the backlog with sections.
-ID = r"[A-Z][A-Z0-9]{0,7}-?\d{1,4}"
+#: An id looks like T1, D9, E0, ITEM-3, or P0.1 -- letters then digits,
+#: optionally hyphenated, optionally with dotted sub-numbering.
+#:
+#: The dotted form is not cosmetic. Real plans nest work under a phase
+#: (`### P0` with `#### P0.1`, `#### P0.2` beneath it), and without it every
+#: sub-item collapses onto its parent's id: eleven distinct items became
+#: three, and the sync would have refused the plan as full of duplicates.
+#: Found by parsing a second, independently-written plan — which is exactly
+#: what a second workload is for.
+#:
+#: Still deliberately narrow: "## 5. Architecture" is NOT an item, and
+#: treating it as one would fill the backlog with the document's structure.
+ID = r"[A-Z][A-Z0-9]{0,7}-?\d{1,4}(?:\.\d{1,3})*"
 
 _SEP = r"[:.)\s\u2010-\u2015-]+"
 _HEADING = re.compile(rf"^(#{{2,6}})\s+({ID}){_SEP}\s*(.+?)\s*$")

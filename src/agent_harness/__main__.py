@@ -145,7 +145,7 @@ def _run(args: argparse.Namespace) -> int:
     from .executor import Checks, Executor
     from .github import GitHub
     from .model_client import ModelClient, Route
-    from .work import WorkQueue, WorkRecord
+    from .work import RUNNING, WorkQueue, WorkRecord
 
     # With a session host the CLI agent does the implementing, so only the
     # reviewer needs a model. Demanding three would be asking for two that are
@@ -273,7 +273,27 @@ def _run(args: argparse.Namespace) -> int:
             on_event=emit,
             push=not args.no_push,
         )
-    outcomes = executor.run(limit=args.limit)
+    # Typing `agent-harness run` IS the human deciding to start this project.
+    # A project starts `stopped` so a restart never resumes on its own, but
+    # applying that to an explicit command would make the CLI silently do
+    # nothing -- correct by the letter of the rule and useless.
+    state, _ = queue.control(project_id=args.project)
+    if state != RUNNING:
+        queue.set_control(RUNNING, reason="agent-harness run", project_id=args.project)
+        print(f"project {args.project}: {state} -> running")
+
+    if args.serve:
+        print(f"serving; polling every {args.poll:.0f}s. Ctrl-C to stop.")
+        try:
+            outcomes = executor.serve(poll_seconds=args.poll)
+        except KeyboardInterrupt:
+            outcomes = []
+            print("\nstopping after the current item")
+        finally:
+            queue.checkpoint()
+    else:
+        outcomes = executor.run(limit=args.limit)
+        queue.checkpoint()
     if not outcomes:
         print("nothing to do")
         return 0
@@ -369,6 +389,24 @@ def main(argv: list[str] | None = None) -> int:
         help="CLI agent to run per item. `{prompt_file}` is substituted.",
     )
     p_run.add_argument("--limit", type=int, help="stop after N items")
+    p_run.add_argument(
+        "--project",
+        default="default",
+        help="Which project's queue to work. Items are keyed by (project, id), "
+        "so two projects may each have a T1.",
+    )
+    p_run.add_argument(
+        "--serve",
+        action="store_true",
+        help="Keep running when the queue is empty, waiting for work, instead "
+        "of exiting. Without this a plan synced an hour later is never picked up.",
+    )
+    p_run.add_argument(
+        "--poll",
+        type=float,
+        default=15.0,
+        help="Seconds between checks for new work when serving.",
+    )
     p_run.add_argument("--base", default="main", help="branch to base work on")
     p_run.add_argument(
         "--no-push", action="store_true", help="commit locally but do not push or open PRs"
@@ -392,6 +430,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_serve = sub.add_parser(
         "serve", help="serve the JSON API (headless — the GUI is the session host's)"
+    )
+    p_serve.add_argument(
+        "--audit-db",
+        default="",
+        help="Audit database. Defaults to audit.sqlite beside --db, or "
+        "HARNESS_AUDIT_DB. Put it on a different volume to stop history "
+        "sharing a fate with the queue.",
     )
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8099)
@@ -437,10 +482,57 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     from .api import create_api
+    from .audit import open_audit_store
+    from .maintenance import DEFAULT_RETENTION_DAYS, MaintenanceLoop
     from .work import WorkQueue
 
+    # A separate file, deliberately. History must not share a fate with the
+    # queue: the queue is migrated in place and is a reasonable thing to
+    # delete and rebuild from the plan, and anything in that file goes with it.
+    #
+    # Defaults to sitting beside the queue so a single-file deployment still
+    # works; point HARNESS_AUDIT_DB at a different volume to make the
+    # separation physical as well as logical.
+    audit_path = (
+        args.audit_db
+        or os.environ.get("HARNESS_AUDIT_DB")
+        or (str(Path(args.db).with_name("audit.sqlite")))
+    )
+    audit = open_audit_store(
+        audit_path,
+        required=os.environ.get("HARNESS_AUDIT_REQUIRED", "").lower() in {"1", "true", "yes"},
+        adopt_from=args.db,
+    )
+    if audit.degraded:
+        print(
+            f"WARNING: audit store at {audit_path} is DEGRADED; history is NOT "
+            "being recorded. The harness will keep working.",
+            file=sys.stderr,
+        )
+    else:
+        print(f"audit: {audit_path} ({audit.count()} events)")
+
+    # Started here rather than left to cron: retention that depends on an
+    # external scheduler silently stops when nobody installs it, and the
+    # symptom is a database that grows for months before anyone notices.
+    queue_for_serve = WorkQueue(args.db)
+    maintenance = MaintenanceLoop(
+        audit,
+        retention_days=int(os.environ.get("HARNESS_AUDIT_RETENTION_DAYS", DEFAULT_RETENTION_DAYS)),
+        # Reconciliation needs the queue: a pull request is only attributable
+        # to an item because the queue recorded its URL.
+        queue=queue_for_serve,
+    )
+    maintenance.start()
+
     uvicorn.run(
-        create_api(store, queue=WorkQueue(args.db), token=token, root_path=args.root_path),
+        create_api(
+            store,
+            queue=queue_for_serve,
+            token=token,
+            root_path=args.root_path,
+            audit=audit,
+        ),
         host=args.host,
         port=args.port,
         log_level="info",

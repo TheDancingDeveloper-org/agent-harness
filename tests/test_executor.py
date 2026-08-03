@@ -27,6 +27,7 @@ from agent_harness.executor import (
 )
 from agent_harness.model_client import ModelClient, Response, RetryPolicy, Route
 from agent_harness.work import DONE, FAILED, WorkQueue, WorkRecord
+from conftest import make_queue
 
 DIFF = """\
 diff --git a/hello.txt b/hello.txt
@@ -86,7 +87,7 @@ def build(
     events: list[dict[str, Any]] | None = None,
     github: Any = None,
 ) -> tuple[Executor, WorkQueue, ScriptedModel]:
-    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
     transport = ScriptedModel(replies)
     client = ModelClient(
         roles={
@@ -594,7 +595,7 @@ diff --git a/m.py b/m.py
 +def i():
 +    return 4
 """
-    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
     queue.add(
         [
             WorkRecord(item_id="A1", title="add h", brief="add h"),

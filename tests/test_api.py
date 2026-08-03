@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,6 +15,7 @@ from agent_harness.api import create_api
 from agent_harness.events import MODEL_CALL, UNCLASSIFIED, WORK, Event
 from agent_harness.store import EventStore
 from agent_harness.work import CLAIMED, DONE, PENDING, WorkQueue, WorkRecord
+from conftest import make_queue
 
 TOKEN = "test-token"  # noqa: S105 - a fixture, not a credential
 
@@ -24,7 +27,7 @@ def store(tmp_path: Path) -> EventStore:
 
 @pytest.fixture
 def queue(tmp_path: Path) -> WorkQueue:
-    q = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    q = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
     q.add(
         [
             WorkRecord(item_id="W1", title="First", brief="do the first thing", issue=1),
@@ -51,9 +54,69 @@ def test_healthz_is_open(client: TestClient) -> None:
     assert client.get("/healthz").status_code == 200
 
 
-@pytest.mark.parametrize("path", ["/api/work", "/api/errors", "/api/events", "/api/summary"])
-def test_every_other_route_requires_a_token(client: TestClient, path: str) -> None:
-    assert client.get(path).status_code == 401
+#: Routes that are deliberately open, with the reason. Anything not named
+#: here must refuse an anonymous caller, and `test_every_protected_route_
+#: requires_a_token` derives its cases from the app so a route added later is
+#: covered without anyone remembering to add it.
+#:
+#: The previous version of that test hardcoded four paths under the name
+#: "every other route". It was wrong about three routes -- including
+#: `POST /api/plan/sync`, which creates GitHub issues -- and its name was
+#: exactly what stopped anyone checking. A list that does not grow with the
+#: thing it describes is worse than no list, because it reads as coverage.
+OPEN_ROUTES = {
+    "/healthz": "liveness, checked before a credential is available",
+    "/docs": "the schema is not secret; the backlog is",
+    "/docs/oauth2-redirect": "mounted by FastAPI for Swagger UI",
+    "/redoc": "as /docs",
+    "/openapi.json": "as /docs -- requiring a token makes the API undiscoverable",
+}
+
+
+def _app_for_introspection() -> Any:
+    """An app instance built purely to read its route table.
+
+    Collection-time, so it cannot use the `tmp_path` fixture -- and EventStore
+    writes on construction, so it needs a real writable path.
+    """
+    return create_api(EventStore(Path(tempfile.mkdtemp()) / "e.sqlite"), token=TOKEN)  # noqa: S106
+
+
+def protected_routes() -> list[tuple[str, str]]:
+    """Every (method, path) the app serves that is not deliberately open."""
+    app = _app_for_introspection()
+    out = []
+    for route in app.routes:
+        path = getattr(route, "path", None)
+        methods = getattr(route, "methods", None)
+        if not path or not methods or path in OPEN_ROUTES:
+            continue
+        for method in sorted(methods - {"HEAD", "OPTIONS"}):
+            out.append((method, path))
+    return sorted(set(out))
+
+
+def test_the_open_route_list_still_matches_the_app() -> None:
+    """If a documented-open route disappears, the exemption must go with it.
+
+    Otherwise the exemption silently starts covering nothing, or worse,
+    starts matching a new route that happens to reuse the path.
+    """
+    served = {getattr(r, "path", None) for r in _app_for_introspection().routes}
+    stale = sorted(set(OPEN_ROUTES) - served)
+    assert not stale, f"OPEN_ROUTES exempts routes the app no longer serves: {stale}"
+
+
+@pytest.mark.parametrize(("method", "path"), protected_routes())
+def test_every_protected_route_requires_a_token(client: TestClient, method: str, path: str) -> None:
+    """Derived from `app.routes`, so a new route is covered by construction."""
+    # Path params only need to be syntactically present; auth is checked before
+    # the handler runs, so the item need not exist.
+    concrete = path.replace("{item_id}", "W1")
+    response = client.request(method, concrete, json={})
+    assert response.status_code == 401, (
+        f"{method} {path} answered {response.status_code} without a token"
+    )
 
 
 def test_no_token_configured_fails_closed(store: EventStore) -> None:
@@ -137,7 +200,7 @@ def test_retry_refuses_an_item_with_a_live_claim(client: TestClient, queue: Work
 def test_retry_allows_an_item_whose_lease_expired(tmp_path: Path, store: EventStore) -> None:
     """A stale claim means the worker is gone; it needs no ceremony."""
     clock = [1000.0]
-    q = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=10.0, now=lambda: clock[0])
+    q = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=10.0, now=lambda: clock[0])
     q.add([WorkRecord(item_id="W1", title="t", brief="b")])
     q.claim("gone")
     clock[0] += 100

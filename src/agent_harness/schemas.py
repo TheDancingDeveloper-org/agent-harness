@@ -86,6 +86,12 @@ class NewWorkItem(BaseModel):
 
 
 class AddItemsRequest(BaseModel):
+    project_id: str = Field(
+        "default",
+        description="Which project these items belong to. Items are keyed by "
+        "(project_id, item_id), so two projects may each have a `T1` -- and without "
+        "this they would be the same row.",
+    )
     items: list[NewWorkItem] = Field(
         description="Items to add. Existing ids are refreshed, "
         "never reset — re-adding cannot un-finish work."
@@ -98,11 +104,13 @@ class AddItemsResult(BaseModel):
 
 
 class FleetControl(BaseModel):
-    state: Literal["running", "paused", "draining"] = Field(
+    state: Literal["running", "paused", "draining", "stopped"] = Field(
         description="`running` claims freely. `paused` and `draining` both stop new "
         "claims; neither interrupts work in flight, because killing an agent mid-item "
         "destroys its context and leaves a half-finished worktree. The difference is "
-        "what the operator meant."
+        "what the operator meant. `stopped` means no workers exist for this project "
+        "at all -- it is what every project is set to on boot, and only an explicit "
+        "start leaves it."
     )
     reason: str | None = Field(
         None,
@@ -113,7 +121,7 @@ class FleetControl(BaseModel):
 
 
 class SetFleetControl(BaseModel):
-    state: Literal["running", "paused", "draining"]
+    state: Literal["running", "paused", "draining", "stopped"]
     reason: str | None = None
 
 
@@ -134,6 +142,56 @@ class RoleMap(BaseModel):
         "call: the call site names a ROLE, never a model, which is what makes the map "
         "changeable without a redeploy."
     )
+
+
+class ProjectSpec(BaseModel):
+    """A project as it is registered. Persisted, so nothing here has to be
+    supplied again after a restart -- every field was previously a CLI flag
+    with nowhere to be written down."""
+
+    project_id: str = Field(description="Stable id, used to scope every other call.")
+    name: str
+    repo: str | None = Field(None, description="GitHub repo as `owner/name`.")
+    work_dir: str | None = Field(None, description="Checkout the worktrees branch from.")
+    base_branch: str = "main"
+    checks: list[str] = Field(
+        default_factory=list, description="Commands run before the reviewer, cheapest first."
+    )
+    plan_path: str | None = None
+    roles: dict[str, RoleRoute] | None = Field(
+        None, description="Role overrides for this project. Null uses the global map."
+    )
+    max_workers: int = Field(
+        1,
+        description="Concurrency budget. Its purpose is that one project cannot "
+        "starve another, so it is per project rather than per fleet.",
+    )
+
+
+class ProjectSummary(BaseModel):
+    """A project plus enough state for the overview screen."""
+
+    project: ProjectSpec
+    counts: dict[str, int] = Field(default_factory=dict)
+    control: FleetControl
+    previous_state: str | None = Field(
+        None,
+        description="What it was doing before the process last stopped it. This is what "
+        "keeps 'was running' distinguishable from 'was drained because we were deploying' "
+        "across a restart -- the operator's intent is otherwise what a restart destroys.",
+    )
+    stale: int = 0
+    workers: int = Field(
+        0,
+        description="Workers actually alive for this project. Distinct from the control "
+        "state on purpose: `running` is an instruction, this is whether anything is "
+        "carrying it out. A project marked running with zero workers is the failure "
+        "that otherwise looks like success.",
+    )
+
+
+class ProjectList(BaseModel):
+    projects: list[ProjectSummary]
 
 
 # --------------------------------------------------------------------- plan
@@ -217,6 +275,155 @@ class RateLimits(BaseModel):
     by_role: list[dict[str, Any]] = Field(default_factory=list)
 
 
+# -------------------------------------------------------------------- audit
+
+
+class AuditHealth(BaseModel):
+    """Whether history is actually being recorded.
+
+    Its own field because a degraded audit store is invisible otherwise: a
+    fleet running unaudited looks exactly like a fleet running audited, and
+    the difference is only discovered when someone asks a question months
+    later and the answer is empty.
+    """
+
+    configured: bool = Field(description="False when no audit store is attached.")
+    degraded: bool = Field(
+        description="True when the store could not be opened and writes are being "
+        "dropped. The harness keeps working on purpose -- observation failing must "
+        "not stop delivery -- so this is the only signal that it is happening."
+    )
+    path: str | None = Field(None, description="Where the audit database lives.")
+    events: int = 0
+    oldest: float | None = Field(None, description="Unix time of the earliest event.")
+    newest: float | None = None
+    schema_version: int | None = None
+
+
+class AuditCostRow(BaseModel):
+    project_id: str | None = None
+    role: str | None = None
+    model: str | None = None
+    calls: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float | None = Field(
+        None, description="Null when no call in this group carried a known price."
+    )
+    unpriced: int = Field(
+        0,
+        description="Calls whose price was unknown, counted SEPARATELY and never "
+        "folded into the total. A sum that silently omits them reads as complete "
+        "and is not.",
+    )
+
+
+class AuditCost(BaseModel):
+    window: str
+    rows: list[AuditCostRow] = Field(default_factory=list)
+    total_cost_usd: float | None = None
+    total_unpriced: int = 0
+    partial: bool = Field(
+        False,
+        description="True when the requested window starts before the earliest "
+        "recorded event, so the answer covers less than it was asked for.",
+    )
+
+
+class AuditDeliveryRow(BaseModel):
+    project_id: str | None = None
+    outcome: str | None = None
+    n: int = 0
+    items: int = Field(0, description="Distinct items, not events.")
+
+
+class AuditDelivery(BaseModel):
+    window: str
+    rows: list[AuditDeliveryRow] = Field(default_factory=list)
+    partial: bool = False
+
+
+class AuditRollupRow(BaseModel):
+    day: str
+    project_id: str | None = None
+    role: str | None = None
+    model: str | None = None
+    outcome: str | None = None
+    events: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float | None = None
+    latency_p50: float | None = None
+
+
+class AuditRollups(BaseModel):
+    rows: list[AuditRollupRow] = Field(default_factory=list)
+    rolled_up_through: str | None = Field(
+        None,
+        description="Last day covered. Raw events are only ever thinned once their day "
+        "appears here -- thinning first would leave a hole in the series that nothing "
+        "reports.",
+    )
+
+
+class MaintenanceResult(BaseModel):
+    rolled_up: int = Field(
+        description="Daily rows written. Zero is normal once today is the only uncovered day."
+    )
+    thinned: int = Field(
+        description="Raw events removed. Only ever events whose day a rollup already covers."
+    )
+    errors: list[str] = Field(default_factory=list)
+
+
+class ReconcileResult(BaseModel):
+    """What GitHub said happened to the work."""
+
+    merged: int = 0
+    closed_unmerged: int = Field(
+        0,
+        description="Rejected outright -- from inside the harness this looks identical "
+        "to a pull request still waiting.",
+    )
+    reverted: int = Field(
+        0,
+        description="Merged and then undone. The only honest quality metric here: "
+        "approval rate says a reviewer agreed, revert rate says whether they should have.",
+    )
+    skipped: int = Field(
+        0,
+        description="Pull requests the harness did not create -- dependabot, humans. "
+        "Counted, never attributed: an outcome belonging to no item inflates every "
+        "rate it appears in.",
+    )
+    errors: list[str] = Field(default_factory=list)
+
+
+class Baseline(BaseModel):
+    baseline_id: str
+    project_id: str
+    recorded_at: float
+    label: str
+    window_days: int
+    items_done: int | None = None
+    cost_usd: float | None = None
+    notes: str | None = None
+
+
+class BaselineList(BaseModel):
+    baselines: list[Baseline] = Field(default_factory=list)
+
+
+class NewBaseline(BaseModel):
+    baseline_id: str = Field(description="Stable id. Recording twice under one id is refused.")
+    project_id: str
+    label: str = Field(description="What was measured, in words.")
+    window_days: int
+    items_done: int | None = None
+    cost_usd: float | None = None
+    notes: str | None = None
+
+
 # ------------------------------------------------------------------- events
 
 
@@ -257,6 +464,13 @@ class Summary(BaseModel):
     done: int
     failed: int
     stale: int
+    abandoned_sessions: int = Field(
+        0,
+        description="Terminal sessions kept alive after an agent timed out. They hold "
+        "the agent's context so a human can pick the item up, and each may still hold "
+        "an agent spending tokens. A rising count nobody returns to is waste, not "
+        "resilience -- the reaper collects them past a max age.",
+    )
     waiting_for_input: list[WaitingItem] = Field(
         description="Agents that have stopped to ask a human something. Its own field "
         "rather than a count, because it is the one state that needs a person."

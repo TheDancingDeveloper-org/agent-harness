@@ -21,6 +21,7 @@ from agent_harness.model_client import ModelClient, Response, Route
 from agent_harness.session_executor import AgentSpec, SessionExecutor
 from agent_harness.session_host import IDLE, RUNNING, WAITING, Session
 from agent_harness.work import DONE, FAILED, WorkQueue, WorkRecord
+from conftest import make_queue
 
 
 def git(repo: Path, *args: str) -> str:
@@ -134,7 +135,7 @@ def build(
     events: list[dict[str, Any]] | None = None,
     github: Any = None,
 ) -> tuple[SessionExecutor, WorkQueue]:
-    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
     executor = SessionExecutor(
         queue,
         devenv,
@@ -305,7 +306,7 @@ def test_a_rejected_review_does_not_commit(repo: Path, tmp_path: Path) -> None:
 def test_no_reviewer_configured_is_a_rejection_not_an_approval(repo: Path, tmp_path: Path) -> None:
     """Unreviewed work must never be silently treated as reviewed."""
     devenv = FakeDevEnv(agent=add_multiply)
-    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue = make_queue(str(tmp_path / "w.sqlite"))
     executor = SessionExecutor(
         queue,
         devenv,

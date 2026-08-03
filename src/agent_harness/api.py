@@ -23,6 +23,7 @@ default for something reachable over a network.
 
 from __future__ import annotations
 
+import json
 import secrets
 import time
 from pathlib import Path
@@ -33,21 +34,39 @@ from fastapi import Path as PathParam
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import __version__
+from .audit import AuditStore
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
+from .maintenance import DEFAULT_RETENTION_DAYS, run_maintenance
 from .providers import MEANING
+from .reconcile import GitHubReconciler, items_by_pr
 from .schemas import (
     AddItemsRequest,
     AddItemsResult,
+    AuditCost,
+    AuditCostRow,
+    AuditDelivery,
+    AuditDeliveryRow,
+    AuditHealth,
+    AuditRollupRow,
+    AuditRollups,
+    Baseline,
+    BaselineList,
     Event,
     EventPage,
     FleetControl,
     Health,
     LatestEvent,
+    MaintenanceResult,
+    NewBaseline,
     PlanItem,
     PlanParseResult,
     PlanSyncRequest,
     PlanSyncResult,
+    ProjectList,
+    ProjectSpec,
+    ProjectSummary,
     RateLimits,
+    ReconcileResult,
     RetryResult,
     RoleMap,
     RoleRoute,
@@ -58,7 +77,17 @@ from .schemas import (
     WorkList,
 )
 from .store import EventStore
-from .work import CLAIMED, DONE, FAILED, PENDING, WorkQueue, WorkRecord
+from .work import (
+    CLAIMED,
+    DONE,
+    FAILED,
+    PENDING,
+    RUNNING,
+    STOPPED,
+    Project,
+    WorkQueue,
+    WorkRecord,
+)
 
 WINDOWS = {"1h": 3600, "24h": 86400, "72h": 3 * 86400, "7d": 7 * 86400, "all": None}
 
@@ -103,6 +132,8 @@ def create_api(
     queue: WorkQueue | None = None,
     token: str | None = None,
     root_path: str = "",
+    audit: AuditStore | None = None,
+    fleet: Any | None = None,
 ) -> FastAPI:
     """Build the API.
 
@@ -123,6 +154,8 @@ def create_api(
     )
     app.state.store = store
     app.state.queue = queue
+    app.state.audit = audit
+    app.state.fleet = fleet
     app.state.token = token
 
     def require_token(
@@ -168,7 +201,12 @@ def create_api(
     # ---------------------------------------------------------------- work
 
     @app.get("/api/work", tags=["work"], summary="The whole backlog", response_model=WorkList)
-    def work(_: None = Depends(require_token)) -> WorkList:
+    def work(
+        project_id: str | None = Query(
+            None, description="Limit to one project. Omit for every project."
+        ),
+        _: None = Depends(require_token),
+    ) -> WorkList:
         """Items, counts and stale claims in ONE call.
 
         Deliberately not three endpoints: a client on a flaky connection
@@ -183,9 +221,11 @@ def create_api(
         latest = _latest_by_item(store)
         return WorkList(
             configured=True,
-            counts=queue.counts(),
-            stale=[r.item_id for r in queue.stale()],
-            items=[_item_model(r, latest.get(r.item_id)) for r in queue.all()],
+            counts=queue.counts(project_id=project_id),
+            stale=[r.item_id for r in queue.stale(project_id=project_id)],
+            items=[
+                _item_model(r, latest.get(r.item_id)) for r in queue.items(project_id=project_id)
+            ],
         )
 
     @app.get(
@@ -197,9 +237,10 @@ def create_api(
     )
     def work_item(
         item_id: str = PathParam(description="Plan id, e.g. `T4`."),
+        project_id: str = Query("default", description="Which project the item is in."),
         _: None = Depends(require_token),
     ) -> WorkItem:
-        record = need_queue().get(item_id)
+        record = need_queue().get(item_id, project_id=project_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
         return _item_model(record, _latest_by_item(store).get(item_id))
@@ -230,9 +271,10 @@ def create_api(
                     depends_on=list(item.depends_on),
                 )
                 for item in request.items
-            ]
+            ],
+            project_id=request.project_id,
         )
-        return AddItemsResult(added=added, total=len(queue.all()))
+        return AddItemsResult(added=added, total=len(queue.items(project_id=request.project_id)))
 
     @app.post(
         "/api/work/{item_id}/retry",
@@ -246,6 +288,7 @@ def create_api(
     )
     def retry(
         item_id: str = PathParam(description="Plan id, e.g. `T4`."),
+        project_id: str = Query("default", description="Which project the item is in."),
         _: None = Depends(require_token),
     ) -> RetryResult:
         """Put a finished or failed item back to `pending`.
@@ -256,7 +299,7 @@ def create_api(
         without anyone intervening.
         """
         queue = need_queue()
-        record = queue.get(item_id)
+        record = queue.get(item_id, project_id=project_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
         if record.state == CLAIMED and record.lease_until > time.time():
@@ -265,7 +308,7 @@ def create_api(
                 detail=f"{item_id} is claimed by {record.owner} and its lease is live; "
                 "wait for the lease to expire rather than racing it",
             )
-        queue.release(item_id, PENDING, error=None)
+        queue.release(item_id, PENDING, error=None, project_id=project_id)
         return RetryResult(ok=True, item_id=item_id, state="pending")
 
     # ------------------------------------------------------------- control
@@ -279,6 +322,387 @@ def create_api(
     def get_control(_: None = Depends(require_token)) -> FleetControl:
         state, reason = need_queue().control()
         return FleetControl(state=state, reason=reason)
+
+    # ----------------------------------------------------------------- audit
+
+    def audit_store() -> AuditStore:
+        store_: AuditStore | None = app.state.audit
+        if store_ is None:
+            raise HTTPException(status_code=409, detail="no audit store is attached")
+        return store_
+
+    def audit_window(window: str) -> tuple[float | None, bool]:
+        """Window start, and whether history actually covers it.
+
+        The second value is the honest part. A chart labelled "last 30 days"
+        drawn from three days of history is not wrong about the data, it is
+        wrong about the question -- and nothing in the numbers reveals it.
+        """
+        since = since_for(window)
+        oldest, _ = audit_store().span()
+        partial = bool(since is not None and oldest is not None and oldest > since)
+        return since, partial
+
+    @app.get(
+        "/api/audit/health",
+        tags=["observability"],
+        summary="Is history actually being recorded?",
+        response_model=AuditHealth,
+    )
+    def audit_health(_: None = Depends(require_token)) -> AuditHealth:
+        """Whether the audit store is attached, writable, and how much it holds.
+
+        Worth checking deliberately: writes are dropped rather than raised
+        when the store is degraded, precisely so observation cannot stop
+        work — which means nothing else will tell you.
+        """
+        store_: AuditStore | None = app.state.audit
+        if store_ is None:
+            return AuditHealth(configured=False, degraded=True)
+        oldest, newest = store_.span()
+        return AuditHealth(
+            configured=True,
+            degraded=store_.degraded,
+            path=str(store_.path),
+            events=store_.count(),
+            oldest=oldest,
+            newest=newest,
+            schema_version=AuditStore.SCHEMA_VERSION,
+        )
+
+    @app.get(
+        "/api/audit/events",
+        tags=["observability"],
+        summary="Raw history, paged by row id",
+        response_model=EventPage,
+    )
+    def audit_events(
+        since_id: int = Query(0, description="Exclusive. Pass back the previous `cursor`."),
+        limit: int = Query(200, le=1000),
+        _: None = Depends(require_token),
+    ) -> EventPage:
+        """Paged by id rather than timestamp: two events in the same
+        millisecond must still have a total order, or a page boundary can
+        silently skip one."""
+        rows = audit_store().since_id(since_id, limit=limit)
+        return EventPage(
+            events=[Event(**_audit_event_fields(r)) for r in rows],
+            cursor=rows[-1]["id"] if rows else since_id,
+        )
+
+    @app.get(
+        "/api/audit/cost",
+        tags=["observability"],
+        summary="Spend by project, role and model",
+        response_model=AuditCost,
+    )
+    def audit_cost(
+        window: str = Query("7d", description=f"One of {sorted(WINDOWS)}."),
+        project_id: str | None = Query(None),
+        _: None = Depends(require_token),
+    ) -> AuditCost:
+        """What it cost, computed from the prices recorded at the time.
+
+        Calls whose price was unknown are counted in `unpriced` and never
+        folded into the total — a sum that quietly omits them reads as
+        complete and is not.
+        """
+        since, partial = audit_window(window)
+        rows = audit_store().cost(since=since, project_id=project_id)
+        priced = [r["cost_usd"] for r in rows if r["cost_usd"] is not None]
+        return AuditCost(
+            window=window,
+            rows=[AuditCostRow(**r) for r in rows],
+            total_cost_usd=sum(priced) if priced else None,
+            total_unpriced=sum(r["unpriced"] or 0 for r in rows),
+            partial=partial,
+        )
+
+    @app.get(
+        "/api/audit/delivery",
+        tags=["observability"],
+        summary="What was delivered, by project and outcome",
+        response_model=AuditDelivery,
+    )
+    def audit_delivery(
+        window: str = Query("7d", description=f"One of {sorted(WINDOWS)}."),
+        project_id: str | None = Query(None),
+        _: None = Depends(require_token),
+    ) -> AuditDelivery:
+        since, partial = audit_window(window)
+        rows = audit_store().delivery(since=since, project_id=project_id)
+        return AuditDelivery(
+            window=window,
+            rows=[AuditDeliveryRow(**r) for r in rows],
+            partial=partial,
+        )
+
+    @app.post(
+        "/api/audit/reconcile",
+        tags=["observability"],
+        summary="Pull merge and revert outcomes from GitHub",
+        response_model=ReconcileResult,
+    )
+    def audit_reconcile(
+        repo: str = Query(description="GitHub repo as `owner/name`."),
+        _: None = Depends(require_token),
+    ) -> ReconcileResult:
+        """Record what the world did with the work.
+
+        Everything the harness knows about quality is a proxy: a reviewer
+        approved it, the checks passed. Whether it was merged, rejected or
+        reverted happens outside the harness and has to be fetched.
+
+        Append-only: a pull request merged today and reverted next week
+        produces two facts, in order, both true when recorded — not one fact
+        that changes its mind.
+        """
+        queue = app.state.queue
+        mapping = items_by_pr(queue) if queue is not None else {}
+        report = GitHubReconciler(repo, audit_store()).reconcile(mapping)
+        return ReconcileResult(
+            merged=report.merged,
+            closed_unmerged=report.closed_unmerged,
+            reverted=report.reverted,
+            skipped=report.skipped,
+            errors=report.errors,
+        )
+
+    @app.post(
+        "/api/audit/maintenance",
+        tags=["observability"],
+        summary="Roll up and thin now",
+        response_model=MaintenanceResult,
+    )
+    def audit_maintenance(
+        retention_days: int = Query(
+            DEFAULT_RETENTION_DAYS, ge=0, description="Raw events older than this may be thinned."
+        ),
+        _: None = Depends(require_token),
+    ) -> MaintenanceResult:
+        """Run a maintenance pass immediately.
+
+        This also happens hourly in the background; the manual trigger exists
+        so an operator does not have to wait an hour to see whether retention
+        is working, which is exactly when they are most likely to want to know.
+        """
+        report = run_maintenance(audit_store(), retention_days=retention_days)
+        return MaintenanceResult(
+            rolled_up=report.rolled_up, thinned=report.thinned, errors=report.errors
+        )
+
+    @app.get(
+        "/api/audit/rollups",
+        tags=["observability"],
+        summary="Daily aggregates -- the long series",
+        response_model=AuditRollups,
+    )
+    def audit_rollups(
+        project_id: str | None = Query(None),
+        since_day: str | None = Query(None, description="ISO date, inclusive."),
+        _: None = Depends(require_token),
+    ) -> AuditRollups:
+        """Immutable daily rows, kept forever.
+
+        Raw events are thinned after ~90 days, so anything older than that
+        lives only here. A day is never rewritten once published: if it could
+        be, every historical figure would be provisional and no report could
+        be reproduced.
+        """
+        store_ = audit_store()
+        return AuditRollups(
+            rows=[
+                AuditRollupRow(**r)
+                for r in store_.rollups(project_id=project_id, since_day=since_day)
+            ],
+            rolled_up_through=store_.rolled_up_through(),
+        )
+
+    @app.get(
+        "/api/audit/baselines",
+        tags=["observability"],
+        summary="Recorded baselines",
+        response_model=BaselineList,
+    )
+    def list_baselines(
+        project_id: str | None = Query(None),
+        _: None = Depends(require_token),
+    ) -> BaselineList:
+        """Without a baseline, "better than before" has no before."""
+        return BaselineList(
+            baselines=[Baseline(**b) for b in audit_store().baselines(project_id=project_id)]
+        )
+
+    @app.post(
+        "/api/audit/baselines",
+        tags=["observability"],
+        summary="Record a baseline",
+        response_model=Baseline,
+        responses={409: {"description": "That baseline id already exists"}},
+    )
+    def create_baseline(
+        request: NewBaseline,
+        _: None = Depends(require_token),
+    ) -> Baseline:
+        """Record a dated measurement to compare against.
+
+        Immutable: re-recording under an existing id is refused rather than
+        overwritten. A baseline that can be edited is not a baseline, it is a
+        target that moves to wherever the current numbers are.
+        """
+        store_ = audit_store()
+        created = store_.record_baseline(
+            request.baseline_id,
+            request.project_id,
+            label=request.label,
+            window_days=request.window_days,
+            recorded_at=time.time(),
+            items_done=request.items_done,
+            cost_usd=request.cost_usd,
+            notes=request.notes,
+        )
+        if not created:
+            raise HTTPException(
+                status_code=409,
+                detail=f"baseline {request.baseline_id!r} already exists; "
+                "baselines are immutable, so record a new one rather than replacing it",
+            )
+        match = [
+            b
+            for b in store_.baselines(project_id=request.project_id)
+            if b["baseline_id"] == request.baseline_id
+        ]
+        return Baseline(**match[0])
+
+    # -------------------------------------------------------------- projects
+
+    @app.get(
+        "/api/projects",
+        tags=["work"],
+        summary="Every project, with counts and control state",
+        response_model=ProjectList,
+    )
+    def list_projects(_: None = Depends(require_token)) -> ProjectList:
+        """One call for the overview screen. A per-project fan-out would make
+        the first thing a user sees depend on N successful requests."""
+        queue = need_queue()
+        out = []
+        for project in queue.projects():
+            state, reason, previous = queue.control_detail(project.project_id)
+            out.append(
+                ProjectSummary(
+                    project=_project_spec(project),
+                    counts=queue.counts(project_id=project.project_id),
+                    control=FleetControl(state=state, reason=reason),
+                    previous_state=previous,
+                    stale=len(queue.stale(project_id=project.project_id)),
+                    workers=(
+                        app.state.fleet.running().get(project.project_id, 0)
+                        if app.state.fleet is not None
+                        else 0
+                    ),
+                )
+            )
+        return ProjectList(projects=out)
+
+    @app.post(
+        "/api/projects",
+        tags=["work"],
+        summary="Register a project",
+        response_model=ProjectSummary,
+    )
+    def create_project(
+        spec: ProjectSpec,
+        _: None = Depends(require_token),
+    ) -> ProjectSummary:
+        """Register or update a project, durably.
+
+        It starts **stopped**. Registering a project must not begin spending
+        money on it, and nothing here starts a worker -- only an explicit
+        start does.
+        """
+        queue = need_queue()
+        queue.add_project(
+            Project(
+                project_id=spec.project_id,
+                name=spec.name,
+                repo=spec.repo,
+                work_dir=spec.work_dir,
+                base_branch=spec.base_branch,
+                checks=list(spec.checks),
+                plan_path=spec.plan_path,
+                roles={k: v.model_dump() for k, v in spec.roles.items()} if spec.roles else None,
+                max_workers=spec.max_workers,
+            )
+        )
+        return _project_summary(queue, spec.project_id)
+
+    @app.get(
+        "/api/projects/{project_id}",
+        tags=["work"],
+        summary="One project",
+        response_model=ProjectSummary,
+    )
+    def get_project(
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> ProjectSummary:
+        return _project_summary(need_queue(), project_id)
+
+    @app.post(
+        "/api/projects/{project_id}/start",
+        tags=["control"],
+        summary="Continue execution for one project",
+        response_model=ProjectSummary,
+    )
+    def start_project(
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> ProjectSummary:
+        """The only thing that lets a project claim work.
+
+        Nothing calls this on boot. An auto-resuming fleet turns a routine
+        restart into unattended spend against a stack nobody has looked at
+        yet, and a crash-looping deploy would restart the fleet on every loop.
+        Resuming is a decision, so it is a request.
+        """
+        queue = need_queue()
+        if queue.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+        fleet_ = app.state.fleet
+        if fleet_ is not None:
+            # Starting workers sets control itself. Doing it here as well
+            # would leave a project marked running with nobody claiming when
+            # no fleet is attached -- which reads as working and is not.
+            fleet_.start(project_id)
+        else:
+            queue.set_control(RUNNING, reason=None, project_id=project_id)
+        return _project_summary(queue, project_id, app.state.fleet)
+
+    @app.post(
+        "/api/projects/{project_id}/stop",
+        tags=["control"],
+        summary="Stop claiming for one project",
+        response_model=ProjectSummary,
+    )
+    def stop_project(
+        request: SetFleetControl | None = None,
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> ProjectSummary:
+        """Stop taking new work. **Nothing in flight is interrupted.**"""
+        queue = need_queue()
+        if queue.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+        reason = request.reason if request else None
+        fleet_ = app.state.fleet
+        if fleet_ is not None:
+            # Joins in-flight work rather than killing it: an agent stopped
+            # mid-item loses the context that makes it resumable.
+            fleet_.stop(project_id, reason=reason)
+        else:
+            queue.set_control(STOPPED, reason=reason, project_id=project_id)
+        return _project_summary(queue, project_id, app.state.fleet)
 
     @app.post(
         "/api/control",
@@ -510,6 +934,7 @@ def create_api(
             done=counts.get(DONE, 0),
             failed=counts.get(FAILED, 0),
             stale=len(queue.stale()) if queue else 0,
+            abandoned_sessions=len(queue.abandoned_sessions()) if queue else 0,
             waiting_for_input=[
                 WaitingItem(
                     item_id=e["data"].get("item_id"),
@@ -531,6 +956,58 @@ def _latest_by_item(store: EventStore) -> dict[str, dict[str, Any]]:
         if item_id and item_id not in latest:
             latest[item_id] = event
     return latest
+
+
+def _audit_event_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """An audit row as the wire Event model.
+
+    The audit table has columns the event model does not (cost, tokens,
+    prices); they travel in `data`, where they already are, rather than
+    widening the public event shape for every consumer.
+    """
+    return {
+        "id": row["id"],
+        "ts": row["ts"],
+        "kind": row["kind"],
+        "source": row["source"],
+        "worker": row["worker"],
+        "role": row["role"],
+        "model": row["model"],
+        "endpoint": row["endpoint"],
+        "outcome": row["outcome"],
+        "error_class": row["error_class"],
+        "latency_s": row["latency_s"],
+        "data": json.loads(row["data"] or "{}"),
+    }
+
+
+def _project_spec(project: Project) -> ProjectSpec:
+    return ProjectSpec(
+        project_id=project.project_id,
+        name=project.name,
+        repo=project.repo,
+        work_dir=project.work_dir,
+        base_branch=project.base_branch,
+        checks=list(project.checks),
+        plan_path=project.plan_path,
+        roles={k: RoleRoute(**v) for k, v in project.roles.items()} if project.roles else None,
+        max_workers=project.max_workers,
+    )
+
+
+def _project_summary(queue: WorkQueue, project_id: str, fleet: Any | None = None) -> ProjectSummary:
+    project = queue.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+    state, reason, previous = queue.control_detail(project_id)
+    return ProjectSummary(
+        project=_project_spec(project),
+        counts=queue.counts(project_id=project_id),
+        control=FleetControl(state=state, reason=reason),
+        previous_state=previous,
+        stale=len(queue.stale(project_id=project_id)),
+        workers=(fleet.running().get(project_id, 0) if fleet is not None else 0),
+    )
 
 
 def _item_model(record: WorkRecord, event: dict[str, Any] | None) -> WorkItem:

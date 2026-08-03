@@ -46,6 +46,7 @@ from .work import (
     FAILED,
     PENDING,
     ClaimLost,
+    DependencyInvalidated,
     WorkQueue,
     WorkRecord,
     worker_identity,
@@ -201,6 +202,21 @@ class SessionExecutor:
             self._emit(record, "claim_lost", detail=str(exc))
             self._orphan_session(record, f"claim lost: {exc}")
             return None
+        except DependencyInvalidated as exc:
+            # Still ours, and no longer admissible. The session is released
+            # rather than killed mid-thought, and the item goes back to
+            # `pending` -- nothing went wrong with the attempt, the reason for
+            # it moved. It is claimable again once the graph is satisfied.
+            self._emit(record, "dependency_invalidated", detail=str(exc))
+            self._orphan_session(record, f"dependency invalidated: {exc}")
+            self.queue.release(
+                record.item_id,
+                PENDING,
+                error=str(exc),
+                owner=self.owner,
+                project_id=self.project_id,
+            )
+            return Outcome(record.item_id, PENDING, reason=str(exc))
         except CapExhausted as exc:
             self._emit(record, "budget_exhausted", detail=str(exc))
             self._orphan_session(record, f"budget exhausted: {exc}")
@@ -343,17 +359,28 @@ class SessionExecutor:
     # ------------------------------------------------------------ the loop
 
     def _keepalive(self, record: WorkRecord) -> None:
-        """Extend the lease, and stop if it is no longer ours.
+        """Extend the lease, check the graph, and stop if either has moved.
 
         The heartbeat has always returned whether the claim survived; nothing
         read it, so a worker that lost its claim carried on regardless and
         then reported a result for someone else's item. Reading the answer is
         the whole point of asking.
+
+        Dependencies are checked here for the same reason. Checking them only
+        at claim time leaves a live agent working against a graph that has
+        since changed, and it finds out by having its work rejected much
+        later -- after the expensive gates have been paid for (#107).
         """
         if not self.queue.heartbeat(record.item_id, self.owner, project_id=self.project_id):
             raise ClaimLost(
                 f"{record.item_id} is no longer owned by {self.owner}; "
                 "its lease expired and another worker re-claimed it"
+            )
+        if not self.queue.validate_claim(record.item_id, self.owner, project_id=self.project_id):
+            current = self.queue.get(record.item_id, project_id=self.project_id)
+            raise DependencyInvalidated(
+                (current.invalidation_reason if current else None)
+                or f"{record.item_id} no longer satisfies its dependencies"
             )
 
     def _execute(self, record: WorkRecord) -> Outcome:

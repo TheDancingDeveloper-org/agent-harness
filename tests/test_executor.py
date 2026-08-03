@@ -27,7 +27,7 @@ from agent_harness.executor import (
     validate_diff,
 )
 from agent_harness.model_client import ModelClient, Response, RetryPolicy, Route
-from agent_harness.work import DONE, FAILED, WorkQueue, WorkRecord
+from agent_harness.work import DONE, FAILED, PENDING, WorkQueue, WorkRecord
 from conftest import make_queue
 
 DIFF = """\
@@ -314,6 +314,55 @@ def test_a_failing_check_reports_the_output_not_just_failure(repo: Path, tmp_pat
     outcome = executor.run_once()
     assert outcome is not None
     assert "the-actual-error" in outcome.reason
+
+
+def test_a_dependency_invalidated_mid_flight_stops_before_the_next_gate(
+    repo: Path, tmp_path: Path
+) -> None:
+    """#107. A graph checked only at claim time leaves an agent working on an
+    item the graph has since invalidated, and paying for the expensive gates
+    to find out. The claim is not stolen -- the item comes back as `pending`,
+    because nothing went wrong with the attempt, its reason moved."""
+    events: list[dict[str, Any]] = []
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": f"```diff\n{DIFF}```", "reviewer": "APPROVED\nfine"},
+        events=events,
+    )
+    add_item(queue)
+
+    original = queue.heartbeat
+
+    def invalidate_once(item_id: str, owner: str, **kwargs: Any) -> bool:
+        # The graph moves while the agent is mid-item, exactly as a re-synced
+        # plan or an accepted command would move it.
+        queue.add(
+            [
+                WorkRecord(
+                    item_id=item_id,
+                    title="Change the greeting",
+                    brief="Change hello.txt to say 'hello harness'.",
+                    issue=7,
+                    depends_on=["NOT-A-REAL-ITEM"],
+                )
+            ]
+        )
+        queue.heartbeat = original  # type: ignore[method-assign]
+        return original(item_id, owner, **kwargs)
+
+    queue.heartbeat = invalidate_once  # type: ignore[method-assign]
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.state == PENDING, "an invalidated attempt is not a failure"
+    assert "NOT-A-REAL-ITEM" in (outcome.reason or "")
+    assert [e for e in events if e["outcome"] == "dependency_invalidated"]
+    # Not stolen, and claimable again the moment the graph is satisfied.
+    item = queue.get("T1")
+    assert item is not None and item.state == PENDING
+    assert "review" not in outcome.stages, "it must not reach the expensive gate"
+    assert git(repo, "branch", "--list", "harness/t1").strip() == ""
 
 
 def test_a_rejected_review_does_not_commit(repo: Path, tmp_path: Path) -> None:

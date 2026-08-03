@@ -35,12 +35,76 @@ class LatestEvent(BaseModel):
     session_url: str | None = Field(None, description="Fully-qualified URL for that session.")
 
 
+class DependencyEdgeModel(BaseModel):
+    """One prerequisite, and how its state was established.
+
+    A bare id could not say whether an absent target was an external
+    reference, a typo, or work nobody wrote — and the queue resolved all
+    three by starting anyway. Every field here exists to make that
+    distinction visible to a reader rather than inferred by one.
+    """
+
+    target_kind: str = Field(
+        description="What is being pointed at: `work_item` (this project's queue), "
+        "`external` (another system, answered by an adapter), `human_decision`, "
+        "or `cross_project` (`project/item`)."
+    )
+    target_identity: str = Field(description="The id or reference within that kind.")
+    required: bool = Field(
+        True,
+        description="Required edges gate admission. An advisory edge is recorded and "
+        "resolved but never blocks a claim.",
+    )
+    resolver: str | None = Field(
+        None,
+        description="Adapter registered to answer for this target. Without one, a "
+        "non-local edge stays `unresolved` — the core knows no external system's format.",
+    )
+    resolution: str = Field(
+        description="`unresolved` (nothing could answer), `blocked` (answered, and the "
+        "target is not finished), or `satisfied`. Only `satisfied` admits an item."
+    )
+    provenance: str = Field(
+        "",
+        description="What established the resolution: `queue`, an adapter name, or an "
+        "operator. Blank only while unresolved.",
+    )
+    evidence: dict[str, Any] = Field(
+        default_factory=dict,
+        description="What the resolver saw. This is the difference between a dependency "
+        "that is satisfied and one that is merely asserted to be.",
+    )
+
+
 class WorkItem(BaseModel):
     item_id: str = Field(description="Stable id from the plan, e.g. `T4`.")
     title: str
     brief: str = Field(description="The full specification given to the agent.")
     issue: int | None = Field(None, description="GitHub issue number, when synced.")
-    depends_on: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description="Ids of local work this item waits on. The plain view of "
+        "`dependencies`, kept for clients that only speak local ids.",
+    )
+    dependencies: list[DependencyEdgeModel] = Field(
+        default_factory=list,
+        description="The typed graph, and the authority. Includes references "
+        "`depends_on` cannot express, such as external and cross-project targets.",
+    )
+    graph_revision: int = Field(
+        0,
+        description="Bumped whenever this item's dependency graph changes. A proposal "
+        "reasoned against an older revision is stale and must be rejected.",
+    )
+    dependency_invalidated: bool = Field(
+        False,
+        description="The graph changed under a live claim. The claim is NOT taken away — "
+        "killing a working agent loses its context — but the attempt must not cross its "
+        "next durable or external gate until this clears or an operator overrides it.",
+    )
+    invalidation_reason: str | None = Field(
+        None, description="Which edges stopped being satisfied, and when."
+    )
     state: WorkState
     owner: str | None = Field(None, description="host:pid of the worker holding the claim.")
     lease_until: float = Field(
@@ -121,12 +185,38 @@ class BlockResult(BaseModel):
     reason: str = Field(description="The reason as it is now recorded on the item.")
 
 
+class NewDependencyEdge(BaseModel):
+    """A prerequisite as an author states it.
+
+    Only the author's half: `resolution`, `provenance` and `evidence` are
+    derived by the queue and its resolvers, and accepting them here would let
+    a caller declare its own dependency satisfied.
+    """
+
+    target_kind: str = Field(
+        "work_item",
+        description="`work_item`, `external`, `human_decision` or `cross_project`.",
+    )
+    target_identity: str = Field(description="The id or reference within that kind.")
+    required: bool = Field(True, description="Required edges gate admission; advisory ones do not.")
+    resolver: str | None = Field(
+        None, description="Adapter that can answer for a non-local target."
+    )
+
+
 class NewWorkItem(BaseModel):
     item_id: str
     title: str
     brief: str = ""
     issue: int | None = None
-    depends_on: list[str] = Field(default_factory=list)
+    depends_on: list[str] = Field(
+        default_factory=list, description="Local work ids. Shorthand for `work_item` edges."
+    )
+    dependencies: list[NewDependencyEdge] = Field(
+        default_factory=list,
+        description="Typed edges, for references `depends_on` cannot express. When both "
+        "are given, both are taken at face value.",
+    )
 
 
 class AddItemsRequest(BaseModel):

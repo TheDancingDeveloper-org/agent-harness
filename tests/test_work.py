@@ -9,8 +9,11 @@ import pytest
 
 from agent_harness.work import (
     CLAIMED,
+    DEPENDENCY_INVALIDATED,
     DONE,
     PENDING,
+    DependencyEdge,
+    DependencyResolution,
     WorkQueue,
     WorkRecord,
 )
@@ -96,11 +99,203 @@ def test_dependencies_gate_claiming(queue: WorkQueue) -> None:
     assert second is not None and second.item_id == "T2"
 
 
-def test_a_dependency_outside_the_queue_does_not_block(queue: WorkQueue) -> None:
-    """Plans routinely reference work tracked elsewhere. Refusing to start
-    would strand the item forever."""
+def test_a_required_dependency_outside_the_queue_is_unresolved(queue: WorkQueue) -> None:
+    """An absent reference is not an implicit external success."""
     queue.add([rec("T1", depends_on=["EXTERNAL-9"])])
-    assert queue.claim("a") is not None
+    assert queue.claim("a") is None
+    item = queue.get("T1")
+    assert item is not None
+    assert item.dependencies[0].resolution == "unresolved"
+
+
+def test_typed_external_dependency_requires_authoritative_resolver(queue: WorkQueue) -> None:
+    edge = DependencyEdge(
+        target_kind="external",
+        target_identity="vendor/schema",
+        resolver="catalog",
+        provenance="plan",
+        evidence={"source": "plan.md:4"},
+    )
+    queue.add([rec("T1", dependencies=[edge])])
+    assert queue.claim("a") is None
+
+    queue.set_dependency_resolver(
+        "catalog",
+        lambda _edge, _item: DependencyResolution(
+            "satisfied", provenance="catalog", evidence={"revision": "r1"}
+        ),
+    )
+    claimed = queue.claim("a")
+    assert claimed is not None
+    assert claimed.dependencies[0].resolution == "satisfied"
+    assert claimed.dependencies[0].provenance == "catalog"
+    assert claimed.dependencies[0].evidence == {"revision": "r1"}
+
+
+def test_dependency_graph_revision_and_provenance_survive_reload(queue: WorkQueue) -> None:
+    edge = DependencyEdge(
+        target_kind="human_decision",
+        target_identity="D7",
+        required=True,
+        resolution="satisfied",
+        provenance="operator",
+        evidence={"message_id": "m-1"},
+    )
+    queue.add([rec("T1", dependencies=[edge])])
+    item = queue.get("T1")
+    assert item is not None and item.graph_revision > 0
+    assert item.dependencies[0].provenance == "operator"
+    reloaded = WorkQueue(queue.path, now=queue.now).get("T1")
+    assert reloaded is not None
+    assert reloaded.graph_revision == item.graph_revision
+    assert reloaded.dependencies[0].evidence == {"message_id": "m-1"}
+
+
+def test_graph_update_marks_a_live_claim_invalidated_without_stealing_it(
+    queue: WorkQueue,
+) -> None:
+    queue.add([rec("T1")])
+    claimed = queue.claim("a")
+    assert claimed is not None
+    queue.add([rec("T1", depends_on=["MISSING"])])
+    item = queue.get("T1")
+    assert item is not None
+    assert item.state == CLAIMED and item.owner == "a"
+    assert item.dependency_invalidated is True
+    assert item.invalidation_reason
+    assert item.invalidation_reason.startswith(DEPENDENCY_INVALIDATED)
+    assert queue.validate_claim("T1", "a") is False
+    assert queue.get("T1").state == CLAIMED  # type: ignore[union-attr]
+
+
+def test_dependency_state_change_invalidates_at_the_next_boundary(queue: WorkQueue) -> None:
+    queue.add([rec("T1"), rec("T2", depends_on=["T1"])])
+    queue.claim("a")
+    queue.release("T1", DONE)
+    claimed = queue.claim("b")
+    assert claimed is not None and claimed.item_id == "T2"
+    queue.release("T1", PENDING)
+    assert queue.validate_claim("T2", "b") is False
+    item = queue.get("T2")
+    assert item is not None and item.dependency_invalidated is True
+
+
+def test_a_satisfied_claim_clears_an_earlier_invalidation(queue: WorkQueue) -> None:
+    """The flag must not outlive the reason for it, or it blocks work that
+    nothing is waiting on any more."""
+    queue.add([rec("T1"), rec("T2", depends_on=["T1"])])
+    queue.claim("a")
+    queue.release("T1", DONE)
+    queue.claim("b")
+    queue.release("T1", PENDING)
+    assert queue.validate_claim("T2", "b") is False
+
+    queue.release("T1", DONE)
+    assert queue.validate_claim("T2", "b") is True
+    item = queue.get("T2")
+    assert item is not None
+    assert item.dependency_invalidated is False
+    assert item.invalidation_reason is None
+
+
+def test_validate_claim_refuses_a_worker_that_does_not_own_the_item(queue: WorkQueue) -> None:
+    queue.add([rec("T1")])
+    queue.claim("a")
+    assert queue.validate_claim("T1", "b") is False
+    assert queue.validate_claim("T1", "a") is True
+    assert queue.validate_claim("NOPE", "a") is False
+
+
+def test_an_advisory_dependency_does_not_block(queue: WorkQueue) -> None:
+    """Not every reference is a prerequisite. `required` says which."""
+    edge = DependencyEdge(
+        target_kind="external",
+        target_identity="the design note",
+        required=False,
+        resolver="nothing-registered",
+    )
+    queue.add([rec("T1", dependencies=[edge])])
+    claimed = queue.claim("a")
+    assert claimed is not None
+    assert claimed.dependencies[0].resolution == "unresolved"
+
+
+def test_a_resolver_that_raises_leaves_the_edge_unresolved(queue: WorkQueue) -> None:
+    """An adapter is third-party code. It may not stall the fleet, and it may
+    not be treated as a `satisfied` answer either."""
+
+    def explode(_edge: DependencyEdge, _item: WorkRecord) -> DependencyResolution:
+        raise RuntimeError("the catalog is down")
+
+    queue.set_dependency_resolver("catalog", explode)
+    queue.add(
+        [rec("T1", dependencies=[DependencyEdge("external", "vendor/schema", resolver="catalog")])]
+    )
+    assert queue.claim("a") is None
+    item = queue.get("T1")
+    assert item is not None
+    assert item.dependencies[0].resolution == "unresolved"
+    assert "the catalog is down" in item.dependencies[0].evidence["error"]
+
+
+def test_unresolved_dependencies_reports_what_was_asked(queue: WorkQueue) -> None:
+    queue.add(
+        [
+            rec("T1"),
+            rec("T2", depends_on=["T1"]),
+            rec("T3", depends_on=["NOBODY-WROTE-THIS"]),
+        ]
+    )
+    unresolved = queue.unresolved_dependencies()
+    assert [(record.item_id, edge.target_identity) for record, edge in unresolved] == [
+        ("T3", "NOBODY-WROTE-THIS")
+    ]
+    # T2's dependency resolves to `blocked`, which is a different situation:
+    # the target exists and is not done. Reporting it as unresolved would send
+    # a coordinator looking for a work item that is right there.
+    assert unresolved[0][1].resolution == "unresolved"
+
+
+def test_a_cross_project_edge_names_its_project(queue: WorkQueue) -> None:
+    queue.add([rec("T1")], project_id="other")
+    edge = DependencyEdge("cross_project", "other/T1")
+    queue.add([rec("T2", dependencies=[edge])])
+    assert queue.claim("a") is None
+
+    queue.release("T1", DONE, project_id="other")
+    claimed = queue.claim("a")
+    assert claimed is not None and claimed.item_id == "T2"
+    assert claimed.dependencies[0].resolution == "satisfied"
+
+
+def test_an_untyped_row_upgrades_to_typed_edges(tmp_path: Path, clock: list[float]) -> None:
+    """A queue written before the typed graph must not need a rewrite step."""
+    path = str(tmp_path / "legacy.sqlite")
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE work (
+            project_id TEXT NOT NULL DEFAULT 'default', item_id TEXT NOT NULL,
+            issue INTEGER, title TEXT NOT NULL, brief TEXT NOT NULL DEFAULT '',
+            depends_on TEXT NOT NULL DEFAULT '[]', state TEXT NOT NULL DEFAULT 'pending',
+            owner TEXT, lease_until REAL NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, branch TEXT,
+            pr_url TEXT, updated_at REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (project_id, item_id)
+        );
+        INSERT INTO work (item_id, title, depends_on) VALUES ('T2', 'after', '["T1"]');
+        INSERT INTO work (item_id, title) VALUES ('T1', 'first');
+    """)
+    conn.commit()
+    conn.close()
+
+    queue = make_queue(path, now=lambda: clock[0])
+    item = queue.get("T2")
+    assert item is not None
+    assert [e.shape for e in item.dependencies] == [("work_item", "T1", True, None)]
+    assert queue.claim("a").item_id == "T1"  # type: ignore[union-attr]
+    assert queue.claim("b") is None  # T2 still waits on T1
 
 
 def test_re_adding_a_synced_plan_does_not_reset_progress(queue: WorkQueue) -> None:

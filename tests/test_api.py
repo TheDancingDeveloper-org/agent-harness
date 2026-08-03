@@ -279,6 +279,74 @@ def test_blocking_a_decision_holds_back_what_depends_on_it(
     assert "W3" not in claimed, "work depending on an open decision must wait for it"
 
 
+def test_an_external_dependency_is_visible_and_blocks(client: TestClient, queue: WorkQueue) -> None:
+    """The API has to be able to say "waiting on something outside the queue".
+
+    With bare ids it could not: an external reference and a typo looked the
+    same on the wire, and both silently ran.
+    """
+    added = client.post(
+        "/api/work",
+        headers=auth(),
+        json={
+            "items": [
+                {
+                    "item_id": "W9",
+                    "title": "after the vendor schema",
+                    "dependencies": [
+                        {
+                            "target_kind": "external",
+                            "target_identity": "vendor/schema",
+                            "resolver": "catalog",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert added.status_code == 200
+
+    items = {i["item_id"]: i for i in client.get("/api/work", headers=auth()).json()["items"]}
+    edge = items["W9"]["dependencies"][0]
+    assert edge["target_kind"] == "external"
+    assert edge["resolver"] == "catalog"
+    assert items["W9"]["graph_revision"] == 1
+
+    claimed = {c.item_id for c in (queue.claim("w"), queue.claim("w"), queue.claim("w")) if c}
+    assert "W9" not in claimed, "an unresolved external dependency must not admit work"
+    listed = {i["item_id"]: i for i in client.get("/api/work", headers=auth()).json()["items"]}
+    assert listed["W9"]["dependencies"][0]["resolution"] == "unresolved"
+
+
+def test_a_caller_cannot_declare_its_own_dependency_satisfied(client: TestClient) -> None:
+    """`resolution` is derived. Accepting it on the way in would make the
+    gate advisory, which is the one thing it must never be."""
+    response = client.post(
+        "/api/work",
+        headers=auth(),
+        json={
+            "items": [
+                {
+                    "item_id": "W9",
+                    "title": "sneaky",
+                    "dependencies": [
+                        {
+                            "target_kind": "external",
+                            "target_identity": "vendor/schema",
+                            "resolution": "satisfied",
+                            "provenance": "me",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert response.status_code == 200
+    items = {i["item_id"]: i for i in client.get("/api/work", headers=auth()).json()["items"]}
+    assert items["W9"]["dependencies"][0]["resolution"] == "unresolved"
+    assert items["W9"]["dependencies"][0]["provenance"] == ""
+
+
 def test_a_reason_is_required(client: TestClient) -> None:
     """An item parked with no reason is indistinguishable from one nobody got
     to, and whoever has to unblock it is rarely whoever blocked it."""

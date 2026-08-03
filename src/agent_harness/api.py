@@ -54,6 +54,7 @@ from .schemas import (
     BaselineList,
     BlockRequest,
     BlockResult,
+    DependencyEdgeModel,
     Event,
     EventPage,
     ExecutionReadiness,
@@ -95,8 +96,10 @@ from .work import (
     CLAIMED,
     DONE,
     FAILED,
+    LOCAL_WORK,
     PENDING,
     STOPPED,
+    DependencyEdge,
     Project,
     WorkQueue,
     WorkRecord,
@@ -297,6 +300,22 @@ def create_api(
                     brief=item.brief,
                     issue=item.issue,
                     depends_on=list(item.depends_on),
+                    dependencies=[
+                        DependencyEdge(
+                            target_kind=edge.target_kind,
+                            target_identity=edge.target_identity,
+                            required=edge.required,
+                            resolver=edge.resolver,
+                        )
+                        for edge in item.dependencies
+                    ]
+                    # A caller sending only local ids gets the same edges the
+                    # record would have built for itself; sending both means
+                    # both, so `depends_on` is folded in rather than replaced.
+                    + [
+                        DependencyEdge(target_kind=LOCAL_WORK, target_identity=dependency)
+                        for dependency in item.depends_on
+                    ],
                 )
                 for item in request.items
             ],
@@ -1449,6 +1468,10 @@ def _item_model(record: WorkRecord, event: dict[str, Any] | None) -> WorkItem:
         brief=record.brief,
         issue=record.issue,
         depends_on=list(record.depends_on),
+        dependencies=[DependencyEdgeModel(**edge.as_dict()) for edge in record.dependencies],
+        graph_revision=record.graph_revision,
+        dependency_invalidated=record.dependency_invalidated,
+        invalidation_reason=record.invalidation_reason,
         state=record.state,
         owner=record.owner,
         lease_until=record.lease_until,

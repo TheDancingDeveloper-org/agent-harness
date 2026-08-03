@@ -25,7 +25,7 @@ import os
 import socket
 import sqlite3
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -89,6 +89,44 @@ CLAIM_SCAN_LIMIT = 200
 #: into this, so an upgrade never orphans a row.
 DEFAULT_PROJECT = "default"
 
+# ------------------------------------------------------------ the work graph
+#
+# A dependency used to be a bare string, and an id that named nothing was
+# treated as satisfied -- on the reasoning that plans routinely reference work
+# tracked elsewhere. That reasoning is sound and the conclusion was not: it
+# makes a legitimate external dependency, a typo and an omitted work item
+# indistinguishable, and the harness resolves all three by starting anyway.
+#
+# An edge therefore says what it points at and how that was established.
+# `unresolved` is a real answer and it blocks: something has to say what the
+# reference means before an agent spends money on the assumption.
+
+#: An item in this project's queue. The queue itself is the authority, so an
+#: edge of this kind is always re-derived rather than trusted from storage.
+LOCAL_WORK = "work_item"
+#: Anything outside the queue -- another tracker, a published artefact, a
+#: vendor schema. Resolved by an adapter, never guessed at by the core.
+EXTERNAL = "external"
+#: A person has to decide. No adapter can resolve it and none should try.
+HUMAN_DECISION = "human_decision"
+#: Work in another project of this fleet.
+CROSS_PROJECT = "cross_project"
+
+#: Nothing has established what this edge points at. Blocks admission.
+UNRESOLVED = "unresolved"
+#: Resolved, and the target is not finished yet. Blocks admission. Spelled
+#: the same as the `blocked` work state on purpose: both mean "waiting on
+#: something else", and inventing a second word for it would only invite the
+#: question of how they differ.
+SATISFIED = "satisfied"
+
+#: The marker put on a live attempt whose graph changed under it. The claim
+#: is NOT taken away -- killing a working agent implicitly loses its context
+#: and leaves a half-written worktree. It is told, and it must not cross the
+#: next durable or external gate until the graph is satisfied again or an
+#: operator explicitly overrides. This is issue #107.
+DEPENDENCY_INVALIDATED = "dependency-invalidated"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     project_id  TEXT PRIMARY KEY,
@@ -115,6 +153,10 @@ CREATE TABLE IF NOT EXISTS work (
     title       TEXT NOT NULL,
     brief       TEXT NOT NULL DEFAULT '',
     depends_on  TEXT NOT NULL DEFAULT '[]',
+    dependencies TEXT NOT NULL DEFAULT '[]',
+    graph_revision INTEGER NOT NULL DEFAULT 0,
+    dependency_invalidated INTEGER NOT NULL DEFAULT 0,
+    invalidation_reason TEXT,
     state       TEXT NOT NULL DEFAULT 'pending',
     owner       TEXT,
     lease_until REAL NOT NULL DEFAULT 0,
@@ -172,6 +214,20 @@ class ClaimLost(Exception):
     """
 
 
+class DependencyInvalidated(Exception):
+    """The graph changed under this attempt and no longer admits it.
+
+    Unlike `ClaimLost`, the item is still ours: nobody took it, and the
+    partial work in the worktree is still worth keeping. What is no longer
+    true is the reason for doing it, so the attempt must stop before the
+    next durable or external gate rather than push a branch or open a pull
+    request for work whose prerequisites are unmet.
+
+    The correct response is to release the item back to `pending` with the
+    reason, so the next attempt starts once the graph is satisfied.
+    """
+
+
 def worker_identity() -> str:
     """Who holds a claim. Host and pid, so a stale claim can be traced to a
     specific process rather than to an anonymous 'someone'."""
@@ -207,13 +263,105 @@ class Project:
         return cls(**data)
 
 
+@dataclass(frozen=True)
+class DependencyEdge:
+    """One prerequisite, and how its state was established.
+
+    `resolution`, `provenance` and `evidence` are *derived*: they record what
+    a resolver last found, not what the plan asserted. Only `target_kind`,
+    `target_identity`, `required` and `resolver` come from the author, and
+    only those decide whether re-syncing a plan counts as a graph change.
+    """
+
+    target_kind: str
+    target_identity: str
+    required: bool = True
+    #: Which adapter can answer for a non-local target. The core knows no
+    #: external system's format, so an edge without a registered resolver
+    #: stays `unresolved` rather than being assumed away.
+    resolver: str | None = None
+    resolution: str = UNRESOLVED
+    #: Who or what established the resolution: `queue`, an adapter name, an
+    #: operator. Never blank on anything but an unresolved edge.
+    provenance: str = ""
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def shape(self) -> tuple[str, str, bool, str | None]:
+        """The author's part of the edge -- what a re-synced plan can change."""
+
+        return (self.target_kind, self.target_identity, self.required, self.resolver)
+
+    def resolved(self, resolution: DependencyResolution) -> DependencyEdge:
+        return DependencyEdge(
+            target_kind=self.target_kind,
+            target_identity=self.target_identity,
+            required=self.required,
+            resolver=self.resolver,
+            resolution=resolution.resolution,
+            provenance=resolution.provenance,
+            evidence=dict(resolution.evidence),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "target_kind": self.target_kind,
+            "target_identity": self.target_identity,
+            "required": self.required,
+            "resolver": self.resolver,
+            "resolution": self.resolution,
+            "provenance": self.provenance,
+            "evidence": dict(self.evidence),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DependencyEdge:
+        return cls(
+            target_kind=data["target_kind"],
+            target_identity=data["target_identity"],
+            required=bool(data.get("required", True)),
+            resolver=data.get("resolver"),
+            resolution=data.get("resolution", UNRESOLVED),
+            provenance=data.get("provenance", ""),
+            evidence=dict(data.get("evidence") or {}),
+        )
+
+
+@dataclass(frozen=True)
+class DependencyResolution:
+    """What a resolver found. Evidence is required to claim `satisfied`.
+
+    A resolver that returns `satisfied` with nothing behind it is exactly the
+    failure the typed graph exists to prevent, so the queue records the
+    provenance alongside the answer and a reader can see which is which.
+    """
+
+    resolution: str
+    provenance: str = ""
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+
+#: Answers an edge on behalf of a system the core knows nothing about.
+DependencyResolver = Callable[[DependencyEdge, "WorkRecord"], DependencyResolution]
+
+
 @dataclass
 class WorkRecord:
     item_id: str
     title: str
     brief: str = ""
     issue: int | None = None
+    #: Ids of local work this item waits on. Kept because plans, issue bodies
+    #: and the API all speak it; `dependencies` is the authority, and the two
+    #: are reconciled on construction.
     depends_on: list[str] = field(default_factory=list)
+    dependencies: list[DependencyEdge] = field(default_factory=list)
+    #: Bumped whenever the author's part of the graph changes. A proposal
+    #: reasoned against revision 3 is stale once it reaches revision 4.
+    graph_revision: int = 0
+    #: The graph changed under a live claim. See `DEPENDENCY_INVALIDATED`.
+    dependency_invalidated: bool = False
+    invalidation_reason: str | None = None
     state: str = PENDING
     owner: str | None = None
     lease_until: float = 0.0
@@ -224,10 +372,28 @@ class WorkRecord:
     updated_at: float = 0.0
     project_id: str = DEFAULT_PROJECT
 
+    def __post_init__(self) -> None:
+        # Whichever the caller supplied, the other follows. A caller that
+        # gives both is taken at its word for both -- the API can legitimately
+        # send typed edges alongside the plain ids an older client reads.
+        if self.dependencies and not self.depends_on:
+            self.depends_on = [
+                edge.target_identity for edge in self.dependencies if edge.target_kind == LOCAL_WORK
+            ]
+        elif self.depends_on and not self.dependencies:
+            self.dependencies = [
+                DependencyEdge(target_kind=LOCAL_WORK, target_identity=item)
+                for item in self.depends_on
+            ]
+
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> WorkRecord:
         data = dict(row)
         data["depends_on"] = json.loads(data.get("depends_on") or "[]")
+        data["dependencies"] = [
+            DependencyEdge.from_dict(edge) for edge in json.loads(data.get("dependencies") or "[]")
+        ]
+        data["dependency_invalidated"] = bool(data.get("dependency_invalidated"))
         return cls(**data)
 
 
@@ -240,6 +406,10 @@ class WorkQueue:
         self.path = path
         self.lease_seconds = lease_seconds
         self.now = now
+        # Per queue, never a module global: two projects in one process must
+        # not be able to answer for each other's external references, and a
+        # process-wide registry is how that happens by accident (#106).
+        self._resolvers: dict[str, DependencyResolver] = {}
         self._migrate()
         with self._connect() as conn:
             conn.executescript(SCHEMA)
@@ -307,6 +477,16 @@ class WorkQueue:
     #: still reads its own columns.
     ADDED_COLUMNS = {
         "projects": {"max_attempts": "INTEGER NOT NULL DEFAULT 5"},
+        # The typed graph. Additive, and the defaults are what an untyped row
+        # already meant: no edges recorded yet, no revision, not invalidated.
+        # `add` re-derives edges from `depends_on` the next time a plan is
+        # synced, so an existing queue upgrades without a rewrite step.
+        "work": {
+            "dependencies": "TEXT NOT NULL DEFAULT '[]'",
+            "graph_revision": "INTEGER NOT NULL DEFAULT 0",
+            "dependency_invalidated": "INTEGER NOT NULL DEFAULT 0",
+            "invalidation_reason": "TEXT",
+        },
     }
 
     def _add_missing_columns(self, conn: sqlite3.Connection) -> None:
@@ -486,13 +666,15 @@ class WorkQueue:
         )
         for record in records:
             existing = conn.execute(
-                "SELECT state FROM work WHERE project_id = ? AND item_id = ?",
+                "SELECT state, dependencies, graph_revision FROM work "
+                "WHERE project_id = ? AND item_id = ?",
                 (project_id, record.item_id),
             ).fetchone()
             if existing is None:
                 conn.execute(
                     "INSERT INTO work (project_id, item_id, issue, title, brief, depends_on, "
-                    "state, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "dependencies, graph_revision, state, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         project_id,
                         record.item_id,
@@ -500,21 +682,64 @@ class WorkQueue:
                         record.title,
                         record.brief,
                         json.dumps(record.depends_on),
+                        json.dumps([edge.as_dict() for edge in record.dependencies]),
+                        1,
                         record.state,
                         self.now(),
                     ),
                 )
                 added += 1
-            else:
+                continue
+
+            stored = [DependencyEdge.from_dict(e) for e in json.loads(existing["dependencies"])]
+            changed = [e.shape for e in stored] != [e.shape for e in record.dependencies]
+            # Only the author's part of an edge counts as a change. Comparing
+            # whole edges would call every re-sync a graph change, because
+            # stored edges carry resolutions the incoming ones do not.
+            if not changed:
                 conn.execute(
-                    "UPDATE work SET title = ?, brief = ?, depends_on = ?, issue = ?, "
-                    "updated_at = ? WHERE project_id = ? AND item_id = ?",
+                    "UPDATE work SET title = ?, brief = ?, issue = ?, updated_at = ? "
+                    "WHERE project_id = ? AND item_id = ?",
                     (
                         record.title,
                         record.brief,
-                        json.dumps(record.depends_on),
                         record.issue,
                         self.now(),
+                        project_id,
+                        record.item_id,
+                    ),
+                )
+                continue
+
+            revision = int(existing["graph_revision"]) + 1
+            conn.execute(
+                "UPDATE work SET title = ?, brief = ?, depends_on = ?, dependencies = ?, "
+                "graph_revision = ?, issue = ?, updated_at = ? "
+                "WHERE project_id = ? AND item_id = ?",
+                (
+                    record.title,
+                    record.brief,
+                    json.dumps(record.depends_on),
+                    # Resolutions belong to the old graph, so they are dropped
+                    # with it. Carrying one over would let a satisfied edge
+                    # vouch for a target it no longer points at.
+                    json.dumps([edge.as_dict() for edge in record.dependencies]),
+                    revision,
+                    record.issue,
+                    self.now(),
+                    project_id,
+                    record.item_id,
+                ),
+            )
+            if existing["state"] == CLAIMED:
+                # The claim is not taken away. The agent holding it is told,
+                # and `validate_claim` stops it at the next gate (#107).
+                conn.execute(
+                    "UPDATE work SET dependency_invalidated = 1, invalidation_reason = ? "
+                    "WHERE project_id = ? AND item_id = ?",
+                    (
+                        f"{DEPENDENCY_INVALIDATED}: the graph moved to revision {revision} "
+                        f"while this attempt was running",
                         project_id,
                         record.item_id,
                     ),
@@ -684,11 +909,17 @@ class WorkQueue:
                         ),
                     )
                     continue
-                if not self._dependencies_met(conn, record):
+                edges, admissible = self._resolve(conn, record)
+                # Written back whether or not the item is claimed: an item
+                # that never runs should say what was asked and what answered,
+                # not merely fail to appear.
+                self._store_resolutions(conn, record, edges, project_id)
+                if not admissible:
                     continue
                 conn.execute(
                     "UPDATE work SET state = ?, owner = ?, lease_until = ?, "
-                    "attempts = attempts + 1, updated_at = ? "
+                    "attempts = attempts + 1, dependency_invalidated = 0, "
+                    "invalidation_reason = NULL, updated_at = ? "
                     "WHERE project_id = ? AND item_id = ?",
                     (
                         CLAIMED,
@@ -704,6 +935,9 @@ class WorkQueue:
                 record.owner = owner
                 record.lease_until = now + self.lease_seconds
                 record.attempts += 1
+                record.dependencies = edges
+                record.dependency_invalidated = False
+                record.invalidation_reason = None
                 return record
             conn.execute("COMMIT")
             return None
@@ -722,21 +956,200 @@ class WorkQueue:
         ).fetchone()
         return int(row["max_attempts"]) if row else DEFAULT_MAX_ATTEMPTS
 
-    def _dependencies_met(self, conn: sqlite3.Connection, record: WorkRecord) -> bool:
-        for dependency in record.depends_on:
-            # Scoped to the item's own project: an id means one thing here and
-            # something else there, and resolving across the boundary would
-            # let a project unblock on another project's work.
+    # -------------------------------------------------------- the work graph
+
+    def set_dependency_resolver(self, name: str, resolver: DependencyResolver) -> None:
+        """Register the adapter that can answer for one kind of reference.
+
+        The core deliberately cannot resolve anything but its own queue. A
+        deployment that tracks work in another system registers a resolver
+        here; until it does, edges naming that system stay `unresolved` and
+        block, which is the honest answer rather than a convenient one.
+        """
+
+        self._resolvers[name] = resolver
+
+    def _resolve(
+        self, conn: sqlite3.Connection, record: WorkRecord
+    ) -> tuple[list[DependencyEdge], bool]:
+        """Re-derive every edge. Returns the edges and whether admission passes.
+
+        Nothing is trusted from storage that something authoritative can be
+        asked about instead: the queue answers for local work on every call,
+        and a registered resolver answers for its own targets. Only an edge
+        with no available authority keeps what was last recorded.
+        """
+
+        resolved: list[DependencyEdge] = []
+        admissible = True
+        for edge in record.dependencies:
+            answer = self._resolve_edge(conn, record, edge)
+            new_edge = edge.resolved(answer)
+            resolved.append(new_edge)
+            if new_edge.required and new_edge.resolution != SATISFIED:
+                admissible = False
+        return resolved, admissible
+
+    def _resolve_edge(
+        self, conn: sqlite3.Connection, record: WorkRecord, edge: DependencyEdge
+    ) -> DependencyResolution:
+        if edge.target_kind in (LOCAL_WORK, CROSS_PROJECT):
+            # Scoped to the item's own project unless the edge says otherwise:
+            # an id means one thing here and something else there, and
+            # resolving across the boundary silently would let a project
+            # unblock on another project's work.
+            project_id = record.project_id
+            identity = edge.target_identity
+            if edge.target_kind == CROSS_PROJECT and "/" in identity:
+                project_id, identity = identity.split("/", 1)
             row = conn.execute(
                 "SELECT state FROM work WHERE project_id = ? AND item_id = ?",
-                (record.project_id, dependency),
+                (project_id, identity),
             ).fetchone()
-            # A dependency on something not in the queue is not a blocker:
-            # plans routinely reference work tracked elsewhere, and refusing
-            # to start would strand the item forever.
-            if row is not None and row["state"] != DONE:
+            if row is None:
+                # An id naming nothing used to count as satisfied, on the
+                # reasoning that it was probably tracked elsewhere. It might
+                # equally be a typo or an item nobody wrote, and starting on
+                # that assumption is what this refuses to do.
+                return DependencyResolution(
+                    UNRESOLVED,
+                    provenance="queue",
+                    evidence={"reason": f"{identity!r} is not an item in {project_id!r}"},
+                )
+            if row["state"] == DONE:
+                return DependencyResolution(SATISFIED, provenance="queue", evidence={"state": DONE})
+            return DependencyResolution(
+                BLOCKED, provenance="queue", evidence={"state": row["state"]}
+            )
+
+        resolver = self._resolvers.get(edge.resolver or "")
+        if resolver is not None:
+            try:
+                return resolver(edge, record)
+            except Exception as exc:  # noqa: BLE001 - an adapter must not stall the fleet
+                log.warning("dependency resolver %s failed: %s", edge.resolver, exc)
+                return DependencyResolution(
+                    UNRESOLVED,
+                    provenance=edge.resolver or "",
+                    evidence={"error": str(exc)},
+                )
+        if edge.resolution == SATISFIED and edge.provenance:
+            # Recorded by something authoritative -- an accepted command or an
+            # operator -- and there is no resolver to ask again. Kept, with
+            # its provenance, rather than quietly re-opened.
+            return DependencyResolution(SATISFIED, edge.provenance, dict(edge.evidence))
+        return DependencyResolution(
+            UNRESOLVED,
+            evidence={
+                "reason": (
+                    f"no resolver is registered for {edge.resolver!r}"
+                    if edge.resolver
+                    else f"nothing can answer for a {edge.target_kind} reference"
+                )
+            },
+        )
+
+    def _store_resolutions(
+        self,
+        conn: sqlite3.Connection,
+        record: WorkRecord,
+        edges: list[DependencyEdge],
+        project_id: str,
+    ) -> None:
+        """Write back what the resolvers found, if it moved.
+
+        Recording this is the difference between "blocked, and here is what
+        was asked and what answered" and an item that silently never runs.
+        """
+
+        stored = json.dumps([edge.as_dict() for edge in record.dependencies])
+        fresh = json.dumps([edge.as_dict() for edge in edges])
+        if stored == fresh:
+            return
+        conn.execute(
+            "UPDATE work SET dependencies = ? WHERE project_id = ? AND item_id = ?",
+            (fresh, project_id, record.item_id),
+        )
+
+    def validate_claim(self, item_id: str, owner: str, project_id: str = DEFAULT_PROJECT) -> bool:
+        """Is this claim still valid *now*? Called at every execution gate.
+
+        Checking dependencies only at claim time leaves an agent working on
+        an item the graph has since invalidated, and it finds out by having
+        its work rejected much later. False means: reach a safe boundary and
+        stop before the next durable or external gate (#107).
+
+        A false answer never releases the claim. Killing a live agent throws
+        away its context and leaves a half-written worktree, which is worse
+        than the wasted minutes -- so the item stays owned, and the flag and
+        its reason are recorded for whoever decides what happens next.
+        """
+
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM work WHERE project_id = ? AND item_id = ?",
+                (project_id, item_id),
+            ).fetchone()
+            if row is None:
                 return False
-        return True
+            record = WorkRecord.from_row(row)
+            if record.state != CLAIMED or record.owner != owner:
+                return False
+            edges, admissible = self._resolve(conn, record)
+            self._store_resolutions(conn, record, edges, project_id)
+            if admissible:
+                if record.dependency_invalidated:
+                    # The graph moved again and this time it is satisfied.
+                    # Leaving the flag set would block work nothing is
+                    # waiting on any more.
+                    conn.execute(
+                        "UPDATE work SET dependency_invalidated = 0, invalidation_reason = NULL "
+                        "WHERE project_id = ? AND item_id = ?",
+                        (project_id, item_id),
+                    )
+                return True
+            unmet = [e for e in edges if e.required and e.resolution != SATISFIED]
+            reason = f"{DEPENDENCY_INVALIDATED}: " + ", ".join(
+                f"{e.target_identity} is {e.resolution}" for e in unmet
+            )
+            conn.execute(
+                "UPDATE work SET dependency_invalidated = 1, invalidation_reason = ? "
+                "WHERE project_id = ? AND item_id = ?",
+                (reason, project_id, item_id),
+            )
+            return False
+        finally:
+            conn.close()
+
+    def unresolved_dependencies(
+        self, project_id: str = DEFAULT_PROJECT
+    ) -> list[tuple[WorkRecord, DependencyEdge]]:
+        """Every required edge nothing has been able to answer for.
+
+        This is the queue's half of the missing-dependency flow: it says what
+        could not be resolved and what was asked, so a coordinator or a human
+        can decide whether it is a typo, an external reference or work nobody
+        wrote. Deciding that is not the queue's job.
+        """
+
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM work WHERE project_id = ? ORDER BY item_id", (project_id,)
+            ).fetchall()
+            out: list[tuple[WorkRecord, DependencyEdge]] = []
+            for row in rows:
+                record = WorkRecord.from_row(row)
+                edges, _ = self._resolve(conn, record)
+                out.extend(
+                    (record, edge)
+                    for edge in edges
+                    if edge.required and edge.resolution == UNRESOLVED
+                )
+            return out
+        finally:
+            conn.close()
 
     def heartbeat(self, item_id: str, owner: str, project_id: str = DEFAULT_PROJECT) -> bool:
         """Extend the lease. Returns False if the claim was lost — which is

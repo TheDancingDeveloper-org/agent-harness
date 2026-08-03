@@ -61,6 +61,8 @@ from .schemas import (
     ExecutionReadiness,
     FleetControl,
     Health,
+    InceptionDraft,
+    InceptionPlan,
     InceptionStart,
     LatestEvent,
     MaintenanceResult,
@@ -184,12 +186,11 @@ def create_api(
     app.state.fleet = fleet
     app.state.model_client = model_client
     app.state.session_host = session_host
-    _APP_STATE["fleet"] = fleet
-    _APP_STATE["model_client"] = model_client
-    _APP_STATE["session_host"] = session_host
-    _APP_STATE["probes"] = dict(probes or {})
+    # Everything preflight needs lives on THIS app. It used to be copied into
+    # a module-level dictionary, so a second `create_api` in the same process
+    # silently took over the first's wiring.
+    app.state.probes = dict(probes or {})
     app.state.base_checks = BaseChecks()
-    _APP_STATE["base_checks"] = app.state.base_checks
     app.state.token = token
 
     def require_token(
@@ -252,7 +253,7 @@ def create_api(
                 configured=False,
                 reason="no work queue is attached to this harness",
             )
-        latest = _latest_by_item(store, app.state.audit)
+        latest = _latest_by_item(store, app.state.audit, project_id)
         return WorkList(
             configured=True,
             counts=queue.counts(project_id=project_id),
@@ -277,7 +278,7 @@ def create_api(
         record = need_queue().get(item_id, project_id=project_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
-        return _item_model(record, _latest_by_item(store, app.state.audit).get(item_id))
+        return _item_model(record, _latest_by_item(store, app.state.audit, project_id).get(item_id))
 
     @app.post(
         "/api/work",
@@ -450,15 +451,15 @@ def create_api(
         "/api/inception",
         tags=["work"],
         summary="Describe a project in a paragraph",
-        response_model=dict,
+        response_model=InceptionDraft,
     )
     def inception_start(
         request: InceptionStart,
         _: None = Depends(require_token),
-    ) -> dict[str, Any]:
+    ) -> InceptionDraft:
         """Begin scoping. Nothing external exists yet and will not until you
         approve: no repository, no issues, no branches, no queue rows."""
-        return inception_for().start(request.project_id, request.overview)  # type: ignore[no-any-return]
+        return InceptionDraft(**inception_for().start(request.project_id, request.overview))
 
     @app.post(
         "/api/inception/{project_id}/scope",
@@ -548,13 +549,13 @@ def create_api(
         "/api/inception/{project_id}/plan",
         tags=["work"],
         summary="The proposal as a PLAN.md",
-        response_model=dict,
+        response_model=InceptionPlan,
     )
     def inception_plan(
         project_id: str = PathParam(description="Project id."),
         name: str | None = Query(None),
         _: None = Depends(require_token),
-    ) -> dict[str, str]:
+    ) -> InceptionPlan:
         """A real plan document, not queue rows.
 
         Writing straight to the queue would fork the pipeline into a generated
@@ -564,7 +565,7 @@ def create_api(
         consume is caught before it creates a single issue.
         """
         try:
-            return {"markdown": inception_for().plan_markdown(project_id, name)}
+            return InceptionPlan(markdown=inception_for().plan_markdown(project_id, name))
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -933,7 +934,7 @@ def create_api(
         if project is None:
             raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
 
-        report = _preflight(queue, project, check_base=check_base)
+        report = _preflight(app.state, queue, project, check_base=check_base)
         if not report.ready and not force:
             # Refuses rather than setting a flag nobody acts on. Previously
             # this branch set RUNNING with no fleet attached -- the comment
@@ -982,7 +983,7 @@ def create_api(
         project = queue.get_project(project_id)
         if project is None:
             raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
-        report = _preflight(queue, project, check_base=check_base)
+        report = _preflight(app.state, queue, project, check_base=check_base)
         return PreflightResult(
             project_id=report.project_id,
             ready=report.ready,
@@ -1113,7 +1114,9 @@ def create_api(
 
         reports = []
         for project in projects:
-            report = _preflight(queue, project, session_host=probe, check_base=check_base)
+            report = _preflight(
+                app.state, queue, project, session_host=probe, check_base=check_base
+            )
             reports.append(
                 ProjectReadiness(
                     project_id=project.project_id,
@@ -1407,7 +1410,9 @@ def create_api(
     return app
 
 
-def _latest_by_item(store: EventStore, audit: Any | None = None) -> dict[str, dict[str, Any]]:
+def _latest_by_item(
+    store: EventStore, audit: Any | None = None, project_id: str | None = None
+) -> dict[str, dict[str, Any]]:
     """Newest event per work item. One scan — doing it per item would be a
     query per row.
 
@@ -1416,9 +1421,14 @@ def _latest_by_item(store: EventStore, audit: Any | None = None) -> dict[str, di
     `EventStore`, so reading that alone reported `latest: null` for every item
     forever, no matter how much work ran. The ingest store remains the source
     for a harness run as a plain `ingest` + `serve` pair over log files.
+
+    Scoped to one project. `(project_id, item_id)` is an item's identity and
+    two projects each having a `T1` is explicitly supported, so keying on the
+    item id alone showed one project's newest event as the other's `latest` —
+    including its session deep link.
     """
     if audit is not None:
-        rows = audit.latest_by_item()
+        rows = audit.latest_by_item(project_id=project_id)
         if rows:
             return {
                 item_id: {**row, "data": json.loads(row.get("data") or "{}")}
@@ -1426,7 +1436,10 @@ def _latest_by_item(store: EventStore, audit: Any | None = None) -> dict[str, di
             }
     latest: dict[str, dict[str, Any]] = {}
     for event in store.recent(kind="work", limit=2000):
-        item_id = event["data"].get("item_id")
+        data = event["data"]
+        item_id = data.get("item_id")
+        if project_id is not None and data.get("project_id") not in (None, project_id):
+            continue
         if item_id and item_id not in latest:
             latest[item_id] = event
     return latest
@@ -1471,6 +1484,7 @@ def _audit_event_fields(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _preflight(
+    state: Any,
     queue: WorkQueue,
     project: Project,
     session_host: Any | None = None,
@@ -1479,32 +1493,35 @@ def _preflight(
 ) -> Any:
     """Build a preflight report for a project, using whatever is configured.
 
+    `state` is the calling app's own `app.state`. It used to be a module-level
+    dictionary, which meant a second `create_api` silently overwrote the
+    first's wiring: app A would report app B's worker pool, session host and
+    probe results, while its top-level readiness fields still came from its
+    own state. A readiness gate that can be changed by an unrelated app in the
+    same process is not a gate.
+
     `session_host` is a *probe*, not the host: readiness over many projects
     would otherwise ask the same host the same question once per project.
     """
     from .preflight import last_base_result_probe, preflight_project, session_host_probe
 
     stored = queue.get_setting("role_map") or {}
-    client = _APP_STATE.get("model_client")
-    host = _APP_STATE.get("session_host")
+    client = getattr(state, "model_client", None)
+    host = getattr(state, "session_host", None)
+    base_checks = getattr(state, "base_checks", None)
     return preflight_project(
         project,
-        has_fleet=_APP_STATE.get("fleet") is not None,
+        has_fleet=getattr(state, "fleet", None) is not None,
         reviewer_route=(project.roles or stored).get("reviewer"),
         reviewer_independent=client.reviewer_independence() if client is not None else None,
         session_host=session_host or (session_host_probe(host) if host is not None else None),
         checks_probe=(
-            last_base_result_probe(_APP_STATE["base_checks"], project.project_id)
-            if check_base and _APP_STATE.get("base_checks") is not None
+            last_base_result_probe(base_checks, project.project_id)
+            if check_base and base_checks is not None
             else None
         ),
-        **(_APP_STATE.get("probes") or {}),
+        **(getattr(state, "probes", None) or {}),
     )
-
-
-#: Set by `create_api`. A module-level handle so helpers outside the closure
-#: can see the same wiring the routes do.
-_APP_STATE: dict[str, Any] = {}
 
 
 def _project_spec(project: Project) -> ProjectSpec:

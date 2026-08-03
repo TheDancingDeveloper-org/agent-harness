@@ -376,6 +376,31 @@ class ExecutionReadiness(BaseModel):
     )
 
 
+class InceptionDraft(BaseModel):
+    """A scoping session that has been opened and nothing more.
+
+    Named rather than returned as a bare dictionary: a generated client cannot
+    discover `state` or `project_id` from `additionalProperties: true`, and
+    these two fields are the whole answer to "did it start, and under what id".
+    """
+
+    project_id: str = Field(description="The project being scoped.")
+    state: str = Field(description="Where in the inception flow this sits, e.g. `draft`.")
+    overview: str = Field(description="The paragraph the human supplied.")
+    revisions: list[str] = Field(
+        default_factory=list, description="Feedback given on previous proposals, oldest first."
+    )
+    created_at: float | None = Field(None, description="When scoping began, unix seconds.")
+
+
+class InceptionPlan(BaseModel):
+    """A proposal rendered as a PLAN.md."""
+
+    markdown: str = Field(
+        description="The plan document, ready to be written to a file and synced."
+    )
+
+
 class BaseCheckStatus(BaseModel):
     """A base-branch check run, which happens off the request thread.
 

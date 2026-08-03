@@ -346,6 +346,15 @@ an instruction; `workers` is whether anything is carrying it out, and a project
 marked running with zero workers is the failure that otherwise reads as
 success.
 
+**Changing capacity without stopping.** Re-registering a running project with a
+different `max_workers` resizes its pool in place — POST the same body with the
+new number. Extra workers start immediately; surplus ones stop claiming and are
+joined once the item they are holding finishes, so no agent is interrupted and
+the project never leaves `running`. That means `workers` stays at the old count
+for as long as those items take, which is the honest answer: `max_workers` is
+what you asked for, `workers` is what is alive. On a stopped project it changes
+nothing until the next start, as registering anything does.
+
 **Giving up.** An item that reliably kills its worker is never released, so its
 lease lapses and it would be re-claimed forever — spending money each cycle
 while looking exactly like an item that is busy. Past `max_attempts` it becomes

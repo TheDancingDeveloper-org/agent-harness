@@ -29,6 +29,7 @@ import contextlib
 import logging
 import shlex
 import shutil
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -210,6 +211,46 @@ class SessionExecutor:
         if report.reaped or report.failed:
             log.info("session reaper: %s", report)
         return report
+
+    def serve(
+        self,
+        *,
+        poll_seconds: float = 15.0,
+        stop: threading.Event | None = None,
+        max_idle_polls: int | None = None,
+    ) -> list[Outcome]:
+        """Run until stopped, waiting for work rather than exiting without it.
+
+        `run()` drains the backlog and returns, which is right for a one-shot
+        invocation and wrong for a fleet: add an item an hour later and
+        nothing claims it. This is the daemon.
+
+        Control state is re-read on every pass, so pausing a project takes
+        effect at the next item boundary without a restart -- and resuming it
+        needs no restart either.
+        """
+        outcomes: list[Outcome] = []
+        stop = stop or threading.Event()
+        idle = 0
+        while not stop.is_set():
+            self.reap()
+            try:
+                outcome = self.run_once()
+            except CapExhausted as exc:
+                # Out of budget. Waiting is the only useful response, and the
+                # park in ModelClient already knows for how long -- so sleep a
+                # poll and re-ask rather than exiting the fleet.
+                log.info("budget exhausted, waiting: %s", exc)
+                outcome = None
+            if outcome is None:
+                idle += 1
+                if max_idle_polls is not None and idle >= max_idle_polls:
+                    return outcomes
+                stop.wait(poll_seconds)
+                continue
+            idle = 0
+            outcomes.append(outcome)
+        return outcomes
 
     def run(self, limit: int | None = None) -> list[Outcome]:
         outcomes: list[Outcome] = []

@@ -145,7 +145,7 @@ def _run(args: argparse.Namespace) -> int:
     from .executor import Checks, Executor
     from .github import GitHub
     from .model_client import ModelClient, Route
-    from .work import WorkQueue, WorkRecord
+    from .work import RUNNING, WorkQueue, WorkRecord
 
     # With a session host the CLI agent does the implementing, so only the
     # reviewer needs a model. Demanding three would be asking for two that are
@@ -273,7 +273,27 @@ def _run(args: argparse.Namespace) -> int:
             on_event=emit,
             push=not args.no_push,
         )
-    outcomes = executor.run(limit=args.limit)
+    # Typing `agent-harness run` IS the human deciding to start this project.
+    # A project starts `stopped` so a restart never resumes on its own, but
+    # applying that to an explicit command would make the CLI silently do
+    # nothing -- correct by the letter of the rule and useless.
+    state, _ = queue.control(project_id=args.project)
+    if state != RUNNING:
+        queue.set_control(RUNNING, reason="agent-harness run", project_id=args.project)
+        print(f"project {args.project}: {state} -> running")
+
+    if args.serve:
+        print(f"serving; polling every {args.poll:.0f}s. Ctrl-C to stop.")
+        try:
+            outcomes = executor.serve(poll_seconds=args.poll)
+        except KeyboardInterrupt:
+            outcomes = []
+            print("\nstopping after the current item")
+        finally:
+            queue.checkpoint()
+    else:
+        outcomes = executor.run(limit=args.limit)
+        queue.checkpoint()
     if not outcomes:
         print("nothing to do")
         return 0
@@ -369,6 +389,24 @@ def main(argv: list[str] | None = None) -> int:
         help="CLI agent to run per item. `{prompt_file}` is substituted.",
     )
     p_run.add_argument("--limit", type=int, help="stop after N items")
+    p_run.add_argument(
+        "--project",
+        default="default",
+        help="Which project's queue to work. Items are keyed by (project, id), "
+        "so two projects may each have a T1.",
+    )
+    p_run.add_argument(
+        "--serve",
+        action="store_true",
+        help="Keep running when the queue is empty, waiting for work, instead "
+        "of exiting. Without this a plan synced an hour later is never picked up.",
+    )
+    p_run.add_argument(
+        "--poll",
+        type=float,
+        default=15.0,
+        help="Seconds between checks for new work when serving.",
+    )
     p_run.add_argument("--base", default="main", help="branch to base work on")
     p_run.add_argument(
         "--no-push", action="store_true", help="commit locally but do not push or open PRs"

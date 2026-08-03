@@ -20,6 +20,7 @@ append-only even though current state does not.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import sqlite3
@@ -31,6 +32,8 @@ from typing import Any
 # Lease length. Long enough that an agent thinking hard about a hard problem
 # is not evicted; short enough that a crashed worker's item is picked up in
 # the same session rather than the next day.
+log = logging.getLogger(__name__)
+
 DEFAULT_LEASE_SECONDS = 900.0
 
 PENDING = "pending"
@@ -38,6 +41,18 @@ CLAIMED = "claimed"
 DONE = "done"
 FAILED = "failed"
 BLOCKED = "blocked"
+#: Tried too many times and given up on. Distinct from `failed`, which is one
+#: attempt that did not work: `exhausted` says the harness will not try again
+#: without a human. Without it, an item that reliably kills its worker is
+#: re-claimed forever -- it sinks to the back of the queue on `attempts` and
+#: returns every cycle, spending real money each time, looking identical to
+#: an item that is merely busy.
+EXHAUSTED = "exhausted"
+
+#: Attempts before an item is given up on. Generous: a lease expiring because
+#: a pod restarted is not the item's fault, and giving up on the first crash
+#: would strand work a retry would have finished.
+DEFAULT_MAX_ATTEMPTS = 5
 
 # Fleet control, per project. None of these states kill anything: stopping
 # work mid-item destroys an agent's context and leaves a half-finished
@@ -85,6 +100,7 @@ CREATE TABLE IF NOT EXISTS projects (
     plan_path   TEXT,
     roles       TEXT,
     max_workers INTEGER NOT NULL DEFAULT 1,
+    max_attempts INTEGER NOT NULL DEFAULT 5,
     created_at  REAL NOT NULL DEFAULT 0,
     updated_at  REAL NOT NULL DEFAULT 0
 );
@@ -179,6 +195,7 @@ class Project:
     plan_path: str | None = None
     roles: dict[str, Any] | None = None
     max_workers: int = 1
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -278,8 +295,28 @@ class WorkQueue:
                 columns = {r["name"] for r in conn.execute("PRAGMA table_info(control)")}
                 if "project_id" not in columns:
                     self._migrate_control_to_projects(conn)
+            self._add_missing_columns(conn)
         finally:
             conn.close()
+
+    #: Columns added after a table first shipped. SQLite cannot add them via
+    #: CREATE TABLE IF NOT EXISTS on an existing table, and the bootstrap in
+    #: `_migrate` creates `projects` before SCHEMA runs -- so without this,
+    #: every new column exists in the schema string and nowhere else. Additive
+    #: only: nothing here drops or rewrites, so a rollback to an older build
+    #: still reads its own columns.
+    ADDED_COLUMNS = {
+        "projects": {"max_attempts": "INTEGER NOT NULL DEFAULT 5"},
+    }
+
+    def _add_missing_columns(self, conn: sqlite3.Connection) -> None:
+        for table, columns in self.ADDED_COLUMNS.items():
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if not existing:
+                continue
+            for name, declaration in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
     def _migrate_work_to_projects(self, conn: sqlite3.Connection) -> None:
         conn.execute("BEGIN IMMEDIATE")
@@ -373,13 +410,14 @@ class WorkQueue:
         try:
             conn.execute(
                 "INSERT INTO projects (project_id, name, repo, work_dir, base_branch, "
-                "checks, plan_path, roles, max_workers, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "checks, plan_path, roles, max_workers, max_attempts, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET "
                 "name=excluded.name, repo=excluded.repo, work_dir=excluded.work_dir, "
                 "base_branch=excluded.base_branch, checks=excluded.checks, "
                 "plan_path=excluded.plan_path, roles=excluded.roles, "
-                "max_workers=excluded.max_workers, updated_at=excluded.updated_at",
+                "max_workers=excluded.max_workers, max_attempts=excluded.max_attempts, "
+                "updated_at=excluded.updated_at",
                 (
                     project.project_id,
                     project.name,
@@ -390,6 +428,7 @@ class WorkQueue:
                     project.plan_path,
                     json.dumps(project.roles) if project.roles else None,
                     project.max_workers,
+                    project.max_attempts,
                     project.created_at or self.now(),
                     self.now(),
                 ),
@@ -618,6 +657,7 @@ class WorkQueue:
         now = self.now()
         conn = self._connect()
         try:
+            limit = self.max_attempts_for(conn, project_id)
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM work WHERE project_id = ? "
@@ -627,6 +667,23 @@ class WorkQueue:
             ).fetchall()
             for candidate in row:
                 record = WorkRecord.from_row(candidate)
+                if limit and record.attempts >= limit:
+                    # Give up rather than recycle. An item that reliably kills
+                    # its worker is never released, so its lease expires and it
+                    # is re-claimed forever -- spending money every cycle while
+                    # looking exactly like an item that is merely busy.
+                    conn.execute(
+                        "UPDATE work SET state = ?, owner = NULL, lease_until = 0, "
+                        "last_error = ?, updated_at = ? WHERE project_id = ? AND item_id = ?",
+                        (
+                            EXHAUSTED,
+                            f"gave up after {record.attempts} attempts",
+                            now,
+                            project_id,
+                            record.item_id,
+                        ),
+                    )
+                    continue
                 if not self._dependencies_met(conn, record):
                     continue
                 conn.execute(
@@ -652,6 +709,18 @@ class WorkQueue:
             return None
         finally:
             conn.close()
+
+    def max_attempts_for(self, conn: sqlite3.Connection, project_id: str) -> int:
+        """The project's give-up threshold. 0 disables it.
+
+        Read per claim rather than cached: raising it is how an operator
+        rescues a batch of exhausted items, and that should take effect
+        without a restart.
+        """
+        row = conn.execute(
+            "SELECT max_attempts FROM projects WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        return int(row["max_attempts"]) if row else DEFAULT_MAX_ATTEMPTS
 
     def _dependencies_met(self, conn: sqlite3.Connection, record: WorkRecord) -> bool:
         for dependency in record.depends_on:
@@ -771,6 +840,22 @@ class WorkQueue:
                     "SELECT * FROM work WHERE project_id = ? ORDER BY item_id", (project_id,)
                 )
             return [WorkRecord.from_row(r) for r in rows]
+        finally:
+            conn.close()
+
+    def checkpoint(self) -> None:
+        """Fold the WAL back into the main database file.
+
+        Called on clean shutdown. Nearly all of a WAL-mode database can live
+        in the -wal sidecar -- this one was 4 KB against a 754 KB WAL in
+        production -- so any backup or volume migration that copies only the
+        .sqlite silently takes almost nothing.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as exc:
+            log.warning("could not checkpoint %s: %s", self.path, exc)
         finally:
             conn.close()
 

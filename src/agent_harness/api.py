@@ -133,6 +133,7 @@ def create_api(
     token: str | None = None,
     root_path: str = "",
     audit: AuditStore | None = None,
+    fleet: Any | None = None,
 ) -> FastAPI:
     """Build the API.
 
@@ -154,6 +155,7 @@ def create_api(
     app.state.store = store
     app.state.queue = queue
     app.state.audit = audit
+    app.state.fleet = fleet
     app.state.token = token
 
     def require_token(
@@ -594,6 +596,11 @@ def create_api(
                     control=FleetControl(state=state, reason=reason),
                     previous_state=previous,
                     stale=len(queue.stale(project_id=project.project_id)),
+                    workers=(
+                        app.state.fleet.running().get(project.project_id, 0)
+                        if app.state.fleet is not None
+                        else 0
+                    ),
                 )
             )
         return ProjectList(projects=out)
@@ -662,8 +669,15 @@ def create_api(
         queue = need_queue()
         if queue.get_project(project_id) is None:
             raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
-        queue.set_control(RUNNING, reason=None, project_id=project_id)
-        return _project_summary(queue, project_id)
+        fleet_ = app.state.fleet
+        if fleet_ is not None:
+            # Starting workers sets control itself. Doing it here as well
+            # would leave a project marked running with nobody claiming when
+            # no fleet is attached -- which reads as working and is not.
+            fleet_.start(project_id)
+        else:
+            queue.set_control(RUNNING, reason=None, project_id=project_id)
+        return _project_summary(queue, project_id, app.state.fleet)
 
     @app.post(
         "/api/projects/{project_id}/stop",
@@ -680,12 +694,15 @@ def create_api(
         queue = need_queue()
         if queue.get_project(project_id) is None:
             raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
-        queue.set_control(
-            STOPPED,
-            reason=request.reason if request else None,
-            project_id=project_id,
-        )
-        return _project_summary(queue, project_id)
+        reason = request.reason if request else None
+        fleet_ = app.state.fleet
+        if fleet_ is not None:
+            # Joins in-flight work rather than killing it: an agent stopped
+            # mid-item loses the context that makes it resumable.
+            fleet_.stop(project_id, reason=reason)
+        else:
+            queue.set_control(STOPPED, reason=reason, project_id=project_id)
+        return _project_summary(queue, project_id, app.state.fleet)
 
     @app.post(
         "/api/control",
@@ -978,7 +995,7 @@ def _project_spec(project: Project) -> ProjectSpec:
     )
 
 
-def _project_summary(queue: WorkQueue, project_id: str) -> ProjectSummary:
+def _project_summary(queue: WorkQueue, project_id: str, fleet: Any | None = None) -> ProjectSummary:
     project = queue.get_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
@@ -989,6 +1006,7 @@ def _project_summary(queue: WorkQueue, project_id: str) -> ProjectSummary:
         control=FleetControl(state=state, reason=reason),
         previous_state=previous,
         stale=len(queue.stale(project_id=project_id)),
+        workers=(fleet.running().get(project_id, 0) if fleet is not None else 0),
     )
 
 

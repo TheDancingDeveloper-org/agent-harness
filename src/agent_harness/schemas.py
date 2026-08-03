@@ -181,6 +181,13 @@ class ProjectSummary(BaseModel):
         "across a restart -- the operator's intent is otherwise what a restart destroys.",
     )
     stale: int = 0
+    workers: int = Field(
+        0,
+        description="Workers actually alive for this project. Distinct from the control "
+        "state on purpose: `running` is an instruction, this is whether anything is "
+        "carrying it out. A project marked running with zero workers is the failure "
+        "that otherwise looks like success.",
+    )
 
 
 class ProjectList(BaseModel):

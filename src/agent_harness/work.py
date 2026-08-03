@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS projects (
     roles       TEXT,
     max_workers INTEGER NOT NULL DEFAULT 1,
     max_attempts INTEGER NOT NULL DEFAULT 5,
+    min_free_disk_gb REAL NOT NULL DEFAULT 0,
     created_at  REAL NOT NULL DEFAULT 0,
     updated_at  REAL NOT NULL DEFAULT 0
 );
@@ -196,6 +197,7 @@ class Project:
     roles: dict[str, Any] | None = None
     max_workers: int = 1
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    min_free_disk_gb: float = 0.0
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -306,7 +308,10 @@ class WorkQueue:
     #: only: nothing here drops or rewrites, so a rollback to an older build
     #: still reads its own columns.
     ADDED_COLUMNS = {
-        "projects": {"max_attempts": "INTEGER NOT NULL DEFAULT 5"},
+        "projects": {
+            "max_attempts": "INTEGER NOT NULL DEFAULT 5",
+            "min_free_disk_gb": "REAL NOT NULL DEFAULT 0",
+        },
     }
 
     def _add_missing_columns(self, conn: sqlite3.Connection) -> None:
@@ -410,13 +415,15 @@ class WorkQueue:
         try:
             conn.execute(
                 "INSERT INTO projects (project_id, name, repo, work_dir, base_branch, "
-                "checks, plan_path, roles, max_workers, max_attempts, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "checks, plan_path, roles, max_workers, max_attempts, min_free_disk_gb, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET "
                 "name=excluded.name, repo=excluded.repo, work_dir=excluded.work_dir, "
                 "base_branch=excluded.base_branch, checks=excluded.checks, "
                 "plan_path=excluded.plan_path, roles=excluded.roles, "
                 "max_workers=excluded.max_workers, max_attempts=excluded.max_attempts, "
+                "min_free_disk_gb=excluded.min_free_disk_gb, "
                 "updated_at=excluded.updated_at",
                 (
                     project.project_id,
@@ -429,6 +436,7 @@ class WorkQueue:
                     json.dumps(project.roles) if project.roles else None,
                     project.max_workers,
                     project.max_attempts,
+                    project.min_free_disk_gb,
                     project.created_at or self.now(),
                     self.now(),
                 ),
@@ -677,7 +685,10 @@ class WorkQueue:
                         "last_error = ?, updated_at = ? WHERE project_id = ? AND item_id = ?",
                         (
                             EXHAUSTED,
-                            f"gave up after {record.attempts} attempts",
+                            (
+                                f"gave up after {record.attempts} attempts"
+                                + (f": {record.last_error}" if record.last_error else "")
+                            ),
                             now,
                             project_id,
                             record.item_id,

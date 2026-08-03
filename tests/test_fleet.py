@@ -144,6 +144,29 @@ def test_stopping_leaves_the_other_projects_running(queue: WorkQueue) -> None:
         fleet.stop_all()
 
 
+def test_requesting_a_stop_returns_while_an_item_is_still_draining(queue: WorkQueue) -> None:
+    entered = threading.Event()
+    finish = threading.Event()
+
+    class SlowExecutor:
+        def serve(self, *, poll_seconds: float, stop: threading.Event) -> None:
+            entered.set()
+            finish.wait(5)
+
+    fleet = Fleet(queue, lambda _pid: SlowExecutor(), poll_seconds=0.01)
+    fleet.start("a")
+    assert entered.wait(1)
+
+    started = time.monotonic()
+    fleet.request_stop("a", reason="deploying")
+
+    assert time.monotonic() - started < 0.5
+    assert queue.control(project_id="a") == ("draining", "deploying")
+    assert fleet.running().get("a", 0) >= 1
+    finish.set()
+    assert wait_for(lambda: queue.control(project_id="a")[0] == STOPPED)
+
+
 def test_a_worker_that_dies_does_not_take_the_fleet_with_it(queue: WorkQueue) -> None:
     """Its claim is a lease, so whatever it held comes back on its own."""
 
@@ -195,6 +218,20 @@ def test_an_item_that_keeps_killing_its_worker_is_given_up_on(tmp_path: Path) ->
     assert record is not None
     assert record.state == EXHAUSTED
     assert "gave up after" in (record.last_error or "")
+
+
+def test_giving_up_keeps_the_last_retry_class(tmp_path: Path) -> None:
+    q = WorkQueue(str(tmp_path / "w.sqlite"))
+    q.add_project(Project(project_id="p", name="P", max_attempts=1))
+    q.set_control(RUNNING, project_id="p")
+    q.add([rec("T1")], project_id="p")
+    assert q.claim("w", project_id="p") is not None
+    q.release("T1", PENDING, error="reviewer retries exhausted; last was transient", project_id="p")
+
+    assert q.claim("w", project_id="p") is None
+    record = q.get("T1", project_id="p")
+    assert record is not None and record.state == EXHAUSTED
+    assert "last was transient" in (record.last_error or "")
 
 
 def test_raising_the_limit_rescues_exhausted_work(tmp_path: Path) -> None:

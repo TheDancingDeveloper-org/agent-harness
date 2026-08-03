@@ -16,6 +16,7 @@ from agent_harness.model_client import (
     ModelClient,
     RequestRefused,
     Response,
+    RetryExhausted,
     RetryPolicy,
     Route,
 )
@@ -282,8 +283,10 @@ def test_jitter_actually_reaches_the_sleep() -> None:
 def test_exhausting_the_ladder_names_the_last_failure() -> None:
     transport = Recorder(*[fail(503) for _ in range(4)])
     client = build(transport, policy=RetryPolicy(max_attempts=4))
-    with pytest.raises(RuntimeError, match="transient"):
+    with pytest.raises(RetryExhausted, match="transient") as excinfo:
         client.call("implementer", MESSAGES)
+    assert excinfo.value.kind == P.TRANSIENT
+    assert excinfo.value.endpoint == "https://a"
 
 
 # ---------------------------------------------------------------- locality

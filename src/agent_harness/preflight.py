@@ -20,8 +20,10 @@ the last thing that should be trusted.
 
 from __future__ import annotations
 
+import shlex
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -139,6 +141,88 @@ def session_host_probe(host: Any) -> Probe:
     return probe
 
 
+def clean_checks_probe(project: Any, *, timeout: float = 900.0) -> Probe:
+    """Run configured argv checks in a detached worktree of base_branch.
+
+    This is intentionally opt-in: a clean build can be as expensive as the
+    work itself, but when requested it must happen before any agent spends
+    tokens and its failure must name the command that failed.
+    """
+
+    def probe() -> tuple[bool, str]:
+        work_dir = getattr(project, "work_dir", None)
+        commands = list(getattr(project, "checks", None) or [])
+        if not work_dir or not commands:
+            return (True, "no checks configured")
+        root = Path(work_dir)
+        if not (root / ".git").exists():
+            return (False, f"cannot probe checks: {work_dir} is not a git repository")
+        temp = Path(tempfile.mkdtemp(prefix="harness-check-", dir=str(root.parent)))
+        try:
+            temp.rmdir()
+            base = getattr(project, "base_branch", "main")
+            added = subprocess.run(
+                ["git", "-C", str(root), "worktree", "add", "--detach", str(temp), base],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if added.returncode != 0:
+                return (False, f"could not create clean worktree: {added.stderr.strip()[:300]}")
+            for raw in commands:
+                from .runtime import validate_check_command
+
+                try:
+                    validate_check_command(raw)
+                    argv = shlex.split(raw)
+                    result = subprocess.run(
+                        argv,
+                        cwd=temp,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    return (False, f"`{raw}` timed out after {timeout:.0f}s on the base branch")
+                except ValueError as exc:
+                    return (False, str(exc))
+                if result.returncode != 0:
+                    tail = (result.stdout + result.stderr).strip().splitlines()[-40:]
+                    return (False, f"`{raw}` failed on base branch:\n" + "\n".join(tail))
+            return (True, f"{len(commands)} check(s) pass on {base}")
+        finally:
+            subprocess.run(
+                ["git", "-C", str(root), "worktree", "remove", "--force", str(temp)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            # `git worktree add` can fail after creating the directory but
+            # before registering it, in which case `worktree remove` has
+            # nothing to remove. The probe must not become another source of
+            # orphaned trees.
+            shutil.rmtree(temp, ignore_errors=True)
+
+    return probe
+
+
+def disk_space_probe(path: str, floor_gb: float = 0.0) -> tuple[bool, str]:
+    """Free space on the volume holding a project's checkout."""
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError as exc:
+        return (False, f"could not measure free space at {path}: {exc}")
+    gib = 1024**3
+    free_gb = usage.free / gib
+    total_gb = usage.total / gib
+    ok = floor_gb <= 0 or free_gb >= floor_gb
+    detail = f"{free_gb:.1f} GiB free of {total_gb:.1f} GiB on volume holding {path}"
+    if floor_gb > 0:
+        detail += f"; configured floor {floor_gb:.1f} GiB"
+    return (ok, detail)
+
+
 def preflight_project(
     project: Any,
     *,
@@ -148,6 +232,8 @@ def preflight_project(
     session_host: Probe | None = None,
     git_probe: Callable[[str], tuple[bool, str]] = _is_git_repo,
     github_probe: Callable[[str], tuple[bool, str]] = _gh_can_write,
+    checks_probe: Probe | None = None,
+    disk_probe: Callable[[str, float], tuple[bool, str]] = disk_space_probe,
 ) -> Preflight:
     """Everything that must hold before this project can produce a pull request."""
     checks: list[Check] = []
@@ -164,6 +250,9 @@ def preflight_project(
             else "no worker pool is attached, so starting would set a flag nobody acts on",
         )
     )
+    if checks_probe is not None:
+        ok, detail = checks_probe()
+        checks.append(Check("base checks", ok, detail))
 
     # Only when one is configured. A deployment with no session host is
     # already caught by the workers check above, and adding a second failing
@@ -182,6 +271,10 @@ def preflight_project(
     if work_dir:
         ok, detail = git_probe(work_dir)
         checks.append(Check("checkout", ok, detail))
+        disk_ok, disk_detail = disk_probe(
+            work_dir, float(getattr(project, "min_free_disk_gb", 0.0) or 0.0)
+        )
+        checks.append(Check("disk space", disk_ok, disk_detail))
     else:
         checks.append(
             Check("checkout", False, "no work_dir is configured, so no worktree can be made")

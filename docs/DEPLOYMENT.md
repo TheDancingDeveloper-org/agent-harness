@@ -84,8 +84,11 @@ the opposite:
   on every loop. `POST /api/projects/{id}/start` is the only thing that starts
   work, and it runs preflight first.
 - **Stopping drains.** Process shutdown and `POST /api/projects/{id}/stop`
-  both stop *new* claims and join in-flight work. Killing an agent mid-item
-  destroys the context that makes its work resumable.
+  both stop *new* claims and join in-flight work. The HTTP action returns once
+  `control.state` is `draining`; `GET /api/projects/{id}` shows the
+  `draining_items` it is waiting for and reports `stopped` after the join.
+  Process shutdown itself still blocks. Killing an agent mid-item destroys
+  the context that makes its work resumable.
 
 ---
 
@@ -146,6 +149,12 @@ Each project costs one read of GitHub's permissions for its repo, so a
 deployment that polls this should name the project it cares about:
 `/api/readiness?project_id=widgets`.
 
+To run the configured argv checks in a detached, clean worktree of the base
+branch, add `&check_base=true`. This probe can compile and test an entire
+repository, so it is deliberately opt-in. The same option is available on
+the project preflight endpoint and on `POST /api/projects/{id}/start`; a
+failure is blocking and names the first command and its output.
+
 **Do not** smoke-test by calling `start`. It is a state-changing request: on a
 correctly configured deployment it begins spending money, and on a
 misconfigured one it tells you less than the line above.
@@ -159,8 +168,10 @@ misconfigured one it tells you less than the line above.
 | `workers` | The process is monitoring-only. Restart it with `--session-host` (and the agent/reviewer flags). |
 | `session host` | The host is configured but refused a read. Check it is up, and that `AIDEVENV_TOKEN` is the token it expects. |
 | `checkout` | The project's `work_dir` is missing or is not a git repository *inside this process's filesystem* — a container needs it mounted. |
+| `disk space` | The volume holding `work_dir` is below the project's configured `min_free_disk_gb` floor. Free and total GiB are included in the detail. |
 | `github write` | `gh` is missing, unauthenticated, or the account lacks push on that repo. |
 | `reviewer` | No reviewer route. `PUT /api/roles`, or restart with `--reviewer`/`--endpoint`. |
+| `base checks` | A configured command failed on an unmodified base-branch worktree. Fix the command/prerequisites before starting. |
 
 Warnings do not block a start and are still worth reading: `checks` means
 nothing verifies a diff before the reviewer sees it, and `reviewer

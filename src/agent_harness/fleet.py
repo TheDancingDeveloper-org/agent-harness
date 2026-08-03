@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .work import CLAIMED, FAILED, RUNNING, STOPPED, WorkQueue
+from .work import CLAIMED, DRAINING, FAILED, RUNNING, STOPPED, WorkQueue
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +58,7 @@ class ProjectPool:
     project_id: str
     threads: list[threading.Thread] = field(default_factory=list)
     stop: threading.Event = field(default_factory=threading.Event)
+    draining: bool = False
 
     @property
     def size(self) -> int:
@@ -105,8 +106,15 @@ class Fleet:
 
         with self._lock:
             existing = self._pools.get(project_id)
-            if existing is not None and existing.size:
-                return existing.size
+            if existing is not None:
+                if existing.draining:
+                    # The pool remains registered until its background join
+                    # completes. Starting a replacement in that small window
+                    # would let the old finalizer set the new pool's control
+                    # state to STOPPED underneath it.
+                    return existing.size
+                if existing.size:
+                    return existing.size
 
             pool = ProjectPool(project_id=project_id)
             # Set control BEFORE the threads exist. A worker that starts while
@@ -126,7 +134,9 @@ class Fleet:
             log.info("started %d worker(s) for project %s", len(pool.threads), project_id)
             return len(pool.threads)
 
-    def stop(self, project_id: str, *, reason: str | None = None, timeout: float = 30.0) -> None:
+    def stop(
+        self, project_id: str, *, reason: str | None = None, timeout: float | None = None
+    ) -> None:
         """Stop claiming and wait for in-flight work to finish.
 
         **Nothing in flight is interrupted.** Killing an agent mid-item
@@ -135,14 +145,50 @@ class Fleet:
         better, which is why this joins rather than kills.
         """
         with self._lock:
-            pool = self._pools.pop(project_id, None)
-        self.queue.set_control(STOPPED, reason=reason, project_id=project_id)
+            pool = self._pools.get(project_id)
         if pool is None:
+            self.queue.set_control(STOPPED, reason=reason, project_id=project_id)
             return
+        self.queue.set_control(DRAINING, reason=reason, project_id=project_id)
         pool.stop.set()
         for thread in pool.threads:
             thread.join(timeout=timeout)
+        with self._lock:
+            if self._pools.get(project_id) is pool:
+                self._pools.pop(project_id, None)
+        self.queue.set_control(STOPPED, reason=reason, project_id=project_id)
         log.info("stopped project %s", project_id)
+
+    def request_stop(self, project_id: str, *, reason: str | None = None) -> None:
+        """Cease claims now and finish the blocking join in the background."""
+        with self._lock:
+            pool = self._pools.get(project_id)
+            if pool is None:
+                self.queue.set_control(STOPPED, reason=reason, project_id=project_id)
+                return
+            if pool.draining:
+                return
+            pool.draining = True
+        # State first: workers consult it before every claim, so this is the
+        # point after which the HTTP caller can truthfully be told no new work
+        # will start.
+        self.queue.set_control(DRAINING, reason=reason, project_id=project_id)
+        pool.stop.set()
+        threading.Thread(
+            target=self._finish_stop,
+            args=(project_id, pool, reason),
+            name=f"harness-drain-{project_id}",
+            daemon=True,
+        ).start()
+
+    def _finish_stop(self, project_id: str, pool: ProjectPool, reason: str | None) -> None:
+        for thread in pool.threads:
+            thread.join()
+        with self._lock:
+            if self._pools.get(project_id) is pool:
+                self._pools.pop(project_id, None)
+        self.queue.set_control(STOPPED, reason=reason, project_id=project_id)
+        log.info("drained project %s", project_id)
 
     def stop_all(self, *, reason: str | None = None) -> None:
         for project_id in list(self._pools):

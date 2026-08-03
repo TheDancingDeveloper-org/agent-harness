@@ -306,8 +306,13 @@ curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/projects \
     "project_id": "ngms", "name": "NGMS",
     "repo": "owner/NGMS", "work_dir": "/work/ngms",
     "base_branch": "main", "checks": ["cargo test"],
-    "max_workers": 3, "max_attempts": 5
+    "max_workers": 3, "max_attempts": 5, "min_free_disk_gb": 48
   }'
+
+# Check the base branch before paying for an agent. Check entries are argv,
+# not shell: use separate list entries instead of `cmd1 && cmd2`.
+curl -sH "Authorization: Bearer $TOKEN" \
+  'localhost:8099/api/readiness?project_id=ngms&check_base=true' | jq
 
 # Everything about it, in one call — counts, control state, live worker count.
 curl -sH "Authorization: Bearer $TOKEN" localhost:8099/api/projects | jq
@@ -407,7 +412,9 @@ line. Register them with `POST /api/projects`.
 **Nothing starts on its own.** Booting registers no workers and resumes no
 project; `POST /api/projects/{id}/start` is the only thing that creates a
 worker, and only after preflight passes. Stopping drains: no new claims, and
-in-flight items are joined rather than killed.
+in-flight items are joined rather than killed. The stop request returns while
+that happens; read `control.state` and `draining_items` from the project until
+it changes from `draining` to `stopped`.
 
 Monitoring-only deployments stay supported — a dashboard over someone else's
 harness should not need a session host, a model key or a checkout.

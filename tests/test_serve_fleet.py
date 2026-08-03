@@ -13,6 +13,7 @@ touched — which is the only way this wiring can be tested at all.
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import time
@@ -24,7 +25,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_harness import providers as P
+from agent_harness.__main__ import _fleet_for_serve
 from agent_harness.api import ROLE_MAP_KEY, create_api
+from agent_harness.audit import AuditStore
 from agent_harness.fleet import Fleet
 from agent_harness.model_client import ModelClient, Response, Route
 from agent_harness.runtime import NotExecutable, session_executor_factory
@@ -244,14 +247,12 @@ def test_stopping_drains_rather_than_kills(served: Any) -> None:
     served.post("/api/projects/p/start?force=true", headers=hdr())
     assert wait_for(lambda: served.fleet.running().get("p", 0) == 1)
 
-    response = served.post(
-        "/api/projects/p/stop", headers=hdr(), json={"state": "stopped", "reason": "deploying"}
-    )
+    response = served.post("/api/projects/p/stop", headers=hdr(), json={"reason": "deploying"})
 
     assert response.status_code == 200
-    assert served.fleet.running().get("p", 0) == 0
-    state, reason = served.queue.control(project_id="p")
-    assert state == STOPPED and reason == "deploying"
+    assert response.json()["control"]["state"] in {"draining", "stopped"}
+    assert wait_for(lambda: served.queue.control(project_id="p")[0] == STOPPED)
+    assert served.queue.control(project_id="p")[1] == "deploying"
 
 
 def test_monitoring_only_is_still_supported(repo: Path, tmp_path: Path) -> None:
@@ -267,3 +268,58 @@ def test_monitoring_only_is_still_supported(repo: Path, tmp_path: Path) -> None:
         refused = c.post("/api/projects/p/start?force=true", headers=hdr())
     assert refused.status_code == 409
     assert "no worker pool" in refused.json()["detail"]
+
+
+def test_serve_event_sink_writes_live_telemetry_to_the_audit_store(tmp_path: Path) -> None:
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue.set_setting(
+        ROLE_MAP_KEY,
+        {"reviewer": {"model": "m", "endpoint": "https://e", "provider": "generic"}},
+    )
+    audit = AuditStore(tmp_path / "audit.sqlite")
+    args = argparse.Namespace(
+        session_host="https://sessions.example",
+        reviewer="",
+        endpoint="",
+        events=tmp_path / "events.jsonl",
+        db=str(tmp_path / "w.sqlite"),
+        agent="claude -p {prompt_file}",
+        no_push=True,
+        poll=1.0,
+    )
+
+    fleet, client, _host = _fleet_for_serve(args, queue, audit=audit)
+    assert fleet is not None and client is not None
+
+    fleet.on_event(
+        {
+            "ts": 123.0,
+            "kind": "work",
+            "project_id": "p",
+            "item_id": "T1",
+            "outcome": "draft_pr_opened",
+            "detail": "https://github.com/o/r/pull/9",
+        }
+    )
+    client.on_event(
+        {
+            "ts": 124.0,
+            "role": "reviewer",
+            "model": "m",
+            "endpoint": "https://e",
+            "outcome": "error",
+            "error_class": "rpm",
+            "attempt": 0,
+        }
+    )
+
+    assert audit.count() == 2
+    assert {row["kind"] for row in audit.recent(limit=10)} == {"work", "model_call"}
+    assert audit.delivery(project_id="p")[0]["outcome"] == "draft_pr_opened"
+
+    store = EventStore(tmp_path / "api.sqlite")
+    with TestClient(create_api(store, token=TOKEN, audit=audit)) as api:
+        errors = api.get("/api/errors?window=all", headers=hdr()).json()
+    assert errors["total"] == 1
+    assert errors["by_role"][0]["key"] == "reviewer"
+    assert errors["by_endpoint"][0]["key"] == "https://e"

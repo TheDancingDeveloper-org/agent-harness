@@ -85,7 +85,11 @@ A reviewer then reads your diff against the item above and can reject it.
 """
 
 REVIEW_PROMPT = """\
-Review this change. You did not write it.
+Review this change. You did not write it, and your job is not to be agreeable.
+
+Assume it is wrong until the diff shows otherwise. Most changes that fail
+review fail because they do something *adjacent* to what was asked, or claim
+more than they did — not because they are obviously broken.
 
 The task:
 {brief}
@@ -97,11 +101,26 @@ The diff:
 
 Checks: {checks}
 
-Answer with a first line of exactly APPROVED or REJECTED, then your reasoning.
-Reject if the change does not do what the task asked, breaks something, or
-claims to do more than it does. Approving work that does not do what was
-asked is the expensive failure here; an unnecessary rejection costs one
-retry.
+## Answer
+
+First line exactly APPROVED or REJECTED. Then, in order:
+
+1. **What I verified** — the specific things in the diff you actually checked
+   against the task. If you cannot name any, that is a REJECTED.
+2. **What I could not verify** — anything the diff claims that the diff alone
+   does not show. Say it, do not assume it.
+3. **Why** — one paragraph.
+
+## Reject if
+
+- It does not do what the task asked, or does more than the task asked.
+- It claims an effect the diff does not demonstrate.
+- It changes something unrelated, however small.
+- The task cannot be judged from what you were given.
+
+Approving work that does not do what was asked is the expensive failure here:
+it reaches a pull request, a human reads it as reviewed, and the cost lands
+much later. An unnecessary rejection costs one retry.
 """
 
 
@@ -425,11 +444,12 @@ class SessionExecutor:
         )
 
     def _review(self, record: WorkRecord, tree: Path, passed: bool, failure: str) -> str:
-        diff = run_git(tree, "diff", "HEAD")
         if self.reviewer is None:
-            # No reviewer configured. Say so rather than silently treating
+            # Checked before the diff is computed: there is no point building
+            # a diff nobody will read. Says so rather than silently treating
             # unreviewed work as approved.
             return "REJECTED\nNo reviewer is configured, so nothing has reviewed this."
+        diff = run_git(tree, "diff", "HEAD")
         prompt = REVIEW_PROMPT.format(
             brief=record.brief,
             diff=diff[:20000],

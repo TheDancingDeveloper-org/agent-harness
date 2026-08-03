@@ -318,7 +318,17 @@ Only an explicit *Continue execution* creates workers.
 
 ---
 
-## 8. What is not built yet
+## 8. Going deeper
+
+[`INTERNALS.md`](INTERNALS.md) covers what happens *inside* these boxes:
+how a backlog is built and what the parser refuses, how triage picks the next
+item and why claims are leases, how a role becomes a model call, the retry
+ladder and why a cap is never retried, how a change becomes a pull request,
+what makes the reviewer cynical, and how merges and reverts are reconciled.
+
+---
+
+## 9. What is not built yet
 
 - **The Work tab renders 2 of ~20 endpoints.** Board, item detail, live event
   feed, fleet controls, role editor and the rate-limit dashboard are designed

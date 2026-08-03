@@ -85,6 +85,9 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
   Diagrams: the whole system, what an agent actually is, the components, the
   life of a work item, failure classification, the audit layer, and project
   isolation.
+- **[`docs/INTERNALS.md`](docs/INTERNALS.md) — a layer deeper.** What actually happens
+  inside: backlog building, triage and claiming, model routing, the retry ladder,
+  completion, review, and merge/revert reconciliation.
 - **[`docs/USAGE.md`](docs/USAGE.md) — start here.** A worked example end to end, with
   real output: write a plan, sync it, execute it, resume it, drive it from the API, and
   read the failures.

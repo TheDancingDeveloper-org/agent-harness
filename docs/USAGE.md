@@ -132,6 +132,10 @@ checks before review: ['pytest -q']
 dry run: no model calls, no commits, no pull requests.
 ```
 
+Add `--serve` to keep it running when the queue empties, waiting for work
+rather than exiting — without it, a plan synced an hour later is never picked
+up. `--project` selects which project's queue to work.
+
 Drop `--dry-run` to actually run it. Per item:
 
 ```
@@ -189,6 +193,54 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8099/api/work | jq '.stale'
 
 A non-empty `stale` list is not an error — those items are re-claimed
 automatically. A *rising* count means something is killing workers.
+
+---
+
+## 4a. Projects — running more than one thing at once
+
+Work is keyed by **(project, item id)**, so two plans that both name `T1` are
+two items rather than one row quietly overwriting the other.
+
+```bash
+# Register a project. It starts STOPPED: registering must not begin spending.
+curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/projects \
+  -H 'content-type: application/json' -d '{
+    "project_id": "ngms", "name": "NGMS",
+    "repo": "owner/NGMS", "work_dir": "/work/ngms",
+    "base_branch": "main", "checks": ["cargo test"],
+    "max_workers": 3, "max_attempts": 5
+  }'
+
+# Everything about it, in one call — counts, control state, live worker count.
+curl -sH "Authorization: Bearer $TOKEN" localhost:8099/api/projects | jq
+
+# Continue execution. This is the ONLY thing that creates workers.
+curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/projects/ngms/start
+```
+
+**Nothing resumes on its own after a restart.** Every project comes back
+`stopped`, carrying what it *was* doing:
+
+```json
+{"state": "stopped", "reason": "process started (was running)",
+ "previous_state": "running"}
+```
+
+So a project you deliberately drained before a deploy does not come back
+looking identical to one that was running happily — and a crash-looping pod
+cannot restart the fleet on every loop.
+
+`workers` is reported separately from `control.state` on purpose. `running` is
+an instruction; `workers` is whether anything is carrying it out, and a project
+marked running with zero workers is the failure that otherwise reads as
+success.
+
+**Giving up.** An item that reliably kills its worker is never released, so its
+lease lapses and it would be re-claimed forever — spending money each cycle
+while looking exactly like an item that is busy. Past `max_attempts` it becomes
+`exhausted`, which is different from `failed`: failed is one attempt that did
+not work, exhausted says the harness will not try again without you. Raise the
+limit and retry to rescue it; `0` disables it.
 
 ---
 
@@ -293,6 +345,78 @@ curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/plan/sync \
 
 ---
 
+## 5b. Measure it over months
+
+The audit log lives in its **own database**. The queue is mutable, migrated in
+place, and a reasonable thing to delete and rebuild from the plan — anything
+sharing that file shares that fate.
+
+```bash
+export HARNESS_AUDIT_DB=/var/lib/aidevenv/audit.sqlite   # a different volume
+export HARNESS_AUDIT_REQUIRED=1                          # refuse to start without it
+```
+
+```bash
+# Is anything actually being recorded?
+curl -sH "Authorization: Bearer $TOKEN" localhost:8099/api/audit/health | jq
+# {"configured":true,"degraded":false,"events":48213,"oldest":1754...}
+
+# What did it cost?
+curl -sH "Authorization: Bearer $TOKEN" 'localhost:8099/api/audit/cost?window=7d' | jq
+```
+
+```json
+{"window": "7d", "total_cost_usd": 42.18, "total_unpriced": 61, "partial": false,
+ "rows": [{"project_id": "ngms", "role": "implementer", "model": "a-model",
+           "calls": 312, "tokens_in": 8100000, "cost_usd": 31.4, "unpriced": 0}]}
+```
+
+Three things in that response are deliberate:
+
+| | |
+|---|---|
+| `total_unpriced` | Calls whose price was unknown, counted **separately**. A total that silently omits them reads as complete and is not. |
+| `partial` | True when the window starts before the earliest recorded event. A chart labelled "7 days" drawn from one hour is not wrong about the data, it is wrong about the question. |
+| `cost_usd: null` | Never `0`. Zero is a measurement claiming the call was free. |
+
+**Give it prices.** The table ships pricing nothing — this harness is not tied
+to a vendor and guessed rates produce confident, wrong money.
+
+```bash
+export HARNESS_PRICE_TABLE='{"version":"2026-08-01",
+  "prices":{"a-model":{"in_per_mtok":3.0,"out_per_mtok":15.0}}}'
+```
+
+The price is stored **on each event**, not applied at read time. Applying
+today's rates to last year's tokens is a projection, and it rewrites the past
+every time a vendor reprices; recording the applied rate makes a repricing a
+visible step in the series instead.
+
+**Ground truth comes from GitHub.** Everything the harness knows about quality
+is a proxy — a reviewer approved it, the checks passed. Whether it was merged,
+rejected or reverted happens outside:
+
+```bash
+curl -sH "Authorization: Bearer $TOKEN" -X POST \
+  'localhost:8099/api/audit/reconcile?repo=owner/name'
+# {"merged":14,"closed_unmerged":2,"reverted":1,"skipped":37}
+```
+
+`skipped` is the pull requests the harness did not create — dependabot, humans.
+Counted, never attributed: an outcome belonging to no item inflates every rate
+it appears in.
+
+**Retention runs itself.** Complete days roll up into immutable rows kept
+forever; raw events are thinned after 90 days and **only** once the rollup
+covering them exists. Thinning first is silent data loss that leaves a tidy
+database and a hole in the series.
+
+```bash
+curl -sH "Authorization: Bearer $TOKEN" localhost:8099/api/audit/rollups | jq '.rolled_up_through'
+```
+
+---
+
 ## 6. Read the failures honestly
 
 ```bash
@@ -335,3 +459,7 @@ is the lever.
 | `HARNESS_ROOT_PATH` | `serve` | Prefix when behind a proxy, e.g. `/api/harness`. |
 | `AIDEVENV_URL` | `run` | Session host, enabling attachable agents. |
 | `AIDEVENV_TOKEN` | `run` | Session host token. |
+| `HARNESS_AUDIT_DB` | `serve` | Audit database. Put it on a different volume so history does not share a fate with the queue. Defaults to `audit.sqlite` beside `--db`. |
+| `HARNESS_AUDIT_REQUIRED` | `serve` | `1` refuses to start without a writable audit store. Off by default, because observation failing must not stop work. |
+| `HARNESS_AUDIT_RETENTION_DAYS` | `serve` | How long raw events are kept once a rollup covers them. Default 90. |
+| `HARNESS_PRICE_TABLE` | `run` | JSON price table, inline or a path. Without it, calls are recorded with tokens and **no** cost, and reported as `unpriced`. |

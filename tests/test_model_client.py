@@ -3,6 +3,7 @@ all injected."""
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -160,7 +161,7 @@ def test_a_cap_parks_only_that_endpoint() -> None:
     )
     with pytest.raises(CapExhausted):
         client.call("implementer", MESSAGES)
-    assert parks.remaining("https://capped", 1000.0) == pytest.approx(1800, abs=1)
+    assert parks.remaining("https://capped", 1000.0, "implementer") == pytest.approx(1800, abs=1)
     assert parks.remaining("https://other", 1000.0) == 0.0
 
 
@@ -186,7 +187,7 @@ def test_a_short_window_cap_parks_for_less_than_a_long_one() -> None:
     with pytest.raises(CapExhausted) as excinfo:
         client.call("implementer", MESSAGES)
     assert excinfo.value.kind == P.WINDOW_CAP
-    assert parks.remaining("https://a", 1000.0) == pytest.approx(300, abs=1)
+    assert parks.remaining("https://a", 1000.0, "implementer") == pytest.approx(300, abs=1)
 
 
 def test_a_parked_endpoint_is_waited_out_not_hammered() -> None:
@@ -302,7 +303,7 @@ def test_two_clients_do_not_share_park_state() -> None:
     client_a = build(Recorder(fail(429, body)), parks=a_parks)
     with pytest.raises(CapExhausted):
         client_a.call("implementer", MESSAGES)
-    assert a_parks.remaining("https://a", 1000.0) > 0
+    assert a_parks.remaining("https://a", 1000.0, "implementer") > 0
     assert b_parks.remaining("https://a", 1000.0) == 0.0
 
 
@@ -416,3 +417,96 @@ def test_an_empty_live_map_keeps_the_last_known_routes() -> None:
         routes_provider=dict,
     )
     assert client.call("implementer", MESSAGES).status == 200
+
+
+# ------------------------------------------------- reviewer headroom (T35)
+
+
+def test_an_exhausted_implementer_does_not_silence_the_reviewer() -> None:
+    """The acceptance criterion for T35, stated as the failure it prevents.
+
+    If an implementer exhausts a spend window and that parks the endpoint,
+    the fleet holds patches that passed every gate and cannot be reviewed,
+    committed or merged. The money is already spent; withholding the cheap
+    call that turns it into a pull request loses the work as well.
+    """
+    parks = EndpointParks()
+    now = [1000.0]
+
+    def transport(route: Route, messages: object, options: object) -> Response:
+        # The implementer's endpoint is out of budget; the reviewer's calls
+        # would succeed if they were ever attempted.
+        if route.model == "impl":
+            return Response(
+                429,
+                {},
+                json.dumps(
+                    {
+                        "theclawbayError": {
+                            "category": "quota",
+                            "code": "weekly_cost_limit_reached",
+                            "retryable": False,
+                        }
+                    }
+                ),
+            )
+        return Response(200, {}, "APPROVED\nlooks right")
+
+    client = ModelClient(
+        roles={
+            "implementer": Route("impl", "https://api", P.CLAW_BAY),
+            "reviewer": Route("rev", "https://api", P.CLAW_BAY),
+        },
+        transport=transport,
+        parks=parks,
+        now=lambda: now[0],
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(CapExhausted):
+        client.call("implementer", MESSAGES)
+
+    # Same endpoint, and the implementer is parked on it for a long time.
+    assert parks.remaining("https://api", now[0], "implementer") > 0
+
+    # The reviewer is not, and its call goes through. Before this, the shared
+    # per-endpoint park meant approved work simply stopped moving.
+    assert parks.remaining("https://api", now[0], "reviewer") == 0.0
+    assert client.call("reviewer", MESSAGES).status == 200
+
+
+def test_the_planner_is_ringfenced_too() -> None:
+    """The cheapest call gates every expensive one, so parking it wastes
+    whatever budget is left."""
+    parks = EndpointParks()
+    parks.park("https://api", 3600, 1000.0, "implementer")
+
+    assert parks.remaining("https://api", 1000.0, "planner") == 0.0
+    assert parks.remaining("https://api", 1000.0, "implementer") > 0
+
+
+def test_a_role_still_respects_its_own_park() -> None:
+    """Ringfencing is not immunity: a reviewer that caps out waits like
+    anything else. It is allowed to try and be refused on its own merits."""
+    parks = EndpointParks()
+    parks.park("https://api", 3600, 1000.0, "reviewer")
+
+    assert parks.remaining("https://api", 1000.0, "reviewer") == pytest.approx(3600)
+
+
+def test_an_endpoint_wide_park_still_holds_unringfenced_roles() -> None:
+    parks = EndpointParks()
+    parks.park("https://api", 3600, 1000.0)
+
+    assert parks.remaining("https://api", 1000.0, "implementer") == pytest.approx(3600)
+    assert parks.remaining("https://api", 1000.0, "reviewer") == 0.0
+
+
+def test_clearing_an_endpoint_clears_every_role_on_it() -> None:
+    parks = EndpointParks()
+    parks.park("https://api", 3600, 1000.0, "implementer")
+    parks.park("https://api", 3600, 1000.0, "reviewer")
+    parks.clear("https://api")
+
+    assert parks.remaining("https://api", 1000.0, "implementer") == 0.0
+    assert parks.remaining("https://api", 1000.0, "reviewer") == 0.0

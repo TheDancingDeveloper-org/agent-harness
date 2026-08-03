@@ -55,9 +55,11 @@ from .schemas import (
     EventPage,
     FleetControl,
     Health,
+    InceptionStart,
     LatestEvent,
     MaintenanceResult,
     NewBaseline,
+    OpenQuestion,
     PlanItem,
     PlanParseResult,
     PlanSyncRequest,
@@ -65,11 +67,14 @@ from .schemas import (
     ProjectList,
     ProjectSpec,
     ProjectSummary,
+    ProposalModel,
     RateLimits,
     ReconcileResult,
+    ResolveQuestion,
     RetryResult,
     RoleMap,
     RoleRoute,
+    ScopeRequest,
     SetFleetControl,
     Summary,
     WaitingItem,
@@ -134,6 +139,7 @@ def create_api(
     root_path: str = "",
     audit: AuditStore | None = None,
     fleet: Any | None = None,
+    model_client: Any | None = None,
 ) -> FastAPI:
     """Build the API.
 
@@ -156,6 +162,7 @@ def create_api(
     app.state.queue = queue
     app.state.audit = audit
     app.state.fleet = fleet
+    app.state.model_client = model_client
     app.state.token = token
 
     def require_token(
@@ -322,6 +329,163 @@ def create_api(
     def get_control(_: None = Depends(require_token)) -> FleetControl:
         state, reason = need_queue().control()
         return FleetControl(state=state, reason=reason)
+
+    # ------------------------------------------------------------- inception
+
+    def inception_for() -> Any:
+        from .inception import Inception
+
+        return Inception(need_queue(), model_client=app.state.model_client)
+
+    def _proposal_model(proposal: Any) -> ProposalModel:
+        return ProposalModel(
+            revision=proposal.revision,
+            created_at=proposal.created_at,
+            goal=proposal.goal,
+            assumptions=proposal.assumptions,
+            non_goals=proposal.non_goals,
+            risks=proposal.risks,
+            phases=proposal.phases,
+            questions=[
+                OpenQuestion(
+                    **{
+                        "id": q.id,
+                        "question": q.question,
+                        "severity": q.severity,
+                        "why_it_matters": q.why_it_matters,
+                        "answer": q.answer,
+                        "deferred_reason": q.deferred_reason,
+                        "resolved_by": q.resolved_by,
+                    }
+                )
+                for q in proposal.questions
+            ],
+            feedback=proposal.feedback,
+            item_count=proposal.item_count(),
+            blocking_open=len(proposal.blocking_open()),
+        )
+
+    @app.post(
+        "/api/inception",
+        tags=["work"],
+        summary="Describe a project in a paragraph",
+        response_model=dict,
+    )
+    def inception_start(
+        request: InceptionStart,
+        _: None = Depends(require_token),
+    ) -> dict[str, Any]:
+        """Begin scoping. Nothing external exists yet and will not until you
+        approve: no repository, no issues, no branches, no queue rows."""
+        return inception_for().start(request.project_id, request.overview)  # type: ignore[no-any-return]
+
+    @app.post(
+        "/api/inception/{project_id}/scope",
+        tags=["work"],
+        summary="Propose a scope, or revise the last one",
+        response_model=ProposalModel,
+    )
+    def inception_scope(
+        request: ScopeRequest,
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> ProposalModel:
+        """With `feedback`, revises the previous proposal rather than starting
+        over -- a fresh scope loses whatever was already right and makes you
+        re-argue points you had settled."""
+        try:
+            return _proposal_model(inception_for().scope(project_id, request.feedback))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get(
+        "/api/inception/{project_id}",
+        tags=["work"],
+        summary="The current proposal",
+        response_model=ProposalModel,
+    )
+    def inception_current(
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> ProposalModel:
+        proposal = inception_for().current(project_id)
+        if proposal is None:
+            raise HTTPException(status_code=404, detail="nothing has been scoped yet")
+        return _proposal_model(proposal)
+
+    @app.post(
+        "/api/inception/{project_id}/questions/{question_id}",
+        tags=["work"],
+        summary="Answer, defer, or re-grade a question",
+        response_model=ProposalModel,
+    )
+    def inception_resolve(
+        request: ResolveQuestion,
+        project_id: str = PathParam(description="Project id."),
+        question_id: str = PathParam(description="Question id, e.g. `Q1`."),
+        _: None = Depends(require_token),
+    ) -> ProposalModel:
+        """Silence never resolves a question: close it with an answer or an
+        explicit deferral, and both are recorded with who and when."""
+        try:
+            return _proposal_model(
+                inception_for().resolve(
+                    project_id,
+                    question_id,
+                    answer=request.answer,
+                    defer_reason=request.defer_reason,
+                    severity=request.severity,
+                    who=request.who,
+                )
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/inception/{project_id}/approve",
+        tags=["work"],
+        summary="Approve the scope",
+        response_model=ProposalModel,
+        responses={409: {"description": "A blocking question is unanswered"}},
+    )
+    def inception_approve(
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> ProposalModel:
+        """The human gate. Refused while a **blocking** question is open;
+        deferrable ones do not block."""
+        try:
+            return _proposal_model(inception_for().approve(project_id))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get(
+        "/api/inception/{project_id}/plan",
+        tags=["work"],
+        summary="The proposal as a PLAN.md",
+        response_model=dict,
+    )
+    def inception_plan(
+        project_id: str = PathParam(description="Project id."),
+        name: str | None = Query(None),
+        _: None = Depends(require_token),
+    ) -> dict[str, str]:
+        """A real plan document, not queue rows.
+
+        Writing straight to the queue would fork the pipeline into a generated
+        path and a hand-written one that diverge forever. A PLAN.md runs
+        through the machinery that already exists -- including the parser that
+        reports what it could not read, so a proposal the harness cannot
+        consume is caught before it creates a single issue.
+        """
+        try:
+            return {"markdown": inception_for().plan_markdown(project_id, name)}
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     # ----------------------------------------------------------------- audit
 

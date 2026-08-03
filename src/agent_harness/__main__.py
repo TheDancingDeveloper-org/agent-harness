@@ -17,12 +17,14 @@ logs.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import secrets
 import sys
 from pathlib import Path
 from typing import Any
 
+from .coordination import MessageLedger
 from .ingest import ingest
 from .sources import Source, harness_source
 from .store import EventStore
@@ -358,7 +360,58 @@ def _run(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def _talk(args: argparse.Namespace, opener: Any | None = None) -> int:
+    """Run one `talk` subcommand and print JSON.
+
+    JSON on stdout rather than prose: the caller is usually an agent, and a
+    format it has to parse loosely is one it will parse wrongly. Failures go
+    to stderr with a non-zero exit, so a shell can tell them apart.
+    """
+    from .talk import TalkError, client_from_environment
+
+    try:
+        client = client_from_environment(
+            url=args.url or None,
+            token=args.token or None,
+            project_id=args.project or None,
+            opener=opener,
+        )
+        room = args.room or None
+        if args.talk_command == "send":
+            result: Any = client.send(
+                args.message,
+                message_type=args.message_type,
+                room_id=room,
+                idempotency_key=args.key or None,
+                recipients=args.to,
+                reply_to=args.reply_to or None,
+            )
+        elif args.talk_command == "ask":
+            result = client.ask(args.message, room_id=room, wait_seconds=args.wait)
+            if result is None:
+                # Exit 2, not 0: "nobody answered" and "here is the answer"
+                # must not look the same to whatever runs this.
+                print("no answer within the wait", file=sys.stderr)
+                return 2
+        elif args.talk_command == "read":
+            result = client.read(
+                room_id=room, after=args.after, limit=args.limit, wait_seconds=args.wait
+            )
+        else:
+            result = client.acknowledge(args.message_id, room_id=room)
+    except TalkError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Every argument the CLI accepts, as one inspectable object.
+
+    Separate from `main` so a test can parse a command line without
+    running it, and so `--help` output has one place to come from.
+    """
     parser = argparse.ArgumentParser(prog="agent-harness", description=__doc__)
     parser.add_argument(
         "--db",
@@ -489,8 +542,69 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run", action="store_true", help="show what would run, call nothing, change nothing"
     )
 
+    # `talk` is the agent-facing protocol. It never touches --db: an agent
+    # holds a scoped credential and speaks HTTP, because one that could open
+    # the ledger directly could write another project's rooms.
+    p_talk = sub.add_parser("talk", help="speak to the coordination plane")
+    p_talk.add_argument("--url", default="", help="harness API base URL (default: $HARNESS_URL)")
+    p_talk.add_argument(
+        "--token", default="", help="scoped credential (default: $HARNESS_TALK_TOKEN)"
+    )
+    p_talk.add_argument("--project", default="", help="project id (default: $HARNESS_PROJECT)")
+    p_talk.add_argument(
+        "--room", default="", help="room id (default: $HARNESS_ROOM, else `general`)"
+    )
+    talk_sub = p_talk.add_subparsers(dest="talk_command", required=True)
+
+    t_send = talk_sub.add_parser("send", help="say something, permanently")
+    t_send.add_argument("--message", required=True, help="the message body")
+    t_send.add_argument(
+        "--type",
+        dest="message_type",
+        default="observation",
+        help="message type, e.g. dependency_found. An unknown type is refused.",
+    )
+    t_send.add_argument(
+        "--to", action="append", default=[], metavar="ROLE", help="address a role or agent"
+    )
+    t_send.add_argument(
+        "--key",
+        default="",
+        help="idempotency key. Omit for a fresh one; supply your own when retrying.",
+    )
+    t_send.add_argument("--reply-to", default="", metavar="ID", help="message this answers")
+
+    t_ask = talk_sub.add_parser("ask", help="ask a question, optionally waiting for the answer")
+    t_ask.add_argument("--message", required=True, help="the question")
+    t_ask.add_argument(
+        "--wait",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="wait this long for a reply. Exits 2 if none arrives -- no answer "
+        "is a real outcome, and inventing one is worse than reporting it.",
+    )
+
+    t_read = talk_sub.add_parser("read", help="read a room from a cursor")
+    t_read.add_argument("--after", type=int, default=0, metavar="CURSOR", help="last seen sequence")
+    t_read.add_argument("--limit", type=int, default=50)
+    t_read.add_argument(
+        "--wait", type=float, default=0.0, metavar="SECONDS", help="long-poll for new messages"
+    )
+
+    t_ack = talk_sub.add_parser("acknowledge", help="record that a message was read")
+    t_ack.add_argument("message_id")
+
     p_serve = sub.add_parser(
         "serve", help="serve the JSON API (headless — the GUI is the session host's)"
+    )
+    p_serve.add_argument(
+        "--coordination-db",
+        default="",
+        help="Permanent message ledger. Defaults to coordination.sqlite beside "
+        "--db, or HARNESS_COORDINATION_DB. Put it on independently backed-up "
+        "storage: unlike the queue it is never rebuilt, and unlike the audit "
+        "store it is never thinned.",
     )
     p_serve.add_argument(
         "--audit-db",
@@ -554,6 +668,11 @@ def main(argv: list[str] | None = None) -> int:
         "/api/harness. Without it, Swagger UI tells clients to call URLs that 404.",
     )
 
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.command == "plan":
@@ -561,6 +680,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         return _run(args)
+
+    if args.command == "talk":
+        return _talk(args)
 
     store = EventStore(args.db)
 
@@ -618,6 +740,18 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"audit: {audit_path} ({audit.count()} events)")
 
+    # A third file, and for the opposite reason to the audit store: that one
+    # is separate because it may be thinned, this one because it may NOT be.
+    # A ledger sharing a volume with the disposable queue is a permanent
+    # record one `rm` away from not being permanent.
+    ledger_path = (
+        args.coordination_db
+        or os.environ.get("HARNESS_COORDINATION_DB")
+        or str(Path(args.db).with_name("coordination.sqlite"))
+    )
+    ledger = MessageLedger(ledger_path)
+    print(f"coordination: {ledger_path}")
+
     # Started here rather than left to cron: retention that depends on an
     # external scheduler silently stops when nobody installs it, and the
     # symptom is a database that grows for months before anyone notices.
@@ -652,6 +786,7 @@ def main(argv: list[str] | None = None) -> int:
                 # Readiness probes it with a read. Passing the client rather
                 # than the URL keeps the token out of the API layer.
                 session_host=host,
+                ledger=ledger,
             ),
             host=args.host,
             port=args.port,

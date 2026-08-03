@@ -700,3 +700,184 @@ class Health(BaseModel):
         description="Whether a token is configured. False means every authenticated route refuses."
     )
     version: str
+
+
+# ---------------------------------------------------------------- coordination
+
+
+class Attachment(BaseModel):
+    """An attachment by reference. The ledger keeps messages forever and
+    blobs nowhere, so this is what survives: enough to find and verify it."""
+
+    digest: str = Field(description="Content digest, e.g. `sha256:...`.")
+    size: int = Field(description="Bytes.")
+    media_type: str
+    location: str = Field(description="Durable, content-addressed location.")
+
+
+class Message(BaseModel):
+    """One accepted, permanent record.
+
+    Every field is assigned by the ledger except the ones the sender
+    supplied. Nothing here is editable: a correction is a new message that
+    references this one, and hiding a body is an append-only restriction.
+    """
+
+    message_id: str = Field(description="Immutable. Names this record forever.")
+    project_id: str = Field(
+        description="Rooms are scoped to a project. Two projects with the same room "
+        "id share no messages, no sequence and no idempotency key."
+    )
+    room_id: str = Field(
+        description="`general` for the project, `item:<id>` for one work item. A "
+        "convention, not a constraint."
+    )
+    sequence: int = Field(
+        description="Position within this room, assigned inside the write transaction. "
+        "Gapless and monotonic, so a reader resuming from a cursor cannot skip a "
+        "message two senders wrote in the same millisecond."
+    )
+    sender_id: str = Field(
+        description="Taken from the caller's credential, never from the request. An "
+        "agent cannot post as somebody else however it is prompted."
+    )
+    sender_role: str = Field(description="`agent`, `oversight` or `operator`.")
+    recipients: list[str] = Field(
+        default_factory=list,
+        description="Roles or agent ids this is addressed to. Advisory: everyone in "
+        "the room can read it, and addressing is for routing, not access control.",
+    )
+    message_type: str = Field(
+        description="One of the closed set of types. A reader deciding what to do "
+        "with a message must not have to parse prose."
+    )
+    body: str = Field(
+        description="The message. `[restricted]` when an access restriction covers "
+        "it and the reader is not in its audience -- the stored record is unchanged."
+    )
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Structured detail a reader can act on without parsing the body.",
+    )
+    item_id: str | None = Field(
+        None,
+        description="The work item this is about. Stamped from the sender's credential "
+        "when it was issued for one, so a message cannot claim to be about other work.",
+    )
+    attempt: int | None = Field(None, description="Which attempt at that item.")
+    session_id: str | None = Field(
+        None, description="Terminal session the sender was running in, if any."
+    )
+    reply_to: str | None = Field(None, description="The message this answers or corrects.")
+    correlation_id: str | None = Field(
+        None, description="Groups every message belonging to one exchange."
+    )
+    causation_id: str | None = Field(None, description="The message that directly caused this one.")
+    attachments: list[Attachment] = Field(
+        default_factory=list, description="Blobs by reference. See `Attachment`."
+    )
+    created_at: float = Field(description="Unix time the ledger accepted it.")
+    idempotency_key: str = Field(
+        description="The sender's key for this message. Scoped to the project."
+    )
+    schema_version: int = Field(description="Envelope version this record was written under.")
+    previous_digest: str | None = Field(
+        None,
+        description="Digest of the previous message in this room. The chain is what "
+        "makes an edit behind the ledger's back detectable.",
+    )
+    digest: str = Field(
+        description="Seals this envelope. Unchanged by a restriction, which is how a "
+        "reader can tell a hidden body from a rewritten one."
+    )
+    restricted: bool = Field(
+        False,
+        description="An access restriction covers this message. Says so even "
+        "when the body is visible, so a reader knows the audience is limited.",
+    )
+
+
+class SendMessage(BaseModel):
+    """What a sender may state. Identity and ordering are not up to it."""
+
+    message_type: str = Field(
+        "observation",
+        description="`observation`, `question`, `answer`, `dependency_found`, "
+        "`dependency_unresolved`, `action_proposal`, `decision`, `delivery_receipt`, "
+        "`system_notice` or `correction`. An unknown type is refused.",
+    )
+    body: str
+    idempotency_key: str = Field(
+        description="Makes a retried submission harmless. Reusing a key for DIFFERENT "
+        "content is refused rather than merged -- silently returning the first record "
+        "would swallow the second message."
+    )
+    recipients: list[str] = Field(default_factory=list)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    item_id: str | None = None
+    attempt: int | None = None
+    session_id: str | None = None
+    reply_to: str | None = None
+    correlation_id: str | None = None
+    causation_id: str | None = None
+    attachments: list[Attachment] = Field(default_factory=list)
+
+
+class MessagePage(BaseModel):
+    messages: list[Message]
+    cursor: int = Field(
+        description="Sequence of the last message returned. Pass it back as `after` to "
+        "resume. Unchanged when nothing new arrived."
+    )
+    room_id: str
+    project_id: str
+
+
+class RoomList(BaseModel):
+    project_id: str
+    rooms: list[str] = Field(
+        description="Rooms with at least one message. `general` plus `item:<id>` by "
+        "convention; the ledger does not constrain the name."
+    )
+
+
+class RestrictRequest(BaseModel):
+    audience: list[str] = Field(
+        description="Roles that may still read the body. Must not be empty: a "
+        "restriction nobody can see through is a deletion by another name, and the "
+        "ledger does not delete."
+    )
+    reason: str = Field(description="Why. Recorded permanently alongside the restriction.")
+
+
+class Restriction(BaseModel):
+    restriction_id: str
+    project_id: str
+    message_id: str
+    audience: list[str]
+    reason: str
+    restricted_by: str
+    created_at: float
+
+
+class IssuedToken(BaseModel):
+    """A short-lived credential scoped to one project, item and attempt."""
+
+    token: str = Field(description="Bearer this on the talk routes. Not stored anywhere.")
+    project_id: str
+    agent_id: str
+    role: str
+    item_id: str | None = None
+    attempt: int | None = None
+    expires_at: float = Field(
+        description="Unix time. Revocation waits for expiry, which is why these are short."
+    )
+
+
+class IssueTokenRequest(BaseModel):
+    project_id: str
+    agent_id: str = Field(description="Who the bearer will be recorded as.")
+    role: str = Field("agent", description="`agent`, `oversight` or `operator`.")
+    item_id: str | None = None
+    attempt: int | None = None
+    ttl_seconds: float = Field(21600.0, description="Lifetime in seconds. Must be positive.")

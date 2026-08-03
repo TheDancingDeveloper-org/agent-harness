@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +36,18 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import __version__
 from .audit import AuditStore
+from .coordination import Attachment as LedgerAttachment
+from .coordination import (
+    IdempotencyConflict,
+    LedgerUnavailable,
+    MessageLedger,
+    SecretDetected,
+    Submission,
+    UnknownMessageType,
+)
+from .coordination import Message as LedgerMessage
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
+from .identity import OPERATOR, InvalidScope, Scope, ScopedTokens
 from .maintenance import DEFAULT_RETENTION_DAYS, run_maintenance
 from .providers import MEANING
 from .reconcile import GitHubReconciler, items_by_pr
@@ -60,8 +71,12 @@ from .schemas import (
     FleetControl,
     Health,
     InceptionStart,
+    IssuedToken,
+    IssueTokenRequest,
     LatestEvent,
     MaintenanceResult,
+    Message,
+    MessagePage,
     NewBaseline,
     OpenQuestion,
     PlanItem,
@@ -79,16 +94,21 @@ from .schemas import (
     ReadinessProbe,
     ReconcileResult,
     ResolveQuestion,
+    Restriction,
+    RestrictRequest,
     RetryResult,
     RoleMap,
     RoleRoute,
+    RoomList,
     ScopeRequest,
+    SendMessage,
     SetFleetControl,
     Summary,
     WaitingItem,
     WorkItem,
     WorkList,
 )
+from .schemas import Attachment as SchemaAttachment
 from .store import EventStore
 from .work import (
     BLOCKED,
@@ -134,6 +154,12 @@ TAGS = [
     {"name": "plan", "description": "Turning a plan document into a backlog."},
     {"name": "control", "description": "Starting and stopping the fleet."},
     {"name": "observability", "description": "What the fleet did, and why anything failed."},
+    {
+        "name": "talk",
+        "description": "The coordination plane: what agents, humans and the oversight "
+        "actor said to each other. Permanent and append-only. Nothing said here "
+        "changes state on its own.",
+    },
     {"name": "meta", "description": "Health and version."},
 ]
 
@@ -150,6 +176,9 @@ def create_api(
     model_client: Any | None = None,
     session_host: Any | None = None,
     probes: Mapping[str, Any] | None = None,
+    ledger: MessageLedger | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.time,
 ) -> FastAPI:
     """Build the API.
 
@@ -185,6 +214,17 @@ def create_api(
     _APP_STATE["session_host"] = session_host
     _APP_STATE["probes"] = dict(probes or {})
     app.state.token = token
+    app.state.ledger = ledger
+    # Scoped credentials are signed with the service token, so a deployment
+    # that configured authentication at all has already configured this.
+    # There is no second setting and therefore no deployment quietly running
+    # without it.
+    app.state.scoped_tokens = ScopedTokens(token) if token else None
+    # Injected together, and they must move together: a long poll whose
+    # deadline reads the real clock while its sleep is faked is a busy loop,
+    # and that is precisely what a test should be able to catch.
+    app.state.talk_sleep = sleep
+    app.state.talk_now = now
 
     def require_token(
         request: Request,
@@ -1338,7 +1378,272 @@ def create_api(
             ],
         )
 
+    # ---------------------------------------------------------------- talk
+    #
+    # The coordination plane. Agents, humans and the oversight actor speak
+    # here; nothing said here changes state on its own. A message is what
+    # somebody said, and that is all it is until a command service accepts a
+    # proposal derived from it.
+
+    def need_ledger() -> MessageLedger:
+        ledger: MessageLedger | None = app.state.ledger
+        if ledger is None:
+            # 409 rather than an empty page: "the room is quiet" and "there is
+            # no ledger attached" must not look the same to a caller that is
+            # waiting for an answer.
+            raise HTTPException(status_code=409, detail="no coordination ledger is attached")
+        return ledger
+
+    def caller_scope(
+        request: Request,
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    ) -> Scope:
+        """Who is calling, from the credential alone.
+
+        The operator token grants a fleet-wide operator scope. Anything else
+        must be a scoped token, and its project, identity and expiry are the
+        ones enforced below -- never values taken from the request.
+        """
+        expected = request.app.state.token
+        if not expected:
+            raise HTTPException(status_code=503, detail="no auth token configured")
+        supplied = credentials.credentials if credentials else ""
+        if not supplied:
+            raise HTTPException(status_code=401, detail="unauthorized")
+        if secrets.compare_digest(supplied, expected):
+            return Scope(project_id="*", agent_id="operator", role=OPERATOR, expires_at=0.0)
+        tokens: ScopedTokens | None = app.state.scoped_tokens
+        if tokens is None:  # pragma: no cover - set whenever a token is
+            raise HTTPException(status_code=401, detail="unauthorized")
+        try:
+            return tokens.verify(supplied)
+        except InvalidScope as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    def scoped_to(scope: Scope, project_id: str) -> None:
+        # 404, not 403: whether another project exists is itself information
+        # this credential has no business learning.
+        if not scope.permits(project_id):
+            raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+
+    @app.post(
+        "/api/talk/tokens",
+        tags=["talk"],
+        summary="Issue a scoped agent credential",
+        response_model=IssuedToken,
+        responses={403: {"description": "Only an operator may issue credentials"}},
+    )
+    def issue_token(
+        request: IssueTokenRequest, scope: Scope = Depends(caller_scope)
+    ) -> IssuedToken:
+        """Mint a short-lived credential for one agent, item and attempt.
+
+        Operator-only, and deliberately not self-service: an agent that could
+        issue its own credentials could issue one for another project, which
+        is the entire thing scoping exists to prevent.
+        """
+        if not scope.is_operator:
+            raise HTTPException(status_code=403, detail="only an operator may issue credentials")
+        tokens: ScopedTokens | None = app.state.scoped_tokens
+        if tokens is None:  # pragma: no cover - set whenever a token is
+            raise HTTPException(status_code=503, detail="no auth token configured")
+        if request.ttl_seconds <= 0:
+            raise HTTPException(status_code=422, detail="ttl_seconds must be positive")
+        try:
+            issued = Scope(
+                project_id=request.project_id,
+                agent_id=request.agent_id,
+                role=request.role,
+                item_id=request.item_id,
+                attempt=request.attempt,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        token = tokens.issue(issued, ttl_seconds=request.ttl_seconds)
+        return IssuedToken(
+            token=token,
+            project_id=issued.project_id,
+            agent_id=issued.agent_id,
+            role=issued.role,
+            item_id=issued.item_id,
+            attempt=issued.attempt,
+            expires_at=tokens.verify(token).expires_at,
+        )
+
+    @app.get(
+        "/api/talk/{project_id}/rooms",
+        tags=["talk"],
+        summary="Rooms in one project",
+        response_model=RoomList,
+    )
+    def rooms(project_id: str, scope: Scope = Depends(caller_scope)) -> RoomList:
+        scoped_to(scope, project_id)
+        return RoomList(project_id=project_id, rooms=need_ledger().rooms(project_id))
+
+    @app.get(
+        "/api/talk/{project_id}/{room_id}",
+        tags=["talk"],
+        summary="Read a room from a cursor",
+        response_model=MessagePage,
+    )
+    def read_room(
+        project_id: str,
+        room_id: str,
+        after: int = Query(
+            0, ge=0, description="Last sequence already seen. 0 reads from the start."
+        ),
+        limit: int = Query(200, ge=1, le=1000),
+        wait_seconds: float = Query(
+            0.0,
+            ge=0.0,
+            le=60.0,
+            description="Long-poll: hold the request open until something arrives or "
+            "this elapses. Zero returns immediately. An agent waiting for an answer "
+            "should not have to choose between a busy loop and a slow one.",
+        ),
+        scope: Scope = Depends(caller_scope),
+    ) -> MessagePage:
+        scoped_to(scope, project_id)
+        ledger = need_ledger()
+        clock = app.state.talk_now
+        deadline = clock() + wait_seconds
+        while True:
+            messages = ledger.read(
+                project_id, room_id, after=after, limit=limit, audience=scope.role
+            )
+            if messages or clock() >= deadline:
+                return MessagePage(
+                    project_id=project_id,
+                    room_id=room_id,
+                    # The cursor a quiet room returns is the one it was given.
+                    # Returning 0 would rewind a polling reader to the start of
+                    # the room every time nothing new arrived.
+                    messages=[_message_model(m) for m in messages],
+                    cursor=messages[-1].sequence if messages else after,
+                )
+            app.state.talk_sleep(min(_TALK_POLL_SECONDS, max(0.0, deadline - clock())))
+
+    @app.post(
+        "/api/talk/{project_id}/{room_id}",
+        tags=["talk"],
+        summary="Say something, permanently",
+        response_model=Message,
+        responses={
+            409: {"description": "The idempotency key was used for different content"},
+            422: {"description": "Unknown message type, or the body looks like a credential"},
+            503: {"description": "The ledger could not accept it — nothing was recorded"},
+        },
+    )
+    def send(
+        project_id: str,
+        room_id: str,
+        request: SendMessage,
+        scope: Scope = Depends(caller_scope),
+    ) -> Message:
+        """Append one message. There is no edit and no delete, ever.
+
+        The sender is the credential's, not the request's. Everything else is
+        the caller's, and is refused rather than trimmed if it is wrong.
+        """
+        scoped_to(scope, project_id)
+        ledger = need_ledger()
+        try:
+            accepted = ledger.append(
+                Submission(
+                    project_id=project_id,
+                    room_id=room_id,
+                    sender_id=scope.agent_id,
+                    sender_role=scope.role,
+                    message_type=request.message_type,
+                    body=request.body,
+                    idempotency_key=request.idempotency_key,
+                    recipients=tuple(request.recipients),
+                    payload=request.payload,
+                    # A scoped credential names the item and attempt it was
+                    # issued for. Letting the body override that would make
+                    # the scope decorative.
+                    item_id=scope.item_id or request.item_id,
+                    attempt=scope.attempt if scope.attempt is not None else request.attempt,
+                    session_id=request.session_id,
+                    reply_to=request.reply_to,
+                    correlation_id=request.correlation_id,
+                    causation_id=request.causation_id,
+                    attachments=tuple(
+                        LedgerAttachment(**a.model_dump()) for a in request.attachments
+                    ),
+                )
+            )
+        except IdempotencyConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (UnknownMessageType, SecretDetected) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except LedgerUnavailable as exc:
+            # 503 and not 200: the caller must be able to tell "recorded" from
+            # "lost". A sender that believes it reported a blocking dependency
+            # and did not is worse than one that knows it failed.
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return _message_model(accepted)
+
+    @app.post(
+        "/api/talk/{project_id}/{message_id}/restrict",
+        tags=["talk"],
+        summary="Limit who may read one body",
+        response_model=Restriction,
+        responses={
+            403: {"description": "Only an operator may restrict a message"},
+            404: {"description": "No such message in this project"},
+        },
+    )
+    def restrict(
+        project_id: str,
+        message_id: str,
+        request: RestrictRequest,
+        scope: Scope = Depends(caller_scope),
+    ) -> Restriction:
+        """The only supported answer to "that should not have been posted".
+
+        The record stays, its digest still verifies, and the restriction is
+        itself an auditable append. Operator-only: an agent that could hide
+        its own messages could hide the evidence of what it did.
+        """
+        if not scope.is_operator:
+            raise HTTPException(status_code=403, detail="only an operator may restrict a message")
+        try:
+            restriction = need_ledger().restrict(
+                project_id,
+                message_id,
+                audience=request.audience,
+                reason=request.reason,
+                restricted_by=scope.agent_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return Restriction(
+            restriction_id=restriction.restriction_id,
+            project_id=restriction.project_id,
+            message_id=restriction.message_id,
+            audience=list(restriction.audience),
+            reason=restriction.reason,
+            restricted_by=restriction.restricted_by,
+            created_at=restriction.created_at,
+        )
+
     return app
+
+
+#: How long a long-polling read sleeps between checks. Short enough that an
+#: answer is not sat on, long enough that waiting is not a busy loop.
+_TALK_POLL_SECONDS = 0.25
+
+
+def _message_model(message: LedgerMessage) -> Message:
+    data = message.as_dict()
+    data["attachments"] = [SchemaAttachment(**a) for a in data["attachments"]]
+    return Message(**data)
 
 
 def _latest_by_item(store: EventStore) -> dict[str, dict[str, Any]]:

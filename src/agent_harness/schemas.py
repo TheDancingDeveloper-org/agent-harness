@@ -50,6 +50,12 @@ class WorkItem(BaseModel):
     )
     attempts: int = 0
     last_error: str | None = None
+    blocked_reason: str | None = Field(
+        None,
+        description="Why an operator blocked this item, when its state is `blocked`. "
+        "A block is a decision someone made, not a failure the harness had -- reading "
+        "it out of `last_error` would make the two indistinguishable.",
+    )
     branch: str | None = None
     pr_url: str | None = None
     updated_at: float = 0.0
@@ -86,6 +92,33 @@ class RetryResult(BaseModel):
     ok: bool
     item_id: str
     state: WorkState
+
+
+class BlockRequest(BaseModel):
+    """Blocking an item is a decision, so it is recorded as one."""
+
+    reason: str = Field(
+        min_length=1,
+        description="Why it is blocked, in words, and REQUIRED. An item parked with no "
+        "reason is indistinguishable from one nobody got to, and the person who has to "
+        "decide whether to unblock it is rarely the person who blocked it.",
+    )
+    who: str | None = Field(
+        None, description="Who decided. Recorded with the reason, not verified."
+    )
+    override: bool = Field(
+        False,
+        description="Block even when a worker holds a live claim, or when the item is "
+        "already done. Deliberately explicit: the first yanks an item out from under a "
+        "running agent, and the second un-finishes work.",
+    )
+
+
+class BlockResult(BaseModel):
+    ok: bool
+    item_id: str
+    state: WorkState
+    reason: str = Field(description="The reason as it is now recorded on the item.")
 
 
 class NewWorkItem(BaseModel):

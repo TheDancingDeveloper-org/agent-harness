@@ -51,6 +51,8 @@ from .schemas import (
     AuditRollups,
     Baseline,
     BaselineList,
+    BlockRequest,
+    BlockResult,
     Event,
     EventPage,
     FleetControl,
@@ -85,6 +87,7 @@ from .schemas import (
 )
 from .store import EventStore
 from .work import (
+    BLOCKED,
     CLAIMED,
     DONE,
     FAILED,
@@ -320,6 +323,60 @@ def create_api(
             )
         queue.release(item_id, PENDING, error=None, project_id=project_id)
         return RetryResult(ok=True, item_id=item_id, state="pending")
+
+    @app.post(
+        "/api/work/{item_id}/block",
+        tags=["work"],
+        summary="Park an item on a human decision",
+        response_model=BlockResult,
+        responses={
+            404: {"description": "No such item"},
+            409: {"description": "The item's claim is live, or it is already done"},
+        },
+    )
+    def block(
+        request: BlockRequest,
+        item_id: str = PathParam(description="Plan id, e.g. `D8`."),
+        project_id: str = Query("default", description="Which project the item is in."),
+        _: None = Depends(require_token),
+    ) -> BlockResult:
+        """Stop an item being claimed, and say why.
+
+        A plan routinely contains work that is **a decision, not a task** —
+        which database, whether to keep the old endpoint. The queue has always
+        had a `blocked` state and honoured it, but nothing here could reach
+        it: the only way to park a decision was to write to the database by
+        hand, which goes around the validation and the audit trail that make
+        this an API rather than a wrapper over SQL.
+
+        Blocked items are not claimed, and neither is anything that depends on
+        them, so blocking one decision holds back exactly the work that
+        depended on the decision.
+
+        Idempotent: blocking a blocked item updates the reason and reports the
+        same state. `POST /api/work/{item_id}/retry` is the way back — it
+        returns the item to `pending` once the decision is made.
+        """
+        queue = need_queue()
+        record = queue.get(item_id, project_id=project_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
+        if record.state == CLAIMED and record.lease_until > time.time() and not request.override:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{item_id} is claimed by {record.owner} and its lease is live; "
+                "blocking it now abandons work in flight. Wait for the lease, or pass "
+                "override=true and accept that.",
+            )
+        if record.state == DONE and not request.override:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{item_id} is already done; blocking it would un-finish "
+                "completed work. Pass override=true if that is genuinely what you mean.",
+            )
+        reason = request.reason if request.who is None else f"{request.reason} (— {request.who})"
+        queue.release(item_id, BLOCKED, error=reason, project_id=project_id)
+        return BlockResult(ok=True, item_id=item_id, state="blocked", reason=reason)
 
     # ------------------------------------------------------------- control
 
@@ -1258,6 +1315,9 @@ def _item_model(record: WorkRecord, event: dict[str, Any] | None) -> WorkItem:
         lease_until=record.lease_until,
         attempts=record.attempts,
         last_error=record.last_error,
+        # The queue stores one "why" per item. Which of the two it is depends
+        # entirely on the state, and a client should not have to know that.
+        blocked_reason=record.last_error if record.state == BLOCKED else None,
         branch=record.branch,
         pr_url=record.pr_url,
         updated_at=record.updated_at,

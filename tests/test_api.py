@@ -242,6 +242,110 @@ def test_retry_requires_a_token(client: TestClient) -> None:
     assert client.post("/api/work/W1/retry").status_code == 401
 
 
+# ------------------------------------------------------------------ block
+
+
+def test_blocking_parks_an_item_with_its_reason(client: TestClient, queue: WorkQueue) -> None:
+    """A plan routinely contains work that is a decision, not a task. Before
+    this the only way to park one was to write to the database by hand, which
+    goes around every check this API exists to apply."""
+    response = client.post(
+        "/api/work/W1/block",
+        headers=auth(),
+        json={"reason": "needs a human: which database?", "who": "sprooty"},
+    )
+    assert response.status_code == 200
+    assert response.json()["state"] == "blocked"
+    record = queue.get("W1")
+    assert record is not None and record.state == "blocked"
+    assert "which database" in (record.last_error or "")
+    assert "sprooty" in (record.last_error or "")
+
+
+def test_a_blocked_item_is_not_claimed(client: TestClient, queue: WorkQueue) -> None:
+    """The point of the whole endpoint. An implementation worker must not pick
+    up a decision nobody has made."""
+    client.post("/api/work/W1/block", headers=auth(), json={"reason": "D8 is a decision"})
+    claimed = [queue.claim("w"), queue.claim("w")]
+    assert {c.item_id for c in claimed if c} == {"W2"}
+
+
+def test_blocking_a_decision_holds_back_what_depends_on_it(
+    client: TestClient, queue: WorkQueue
+) -> None:
+    queue.add([WorkRecord(item_id="W3", title="after", brief="b", depends_on=["W1"])])
+    client.post("/api/work/W1/block", headers=auth(), json={"reason": "undecided"})
+    claimed = {c.item_id for c in (queue.claim("w"), queue.claim("w")) if c}
+    assert "W3" not in claimed, "work depending on an open decision must wait for it"
+
+
+def test_a_reason_is_required(client: TestClient) -> None:
+    """An item parked with no reason is indistinguishable from one nobody got
+    to, and whoever has to unblock it is rarely whoever blocked it."""
+    assert client.post("/api/work/W1/block", headers=auth(), json={}).status_code == 422
+    assert client.post("/api/work/W1/block", headers=auth(), json={"reason": ""}).status_code == 422
+
+
+def test_blocking_refuses_a_live_claim_unless_overridden(
+    client: TestClient, queue: WorkQueue
+) -> None:
+    queue.claim("worker-a")
+    response = client.post("/api/work/W1/block", headers=auth(), json={"reason": "stop"})
+    assert response.status_code == 409
+    assert "worker-a" in response.json()["detail"]
+    assert queue.get("W1").state == CLAIMED  # type: ignore[union-attr]
+
+    forced = client.post(
+        "/api/work/W1/block", headers=auth(), json={"reason": "stop", "override": True}
+    )
+    assert forced.status_code == 200
+    assert queue.get("W1").state == "blocked"  # type: ignore[union-attr]
+
+
+def test_blocking_will_not_quietly_un_finish_work(client: TestClient, queue: WorkQueue) -> None:
+    queue.claim("w")
+    queue.release("W1", DONE)
+    response = client.post("/api/work/W1/block", headers=auth(), json={"reason": "hmm"})
+    assert response.status_code == 409
+    assert queue.get("W1").state == DONE  # type: ignore[union-attr]
+
+
+def test_blocking_is_idempotent_and_the_reason_can_be_corrected(client: TestClient) -> None:
+    first = client.post("/api/work/W1/block", headers=auth(), json={"reason": "first"})
+    second = client.post("/api/work/W1/block", headers=auth(), json={"reason": "second"})
+    assert first.status_code == second.status_code == 200
+    assert second.json()["state"] == first.json()["state"] == "blocked"
+    assert second.json()["reason"] == "second"
+
+
+def test_the_reason_is_readable_from_the_list_and_the_item(client: TestClient) -> None:
+    """A block nobody can see the reason for is a stuck item with extra
+    steps."""
+    client.post("/api/work/W1/block", headers=auth(), json={"reason": "waiting on D8"})
+    listed = {i["item_id"]: i for i in client.get("/api/work", headers=auth()).json()["items"]}
+    assert listed["W1"]["blocked_reason"] == "waiting on D8"
+    # And it is not confused with a failure, which is the other thing the
+    # queue's single "why" column holds.
+    assert listed["W2"]["blocked_reason"] is None
+    detail = client.get("/api/work/W1", headers=auth()).json()
+    assert detail["blocked_reason"] == "waiting on D8"
+
+
+def test_retry_is_the_way_back(client: TestClient, queue: WorkQueue) -> None:
+    """A one-way door would mean the operator's own action needs the database
+    edit this endpoint exists to avoid."""
+    client.post("/api/work/W1/block", headers=auth(), json={"reason": "pending a decision"})
+    assert client.post("/api/work/W1/retry", headers=auth()).status_code == 200
+    record = queue.get("W1")
+    assert record is not None and record.state == PENDING
+    assert queue.claim("w") is not None
+
+
+def test_blocking_an_unknown_item_is_404(client: TestClient) -> None:
+    response = client.post("/api/work/NOPE/block", headers=auth(), json={"reason": "x"})
+    assert response.status_code == 404
+
+
 # ----------------------------------------------------------------- errors
 
 

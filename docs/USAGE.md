@@ -405,6 +405,7 @@ GET  /api/work              backlog, counts and stale claims in one call
 GET  /api/work/{id}         one item
 POST /api/work              add items directly, without a plan document
 POST /api/work/{id}/retry   re-queue; refuses while a claim is live
+POST /api/work/{id}/block   park a decision, with a required reason
 POST /api/plan/parse        parse a plan, reporting what it could NOT read
 POST /api/plan/sync         plan → GitHub issues, dry-run by default
 GET  /api/errors            rate limits by class
@@ -434,6 +435,13 @@ curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/work \
 # Retry a failed item
 curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/work/W2/retry
 # 409 if its claim is still live — an agent is working on it right now.
+
+# Park a plan item that is a DECISION, not a task, so nothing claims it
+curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/work/D8/block \
+  -H 'content-type: application/json' \
+  -d '{"reason":"needs a human: which database?","who":"sprooty"}'
+# Anything that depends on D8 waits with it. The reason comes back as
+# `blocked_reason` on the item, and retry is the way back once it is decided.
 
 # Preview a plan sync without writing
 curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/plan/sync \

@@ -193,13 +193,16 @@ class SessionExecutor:
             # new owner is working on it right now, and reporting anything
             # here would overwrite a live claim.
             self._emit(record, "claim_lost", detail=str(exc))
+            self._orphan_session(record, f"claim lost: {exc}")
             return None
         except CapExhausted as exc:
             self._emit(record, "budget_exhausted", detail=str(exc))
+            self._orphan_session(record, f"budget exhausted: {exc}")
             self.queue.release(record.item_id, PENDING, error=f"budget: {exc}", owner=self.owner)
             raise
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
+            self._orphan_session(record, str(exc))
             self.queue.release(record.item_id, FAILED, error=str(exc), owner=self.owner)
             partial = self._partial
             if partial is not None and partial.item_id == record.item_id:
@@ -216,6 +219,32 @@ class SessionExecutor:
             owner=self.owner,
         )
         return outcome
+
+    def _orphan_session(self, record: WorkRecord, reason: str) -> None:
+        """Own the session of an item that failed unexpectedly.
+
+        The item is released either way, but the PTY it was running in stays
+        alive with nobody waiting on it -- possibly with an agent still
+        spending tokens in it. Recorded rather than killed, for the same
+        reason a timed-out session is: it holds the context that makes the
+        failure diagnosable, and the reaper collects it if nobody comes back.
+        """
+        partial = self._partial
+        if partial is None or partial.session_id is None or partial.item_id != record.item_id:
+            return
+        with contextlib.suppress(Exception):
+            self.queue.record_abandoned_session(
+                partial.session_id,
+                record.item_id,
+                reason=f"worker failed and left this session running: {reason}",
+                session_url=None,
+            )
+            self._emit(
+                record,
+                "session_orphaned",
+                detail=reason,
+                session_id=partial.session_id,
+            )
 
     def reap(self) -> ReapReport | None:
         """Collect sessions kept alive after a timeout that nobody returned to.

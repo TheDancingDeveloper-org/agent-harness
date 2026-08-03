@@ -496,3 +496,75 @@ def test_an_approved_item_is_marked_ready_and_a_rejected_one_is_not(
         # why is a lead; one that says nothing is litter.
         assert github.comments, "the verdict was never recorded on the PR"
         assert bool(github.ready) is expect_ready
+
+
+# ------------------------------------------ a worker that dies mid-session
+
+
+class DevEnvThatDiesAfterStarting(FakeDevEnv):
+    """Creates the session, then the host connection goes away.
+
+    This is the reported failure: the worker thread exits while the session
+    is still running, so nothing is waiting on a live PTY.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.deleted: list[str] = []
+
+    def wait_for_exit(self, session_id: str, **kwargs: Any) -> Session:
+        raise RuntimeError("session host connection lost")
+
+    def delete_session(self, session_id: str) -> None:
+        self.deleted.append(session_id)
+
+
+def test_a_session_left_by_a_failed_worker_is_recorded_not_leaked(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The item was already released on failure. The session was not: it kept
+    running with nobody waiting on it, possibly with an agent still spending
+    tokens, and an unrecorded survivor is indistinguishable from a leak."""
+    events: list[dict[str, Any]] = []
+    executor, queue = build(repo, tmp_path, DevEnvThatDiesAfterStarting(), events=events)
+    add_item(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None and outcome.state == FAILED
+    record = queue.get("W1")
+    assert record is not None and record.state == FAILED and record.owner is None
+
+    abandoned = queue.abandoned_sessions()
+    assert [s["session_id"] for s in abandoned] == ["sess-1"]
+    assert "connection lost" in abandoned[0]["reason"]
+    assert any(e["outcome"] == "session_orphaned" for e in events)
+
+
+def test_the_recorded_session_is_reapable(repo: Path, tmp_path: Path) -> None:
+    """Recording it is only half the job: the reaper is what stops survivors
+    accumulating forever."""
+    devenv = DevEnvThatDiesAfterStarting()
+    executor, queue = build(repo, tmp_path, devenv)
+    add_item(queue)
+    executor.run_once()
+
+    executor.session_max_age = 0.0
+    report = executor.reap()
+    assert report is not None
+    assert report.reaped == ["sess-1"]
+    assert devenv.killed == ["sess-1"]
+
+
+def test_a_failure_before_any_session_records_nothing(repo: Path, tmp_path: Path) -> None:
+    """No session, nothing to own. A phantom record would send whoever reads
+    it looking for a terminal that never existed."""
+
+    class DevEnvThatCannotStart(FakeDevEnv):
+        def create_session(self, *args: Any, **kwargs: Any) -> Session:
+            raise RuntimeError("no capacity")
+
+    executor, queue = build(repo, tmp_path, DevEnvThatCannotStart())
+    add_item(queue)
+    executor.run_once()
+    assert queue.abandoned_sessions() == []

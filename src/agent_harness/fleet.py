@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .work import RUNNING, STOPPED, WorkQueue
+from .work import CLAIMED, FAILED, RUNNING, STOPPED, WorkQueue
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,21 @@ DEFAULT_POLL_SECONDS = 15.0
 #: Injected so a pool can be tested without a git repository, a session host
 #: or a provider.
 ExecutorFactory = Callable[[str], Any]
+
+
+@dataclass(frozen=True)
+class WorkerFailure:
+    """A worker that stopped without being asked to.
+
+    Kept because a fleet whose workers are dying looks, from the outside,
+    exactly like a fleet with nothing to do: both report no work in progress.
+    """
+
+    project_id: str
+    worker: str | None
+    error: str
+    at: float
+    released: tuple[str, ...] = ()
 
 
 @dataclass
@@ -62,11 +78,16 @@ class Fleet:
         executor_factory: ExecutorFactory,
         *,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
+        now: Callable[[], float] = time.time,
     ) -> None:
         self.queue = queue
         self.executor_factory = executor_factory
         self.poll_seconds = poll_seconds
+        self.on_event = on_event
+        self.now = now
         self._pools: dict[str, ProjectPool] = {}
+        self._failures: list[WorkerFailure] = []
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------ starting
@@ -139,17 +160,108 @@ class Fleet:
     def is_running(self, project_id: str) -> bool:
         return bool(self.running().get(project_id))
 
+    def failures(self, project_id: str | None = None) -> list[WorkerFailure]:
+        """Workers that died, oldest first."""
+        with self._lock:
+            return [f for f in self._failures if project_id is None or f.project_id == project_id]
+
     # ------------------------------------------------------------ internals
 
     def _worker(self, project_id: str, stop: threading.Event) -> None:
         try:
             executor = self.executor_factory(project_id)
         except Exception as exc:  # noqa: BLE001 - one project must not kill the fleet
-            log.warning("could not build an executor for %s: %s", project_id, exc)
+            self._died(project_id, None, f"could not build an executor: {exc}")
             return
         try:
             executor.serve(poll_seconds=self.poll_seconds, stop=stop)
         except Exception as exc:  # noqa: BLE001
             # A worker dying must not take its siblings or other projects with
-            # it. Its claim is a lease, so whatever it held returns on its own.
-            log.warning("worker for %s exited: %s", project_id, exc)
+            # it -- but it must not leave its work behind either. "The claim is
+            # a lease, so it returns on its own" was true and insufficient: the
+            # item stayed `claimed` by a dead owner for a full lease with no
+            # completion or failure recorded, so the fleet looked busy and the
+            # item was unavailable to everyone including a human.
+            self._died(project_id, executor, f"worker exited: {exc}")
+
+    def _died(self, project_id: str, executor: Any, message: str) -> None:
+        """Record a worker's death, release what it was holding, and stop the
+        project if that was the last of its workers."""
+        log.warning("worker for %s: %s", project_id, message)
+        owner = getattr(executor, "owner", None)
+        released = self._release_claims(project_id, owner, message)
+        failure = WorkerFailure(
+            project_id=project_id,
+            worker=owner,
+            error=message,
+            at=self.now(),
+            released=tuple(released),
+        )
+        with self._lock:
+            self._failures.append(failure)
+        self._emit(
+            {
+                "ts": failure.at,
+                "kind": "work",
+                "worker": owner,
+                "item_id": released[0] if released else None,
+                "outcome": "worker_died",
+                "detail": message + (f"; released {', '.join(released)}" if released else ""),
+                "project_id": project_id,
+            }
+        )
+        self._stop_if_last(project_id, message)
+
+    def _release_claims(self, project_id: str, owner: str | None, message: str) -> list[str]:
+        """Hand back whatever the dead worker was holding.
+
+        Released as FAILED rather than re-queued on purpose: the item that
+        killed a worker is the likeliest item to kill the next one, and a
+        silent requeue turns that into a crash loop that spends money. Retry
+        is one call away, and now it is a decision someone makes.
+        """
+        if owner is None:
+            return []
+        released = []
+        for record in self.queue.items(project_id=project_id):
+            if record.state != CLAIMED or record.owner != owner:
+                continue
+            if self.queue.release(
+                record.item_id,
+                FAILED,
+                error=f"the worker holding this item died: {message}",
+                owner=owner,
+                project_id=project_id,
+            ):
+                released.append(record.item_id)
+        return released
+
+    def _stop_if_last(self, project_id: str, message: str) -> None:
+        """A project whose workers have all died is not running.
+
+        Leaving it `running` with zero workers is the exact state the start
+        preflight exists to refuse -- reached the slow way, after the fact.
+        """
+        with self._lock:
+            pool = self._pools.get(project_id)
+            if pool is None:
+                return
+            current = threading.current_thread()
+            if any(t.is_alive() and t is not current for t in pool.threads):
+                return
+            self._pools.pop(project_id, None)
+        self.queue.set_control(
+            STOPPED,
+            reason=f"every worker for {project_id} died: {message}",
+            project_id=project_id,
+        )
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        if self.on_event is None:
+            return
+        # Telemetry is never load-bearing: a broken sink must not stop the
+        # release above from having happened.
+        try:
+            self.on_event(event)
+        except Exception:  # noqa: BLE001
+            log.warning("fleet event sink failed", exc_info=True)

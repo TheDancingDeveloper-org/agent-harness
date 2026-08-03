@@ -52,16 +52,41 @@ class WorkerFailure:
 
 
 @dataclass
+class Worker:
+    """One worker thread and the switch that stops **it**.
+
+    Per worker rather than per pool, because that is what makes a pool
+    shrinkable: telling three of five workers to finish and leave is not
+    expressible with a single shared event, and stopping everything and
+    restarting the survivors would interrupt in-flight items to change a
+    number.
+    """
+
+    thread: threading.Thread
+    stop: threading.Event
+
+    @property
+    def alive(self) -> bool:
+        return self.thread.is_alive()
+
+
+@dataclass
 class ProjectPool:
-    """The workers running one project, and the switch that stops them."""
+    """The workers running one project."""
 
     project_id: str
-    threads: list[threading.Thread] = field(default_factory=list)
-    stop: threading.Event = field(default_factory=threading.Event)
+    workers: list[Worker] = field(default_factory=list)
 
     @property
     def size(self) -> int:
-        return sum(1 for t in self.threads if t.is_alive())
+        return sum(1 for w in self.workers if w.alive)
+
+    def live(self) -> list[Worker]:
+        return [w for w in self.workers if w.alive]
+
+    def stop_all(self) -> None:
+        for worker in self.workers:
+            worker.stop.set()
 
 
 class Fleet:
@@ -113,18 +138,86 @@ class Fleet:
             # the project still reads `stopped` claims nothing and sleeps a
             # full poll for no reason.
             self.queue.set_control(RUNNING, project_id=project_id)
-            for n in range(max(1, project.max_workers)):
-                thread = threading.Thread(
-                    target=self._worker,
-                    args=(project_id, pool.stop),
-                    name=f"harness-{project_id}-{n}",
-                    daemon=True,
-                )
-                pool.threads.append(thread)
-                thread.start()
             self._pools[project_id] = pool
-            log.info("started %d worker(s) for project %s", len(pool.threads), project_id)
-            return len(pool.threads)
+            started = self._add_workers(pool, max(1, project.max_workers))
+            log.info("started %d worker(s) for project %s", started, project_id)
+            return started
+
+    def resize(self, project_id: str, size: int | None = None) -> int:
+        """Change a running project's worker count in place. Returns the target.
+
+        The target, not the live count, because during a shrink those differ
+        and the live one is momentarily a lie: workers told to leave are still
+        alive until their current item finishes. `running()` is the live
+        answer; this is what the pool is converging to. Zero means the project
+        was not running and nothing was started.
+
+        Raising the limit starts only the additional workers. Lowering it
+        tells the excess to stop claiming and leave once their current item
+        finishes -- they are never joined here and never interrupted, because
+        killing an agent mid-item destroys the context that makes its work
+        resumable, and a capacity change is nowhere near a good enough reason.
+
+        Serialized by the pool lock, so two concurrent resizes cannot both
+        read the same count and both act on it. Idempotent: resizing to the
+        number already running does nothing at all.
+
+        A project that is not running is left alone -- the new limit applies
+        the next time it starts, which is what `max_workers` already meant.
+        """
+        with self._lock:
+            pool = self._pools.get(project_id)
+            if pool is None:
+                return 0
+            if size is None:
+                project = self.queue.get_project(project_id)
+                if project is None:
+                    raise KeyError(f"no project {project_id!r}")
+                size = project.max_workers
+            target = max(1, size)
+            # Threads that have already exited do not count towards capacity,
+            # and leaving them in the list would make a pool that lost workers
+            # look full.
+            pool.workers = pool.live()
+            current = len(pool.workers)
+            if target > current:
+                self._add_workers(pool, target - current)
+            elif target < current:
+                # Newest first: the ones least likely to be deep into an item.
+                for worker in pool.workers[target:]:
+                    worker.stop.set()
+                log.info(
+                    "project %s shrinking from %d to %d worker(s); the excess will "
+                    "finish their current item first",
+                    project_id,
+                    current,
+                    target,
+                )
+            return target
+
+    def _add_workers(self, pool: ProjectPool, count: int) -> int:
+        """Start `count` more workers. A failed start does not disturb its siblings."""
+        started = 0
+        for n in range(count):
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=self._worker,
+                args=(pool.project_id, stop),
+                name=f"harness-{pool.project_id}-{len(pool.workers) + n}",
+                daemon=True,
+            )
+            worker = Worker(thread=thread, stop=stop)
+            pool.workers.append(worker)
+            try:
+                thread.start()
+            except RuntimeError as exc:  # pragma: no cover - OS thread limits
+                # Recorded rather than raised: one thread the OS would not
+                # give us must not take down the workers that are running.
+                pool.workers.remove(worker)
+                self._died(pool.project_id, None, f"could not start a worker: {exc}")
+                continue
+            started += 1
+        return started
 
     def stop(self, project_id: str, *, reason: str | None = None, timeout: float = 30.0) -> None:
         """Stop claiming and wait for in-flight work to finish.
@@ -139,9 +232,9 @@ class Fleet:
         self.queue.set_control(STOPPED, reason=reason, project_id=project_id)
         if pool is None:
             return
-        pool.stop.set()
-        for thread in pool.threads:
-            thread.join(timeout=timeout)
+        pool.stop_all()
+        for worker in pool.workers:
+            worker.thread.join(timeout=timeout)
         log.info("stopped project %s", project_id)
 
     def stop_all(self, *, reason: str | None = None) -> None:
@@ -247,7 +340,7 @@ class Fleet:
             if pool is None:
                 return
             current = threading.current_thread()
-            if any(t.is_alive() and t is not current for t in pool.threads):
+            if any(w.alive and w.thread is not current for w in pool.workers):
                 return
             self._pools.pop(project_id, None)
         self.queue.set_control(

@@ -298,6 +298,8 @@ def client(tmp_path: Path):  # type: ignore[no-untyped-def]
 
         def __init__(self) -> None:
             self.started: list[str] = []
+            self.sizes: dict[str, int] = {}
+            self.resized: list[tuple[str, int]] = []
 
         def start(self, project_id: str) -> int:
             self.started.append(project_id)
@@ -310,7 +312,16 @@ def client(tmp_path: Path):  # type: ignore[no-untyped-def]
             q.set_control(STOPPED, reason=reason, project_id=project_id)
 
         def running(self) -> dict[str, int]:
-            return {p: 1 for p in self.started}
+            return {p: self.sizes.get(p, 1) for p in self.started}
+
+        def resize(self, project_id: str, size: int | None = None) -> int:
+            """A registration that changes `max_workers` reconciles the pool."""
+            if project_id not in self.started:
+                return 0  # not running: the new limit applies at the next start
+            project = q.get_project(project_id)
+            self.sizes[project_id] = max(1, size or (project.max_workers if project else 1))
+            self.resized.append((project_id, self.sizes[project_id]))
+            return self.sizes[project_id]
 
     with TestClient(create_api(store, queue=q, token="tok", fleet=ReadyFleet())) as c:  # noqa: S106
         holder: Any = c

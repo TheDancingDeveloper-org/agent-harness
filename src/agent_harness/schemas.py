@@ -43,29 +43,38 @@ class LatestEvent(BaseModel):
 
 class WorkItem(BaseModel):
     item_id: str = Field(description="Stable id from the plan, e.g. `T4`.")
-    title: str
+    title: str = Field(description="One line, from the plan heading.")
     brief: str = Field(description="The full specification given to the agent.")
     issue: int | None = Field(None, description="GitHub issue number, when synced.")
-    depends_on: list[str] = Field(default_factory=list)
-    state: WorkState
+    depends_on: list[str] = Field(
+        default_factory=list, description="Ids this item waits on before it can be claimed."
+    )
+    state: WorkState = Field(description="Where the item is. See `WorkState`.")
     owner: str | None = Field(None, description="host:pid of the worker holding the claim.")
     lease_until: float = Field(
         0.0,
         description="Unix time the claim expires. A claim is a LEASE — past this, "
         "the item is re-claimable without anyone intervening.",
     )
-    attempts: int = 0
-    last_error: str | None = None
+    attempts: int = Field(
+        0,
+        description="Claims so far. An item is given up on (`exhausted`) at the "
+        "project's limit, because one that reliably kills its worker would "
+        "otherwise be re-claimed forever, spending money each cycle.",
+    )
+    last_error: str | None = Field(None, description="Why the most recent attempt did not finish.")
     blocked_reason: str | None = Field(
         None,
         description="Why an operator blocked this item, when its state is `blocked`. "
         "A block is a decision someone made, not a failure the harness had -- reading "
         "it out of `last_error` would make the two indistinguishable.",
     )
-    branch: str | None = None
-    pr_url: str | None = None
-    updated_at: float = 0.0
-    latest: LatestEvent | None = None
+    branch: str | None = Field(None, description="Candidate branch, once one exists.")
+    pr_url: str | None = Field(None, description="Pull request, once review has approved one.")
+    updated_at: float = Field(0.0, description="Unix time this row last changed.")
+    latest: LatestEvent | None = Field(
+        None, description="Newest event for this item, or null if nothing has happened yet."
+    )
 
     @computed_field(  # type: ignore[prop-decorator]
         description="The same identifier as `item_id`, under the name most clients "
@@ -91,13 +100,15 @@ class WorkList(BaseModel):
         description="Items whose lease expired without finishing — the worker is gone. "
         "They are re-claimed automatically; a rising count means something is killing workers.",
     )
-    items: list[WorkItem] = Field(default_factory=list)
+    items: list[WorkItem] = Field(
+        default_factory=list, description="Every item, filtered to one project when asked."
+    )
 
 
 class RetryResult(BaseModel):
-    ok: bool
-    item_id: str
-    state: WorkState
+    ok: bool = Field(description="Whether the item was re-queued.")
+    item_id: str = Field(description="The item, as it was addressed.")
+    state: WorkState = Field(description="Its state afterwards -- `pending` on success.")
 
 
 class BlockRequest(BaseModel):
@@ -121,18 +132,20 @@ class BlockRequest(BaseModel):
 
 
 class BlockResult(BaseModel):
-    ok: bool
-    item_id: str
-    state: WorkState
+    ok: bool = Field(description="Whether the item was blocked.")
+    item_id: str = Field(description="The item, as it was addressed.")
+    state: WorkState = Field(description="Its state afterwards.")
     reason: str = Field(description="The reason as it is now recorded on the item.")
 
 
 class NewWorkItem(BaseModel):
-    item_id: str
-    title: str
-    brief: str = ""
-    issue: int | None = None
-    depends_on: list[str] = Field(default_factory=list)
+    item_id: str = Field(description="Stable id, unique within the project.")
+    title: str = Field(description="One line.")
+    brief: str = Field("", description="The full specification the agent will be given.")
+    issue: int | None = Field(None, description="GitHub issue number, when there is one.")
+    depends_on: list[str] = Field(
+        default_factory=list, description="Ids this item waits on before it can be claimed."
+    )
 
 
 class AddItemsRequest(BaseModel):
@@ -171,8 +184,12 @@ class FleetControl(BaseModel):
 
 
 class SetFleetControl(BaseModel):
-    state: Literal["running", "paused", "draining", "stopped"]
-    reason: str | None = None
+    state: Literal["running", "paused", "draining", "stopped"] = Field(
+        description="The state to move to. See `FleetControl.state` for what each means."
+    )
+    reason: str | None = Field(
+        None, description="Why. Shown to whoever finds the fleet in this state later."
+    )
 
 
 class RoleRoute(BaseModel):
@@ -208,14 +225,18 @@ class ProjectSpec(BaseModel):
     with nowhere to be written down."""
 
     project_id: str = Field(description="Stable id, used to scope every other call.")
-    name: str
+    name: str = Field(description="Human-readable name. Never used as an identifier.")
     repo: str | None = Field(None, description="GitHub repo as `owner/name`.")
     work_dir: str | None = Field(None, description="Checkout the worktrees branch from.")
-    base_branch: str = "main"
+    base_branch: str = Field(
+        "main", description="Branch candidates are cut from and proposed against."
+    )
     checks: list[str] = Field(
         default_factory=list, description="Commands run before the reviewer, cheapest first."
     )
-    plan_path: str | None = None
+    plan_path: str | None = Field(
+        None, description="Plan document for this project, as the service sees the filesystem."
+    )
     roles: dict[str, RoleRoute] | None = Field(
         None, description="Role overrides for this project. Null uses the global map."
     )
@@ -229,16 +250,20 @@ class ProjectSpec(BaseModel):
 class ProjectSummary(BaseModel):
     """A project plus enough state for the overview screen."""
 
-    project: ProjectSpec
-    counts: dict[str, int] = Field(default_factory=dict)
-    control: FleetControl
+    project: ProjectSpec = Field(description="The project as registered.")
+    counts: dict[str, int] = Field(
+        default_factory=dict, description="Item count per state, for this project only."
+    )
+    control: FleetControl = Field(description="What the operator has instructed.")
     previous_state: str | None = Field(
         None,
         description="What it was doing before the process last stopped it. This is what "
         "keeps 'was running' distinguishable from 'was drained because we were deploying' "
         "across a restart -- the operator's intent is otherwise what a restart destroys.",
     )
-    stale: int = 0
+    stale: int = Field(
+        0, description="Claims whose lease expired without finishing -- the worker is gone."
+    )
     workers: int = Field(
         0,
         description="Workers actually alive for this project. Distinct from the control "
@@ -258,9 +283,9 @@ class ProjectSummary(BaseModel):
 
 
 class PreflightCheck(BaseModel):
-    name: str
-    ok: bool
-    detail: str
+    name: str = Field(description="What was checked, e.g. `reviewer`, `checkout`.")
+    ok: bool = Field(description="Whether it passed.")
+    detail: str = Field(description="What was found, in words. Never a credential.")
     blocking: bool = Field(
         description="Blocking means the definition of done is unreachable, not merely "
         "that quality suffers. Only blocking checks refuse a start."
@@ -276,14 +301,16 @@ class PreflightResult(BaseModel):
     productive one until the bill arrives.
     """
 
-    project_id: str
-    ready: bool
-    summary: str
-    checks: list[PreflightCheck] = Field(default_factory=list)
+    project_id: str = Field(description="The project this report is about.")
+    ready: bool = Field(description="Whether a start would be accepted right now.")
+    summary: str = Field(description="`ready`, or the blocking reasons joined.")
+    checks: list[PreflightCheck] = Field(
+        default_factory=list, description="Every check run, blocking and advisory alike."
+    )
 
 
 class ProjectList(BaseModel):
-    projects: list[ProjectSummary]
+    projects: list[ProjectSummary] = Field(description="Every registered project.")
 
 
 class ReadinessProbe(BaseModel):
@@ -299,7 +326,7 @@ class ReadinessProbe(BaseModel):
 
 
 class ProjectReadiness(BaseModel):
-    project_id: str
+    project_id: str = Field(description="The project this entry is about.")
     ready_to_start: bool = Field(
         description="Whether `POST /api/projects/{id}/start` would be accepted. Derived "
         "from the same preflight the start action runs, so the two cannot disagree."
@@ -355,18 +382,25 @@ class ExecutionReadiness(BaseModel):
 
 
 class PlanItem(BaseModel):
-    id: str
-    title: str
-    body: str
+    id: str = Field(description="Stable id from the plan, e.g. `T4`.")
+    title: str = Field(description="The heading text, without the id.")
+    body: str = Field(
+        description="The prose under the heading. NOT the whole brief -- an agent is "
+        "given the title and this together, which is what `POST /api/plan/load` builds."
+    )
     labels: list[str] = Field(default_factory=list)
-    milestone: str | None = None
-    depends_on: list[str] = Field(default_factory=list)
-    done: bool = False
+    milestone: str | None = Field(None, description="Milestone the plan assigns it to.")
+    depends_on: list[str] = Field(
+        default_factory=list, description="Ids this item says it waits on."
+    )
+    done: bool = Field(
+        False, description="The plan already marks it finished. Not loaded by default."
+    )
     line: int = Field(description="Line in the source plan, so a reader can find it again.")
 
 
 class PlanParseResult(BaseModel):
-    items: list[PlanItem]
+    items: list[PlanItem] = Field(description="Everything recognised as work.")
     skipped: list[str] = Field(
         description="Headings not recognised as work. Never empty on a real plan — most "
         "headings are narrative — but a large number relative to items means the plan "
@@ -398,24 +432,32 @@ class PlanSyncRequest(BaseModel):
 
 
 class PlanSyncResult(BaseModel):
-    created: list[str] = Field(default_factory=list)
-    updated: list[str] = Field(default_factory=list)
-    unchanged: list[str] = Field(default_factory=list)
+    created: list[str] = Field(default_factory=list, description="Issues created.")
+    updated: list[str] = Field(
+        default_factory=list, description="Issues whose description was refreshed."
+    )
+    unchanged: list[str] = Field(default_factory=list, description="Issues already matching.")
     orphaned: list[str] = Field(
         default_factory=list,
         description="Issues for items no longer in the plan. Never closed automatically — "
         "an item vanishing from a document is not grounds to close work.",
     )
-    labels_created: list[str] = Field(default_factory=list)
-    milestones_created: list[str] = Field(default_factory=list)
-    dry_run: bool
+    labels_created: list[str] = Field(
+        default_factory=list,
+        description="Labels the plan asked for and the repository lacked. Reported "
+        "because creating them changes the repository, and that must not be silent.",
+    )
+    milestones_created: list[str] = Field(
+        default_factory=list, description="Milestones created, for the same reason."
+    )
+    dry_run: bool = Field(description="Whether this was a report or a real sync.")
 
 
 # ------------------------------------------------------------------- errors
 
 
 class RateLimits(BaseModel):
-    window: str
+    window: str = Field(description="The window these counts cover, e.g. `24h`.")
     classified: dict[str, int] = Field(
         description="Counts per class: `rpm` (going too fast), `window_cap` (short spend "
         "window exhausted), `terminal_cap` (spend cap or credential rejected)."
@@ -427,9 +469,15 @@ class RateLimits(BaseModel):
         "these and cannot be recovered."
     )
     total: int = Field(description="Classified rate limits only. Excludes `unclassified`.")
-    by_worker: list[dict[str, Any]] = Field(default_factory=list)
-    by_endpoint: list[dict[str, Any]] = Field(default_factory=list)
-    by_role: list[dict[str, Any]] = Field(default_factory=list)
+    by_worker: list[dict[str, Any]] = Field(
+        default_factory=list, description="Counts split by worker, busiest first."
+    )
+    by_endpoint: list[dict[str, Any]] = Field(
+        default_factory=list, description="Counts split by provider endpoint."
+    )
+    by_role: list[dict[str, Any]] = Field(
+        default_factory=list, description="Counts split by role, so spend caps can be attributed."
+    )
 
 
 # -------------------------------------------------------------------- audit
@@ -451,19 +499,21 @@ class AuditHealth(BaseModel):
         "not stop delivery -- so this is the only signal that it is happening."
     )
     path: str | None = Field(None, description="Where the audit database lives.")
-    events: int = 0
+    events: int = Field(0, description="Events recorded.")
     oldest: float | None = Field(None, description="Unix time of the earliest event.")
-    newest: float | None = None
-    schema_version: int | None = None
+    newest: float | None = Field(None, description="Unix time of the most recent event.")
+    schema_version: int | None = Field(
+        None, description="Schema the store was written under. Migrations are deliberate."
+    )
 
 
 class AuditCostRow(BaseModel):
-    project_id: str | None = None
-    role: str | None = None
-    model: str | None = None
-    calls: int = 0
-    tokens_in: int = 0
-    tokens_out: int = 0
+    project_id: str | None = Field(None, description="Project these calls belong to.")
+    role: str | None = Field(None, description="Role that made them, e.g. `reviewer`.")
+    model: str | None = Field(None, description="Model as the provider names it.")
+    calls: int = Field(0, description="Calls in this group.")
+    tokens_in: int = Field(0, description="Prompt tokens.")
+    tokens_out: int = Field(0, description="Completion tokens.")
     cost_usd: float | None = Field(
         None, description="Null when no call in this group carried a known price."
     )
@@ -476,10 +526,18 @@ class AuditCostRow(BaseModel):
 
 
 class AuditCost(BaseModel):
-    window: str
-    rows: list[AuditCostRow] = Field(default_factory=list)
-    total_cost_usd: float | None = None
-    total_unpriced: int = 0
+    window: str = Field(description="The window these rows cover.")
+    rows: list[AuditCostRow] = Field(
+        default_factory=list, description="One row per project/role/model group."
+    )
+    total_cost_usd: float | None = Field(
+        None, description="Summed across priced calls only. Null when nothing was priced."
+    )
+    total_unpriced: int = Field(
+        0,
+        description="Calls excluded from that total because their price was unknown. "
+        "A total that silently absorbed them would read as complete and not be.",
+    )
     partial: bool = Field(
         False,
         description="True when the requested window starts before the earliest "
@@ -488,29 +546,35 @@ class AuditCost(BaseModel):
 
 
 class AuditDeliveryRow(BaseModel):
-    project_id: str | None = None
-    outcome: str | None = None
-    n: int = 0
+    project_id: str | None = Field(None, description="Project this row belongs to.")
+    outcome: str | None = Field(None, description="Terminal outcome, e.g. `done`, `failed`.")
+    n: int = Field(0, description="Events with this outcome.")
     items: int = Field(0, description="Distinct items, not events.")
 
 
 class AuditDelivery(BaseModel):
-    window: str
-    rows: list[AuditDeliveryRow] = Field(default_factory=list)
-    partial: bool = False
+    window: str = Field(description="The window these rows cover.")
+    rows: list[AuditDeliveryRow] = Field(
+        default_factory=list, description="One row per project and outcome."
+    )
+    partial: bool = Field(
+        False,
+        description="True when the window starts before the earliest recorded event, "
+        "so the answer covers less than it was asked for.",
+    )
 
 
 class AuditRollupRow(BaseModel):
-    day: str
-    project_id: str | None = None
-    role: str | None = None
-    model: str | None = None
-    outcome: str | None = None
-    events: int = 0
-    tokens_in: int = 0
-    tokens_out: int = 0
-    cost_usd: float | None = None
-    latency_p50: float | None = None
+    day: str = Field(description="The day summarised, as `YYYY-MM-DD`.")
+    project_id: str | None = Field(None, description="Project this row belongs to.")
+    role: str | None = Field(None, description="Role these calls were made for.")
+    model: str | None = Field(None, description="Model as the provider names it.")
+    outcome: str | None = Field(None, description="Outcome these events shared.")
+    events: int = Field(0, description="Events folded into this row.")
+    tokens_in: int = Field(0, description="Prompt tokens for the day.")
+    tokens_out: int = Field(0, description="Completion tokens for the day.")
+    cost_usd: float | None = Field(None, description="Priced calls only, as in `AuditCostRow`.")
+    latency_p50: float | None = Field(None, description="Median call latency, seconds.")
 
 
 class AuditRollups(BaseModel):
@@ -530,13 +594,16 @@ class MaintenanceResult(BaseModel):
     thinned: int = Field(
         description="Raw events removed. Only ever events whose day a rollup already covers."
     )
-    errors: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(
+        default_factory=list,
+        description="What went wrong, if anything. Maintenance is best-effort.",
+    )
 
 
 class ReconcileResult(BaseModel):
     """What GitHub said happened to the work."""
 
-    merged: int = 0
+    merged: int = Field(0, description="Pull requests that landed.")
     closed_unmerged: int = Field(
         0,
         description="Rejected outright -- from inside the harness this looks identical "
@@ -553,11 +620,13 @@ class ReconcileResult(BaseModel):
         "Counted, never attributed: an outcome belonging to no item inflates every "
         "rate it appears in.",
     )
-    errors: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(
+        default_factory=list, description="Pull requests that could not be read, and why."
+    )
 
 
 class InceptionStart(BaseModel):
-    project_id: str
+    project_id: str = Field(description="Id the project will be registered under.")
     overview: str = Field(
         description="A paragraph describing what you want. Not a plan -- the point is "
         "that you do not have to write one."
@@ -573,42 +642,57 @@ class ScopeRequest(BaseModel):
 
 
 class OpenQuestion(BaseModel):
-    id: str
-    question: str
+    id: str = Field(description="Stable id, used to answer or defer it.")
+    question: str = Field(description="What is being asked.")
     severity: Literal["blocking", "deferrable"] = Field(
         description="`blocking` means the answer changes what gets built -- choosing "
         "wrong means work is done and thrown away. `deferrable` means a reasonable "
         "default holds. Blocking on EVERY question is worse than no gate: one cosmetic "
         "question stalls the project and people answer carelessly to get past it."
     )
-    why_it_matters: str = ""
-    answer: str | None = None
+    why_it_matters: str = Field(
+        "", description="What changes depending on the answer. The case for asking at all."
+    )
+    answer: str | None = Field(None, description="The answer given, if it has been answered.")
     deferred_reason: str | None = Field(
         None,
         description="Deferring is answering 'not now', which is different from unasked. "
         "It survives approval and stays visible on the plan.",
     )
-    resolved_by: str | None = None
+    resolved_by: str | None = Field(None, description="Who answered or deferred it.")
 
 
 class ProposalModel(BaseModel):
-    revision: int
-    created_at: float
-    goal: str = ""
-    assumptions: list[str] = Field(default_factory=list)
-    non_goals: list[str] = Field(default_factory=list)
-    risks: list[str] = Field(default_factory=list)
-    phases: list[dict[str, Any]] = Field(default_factory=list)
-    questions: list[OpenQuestion] = Field(default_factory=list)
-    feedback: str | None = None
-    item_count: int = 0
+    revision: int = Field(
+        description="Which revision this is. Feedback revises rather than restarts, so "
+        "these accumulate instead of replacing one another."
+    )
+    created_at: float = Field(description="Unix time this revision was produced.")
+    goal: str = Field("", description="What the project is for, in a sentence.")
+    assumptions: list[str] = Field(
+        default_factory=list,
+        description="What it took as given. The most useful thing to argue with.",
+    )
+    non_goals: list[str] = Field(
+        default_factory=list,
+        description="Explicitly out of scope, so it is not quietly added later.",
+    )
+    risks: list[str] = Field(default_factory=list, description="What could make this go wrong.")
+    phases: list[dict[str, Any]] = Field(
+        default_factory=list, description="Proposed phases, each with its items."
+    )
+    questions: list[OpenQuestion] = Field(
+        default_factory=list, description="What it could not decide on its own."
+    )
+    feedback: str | None = Field(None, description="The feedback that produced this revision.")
+    item_count: int = Field(0, description="Work items across every phase.")
     blocking_open: int = Field(
         0, description="Unanswered blocking questions. Approval is refused while > 0."
     )
 
 
 class ResolveQuestion(BaseModel):
-    answer: str | None = None
+    answer: str | None = Field(None, description="The answer. Required unless deferring.")
     defer_reason: str | None = Field(
         None, description="Required to defer. Silence never resolves a question."
     )
@@ -617,32 +701,34 @@ class ResolveQuestion(BaseModel):
         description="Overrule the model, in either direction. It proposes severity so "
         "you are not triaging a flat list, but it does not decide what matters.",
     )
-    who: str = "operator"
+    who: str = Field("operator", description="Who is answering. Recorded, not verified.")
 
 
 class Baseline(BaseModel):
-    baseline_id: str
-    project_id: str
-    recorded_at: float
-    label: str
-    window_days: int
-    items_done: int | None = None
-    cost_usd: float | None = None
-    notes: str | None = None
+    baseline_id: str = Field(description="Stable id for this measurement.")
+    project_id: str = Field(description="Project it was measured on.")
+    recorded_at: float = Field(description="Unix time it was recorded.")
+    label: str = Field(description="What was measured, in words.")
+    window_days: int = Field(description="Days the measurement covers.")
+    items_done: int | None = Field(None, description="Items finished in that window.")
+    cost_usd: float | None = Field(None, description="Spend across that window, where priced.")
+    notes: str | None = Field(None, description="Anything a later comparison would need to know.")
 
 
 class BaselineList(BaseModel):
-    baselines: list[Baseline] = Field(default_factory=list)
+    baselines: list[Baseline] = Field(
+        default_factory=list, description="Recorded baselines, newest first."
+    )
 
 
 class NewBaseline(BaseModel):
     baseline_id: str = Field(description="Stable id. Recording twice under one id is refused.")
-    project_id: str
+    project_id: str = Field(description="Project being measured.")
     label: str = Field(description="What was measured, in words.")
-    window_days: int
-    items_done: int | None = None
-    cost_usd: float | None = None
-    notes: str | None = None
+    window_days: int = Field(description="Days the measurement covers.")
+    items_done: int | None = Field(None, description="Items finished in that window.")
+    cost_usd: float | None = Field(None, description="Spend across that window, where priced.")
+    notes: str | None = Field(None, description="Anything a later comparison would need to know.")
 
 
 # ------------------------------------------------------------------- events
@@ -653,9 +739,9 @@ class Event(BaseModel):
         description="Monotonic row id. Page with this, not with `ts`: two "
         "events in one millisecond must still have a total order."
     )
-    ts: float
-    kind: str
-    source: str
+    ts: float = Field(description="Unix time the event happened.")
+    kind: str = Field(description="What kind of event, e.g. `work`, `model_call`.")
+    source: str = Field(description="Which stream it was read from.")
     worker: str | None = None
     role: str | None = None
     model: str | None = None
@@ -663,7 +749,12 @@ class Event(BaseModel):
     outcome: str | None = None
     error_class: str | None = None
     latency_s: float | None = None
-    data: dict[str, Any] = Field(default_factory=dict)
+    data: dict[str, Any] = Field(
+        default_factory=dict,
+        description="The event's own payload. For work events this carries "
+        "`project_id`, `item_id` and any session ids -- an item is identified by "
+        "project AND id, so a reader keying on `item_id` alone conflates projects.",
+    )
 
 
 class EventPage(BaseModel):
@@ -680,11 +771,14 @@ class WaitingItem(BaseModel):
 
 
 class Summary(BaseModel):
-    running: int
-    pending: int
-    done: int
-    failed: int
-    stale: int
+    running: int = Field(description="Items claimed right now.")
+    pending: int = Field(description="Items waiting to be claimed.")
+    done: int = Field(description="Items finished.")
+    failed: int = Field(description="Items whose last attempt did not work.")
+    stale: int = Field(
+        description="Claims whose lease expired without finishing. Re-claimed "
+        "automatically; a rising count means something is killing workers."
+    )
     abandoned_sessions: int = Field(
         0,
         description="Terminal sessions kept alive after an agent timed out. They hold "
@@ -699,10 +793,43 @@ class Summary(BaseModel):
 
 
 class Health(BaseModel):
-    ok: bool
-    events: int
+    ok: bool = Field(description="Always true when the service answers at all.")
+    events: int = Field(description="Events in the store. Zero is normal on a fresh deployment.")
     queue: bool = Field(description="Whether a work queue is attached.")
     authenticated: bool = Field(
         description="Whether a token is configured. False means every authenticated route refuses."
     )
-    version: str
+    version: str = Field(description="The build serving this response.")
+
+
+class InceptionRecord(BaseModel):
+    """A scoping conversation before anything external exists.
+
+    Nothing here has created a repository, an issue, a branch or a queue row.
+    That only happens on approval, which is what makes `state` the field to
+    read: it says how far a project is from being real.
+    """
+
+    project_id: str = Field(description="Id the project will be registered under.")
+    state: str = Field(
+        description="`draft` (a paragraph, nothing proposed yet), `scoping`, "
+        "`proposed`, or `approved`. Only approval creates anything external."
+    )
+    overview: str = Field(description="The paragraph the project was described in.")
+    revisions: list[str] = Field(
+        default_factory=list,
+        description="Feedback given on successive proposals, oldest first. Kept "
+        "because a revised scope should not make somebody re-argue a settled point.",
+    )
+    created_at: float = Field(description="Unix time scoping began.")
+
+
+class InceptionPlan(BaseModel):
+    """The proposal rendered as a plan document."""
+
+    markdown: str = Field(
+        description="A real PLAN.md, not queue rows. It goes through the same "
+        "parser as a hand-written plan -- including the part that reports what it "
+        "could not read -- so a proposal the harness cannot consume is caught "
+        "before it creates a single issue."
+    )

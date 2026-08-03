@@ -855,3 +855,59 @@ def test_the_api_keeps_no_module_level_wiring() -> None:
     assert "_APP_STATE" not in source
     module_dicts = re.findall(r"^_[A-Z_]+: dict\[str, Any\] = \{\}", source, re.MULTILINE)
     assert module_dicts == [], f"mutable module-level state is back: {module_dicts}"
+
+
+# ------------------------------------------------ the schema is the contract
+
+
+def _success_schema(operation: dict[str, Any]) -> dict[str, Any] | None:
+    for status in ("200", "201"):
+        content = (operation.get("responses", {}).get(status) or {}).get("content") or {}
+        if "application/json" in content:
+            return content["application/json"].get("schema") or {}
+    return None
+
+
+def test_no_route_returns_an_unstructured_object(client: TestClient) -> None:
+    """AGENTS.md: the schema IS the documentation.
+
+    Derived from the served document rather than a hand-maintained list of
+    routes. The previous check covered five older routes, so the inception
+    surface grew two `response_model=dict` routes without anything noticing —
+    and a generated client cannot discover a field that is documented as
+    `additionalProperties: true`.
+    """
+    schema = client.get("/openapi.json").json()
+    bare: list[str] = []
+    for path, methods in schema["paths"].items():
+        for method, operation in methods.items():
+            success = _success_schema(operation)
+            if success is None:
+                continue
+            named = "$ref" in success or "items" in success or "anyOf" in success
+            if not named and success.get("type") in (None, "object"):
+                bare.append(f"{method.upper()} {path}")
+    assert bare == [], f"routes documenting an unstructured object: {bare}"
+
+
+def test_every_documented_field_has_a_description(client: TestClient) -> None:
+    """A named model whose fields say nothing is barely better than a dict."""
+    components = client.get("/openapi.json").json()["components"]["schemas"]
+    undescribed: list[str] = []
+    for name, model in components.items():
+        if name.startswith("HTTPValidationError") or name == "ValidationError":
+            continue  # FastAPI's own, not ours to document
+        for field, spec in (model.get("properties") or {}).items():
+            structured = "$ref" in spec or "allOf" in spec or "anyOf" in spec or "items" in spec
+            if not spec.get("description") and not structured:
+                undescribed.append(f"{name}.{field}")
+    assert undescribed == [], f"fields with no description: {undescribed}"
+
+
+def test_the_inception_routes_name_their_shapes(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    started = _success_schema(schema["paths"]["/api/inception"]["post"])
+    plan = _success_schema(schema["paths"]["/api/inception/{project_id}/plan"]["get"])
+    assert started and "$ref" in started
+    assert plan and "$ref" in plan
+    assert "markdown" in schema["components"]["schemas"]["InceptionPlan"]["properties"]

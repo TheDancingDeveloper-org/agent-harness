@@ -402,3 +402,166 @@ def test_a_factory_that_cannot_build_an_executor_is_recorded(queue: WorkQueue) -
     assert wait_for(lambda: bool(fleet.failures("b")))
     assert "no checkout" in fleet.failures("b")[0].error
     assert wait_for(lambda: queue.control(project_id="b")[0] == STOPPED)
+
+
+# ---------------------------------------------- resizing a running project
+
+
+def test_a_running_project_can_grow_and_shrink_without_stopping(queue: WorkQueue) -> None:
+    """Capacity used to cost a drain and restart cycle -- lifecycle risk
+    during live work, bought purely to change a number."""
+    fleet = fleet_for(queue, [])
+    try:
+        assert fleet.start("a") == 2
+        assert wait_for(lambda: fleet.running().get("a") == 2)
+
+        assert fleet.resize("a", 4) == 4
+        assert wait_for(lambda: fleet.running().get("a") == 4)
+
+        fleet.resize("a", 1)
+        assert wait_for(lambda: fleet.running().get("a") == 1), fleet.running()
+        # Never stopped: the project is still running throughout.
+        assert queue.control("a")[0] == RUNNING
+    finally:
+        fleet.stop_all()
+
+
+def test_shrinking_lets_in_flight_work_finish(queue: WorkQueue) -> None:
+    """The reason the excess is signalled and not joined or killed: an agent
+    interrupted mid-item loses the context that makes its work resumable."""
+    seen: list[str] = []
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowExecutor:
+        def __init__(self, project_id: str) -> None:
+            self.project_id = project_id
+            self.owner = f"w-{project_id}"
+
+        def serve(self, *, poll_seconds: float, stop: threading.Event) -> None:
+            while not stop.is_set():
+                record = queue.claim(self.owner, project_id=self.project_id)
+                if record is None:
+                    stop.wait(0.01)
+                    continue
+                started.set()
+                # Held past the resize, deliberately. `stop` is ignored here,
+                # exactly as a real agent mid-item ignores it.
+                release.wait(5)
+                seen.append(record.item_id)
+                queue.release(record.item_id, "done", owner=self.owner, project_id=self.project_id)
+
+    fleet = Fleet(queue, lambda pid: SlowExecutor(pid), poll_seconds=0.01)
+    queue.add([rec("T1")], project_id="a")
+    try:
+        fleet.start("a")
+        assert started.wait(5), "no worker ever claimed the item"
+
+        fleet.resize("a", 1)
+        # The item is still claimed and still being worked on, not abandoned.
+        assert queue.get("T1", project_id="a").state == "claimed"  # type: ignore[union-attr]
+
+        release.set()
+        assert wait_for(lambda: queue.get("T1", project_id="a").state == "done")  # type: ignore[union-attr]
+        assert seen == ["T1"], "the in-flight item did not finish"
+    finally:
+        release.set()
+        fleet.stop_all()
+
+
+def test_resizing_to_the_same_number_does_nothing(queue: WorkQueue) -> None:
+    fleet = fleet_for(queue, [])
+    try:
+        fleet.start("a")
+        assert wait_for(lambda: fleet.running().get("a") == 2)
+        assert fleet.resize("a", 2) == 2
+        assert fleet.resize("a", 2) == 2
+        assert fleet.running().get("a") == 2
+    finally:
+        fleet.stop_all()
+
+
+def test_resizing_reads_the_projects_limit_when_none_is_given(queue: WorkQueue) -> None:
+    """What a project update calls: change the row, reconcile the pool."""
+    fleet = fleet_for(queue, [])
+    try:
+        fleet.start("a")
+        assert wait_for(lambda: fleet.running().get("a") == 2)
+        queue.add_project(Project(project_id="a", name="A", max_workers=3))
+        assert fleet.resize("a") == 3
+        assert wait_for(lambda: fleet.running().get("a") == 3)
+    finally:
+        fleet.stop_all()
+
+
+def test_resizing_a_project_that_is_not_running_starts_nothing(queue: WorkQueue) -> None:
+    """A registration must never be what begins spending money."""
+    fleet = fleet_for(queue, [])
+    try:
+        assert fleet.resize("a", 4) == 0
+        assert fleet.running() == {}
+        assert queue.control("a")[0] != RUNNING
+    finally:
+        fleet.stop_all()
+
+
+def test_a_resize_never_drops_below_one_worker(queue: WorkQueue) -> None:
+    """Zero workers on a running project is the false-running state the start
+    gate exists to refuse. Reaching it by resize would be the same bug."""
+    fleet = fleet_for(queue, [])
+    try:
+        fleet.start("a")
+        assert fleet.resize("a", 0) == 1
+        assert wait_for(lambda: fleet.running().get("a") == 1)
+    finally:
+        fleet.stop_all()
+
+
+def test_concurrent_resizes_do_not_both_act_on_one_count(queue: WorkQueue) -> None:
+    """Two requests reading the same live count and both adding to it is how
+    a pool ends up at twice its budget."""
+    fleet = fleet_for(queue, [])
+    try:
+        fleet.start("a")
+        assert wait_for(lambda: fleet.running().get("a") == 2)
+
+        barrier = threading.Barrier(6)
+
+        def resize() -> None:
+            barrier.wait()
+            fleet.resize("a", 5)
+
+        threads = [threading.Thread(target=resize) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert wait_for(lambda: fleet.running().get("a") == 5), fleet.running()
+    finally:
+        fleet.stop_all()
+
+
+def test_a_project_update_resizes_a_running_pool(queue: WorkQueue, tmp_path: Path) -> None:
+    """End to end: the operator changes max_workers and it takes effect."""
+    from fastapi.testclient import TestClient
+
+    from agent_harness.api import create_api
+    from agent_harness.store import EventStore
+
+    fleet = fleet_for(queue, [])
+    app = create_api(EventStore(tmp_path / "e.sqlite"), queue=queue, token="tok", fleet=fleet)
+    try:
+        fleet.start("a")
+        assert wait_for(lambda: fleet.running().get("a") == 2)
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/projects",
+                headers={"Authorization": "Bearer tok"},
+                json={"project_id": "a", "name": "A", "max_workers": 4},
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["project"]["max_workers"] == 4
+        assert wait_for(lambda: fleet.running().get("a") == 4), fleet.running()
+    finally:
+        fleet.stop_all()

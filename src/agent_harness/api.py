@@ -59,6 +59,8 @@ from .schemas import (
     ExecutionReadiness,
     FleetControl,
     Health,
+    InceptionPlan,
+    InceptionRecord,
     InceptionStart,
     LatestEvent,
     MaintenanceResult,
@@ -443,15 +445,15 @@ def create_api(
         "/api/inception",
         tags=["work"],
         summary="Describe a project in a paragraph",
-        response_model=dict,
+        response_model=InceptionRecord,
     )
     def inception_start(
         request: InceptionStart,
         _: None = Depends(require_token),
-    ) -> dict[str, Any]:
+    ) -> InceptionRecord:
         """Begin scoping. Nothing external exists yet and will not until you
         approve: no repository, no issues, no branches, no queue rows."""
-        return inception_for().start(request.project_id, request.overview)  # type: ignore[no-any-return]
+        return InceptionRecord(**inception_for().start(request.project_id, request.overview))
 
     @app.post(
         "/api/inception/{project_id}/scope",
@@ -541,13 +543,15 @@ def create_api(
         "/api/inception/{project_id}/plan",
         tags=["work"],
         summary="The proposal as a PLAN.md",
-        response_model=dict,
+        response_model=InceptionPlan,
     )
     def inception_plan(
         project_id: str = PathParam(description="Project id."),
-        name: str | None = Query(None),
+        name: str | None = Query(
+            None, description="Title for the generated plan. Defaults to the project id."
+        ),
         _: None = Depends(require_token),
-    ) -> dict[str, str]:
+    ) -> InceptionPlan:
         """A real plan document, not queue rows.
 
         Writing straight to the queue would fork the pipeline into a generated
@@ -557,7 +561,7 @@ def create_api(
         consume is caught before it creates a single issue.
         """
         try:
-            return {"markdown": inception_for().plan_markdown(project_id, name)}
+            return InceptionPlan(markdown=inception_for().plan_markdown(project_id, name))
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -856,9 +860,16 @@ def create_api(
     ) -> ProjectSummary:
         """Register or update a project, durably.
 
-        It starts **stopped**. Registering a project must not begin spending
-        money on it, and nothing here starts a worker -- only an explicit
-        start does.
+        A NEW project starts **stopped**. Registering one must not begin
+        spending money on it, and nothing here starts the first worker --
+        only an explicit start does.
+
+        Updating a project that is ALREADY running reconciles its pool to the
+        new `max_workers`. Raising it starts only the additional workers;
+        lowering it lets the excess finish their current item and leave. No
+        session is interrupted, so capacity no longer costs a drain and
+        restart cycle -- which was the expensive part, since a restart during
+        live work adds lifecycle risk to buy a number change.
         """
         queue = need_queue()
         queue.add_project(
@@ -874,7 +885,12 @@ def create_api(
                 max_workers=spec.max_workers,
             )
         )
-        return _project_summary(queue, spec.project_id, app.state.fleet)
+        fleet = app.state.fleet
+        if fleet is not None:
+            # A no-op unless this project already has a pool, so registering
+            # a new project still starts nothing.
+            fleet.resize(spec.project_id)
+        return _project_summary(queue, spec.project_id, fleet)
 
     @app.get(
         "/api/projects/{project_id}",

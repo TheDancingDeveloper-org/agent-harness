@@ -62,7 +62,34 @@ class WorkItem(BaseModel):
         "project's limit, because one that reliably kills its worker would "
         "otherwise be re-claimed forever, spending money each cycle.",
     )
-    last_error: str | None = Field(None, description="Why the most recent attempt did not finish.")
+    last_error: str | None = Field(
+        None, description="Why the most recent attempt did not finish, in full."
+    )
+    failure_summary: str | None = Field(
+        None,
+        description="The first line of `last_error`, bounded in length, for a list "
+        "view. A backlog with several failures is untriageable when every row says "
+        "only `failed` and the reason is one pane deeper. The full text stays in "
+        "`last_error`; this never replaces it.",
+    )
+    failed_stage: str | None = Field(
+        None,
+        description="Where it failed -- `checks_failed`, `review_rejected`, "
+        "`agent_timeout` -- from the last recorded event. Which stage failed usually "
+        "decides whether retrying is worth anything.",
+    )
+    retryable: bool = Field(
+        True,
+        description="Whether `POST /api/work/{item_id}/retry` would be accepted right "
+        "now. Computed by the same rule the route enforces, so a client offering the "
+        "action cannot drift from the server refusing it -- the alternative is a "
+        "button that exists to produce a 409.",
+    )
+    retry_blocked_reason: str | None = Field(
+        None,
+        description="Why retry would be refused, when it would be. A disabled action "
+        "with no explanation is indistinguishable from a broken one.",
+    )
     blocked_reason: str | None = Field(
         None,
         description="Why an operator blocked this item, when its state is `blocked`. "

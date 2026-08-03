@@ -331,12 +331,9 @@ def create_api(
         record = queue.get(item_id, project_id=project_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
-        if record.state == CLAIMED and record.lease_until > time.time():
-            raise HTTPException(
-                status_code=409,
-                detail=f"{item_id} is claimed by {record.owner} and its lease is live; "
-                "wait for the lease to expire rather than racing it",
-            )
+        refusal = retry_refusal(record, time.time())
+        if refusal is not None:
+            raise HTTPException(status_code=409, detail=refusal)
         queue.release(item_id, PENDING, error=None, project_id=project_id)
         return RetryResult(ok=True, item_id=item_id, state="pending")
 
@@ -1360,6 +1357,27 @@ def create_api(
     return app
 
 
+#: Longest failure summary a list view gets. Long enough for a real message,
+#: short enough that a card is not a wall of text -- the full string is always
+#: in `last_error`.
+FAILURE_SUMMARY_LIMIT = 200
+
+
+def retry_refusal(record: WorkRecord, now: float) -> str | None:
+    """Why retrying this item would be refused, or None if it would not.
+
+    One rule, consulted by the route that enforces it AND by the model that
+    advertises it. Two copies drift, and the way they drift is a client
+    offering an action the server answers 409 to.
+    """
+    if record.state == CLAIMED and record.lease_until > now:
+        return (
+            f"{record.item_id} is claimed by {record.owner} and its lease is live; "
+            "wait for the lease to expire rather than racing it"
+        )
+    return None
+
+
 def _latest_by_item(store: EventStore) -> dict[tuple[str | None, str], dict[str, Any]]:
     """Newest event per work item. One scan — doing it per item would be a
     query per row.
@@ -1486,6 +1504,18 @@ def _project_summary(queue: WorkQueue, project_id: str, fleet: Any | None = None
     )
 
 
+def _failure_summary(record: WorkRecord) -> str | None:
+    """One readable line, for a card. Never a replacement for `last_error`."""
+    if record.state not in (FAILED, "exhausted") or not record.last_error:
+        return None
+    first = record.last_error.strip().splitlines()[0].strip()
+    if len(first) <= FAILURE_SUMMARY_LIMIT:
+        return first
+    # Truncation is marked, so a reader can tell a short message from a
+    # clipped one and knows there is more in `last_error`.
+    return first[: FAILURE_SUMMARY_LIMIT - 1].rstrip() + "\u2026"
+
+
 def _worker_health(fleet: Any | None, project_id: str) -> dict[str, Any]:
     """What the fleet knows about workers that died on this project."""
     if fleet is None or not hasattr(fleet, "failures"):
@@ -1512,6 +1542,12 @@ def _item_model(record: WorkRecord, event: dict[str, Any] | None) -> WorkItem:
         # The queue stores one "why" per item. Which of the two it is depends
         # entirely on the state, and a client should not have to know that.
         blocked_reason=record.last_error if record.state == BLOCKED else None,
+        failure_summary=_failure_summary(record),
+        failed_stage=(event or {}).get("outcome")
+        if record.state in (FAILED, "exhausted")
+        else None,
+        retryable=retry_refusal(record, time.time()) is None,
+        retry_blocked_reason=retry_refusal(record, time.time()),
         branch=record.branch,
         pr_url=record.pr_url,
         updated_at=record.updated_at,

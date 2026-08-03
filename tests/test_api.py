@@ -911,3 +911,76 @@ def test_the_inception_routes_name_their_shapes(client: TestClient) -> None:
     assert started and "$ref" in started
     assert plan and "$ref" in plan
     assert "markdown" in schema["components"]["schemas"]["InceptionPlan"]["properties"]
+
+
+# -------------------------------------------- triaging failures from a list
+
+
+def test_a_failed_item_carries_its_reason_and_stage_in_the_list(
+    client: TestClient, queue: WorkQueue, store: EventStore
+) -> None:
+    """A backlog with several failures is untriageable when every row says
+    only `failed` and the reason is one pane deeper."""
+    store.append(
+        [
+            Event(
+                ts=time.time(),
+                kind=WORK,
+                source="events.jsonl",
+                worker="w",
+                outcome="checks_failed",
+                data={"item_id": "W1"},
+            )
+        ]
+    )
+    queue.claim("w")
+    queue.release("W1", "failed", error="pytest exited 1\nassert 3 == 4\n  in test_thing")
+
+    row = {i["item_id"]: i for i in client.get("/api/work", headers=auth()).json()["items"]}["W1"]
+    assert row["failure_summary"] == "pytest exited 1"
+    assert row["failed_stage"] == "checks_failed"
+    # The summary never replaces the full text.
+    assert "assert 3 == 4" in row["last_error"]
+
+
+def test_a_long_failure_is_truncated_and_says_so(client: TestClient, queue: WorkQueue) -> None:
+    queue.claim("w")
+    queue.release("W1", "failed", error="x" * 500)
+
+    row = {i["item_id"]: i for i in client.get("/api/work", headers=auth()).json()["items"]}["W1"]
+    assert len(row["failure_summary"]) <= 200
+    assert row["failure_summary"].endswith("…"), "a clipped message must look clipped"
+    assert len(row["last_error"]) == 500
+
+
+def test_a_healthy_item_advertises_no_failure(client: TestClient) -> None:
+    row = {i["item_id"]: i for i in client.get("/api/work", headers=auth()).json()["items"]}["W1"]
+    assert row["failure_summary"] is None
+    assert row["failed_stage"] is None
+
+
+def test_retryability_matches_what_retry_actually_does(
+    client: TestClient, queue: WorkQueue
+) -> None:
+    """The rule is computed once. A client offering the action cannot drift
+    from the server refusing it -- the alternative is a button that exists to
+    produce a 409."""
+    queue.claim("worker-a")
+    row = client.get("/api/work/W1", headers=auth()).json()
+    assert row["retryable"] is False
+    assert "lease is live" in row["retry_blocked_reason"]
+    assert client.post("/api/work/W1/retry", headers=auth()).status_code == 409
+
+
+def test_a_stale_claim_is_advertised_as_retryable_and_is(tmp_path: Path, store: EventStore) -> None:
+    clock = [1000.0]
+    queue = make_queue(str(tmp_path / "s.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
+    queue.add([WorkRecord(item_id="W1", title="t", brief="b")])
+    queue.claim("worker-a")
+    clock[0] += 101  # the lease expires; nothing is holding it any more
+
+    with TestClient(create_api(store, queue=queue, token=TOKEN)) as c:
+        row = c.get("/api/work/W1", headers=auth()).json()
+        assert row["retryable"] is True
+        assert row["retry_blocked_reason"] is None
+        assert c.post("/api/work/W1/retry", headers=auth()).status_code == 200

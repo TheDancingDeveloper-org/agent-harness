@@ -259,6 +259,26 @@ class LeaseHeartbeat:
                 return
 
 
+def _process_alive(pid: int) -> bool:
+    """Whether a pid on this host is still running.
+
+    Signal 0 performs the permission and existence checks without delivering
+    anything. A pid we are not allowed to signal still exists, which is why
+    `PermissionError` is a yes.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        # Anything unexpected is treated as alive: releasing a claim from a
+        # live worker is far worse than leaving one for its lease to expire.
+        return True
+    return True
+
+
 def worker_identity() -> str:
     """Who holds a claim. Host and pid, so a stale claim can be traced to a
     specific process rather than to an anonymous 'someone'."""
@@ -835,6 +855,33 @@ class WorkQueue:
                 return False
         return True
 
+    def unmet_dependencies(self, item_id: str, *, project_id: str = DEFAULT_PROJECT) -> list[str]:
+        """Dependencies of an item that are not done, right now.
+
+        `claim` checks this once, at the moment of claiming. The graph can be
+        corrected while an item is in flight -- that is what correcting a plan
+        looks like -- and an item that is no longer eligible must not go on to
+        pass a durable gate on the strength of a check made minutes earlier.
+        """
+        record = self.get(item_id, project_id=project_id)
+        if record is None:
+            return []
+        conn = self._connect()
+        try:
+            unmet = []
+            for dependency in record.depends_on:
+                row = conn.execute(
+                    "SELECT state FROM work WHERE project_id = ? AND item_id = ?",
+                    (project_id, dependency),
+                ).fetchone()
+                # Absent means tracked elsewhere, which is not a blocker --
+                # the same rule `claim` uses, for the same reason.
+                if row is not None and row["state"] != DONE:
+                    unmet.append(dependency)
+            return unmet
+        finally:
+            conn.close()
+
     def heartbeat(self, item_id: str, owner: str, project_id: str = DEFAULT_PROJECT) -> bool:
         """Extend the lease. Returns False if the claim was lost — which is
         the signal to stop working, because someone else now owns it."""
@@ -922,6 +969,75 @@ class WorkQueue:
                     state,
                 )
             return applied
+        finally:
+            conn.close()
+
+    def requeue(self, item_id: str, *, project_id: str = DEFAULT_PROJECT) -> bool:
+        """Put an item back for another attempt, and mean it.
+
+        The attempt counter is reset, because an item at its ceiling is
+        retired by the very next claim scan: a "retry" that left the count
+        alone put the item back to `pending` and watched it return to
+        `exhausted` before any worker saw it, while reporting success.
+
+        `last_error` is kept. It is the only record of why the item failed,
+        it is what the retirement message appends to itself, and the operator
+        retrying an item is usually the person who needs to read it. Clearing
+        it turned a diagnosable failure into `gave up after N attempts` with
+        no cause.
+        """
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                "UPDATE work SET state = ?, owner = NULL, lease_until = 0, attempts = 0, "
+                "updated_at = ? WHERE project_id = ? AND item_id = ?",
+                (PENDING, self.now(), project_id, item_id),
+            )
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def reclaim_dead_workers(self, *, project_id: str | None = None) -> list[str]:
+        """Release claims held by a process on this host that no longer exists.
+
+        A lease expiring is how a *crashed* worker's item comes back, and it
+        is deliberately slow so that a merely slow worker is not evicted. But
+        after a pool restart the old worker is provably gone -- its pid is not
+        running -- and waiting out its lease leaves an item stuck alongside
+        newly dispatched work, with no session and nothing saying why.
+
+        Only claims owned by *this host* are touched: a pid on another machine
+        says nothing about whether that process is alive.
+        """
+        here = socket.gethostname()
+        released: list[str] = []
+        for record in self.claimed(project_id=project_id):
+            owner = record.owner or ""
+            host, _, pid = owner.rpartition(":")
+            if host != here or not pid.isdigit():
+                continue
+            if _process_alive(int(pid)):
+                continue
+            self.release(
+                record.item_id,
+                PENDING,
+                error=f"worker {owner} is gone; the claim was released rather than waited out",
+                project_id=record.project_id,
+            )
+            released.append(record.item_id)
+            log.info("reclaimed %s from dead worker %s", record.item_id, owner)
+        return released
+
+    def claimed(self, project_id: str | None = None) -> list[WorkRecord]:
+        """Every item currently held by a worker, expired lease or not."""
+        conn = self._connect()
+        try:
+            sql = "SELECT * FROM work WHERE state = ?"
+            params: list[Any] = [CLAIMED]
+            if project_id is not None:
+                sql += " AND project_id = ?"
+                params.append(project_id)
+            return [WorkRecord.from_row(r) for r in conn.execute(sql, params)]
         finally:
             conn.close()
 

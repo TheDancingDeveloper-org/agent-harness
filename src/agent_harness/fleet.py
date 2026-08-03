@@ -117,6 +117,13 @@ class Fleet:
                     return existing.size
 
             pool = ProjectPool(project_id=project_id)
+            # Before anything new is dispatched. A worker killed with its
+            # lease still running leaves an item `claimed` by a pid that no
+            # longer exists -- unavailable to healthy workers, with no session
+            # and nothing saying why, until the lease times out. Reclaiming it
+            # here is safe precisely because the process is provably gone.
+            for item_id in self.queue.reclaim_dead_workers(project_id=project_id):
+                log.info("reclaimed %s before starting project %s", item_id, project_id)
             # Set control BEFORE the threads exist. A worker that starts while
             # the project still reads `stopped` claims nothing and sleeps a
             # full poll for no reason.

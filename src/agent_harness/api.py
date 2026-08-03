@@ -343,7 +343,7 @@ def create_api(
                 detail=f"{item_id} is claimed by {record.owner} and its lease is live; "
                 "wait for the lease to expire rather than racing it",
             )
-        queue.release(item_id, PENDING, error=None, project_id=project_id)
+        queue.requeue(item_id, project_id=project_id)
         return RetryResult(ok=True, item_id=item_id, state="pending")
 
     @app.post(

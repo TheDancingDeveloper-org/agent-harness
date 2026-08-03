@@ -285,3 +285,91 @@ def test_approval_records_that_it_happened(queue: WorkQueue) -> None:
 def test_render_plan_is_stable_for_an_empty_proposal() -> None:
     proposal = parse_proposal(json.dumps({"goal": "x", "phases": []}), 1, 1000.0)
     assert "# Thing" in render_plan(proposal, "Thing")
+
+
+# ------------------------------------------------------------------- API
+
+
+@pytest.fixture
+def client(tmp_path: Path):  # type: ignore[no-untyped-def]
+    from fastapi.testclient import TestClient
+
+    from agent_harness.api import create_api
+    from agent_harness.store import EventStore
+
+    q = WorkQueue(str(tmp_path / "w.sqlite"))
+    model = FakeModel([json.dumps(PROPOSAL)] * 5)
+    app = create_api(EventStore(tmp_path / "e.sqlite"), queue=q, token="tok", model_client=model)
+    with TestClient(app) as c:  # noqa: S106
+        c.queue = q  # type: ignore[attr-defined]
+        yield c
+
+
+def hdr() -> dict[str, str]:
+    return {"Authorization": "Bearer tok"}
+
+
+def scoped(client) -> None:  # type: ignore[no-untyped-def]
+    client.post("/api/inception", headers=hdr(), json={"project_id": "w", "overview": "widgets"})
+    client.post("/api/inception/w/scope", headers=hdr(), json={})
+
+
+def test_the_api_refuses_approval_while_a_blocking_question_is_open(client) -> None:  # type: ignore[no-untyped-def]
+    scoped(client)
+    response = client.post("/api/inception/w/approve", headers=hdr())
+    assert response.status_code == 409
+    assert "blocking question" in response.json()["detail"]
+
+
+def test_the_api_reports_how_many_questions_block(client) -> None:  # type: ignore[no-untyped-def]
+    scoped(client)
+    body = client.get("/api/inception/w", headers=hdr()).json()
+    assert body["blocking_open"] == 1
+    assert body["item_count"] == 2
+
+
+def test_answering_through_the_api_unblocks_approval(client) -> None:  # type: ignore[no-untyped-def]
+    scoped(client)
+    client.post("/api/inception/w/questions/Q1", headers=hdr(), json={"answer": "Postgres"})
+    assert client.post("/api/inception/w/approve", headers=hdr()).status_code == 200
+
+
+def test_the_api_can_re_grade_a_question(client) -> None:  # type: ignore[no-untyped-def]
+    """The model proposes severity; the human decides it."""
+    scoped(client)
+    body = client.post(
+        "/api/inception/w/questions/Q1", headers=hdr(), json={"severity": "deferrable"}
+    ).json()
+    assert body["blocking_open"] == 0
+    assert client.post("/api/inception/w/approve", headers=hdr()).status_code == 200
+
+
+def test_the_api_returns_a_plan_the_parser_can_read(client) -> None:  # type: ignore[no-untyped-def]
+    from agent_harness.plan import parse_plan
+
+    scoped(client)
+    markdown = client.get("/api/inception/w/plan?name=Widgets", headers=hdr()).json()["markdown"]
+    plan = parse_plan(markdown)
+    assert plan.duplicate_ids() == {}
+    assert {i.id for i in plan.items} >= {"T1", "T2"}
+
+
+def test_nothing_is_created_before_approval(client) -> None:  # type: ignore[no-untyped-def]
+    scoped(client)
+    assert client.queue.projects() == []
+    assert client.queue.items() == []
+
+
+def test_scoping_without_a_model_is_a_clear_409(tmp_path: Path) -> None:
+    """Rather than a 500 that reads like a bug in the harness."""
+    from fastapi.testclient import TestClient
+
+    from agent_harness.api import create_api
+    from agent_harness.store import EventStore
+
+    q = WorkQueue(str(tmp_path / "w.sqlite"))
+    with TestClient(create_api(EventStore(tmp_path / "e.sqlite"), queue=q, token="tok")) as c:  # noqa: S106
+        c.post("/api/inception", headers=hdr(), json={"project_id": "w", "overview": "x"})
+        response = c.post("/api/inception/w/scope", headers=hdr(), json={})
+    assert response.status_code == 409
+    assert "scoper" in response.json()["detail"]

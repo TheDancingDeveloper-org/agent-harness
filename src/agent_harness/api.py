@@ -80,6 +80,8 @@ from .schemas import (
     NewBaseline,
     OpenQuestion,
     PlanItem,
+    PlanLoadRequest,
+    PlanLoadResult,
     PlanParseResult,
     PlanSyncRequest,
     PlanSyncResult,
@@ -1201,6 +1203,88 @@ def create_api(
     # ---------------------------------------------------------------- plan
 
     @app.post(
+        "/api/plan/load",
+        tags=["plan"],
+        summary="Load a plan into a project's backlog",
+        response_model=PlanLoadResult,
+        responses={
+            404: {"description": "No such file"},
+            409: {"description": "The plan states an id more than once"},
+            422: {"description": "Neither `path` nor `content`, or no items found"},
+        },
+    )
+    def plan_load(request: PlanLoadRequest, _: None = Depends(require_token)) -> PlanLoadResult:
+        """Turn a plan document into claimable work, in one call.
+
+        This is the API's equivalent of `agent-harness run --plan`, and it
+        exists because assembling it from `/api/plan/parse` plus `POST
+        /api/work` quietly produced *different* items: a work item's brief is
+        its title and its prose together, and a caller copying `body` across
+        dropped the title from every brief without anything saying so.
+
+        Re-loading an edited plan is safe and is how a plan reaches the queue
+        a second time: existing ids are refreshed, never reset, so nothing
+        here can un-finish work that is already done.
+        """
+        from .plan import parse_plan, parse_plan_file
+        from .work import WorkRecord as QueueRecord
+
+        if (request.path is None) == (request.content is None):
+            raise HTTPException(status_code=422, detail="pass exactly one of `path` or `content`")
+        if request.path is not None:
+            target = Path(request.path)
+            if not target.is_file():
+                raise HTTPException(status_code=404, detail=f"no plan at {request.path!r}")
+            parsed = parse_plan_file(target)
+        else:
+            parsed = parse_plan(request.content or "")
+
+        if not parsed.items:
+            raise HTTPException(
+                status_code=422,
+                detail="no work items found. Items are recognised as '### T1: Title' "
+                "headings, '- [ ] T1 Title' checkboxes, or table rows with an id column.",
+            )
+        duplicates = parsed.duplicate_ids()
+        if duplicates and not request.allow_duplicates:
+            # Refusing beats guessing: each id becomes one item, and collapsing
+            # two silently is how a plan loses work nobody notices is missing.
+            raise HTTPException(
+                status_code=409,
+                detail=f"these ids appear more than once: {duplicates}. Fix the plan, "
+                "or set allow_duplicates to keep the richest description of each.",
+            )
+
+        items = parsed.deduplicated()
+        done = [i.id for i in items if i.done]
+        loadable = items if request.include_done else [i for i in items if not i.done]
+        queue = need_queue()
+        added = queue.add(
+            [
+                QueueRecord(
+                    item_id=i.id,
+                    title=i.title,
+                    # `brief()`, not `body`: the title is half the specification,
+                    # and an agent given only the prose under a heading is being
+                    # told less than the plan says.
+                    brief=i.brief(),
+                    depends_on=list(i.depends_on),
+                )
+                for i in loadable
+            ],
+            project_id=request.project_id,
+        )
+        return PlanLoadResult(
+            project_id=request.project_id,
+            added=added,
+            total=len(queue.items(project_id=request.project_id)),
+            skipped_headings=[f"line {n}: {title}" for n, title in parsed.skipped],
+            duplicate_ids=duplicates,
+            unresolved_dependencies=parsed.unresolved_dependencies(),
+            already_done=done if not request.include_done else [],
+        )
+
+    @app.post(
         "/api/plan/parse",
         tags=["plan"],
         summary="Parse a plan without writing anything",
@@ -1333,6 +1417,14 @@ def create_api(
     def events(
         since_id: int = Query(0, description="Cursor from the previous page."),
         limit: int = Query(200, ge=1, le=1000),
+        kind: str | None = Query(None, description="Only this event kind, e.g. `work`."),
+        item_id: str | None = Query(
+            None,
+            description="Only events about this work item. Filtered in the database, so "
+            "a page of 200 is 200 matches -- following one item otherwise means paging "
+            "the whole fleet's stream and discarding almost all of it.",
+        ),
+        project_id: str | None = Query(None, description="Only events about this project."),
         _: None = Depends(require_token),
     ) -> EventPage:
         """Append-only history, oldest first.
@@ -1341,7 +1433,9 @@ def create_api(
         millisecond must still have a total order, or a poll silently drops
         one.
         """
-        rows = store.since_id(since_id, limit=limit)
+        rows = store.since_id(
+            since_id, limit=limit, kind=kind, item_id=item_id, project_id=project_id
+        )
         return EventPage(
             events=[Event(**row) for row in rows],
             cursor=rows[-1]["id"] if rows else since_id,

@@ -881,3 +881,53 @@ class IssueTokenRequest(BaseModel):
     item_id: str | None = None
     attempt: int | None = None
     ttl_seconds: float = Field(21600.0, description="Lifetime in seconds. Must be positive.")
+
+
+class PlanLoadRequest(BaseModel):
+    """Load a plan into a project's backlog.
+
+    One of `path` or `content`. `path` reads a file the *service* can see;
+    `content` carries the markdown in the request, which is the only option
+    when the harness is not on the machine holding the plan.
+    """
+
+    project_id: str = Field("default", description="Project whose backlog to load into.")
+    path: str | None = Field(
+        None, description="Path to the plan markdown, as the SERVICE sees the filesystem."
+    )
+    content: str | None = Field(None, description="The plan markdown itself.")
+    include_done: bool = Field(
+        False,
+        description="Load items the plan already marks done. Off by default: a plan "
+        "records history as well as intent, and re-running finished work costs money.",
+    )
+    allow_duplicates: bool = Field(
+        False,
+        description="Proceed when an id appears more than once, keeping the richest "
+        "description of each. Off by default, because each id becomes ONE item and "
+        "silently collapsing two is how a plan loses work.",
+    )
+
+
+class PlanLoadResult(BaseModel):
+    project_id: str
+    added: int = Field(description="Items that did not already exist.")
+    total: int = Field(description="Items in the project's backlog afterwards.")
+    skipped_headings: list[str] = Field(
+        default_factory=list,
+        description="Headings not read as work, with line numbers. Never empty on a "
+        "real plan -- most headings are narrative -- but a large number relative to "
+        "items means the plan does not use a recognised shape.",
+    )
+    duplicate_ids: dict[str, list[int]] = Field(
+        default_factory=dict, description="Ids stated more than once, with their lines."
+    )
+    unresolved_dependencies: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Dependencies naming ids the plan does not define. Reported, not "
+        "refused: a reference to work tracked elsewhere is legitimate, and a typo is "
+        "not -- and only a person can tell which this is.",
+    )
+    already_done: list[str] = Field(
+        default_factory=list, description="Ids the plan marks done, and which were skipped."
+    )

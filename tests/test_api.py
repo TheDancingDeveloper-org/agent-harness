@@ -656,3 +656,133 @@ def test_the_role_map_persists_for_a_worker_in_another_process(
 def test_roles_require_a_token(client: TestClient) -> None:
     assert client.get("/api/roles").status_code == 401
     assert client.put("/api/roles", json={"roles": {}}).status_code == 401
+
+
+# ------------------------------------------------- driving a plan over HTTP
+
+PLAN = """\
+# A plan
+
+Narrative that is not work.
+
+### T1: Build the importer
+
+Read the feed and write rows.
+
+### T2: Add the schema
+
+Depends on: T1
+
+The table the importer writes into.
+
+## Checklist
+
+- [x] T3 Already handled
+- [ ] T4 Still to do
+"""
+
+
+def test_a_plan_becomes_claimable_work_in_one_call(client: TestClient, queue: WorkQueue) -> None:
+    """The API's equivalent of `run --plan`. Assembling it from parse plus
+    POST /api/work produced different items, silently."""
+    response = client.post(
+        "/api/plan/load", headers=auth(), json={"content": PLAN, "project_id": "default"}
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["added"] == 3, result
+    assert result["already_done"] == ["T3"]
+    assert result["skipped_headings"], "narrative headings are part of the answer"
+
+    item = queue.get("T2")
+    assert item is not None
+    assert item.depends_on == ["T1"]
+    # The brief is the title AND the prose. A caller copying `body` across
+    # from /api/plan/parse dropped the title from every brief.
+    assert item.brief.startswith("Add the schema")
+    assert "The table the importer writes into." in item.brief
+
+
+def test_loading_a_plan_twice_does_not_reset_progress(client: TestClient, queue: WorkQueue) -> None:
+    client.post("/api/plan/load", headers=auth(), json={"content": PLAN})
+    queue.claim("worker-a")
+    queue.release("T1", DONE)
+
+    again = client.post("/api/plan/load", headers=auth(), json={"content": PLAN})
+    assert again.status_code == 200
+    assert again.json()["added"] == 0
+    assert queue.get("T1").state == DONE  # type: ignore[union-attr]
+
+
+def test_a_plan_that_states_an_id_twice_is_refused(client: TestClient) -> None:
+    """Each id becomes ONE item; collapsing two silently loses work."""
+    doubled = PLAN + "\n### T1: Build the importer again\n\nSomething else.\n"
+    refused = client.post("/api/plan/load", headers=auth(), json={"content": doubled})
+    assert refused.status_code == 409
+    assert "T1" in refused.json()["detail"]
+
+    allowed = client.post(
+        "/api/plan/load", headers=auth(), json={"content": doubled, "allow_duplicates": True}
+    )
+    assert allowed.status_code == 200
+
+
+def test_loading_a_plan_needs_exactly_one_source(client: TestClient) -> None:
+    assert client.post("/api/plan/load", headers=auth(), json={}).status_code == 422
+    both = {"content": PLAN, "path": "/nowhere.md"}
+    assert client.post("/api/plan/load", headers=auth(), json=both).status_code == 422
+    assert (
+        client.post("/api/plan/load", headers=auth(), json={"path": "/nowhere.md"}).status_code
+        == 404
+    )
+
+
+def test_a_plan_with_no_items_says_what_it_looked_for(client: TestClient) -> None:
+    response = client.post(
+        "/api/plan/load", headers=auth(), json={"content": "# Just prose\n\nNothing here.\n"}
+    )
+    assert response.status_code == 422
+    assert "recognised as" in response.json()["detail"]
+
+
+def test_a_plan_loads_into_the_project_it_names(client: TestClient, queue: WorkQueue) -> None:
+    client.post("/api/plan/load", headers=auth(), json={"content": PLAN, "project_id": "ngms"})
+    assert queue.get("T1", project_id="ngms") is not None
+    assert queue.get("T1", project_id="default") is None
+
+
+def test_following_one_item_does_not_mean_paging_the_fleet(
+    client: TestClient, store: EventStore
+) -> None:
+    """A page of 200 must be 200 matches. Filtering after the fact returns an
+    empty page while more matches wait behind the cursor."""
+    for index in range(30):
+        store.append(
+            [
+                Event(
+                    ts=time.time() + index,
+                    kind=WORK,
+                    source="events.jsonl",
+                    worker="w",
+                    outcome="started",
+                    data={"item_id": "W1" if index % 10 == 0 else "W2"},
+                )
+            ]
+        )
+    page = client.get("/api/events?item_id=W1&limit=2", headers=auth()).json()
+    assert len(page["events"]) == 2
+    assert all(e["data"]["item_id"] == "W1" for e in page["events"])
+
+    rest = client.get(f"/api/events?item_id=W1&since_id={page['cursor']}", headers=auth()).json()
+    assert [e["data"]["item_id"] for e in rest["events"]] == ["W1"]
+
+
+def test_events_can_be_filtered_by_kind(client: TestClient, store: EventStore) -> None:
+    store.append(
+        [
+            Event(ts=time.time(), kind=WORK, source="s", outcome="started", data={}),
+            Event(ts=time.time(), kind=MODEL_CALL, source="s", outcome="ok", data={}),
+        ]
+    )
+    page = client.get(f"/api/events?kind={WORK}", headers=auth()).json()
+    assert [e["kind"] for e in page["events"]] == [WORK]

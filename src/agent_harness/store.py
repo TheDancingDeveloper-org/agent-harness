@@ -237,15 +237,43 @@ class EventStore:
         sql += " GROUP BY worker ORDER BY last_seen DESC"
         return [dict(r) for r in self._connect().execute(sql, args)]
 
-    def since_id(self, event_id: int, limit: int = 200) -> list[dict[str, Any]]:
+    def since_id(
+        self,
+        event_id: int,
+        limit: int = 200,
+        kind: str | None = None,
+        item_id: str | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Events after `event_id`, oldest first. This is what SSE resumes
         from on reconnect (T28's last-event-id), which is why the id is a
         monotonic integer and not a timestamp -- two events in the same
-        millisecond must still have an order."""
-        rows = self._connect().execute(
-            "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?", (event_id, limit)
-        )
-        return [self._row_to_dict(r) for r in rows]
+        millisecond must still have an order.
+
+        The filters exist because following ONE item otherwise means paging
+        the whole fleet's stream and discarding almost all of it -- which is
+        the difference between watching an item and downloading a fleet.
+        They are applied in SQL, so `limit` counts matching rows rather than
+        scanned ones; filtering after the fact would return an empty page
+        while more matches waited behind the cursor.
+        """
+        sql = "SELECT * FROM events WHERE id > ?"
+        args: list[Any] = [event_id]
+        if kind is not None:
+            sql += " AND kind = ?"
+            args.append(kind)
+        # `item_id` and `project_id` live in the JSON payload rather than in
+        # columns: they belong to work events and would be NULL on the model
+        # calls that make up most of the table.
+        if item_id is not None:
+            sql += " AND json_extract(data, '$.item_id') = ?"
+            args.append(item_id)
+        if project_id is not None:
+            sql += " AND json_extract(data, '$.project_id') = ?"
+            args.append(project_id)
+        sql += " ORDER BY id LIMIT ?"
+        args.append(limit)
+        return [self._row_to_dict(r) for r in self._connect().execute(sql, args)]
 
     def max_id(self) -> int:
         row = self._connect().execute("SELECT MAX(id) FROM events").fetchone()

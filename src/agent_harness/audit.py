@@ -476,6 +476,32 @@ class AuditStore:
         params.append(limit)
         return [dict(r) for r in self._connect().execute(sql, params)]
 
+    def latest_by_item(
+        self, project_id: str | None = None, kind: str = "work"
+    ) -> dict[str, dict[str, Any]]:
+        """The newest event for each work item.
+
+        Here rather than in the API because the grouping belongs to the store
+        that can do it in one statement. Scanning "the last N events" instead
+        silently drops any item whose most recent activity happens to be older
+        than N rows -- which is precisely the long-running item whose status
+        someone is trying to read.
+        """
+        if self.degraded:
+            return {}
+        where = "item_id IS NOT NULL AND kind = ?"
+        params: list[Any] = [kind]
+        if project_id is not None:
+            where += " AND project_id = ?"
+            params.append(project_id)
+        rows = self._connect().execute(
+            f"SELECT e.* FROM events e JOIN ("  # noqa: S608 - `where` is built above, not input
+            f"SELECT item_id, MAX(id) AS newest FROM events WHERE {where} GROUP BY item_id"
+            f") m ON m.newest = e.id",
+            params,
+        )
+        return {r["item_id"]: dict(r) for r in rows}
+
     def since_id(self, event_id: int, limit: int = 200) -> list[dict[str, Any]]:
         """Paged by row id, not timestamp: two events in one millisecond must
         still have a total order."""

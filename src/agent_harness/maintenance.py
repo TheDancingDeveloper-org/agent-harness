@@ -50,18 +50,58 @@ class MaintenanceReport:
     rolled_up: int = 0
     thinned: int = 0
     reconciled: dict[str, int] = field(default_factory=dict)
+    #: Items whose lost `pr_url` was recovered from the pull request's head
+    #: branch, per project.
+    recovered_prs: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
     def __str__(self) -> str:
         parts = [f"rolled up {self.rolled_up}", f"thinned {self.thinned}"]
         if self.reconciled:
             parts.append("reconciled " + ", ".join(f"{k}={v}" for k, v in self.reconciled.items()))
+        if self.recovered_prs:
+            parts.append(
+                "recovered " + ", ".join(f"{k}={v}" for k, v in self.recovered_prs.items())
+            )
         if self.errors:
             parts.append(f"errors {len(self.errors)}")
         return ", ".join(parts)
 
 
-def reconcile_projects(audit: AuditStore, queue: Any) -> tuple[dict[str, int], list[str]]:
+def adopt_lost_pull_requests(queue: Any, reconciler: Any, project_id: str) -> int:
+    """Re-attach pull requests to items whose `pr_url` was dropped.
+
+    Reconciliation is driven by the URLs the queue recorded, so a URL that was
+    lost made its pull request permanently invisible -- the one kind of pull
+    request most in need of being found. The head branch is the missing link:
+    the queue already stores the branch it pushed, so matching on that recovers
+    the association without guessing.
+
+    Matching is on a branch the harness itself recorded for that item, so this
+    cannot adopt a human's pull request: an unrelated branch is never in the
+    queue to be matched against.
+    """
+    orphans = {
+        record.branch: record
+        for record in queue.items(project_id=project_id)
+        if record.branch and not record.pr_url
+    }
+    if not orphans:
+        return 0
+    recovered = 0
+    for pull in reconciler.pull_requests():
+        record = orphans.get(pull.head)
+        if record is None or not pull.url:
+            continue
+        if queue.record_pr_url(record.item_id, pull.url, project_id=project_id):
+            log.info("reconcile: %s adopted %s from branch %s", record.item_id, pull.url, pull.head)
+            recovered += 1
+    return recovered
+
+
+def reconcile_projects(
+    audit: AuditStore, queue: Any
+) -> tuple[dict[str, int], list[str], dict[str, int]]:
     """Pull GitHub outcomes for every project that names a repository.
 
     Per project, because a repo is a project's property -- reconciling one
@@ -72,22 +112,34 @@ def reconcile_projects(audit: AuditStore, queue: Any) -> tuple[dict[str, int], l
 
     counts: dict[str, int] = {}
     errors: list[str] = []
+    recovered: dict[str, int] = {}
     try:
         projects = queue.projects()
     except Exception as exc:  # noqa: BLE001
-        return counts, [f"projects: {exc}"]
+        return counts, [f"projects: {exc}"], recovered
 
-    mapping = items_by_pr(queue)
     for project in projects:
         if not project.repo:
             continue
+        reconciler = GitHubReconciler(project.repo, audit)
+        try:
+            found = adopt_lost_pull_requests(queue, reconciler, project.project_id)
+        except Exception as exc:  # noqa: BLE001 - recovery is best-effort
+            errors.append(f"adopt {project.repo}: {exc}")
+            found = 0
+        if found:
+            recovered[project.project_id] = found
+        # Built after adoption, and per project rather than once: an item whose
+        # URL was just recovered has to be reconciled on this pass, not left
+        # for the next one an hour later.
+        mapping = items_by_pr(queue)
         scoped = {
             pr: attribution
             for pr, attribution in mapping.items()
             if attribution.get("project_id") == project.project_id
         }
         try:
-            report = GitHubReconciler(project.repo, audit).reconcile(scoped)
+            report = reconciler.reconcile(scoped)
         except Exception as exc:  # noqa: BLE001 - one repo must not stop the others
             errors.append(f"reconcile {project.repo}: {exc}")
             continue
@@ -95,7 +147,7 @@ def reconcile_projects(audit: AuditStore, queue: Any) -> tuple[dict[str, int], l
         recorded = report.merged + report.closed_unmerged + report.reverted
         if recorded:
             counts[project.project_id] = recorded
-    return counts, errors
+    return counts, errors, recovered
 
 
 def run_maintenance(
@@ -127,10 +179,11 @@ def run_maintenance(
         report.errors.append(f"thin: {exc}")
         log.warning("audit maintenance: thin failed: %s", exc)
     if queue is not None:
-        counts, errors = reconcile_projects(audit, queue)
+        counts, errors, recovered = reconcile_projects(audit, queue)
         report.reconciled = counts
+        report.recovered_prs = recovered
         report.errors.extend(errors)
-    if report.rolled_up or report.thinned or report.reconciled:
+    if report.rolled_up or report.thinned or report.reconciled or report.recovered_prs:
         log.info("audit maintenance: %s", report)
     return report
 

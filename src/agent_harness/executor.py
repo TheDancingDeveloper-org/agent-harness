@@ -47,6 +47,7 @@ from .work import (
     FAILED,
     PENDING,
     ClaimLost,
+    LeaseHeartbeat,
     WorkQueue,
     WorkRecord,
     worker_identity,
@@ -469,8 +470,26 @@ class Executor:
         # model actually produced is to pay for it again.
         self.artifacts = Path(artifacts) if artifacts is not None else None
         self.owner = worker_identity()
+        self._heartbeat: LeaseHeartbeat | None = None
 
     # ------------------------------------------------------------- driving
+
+    def _execute_with_heartbeat(self, record: WorkRecord) -> Outcome:
+        """One attempt, with its claim kept alive for the whole of it.
+
+        A check suite is perfectly capable of outlasting the lease on its own,
+        so the heartbeat covers the stages and not merely the gaps between
+        them.
+        """
+        heartbeat = LeaseHeartbeat(
+            self.queue, record.item_id, self.owner, project_id=self.project_id
+        )
+        self._heartbeat = heartbeat
+        try:
+            with heartbeat:
+                return self._execute(record)
+        finally:
+            self._heartbeat = None
 
     def run_once(self) -> Outcome | None:
         """Claim one item and take it as far as it goes. None if nothing is
@@ -479,7 +498,7 @@ class Executor:
         if record is None:
             return None
         try:
-            outcome = self._execute(record)
+            outcome = self._execute_with_heartbeat(record)
         except ClaimLost as exc:
             # Deliberately no release: the item is not ours to finish. The
             # new owner is working on it right now, and reporting anything
@@ -552,7 +571,16 @@ class Executor:
         read it, so a worker that lost its claim carried on regardless and
         then reported a result for someone else's item. Reading the answer is
         the whole point of asking.
+
+        The background heartbeat is checked first: it is what notices a loss
+        during a stage, while this call is what turns that into a stop at the
+        next boundary.
         """
+        if self._heartbeat is not None and self._heartbeat.lost:
+            raise ClaimLost(
+                f"{record.item_id} is no longer owned by {self.owner}; "
+                "its lease was refused while the attempt was still running"
+            )
         if not self.queue.heartbeat(record.item_id, self.owner, project_id=self.project_id):
             raise ClaimLost(
                 f"{record.item_id} is no longer owned by {self.owner}; "

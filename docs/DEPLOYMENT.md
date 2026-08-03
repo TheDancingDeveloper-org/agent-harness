@@ -150,10 +150,24 @@ deployment that polls this should name the project it cares about:
 `/api/readiness?project_id=widgets`.
 
 To run the configured argv checks in a detached, clean worktree of the base
-branch, add `&check_base=true`. This probe can compile and test an entire
-repository, so it is deliberately opt-in. The same option is available on
-the project preflight endpoint and on `POST /api/projects/{id}/start`; a
-failure is blocking and names the first command and its output.
+branch, start a run and poll it:
+
+```bash
+curl -sH "$AUTH" -X POST localhost:8099/api/projects/widgets/preflight/base
+curl -sH "$AUTH" localhost:8099/api/projects/widgets/preflight/base | jq
+```
+
+The run happens on a background thread, and the POST returns as soon as it has
+*started*. That is not a convenience: this probe compiles and tests an entire
+repository, so a request that waited for it would outlive any proxy timeout,
+and the caller would get a transport error for a build that was running fine.
+Calling POST again while one is in flight joins it rather than starting a
+second.
+
+`&check_base=true` on readiness, project preflight and `POST
+/api/projects/{id}/start` then reports **the most recent run**, and never
+starts one — a readiness read stays a read. Before any run it reports
+`not_run`, which is blocking, and names the call that would answer it.
 
 **Do not** smoke-test by calling `start`. It is a state-changing request: on a
 correctly configured deployment it begins spending money, and on a
@@ -171,7 +185,7 @@ misconfigured one it tells you less than the line above.
 | `disk space` | The volume holding `work_dir` is below the project's configured `min_free_disk_gb` floor. Free and total GiB are included in the detail. |
 | `github write` | `gh` is missing, unauthenticated, or the account lacks push on that repo. |
 | `reviewer` | No reviewer route. `PUT /api/roles`, or restart with `--reviewer`/`--endpoint`. |
-| `base checks` | A configured command failed on an unmodified base-branch worktree. Fix the command/prerequisites before starting. |
+| `base checks` | A configured command failed on an unmodified base-branch worktree — fix the command or its prerequisites before starting. Also reported when no run has happened yet (`not_run`) or one is still going. |
 
 Warnings do not block a start and are still worth reading: `checks` means
 nothing verifies a diff before the reviewer sees it, and `reviewer

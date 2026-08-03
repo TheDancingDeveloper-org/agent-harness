@@ -311,6 +311,14 @@ curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/projects \
 
 # Check the base branch before paying for an agent. Check entries are argv,
 # not shell: use separate list entries instead of `cmd1 && cmd2`.
+#
+# The run is a whole build, so it happens in the background: start it, then
+# poll. `check_base=true` on readiness reports the latest run and never starts
+# one.
+curl -sH "Authorization: Bearer $TOKEN" -X POST \
+  localhost:8099/api/projects/ngms/preflight/base
+curl -sH "Authorization: Bearer $TOKEN" \
+  localhost:8099/api/projects/ngms/preflight/base | jq
 curl -sH "Authorization: Bearer $TOKEN" \
   'localhost:8099/api/readiness?project_id=ngms&check_base=true' | jq
 

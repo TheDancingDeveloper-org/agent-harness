@@ -300,3 +300,105 @@ def test_pausing_a_project_stops_claiming_without_a_restart(tmp_path: Path) -> N
         assert wait_for(lambda: len(seen) > settled), "resuming needed a restart"
     finally:
         fleet.stop_all()
+
+
+# ------------------------------------------------- a worker that dies
+
+
+class DyingExecutor:
+    """Claims an item, gets as far as a session, then dies.
+
+    Modelled on the real failure: the worker thread went away while the
+    AIDevEnv session it had created was still running.
+    """
+
+    def __init__(self, queue: WorkQueue, project_id: str, sessions: list[str]) -> None:
+        self.queue, self.project_id = queue, project_id
+        self.owner = f"dying-{project_id}"
+        self.sessions = sessions
+
+    def serve(self, *, poll_seconds: float, stop: threading.Event) -> None:
+        record = self.queue.claim(self.owner, project_id=self.project_id)
+        assert record is not None
+        self.sessions.append(f"pty-{record.item_id}")
+        raise RuntimeError("the session host went away")
+
+
+def dying_fleet(queue: WorkQueue, sessions: list[str], events: list[Any]) -> Fleet:
+    return Fleet(
+        queue,
+        lambda pid: DyingExecutor(queue, pid, sessions),
+        poll_seconds=0.01,
+        on_event=events.append,
+    )
+
+
+def test_a_dead_worker_does_not_strand_its_claim(queue: WorkQueue) -> None:
+    """The bug: the item stayed `claimed` by a dead owner with no completion
+    or failure recorded, so it was unavailable to everyone -- including a
+    human -- until the lease expired."""
+    queue.add([rec("T1")], project_id="b")
+    fleet = dying_fleet(queue, [], [])
+    fleet.start("b")
+
+    assert wait_for(lambda: (queue.get("T1", project_id="b") or rec("x")).state == "failed")
+    record = queue.get("T1", project_id="b")
+    assert record is not None
+    assert record.owner is None
+    assert "the session host went away" in (record.last_error or "")
+
+
+def test_the_death_is_visible_rather_than_only_logged(queue: WorkQueue) -> None:
+    queue.add([rec("T1")], project_id="b")
+    events: list[Any] = []
+    fleet = dying_fleet(queue, [], events)
+    fleet.start("b")
+
+    assert wait_for(lambda: bool(fleet.failures("b")))
+    failure = fleet.failures("b")[0]
+    assert failure.worker == "dying-b"
+    assert "T1" in failure.released
+    assert any(e["outcome"] == "worker_died" for e in events)
+
+
+def test_a_project_whose_workers_all_died_is_not_running(queue: WorkQueue) -> None:
+    """Otherwise it reports `running` with zero workers -- exactly the state
+    the start preflight refuses to create, reached the slow way."""
+    queue.add([rec("T1")], project_id="b")
+    fleet = dying_fleet(queue, [], [])
+    fleet.start("b")
+
+    assert wait_for(lambda: queue.control(project_id="b")[0] == STOPPED)
+    state, reason = queue.control(project_id="b")
+    assert state == STOPPED
+    assert "died" in (reason or "")
+    assert fleet.running().get("b", 0) == 0
+
+
+def test_one_project_s_dying_workers_do_not_touch_another(queue: WorkQueue) -> None:
+    queue.add([rec("T1")], project_id="b")
+    queue.add([rec("A1")], project_id="a")
+    seen: list[str] = []
+    healthy = fleet_for(queue, seen)
+    dying = dying_fleet(queue, [], [])
+    try:
+        healthy.start("a")
+        dying.start("b")
+        assert wait_for(lambda: "a:A1" in seen)
+        assert queue.control(project_id="a")[0] == RUNNING
+    finally:
+        healthy.stop_all()
+
+
+def test_a_factory_that_cannot_build_an_executor_is_recorded(queue: WorkQueue) -> None:
+    """Previously a log line and nothing else: the project sat `running` with
+    a pool of workers that had all returned immediately."""
+
+    def explode(_pid: str) -> Any:
+        raise RuntimeError("no checkout at /gone")
+
+    fleet = Fleet(queue, explode, poll_seconds=0.01)
+    fleet.start("b")
+    assert wait_for(lambda: bool(fleet.failures("b")))
+    assert "no checkout" in fleet.failures("b")[0].error
+    assert wait_for(lambda: queue.control(project_id="b")[0] == STOPPED)

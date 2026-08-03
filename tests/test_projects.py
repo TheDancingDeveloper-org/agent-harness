@@ -457,3 +457,40 @@ def test_retry_cannot_reach_into_another_project(client) -> None:  # type: ignor
 
     assert client.queue.get("T1", project_id="a").state == PENDING
     assert client.queue.get("T1", project_id="b").state == DONE
+
+
+def test_a_dead_worker_shows_up_in_the_project_summary(tmp_path: Path) -> None:
+    """`workers: 0` alone cannot distinguish "nothing to do" from "everything
+    that could do it died"."""
+    from fastapi.testclient import TestClient
+
+    from agent_harness.api import create_api
+    from agent_harness.fleet import WorkerFailure
+    from agent_harness.store import EventStore
+
+    q = WorkQueue(str(tmp_path / "w.sqlite"))
+    q.add_project(Project(project_id="a", name="A"))
+    store = EventStore(tmp_path / "e.sqlite")
+
+    class FleetWithACasualty:
+        def running(self) -> dict[str, int]:
+            return {}
+
+        def failures(self, project_id: str | None = None) -> list[WorkerFailure]:
+            return [
+                WorkerFailure(
+                    project_id="a",
+                    worker="host:1",
+                    error="worker exited: the session host went away",
+                    at=1.0,
+                    released=("T1",),
+                )
+            ]
+
+    with TestClient(
+        create_api(store, queue=q, token="tok", fleet=FleetWithACasualty())  # noqa: S106
+    ) as c:
+        body = c.get("/api/projects/a", headers=hdr()).json()
+    assert body["workers"] == 0
+    assert body["worker_failures"] == 1
+    assert "session host went away" in body["last_worker_error"]

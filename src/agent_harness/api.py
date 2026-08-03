@@ -825,6 +825,7 @@ def create_api(
                         if app.state.fleet is not None
                         else 0
                     ),
+                    **_worker_health(app.state.fleet, project.project_id),
                 )
             )
         return ProjectList(projects=out)
@@ -859,7 +860,7 @@ def create_api(
                 max_workers=spec.max_workers,
             )
         )
-        return _project_summary(queue, spec.project_id)
+        return _project_summary(queue, spec.project_id, app.state.fleet)
 
     @app.get(
         "/api/projects/{project_id}",
@@ -871,7 +872,10 @@ def create_api(
         project_id: str = PathParam(description="Project id."),
         _: None = Depends(require_token),
     ) -> ProjectSummary:
-        return _project_summary(need_queue(), project_id)
+        # With the fleet, not without it: reading one project used to report
+        # `workers: 0` unconditionally, so the single-project view contradicted
+        # the list view whenever anything was actually running.
+        return _project_summary(need_queue(), project_id, app.state.fleet)
 
     @app.post(
         "/api/projects/{project_id}/start",
@@ -1300,7 +1304,19 @@ def _project_summary(queue: WorkQueue, project_id: str, fleet: Any | None = None
         previous_state=previous,
         stale=len(queue.stale(project_id=project_id)),
         workers=(fleet.running().get(project_id, 0) if fleet is not None else 0),
+        **_worker_health(fleet, project_id),
     )
+
+
+def _worker_health(fleet: Any | None, project_id: str) -> dict[str, Any]:
+    """What the fleet knows about workers that died on this project."""
+    if fleet is None or not hasattr(fleet, "failures"):
+        return {}
+    failures = fleet.failures(project_id)
+    return {
+        "worker_failures": len(failures),
+        "last_worker_error": failures[-1].error if failures else None,
+    }
 
 
 def _item_model(record: WorkRecord, event: dict[str, Any] | None) -> WorkItem:

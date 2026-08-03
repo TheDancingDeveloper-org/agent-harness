@@ -240,6 +240,15 @@ class ProjectSummary(BaseModel):
         "carrying it out. A project marked running with zero workers is the failure "
         "that otherwise looks like success.",
     )
+    worker_failures: int = Field(
+        0,
+        description="Workers that stopped without being asked to, since this process "
+        "started. A fleet whose workers are dying and a fleet with nothing to do both "
+        "report no work in progress, which is why this is counted separately.",
+    )
+    last_worker_error: str | None = Field(
+        None, description="Why the most recent one died, and what it was holding."
+    )
 
 
 class PreflightCheck(BaseModel):

@@ -445,6 +445,7 @@ GET  /api/control           is the fleet claiming work?
 POST /api/control           pause, drain or resume — never interrupts work
 GET  /api/roles             where each role's calls go
 PUT  /api/roles             re-route a role, live
+GET  /api/readiness         can anything actually run, and why not
 GET  /healthz               open, cheap, needs no credential
 ```
 
@@ -472,6 +473,17 @@ curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/work/D8/block
   -d '{"reason":"needs a human: which database?","who":"sprooty"}'
 # Anything that depends on D8 waits with it. The reason comes back as
 # `blocked_reason` on the item, and retry is the way back once it is decided.
+
+# Could anything actually run? One read-only call, before starting anything.
+curl -sH "Authorization: Bearer $TOKEN" localhost:8099/api/readiness | jq
+# {"mode":"supervised","ready_to_start":true,
+#  "workers":{"configured":true,"ok":true,"detail":"2 worker(s) running"},
+#  "session_host":{"configured":true,"ok":true,"detail":"reachable and authenticated, …"},
+#  "reviewer":{"configured":true,"ok":true,"detail":"reviewer routed to …"},
+#  "projects":[{"project_id":"ngms","ready_to_start":true,"summary":"ready", …}]}
+#
+# `/healthz` cannot answer this and does not try: a monitoring-only
+# deployment is perfectly healthy and cannot run a single item.
 
 # Preview a plan sync without writing
 curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/plan/sync \

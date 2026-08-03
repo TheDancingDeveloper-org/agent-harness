@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import secrets
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,7 @@ from .schemas import (
     BlockResult,
     Event,
     EventPage,
+    ExecutionReadiness,
     FleetControl,
     Health,
     InceptionStart,
@@ -69,10 +71,12 @@ from .schemas import (
     PreflightCheck,
     PreflightResult,
     ProjectList,
+    ProjectReadiness,
     ProjectSpec,
     ProjectSummary,
     ProposalModel,
     RateLimits,
+    ReadinessProbe,
     ReconcileResult,
     ResolveQuestion,
     RetryResult,
@@ -144,6 +148,8 @@ def create_api(
     audit: AuditStore | None = None,
     fleet: Any | None = None,
     model_client: Any | None = None,
+    session_host: Any | None = None,
+    probes: Mapping[str, Any] | None = None,
 ) -> FastAPI:
     """Build the API.
 
@@ -151,6 +157,12 @@ def create_api(
     behind a proxy (the session host mounts it at `/api/harness`). Setting it
     makes the OpenAPI document and Swagger UI emit URLs the *client* can
     actually call, rather than the ones the app sees internally.
+
+    `probes` overrides how readiness inspects the world -- `git_probe` and
+    `github_probe`, as `preflight` defines them. Preflight was built with
+    every probe injected precisely so a readiness gate could be tested; this
+    layer used to hardcode the defaults, which put a real `gh` subprocess and
+    a real filesystem read behind an HTTP route.
     """
     app = FastAPI(
         title="agent-harness",
@@ -167,8 +179,11 @@ def create_api(
     app.state.audit = audit
     app.state.fleet = fleet
     app.state.model_client = model_client
+    app.state.session_host = session_host
     _APP_STATE["fleet"] = fleet
     _APP_STATE["model_client"] = model_client
+    _APP_STATE["session_host"] = session_host
+    _APP_STATE["probes"] = dict(probes or {})
     app.state.token = token
 
     def require_token(
@@ -957,6 +972,107 @@ def create_api(
             checks=[PreflightCheck(**c.as_dict()) for c in report.checks],
         )
 
+    @app.get(
+        "/api/readiness",
+        tags=["control"],
+        summary="Can this harness execute anything, and why not?",
+        response_model=ExecutionReadiness,
+    )
+    def readiness(
+        project_id: str | None = Query(
+            None,
+            description="Limit to one project. Omit for all of them — each project costs "
+            "one read of GitHub's permissions for its repo, so a large deployment "
+            "polling this should name the project it cares about.",
+        ),
+        _: None = Depends(require_token),
+    ) -> ExecutionReadiness:
+        """One read-only request that answers "could I start work right now?".
+
+        `/healthz` cannot answer it and should not try: a monitoring-only
+        deployment is perfectly healthy while being unable to run a single
+        item, so a healthy service reads as an executable fleet. Until this
+        existed the only way to find out was to attempt a **state-changing**
+        start and read the 409.
+
+        Nothing here writes. No worker is created, no session is started, no
+        item is claimed, no control state changes, and no credential is
+        echoed — the session host is probed with a read, which proves both
+        reachability and that the token is accepted.
+        """
+        queue = need_queue()
+        fleet_ = app.state.fleet
+        host = app.state.session_host
+
+        workers = ReadinessProbe(
+            configured=fleet_ is not None,
+            ok=fleet_ is not None,
+            detail=(
+                f"{sum(fleet_.running().values())} worker(s) running"
+                if fleet_ is not None
+                else "no worker pool is attached; this deployment is monitoring-only"
+            ),
+        )
+
+        # Probed ONCE, then reused for every project: the answer is a property
+        # of the deployment, not of the project, and asking N times would make
+        # readiness cost more the more projects you have.
+        probe = None
+        if host is None:
+            session_host_state = ReadinessProbe(
+                configured=False,
+                ok=False,
+                detail="no session host is configured; agents cannot run as sessions",
+            )
+        else:
+            from .preflight import session_host_probe
+
+            ok, detail = session_host_probe(host)()
+            session_host_state = ReadinessProbe(configured=True, ok=ok, detail=detail)
+            probe = lambda ok=ok, detail=detail: (ok, detail)  # noqa: E731
+
+        stored = queue.get_setting(ROLE_MAP_KEY) or {}
+        route = stored.get("reviewer") or {}
+        client = app.state.model_client
+        independence = client.reviewer_independence() if client is not None else None
+        reviewer_state = ReadinessProbe(
+            configured=bool(route.get("model")),
+            ok=bool(route.get("model")),
+            detail=(
+                f"reviewer routed to {route['model']}"
+                + (f"; {independence[1]}" if independence else "")
+                if route.get("model")
+                else "no reviewer is routed; every review fails closed, so every item "
+                "would fail after the implementation was paid for"
+            ),
+        )
+
+        projects = [p for p in queue.projects() if project_id is None or p.project_id == project_id]
+        if project_id is not None and not projects:
+            raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+
+        reports = []
+        for project in projects:
+            report = _preflight(queue, project, session_host=probe)
+            reports.append(
+                ProjectReadiness(
+                    project_id=project.project_id,
+                    ready_to_start=report.ready,
+                    summary=report.summary(),
+                    blockers=[PreflightCheck(**c.as_dict()) for c in report.blockers],
+                    warnings=[PreflightCheck(**c.as_dict()) for c in report.warnings],
+                )
+            )
+
+        return ExecutionReadiness(
+            mode="supervised" if fleet_ is not None else "monitoring-only",
+            ready_to_start=any(r.ready_to_start for r in reports),
+            workers=workers,
+            session_host=session_host_state,
+            reviewer=reviewer_state,
+            projects=reports,
+        )
+
     @app.post(
         "/api/projects/{project_id}/stop",
         tags=["control"],
@@ -1259,17 +1375,24 @@ def _audit_event_fields(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _preflight(queue: WorkQueue, project: Project) -> Any:
-    """Build a preflight report for a project, using whatever is configured."""
-    from .preflight import preflight_project
+def _preflight(queue: WorkQueue, project: Project, session_host: Any | None = None) -> Any:
+    """Build a preflight report for a project, using whatever is configured.
+
+    `session_host` is a *probe*, not the host: readiness over many projects
+    would otherwise ask the same host the same question once per project.
+    """
+    from .preflight import preflight_project, session_host_probe
 
     stored = queue.get_setting("role_map") or {}
     client = _APP_STATE.get("model_client")
+    host = _APP_STATE.get("session_host")
     return preflight_project(
         project,
         has_fleet=_APP_STATE.get("fleet") is not None,
         reviewer_route=(project.roles or stored).get("reviewer"),
         reviewer_independent=client.reviewer_independence() if client is not None else None,
+        session_host=session_host or (session_host_probe(host) if host is not None else None),
+        **(_APP_STATE.get("probes") or {}),
     )
 
 

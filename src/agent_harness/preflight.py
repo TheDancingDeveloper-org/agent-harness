@@ -118,12 +118,34 @@ def _gh_can_write(repo: str) -> tuple[bool, str]:
     return (True, f"push access to {repo}")
 
 
+def session_host_probe(host: Any) -> Probe:
+    """A probe that reads from the session host, and creates nothing.
+
+    `list_sessions` is the cheapest call that proves both halves of what
+    matters: the host is reachable, and the token is accepted. Creating a
+    session would prove the same thing and leave a PTY behind, which is not
+    a readiness check but a side effect.
+    """
+
+    def probe() -> tuple[bool, str]:
+        try:
+            sessions = host.list_sessions()
+        except Exception as exc:  # noqa: BLE001 - any failure is the same answer
+            # Truncated, and never echoing a token: the detail is for a human
+            # deciding what to fix, not a place to leak a credential.
+            return (False, f"the session host refused a read: {str(exc)[:200]}")
+        return (True, f"reachable and authenticated, {len(sessions)} live session(s)")
+
+    return probe
+
+
 def preflight_project(
     project: Any,
     *,
     has_fleet: bool,
     reviewer_route: Any = None,
     reviewer_independent: tuple[bool, str] | None = None,
+    session_host: Probe | None = None,
     git_probe: Callable[[str], tuple[bool, str]] = _is_git_repo,
     github_probe: Callable[[str], tuple[bool, str]] = _gh_can_write,
 ) -> Preflight:
@@ -142,6 +164,19 @@ def preflight_project(
             else "no worker pool is attached, so starting would set a flag nobody acts on",
         )
     )
+
+    # Only when one is configured. A deployment with no session host is
+    # already caught by the workers check above, and adding a second failing
+    # check for the same fact would just make the summary noisier.
+    if session_host is not None:
+        ok, detail = session_host()
+        checks.append(
+            Check(
+                "session host",
+                ok,
+                detail if ok else f"{detail} — agents run as sessions on it, so none can start",
+            )
+        )
 
     work_dir = getattr(project, "work_dir", None)
     if work_dir:

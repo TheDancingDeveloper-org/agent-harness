@@ -631,7 +631,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     maintenance.start()
 
-    fleet, reviewer_client = _fleet_for_serve(args, queue_for_serve)
+    fleet, reviewer_client, host = _fleet_for_serve(args, queue_for_serve)
     if fleet is None:
         print(
             "monitoring only: no --session-host, so no worker pool is attached and "
@@ -649,6 +649,9 @@ def main(argv: list[str] | None = None) -> int:
                 audit=audit,
                 fleet=fleet,
                 model_client=reviewer_client,
+                # Readiness probes it with a read. Passing the client rather
+                # than the URL keeps the token out of the API layer.
+                session_host=host,
             ),
             host=args.host,
             port=args.port,
@@ -663,7 +666,9 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _fleet_for_serve(args: argparse.Namespace, queue: Any) -> tuple[Any | None, Any | None]:
+def _fleet_for_serve(
+    args: argparse.Namespace, queue: Any
+) -> tuple[Any | None, Any | None, Any | None]:
     """The supervised half of `serve`: a fleet the API's start action can use.
 
     Returns (None, None) for a monitoring-only deployment. That mode is
@@ -675,7 +680,7 @@ def _fleet_for_serve(args: argparse.Namespace, queue: Any) -> tuple[Any | None, 
     the API's start action does, and only after preflight passes.
     """
     if not args.session_host:
-        return (None, None)
+        return (None, None, None)
 
     import json as _json
     import shlex
@@ -742,9 +747,10 @@ def _fleet_for_serve(args: argparse.Namespace, queue: Any) -> tuple[Any | None, 
         with events_path.open("a") as handle:
             handle.write(_json.dumps(event) + "\n")
 
+    host = HttpSessionHost(args.session_host, token=host_token)
     factory = session_executor_factory(
         queue,
-        host=HttpSessionHost(args.session_host, token=host_token),
+        host=host,
         agent=AgentSpec(command=tuple(shlex.split(args.agent))),
         reviewer=reviewer_client,
         github_for=GitHub,
@@ -756,7 +762,7 @@ def _fleet_for_serve(args: argparse.Namespace, queue: Any) -> tuple[Any | None, 
     print(f"events: {events_path}")
     # The fleet emits into the same stream as the executors: a worker that
     # dies is recorded next to the work it was doing, not in a separate log.
-    return (Fleet(queue, factory, poll_seconds=args.poll, on_event=emit), reviewer_client)
+    return (Fleet(queue, factory, poll_seconds=args.poll, on_event=emit), reviewer_client, host)
 
 
 if __name__ == "__main__":

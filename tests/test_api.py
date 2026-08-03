@@ -146,6 +146,32 @@ def test_work_returns_items_counts_and_stale_in_one_call(client: TestClient) -> 
     assert payload["stale"] == []
 
 
+def test_every_listed_item_can_be_addressed_by_the_id_it_reports(client: TestClient) -> None:
+    """A row a client cannot address is a row it can render and not act on.
+
+    The list reported the identifier only as `item_id`; a client reading the
+    conventional `id` got `null` for every row and lost the value needed for
+    retry, detail and status -- while `GET /api/work/W1` worked perfectly for
+    anyone who already knew the id.
+    """
+    items = client.get("/api/work", headers=auth()).json()["items"]
+    assert items
+    for item in items:
+        assert item["id"], f"unaddressable row: {item}"
+        assert item["id"] == item["item_id"]
+        # The id it reported is the one the item routes actually take.
+        assert client.get(f"/api/work/{item['id']}", headers=auth()).status_code == 200
+
+
+def test_the_schema_documents_the_id_clients_read(client: TestClient) -> None:
+    """A field clients depend on and the schema omits is an undocumented
+    contract, which is the thing this API exists not to have."""
+    schema = client.get("/openapi.json").json()["components"]["schemas"]["WorkItem"]
+    assert "id" in schema["properties"]
+    assert schema["properties"]["id"].get("description")
+    assert "id" in schema["required"]
+
+
 def test_work_carries_the_session_deep_link(client: TestClient, store: EventStore) -> None:
     """The whole point of the Work tab: click an item, land in the terminal
     that is doing it."""

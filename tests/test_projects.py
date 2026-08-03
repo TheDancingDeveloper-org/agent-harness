@@ -285,7 +285,7 @@ def client(tmp_path: Path):  # type: ignore[no-untyped-def]
     q = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
     store = EventStore(tmp_path / "e.sqlite")
     with TestClient(create_api(store, queue=q, token="tok")) as c:  # noqa: S106
-        c.queue = q  # type: ignore[attr-defined]
+        c.queue = q
         yield c
 
 
@@ -392,7 +392,7 @@ def test_adding_work_through_the_api_respects_the_project(client) -> None:  # ty
         ("harness", "T1"),
         ("harness", "T2"),
     }
-    assert client.queue.get("T1", project_id="ngms").title == "ngms first"  # type: ignore[union-attr]
+    assert client.queue.get("T1", project_id="ngms").title == "ngms first"
 
 
 def test_the_backlog_can_be_filtered_to_one_project(client) -> None:  # type: ignore[no-untyped-def]
@@ -423,5 +423,5 @@ def test_retry_cannot_reach_into_another_project(client) -> None:  # type: ignor
 
     client.post("/api/work/T1/retry?project_id=a", headers=hdr())
 
-    assert client.queue.get("T1", project_id="a").state == PENDING  # type: ignore[union-attr]
-    assert client.queue.get("T1", project_id="b").state == DONE  # type: ignore[union-attr]
+    assert client.queue.get("T1", project_id="a").state == PENDING
+    assert client.queue.get("T1", project_id="b").state == DONE

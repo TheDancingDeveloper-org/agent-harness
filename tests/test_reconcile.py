@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -25,7 +26,7 @@ from agent_harness.reconcile import (
 class FakeGh:
     """Answers `gh pr list` and `git log` from canned data."""
 
-    def __init__(self, prs: list[dict], log_records: list[str] | None = None) -> None:
+    def __init__(self, prs: list[dict[str, Any]], log_records: list[str] | None = None) -> None:
         self.prs = prs
         self.log_records = log_records or []
         self.calls: list[list[str]] = []

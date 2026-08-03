@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -241,7 +242,7 @@ def test_serve_waits_for_work_instead_of_exiting(tmp_path: Path) -> None:
 
     executor = SessionExecutor(q, Host(), tmp_path)  # type: ignore[arg-type]
     stop = threading.Event()
-    result: list = []
+    result: list[list[Any]] = []
 
     def run() -> None:
         result.append(executor.serve(poll_seconds=0.01, stop=stop))

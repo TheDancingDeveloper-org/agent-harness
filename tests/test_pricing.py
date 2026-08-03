@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -151,7 +152,7 @@ def test_a_successful_call_emits_usage(tmp_path: Path) -> None:
     from agent_harness import providers
     from agent_harness.model_client import ModelClient, Response, Route
 
-    events: list[dict] = []
+    events: list[dict[str, Any]] = []
 
     def transport(route, messages, options):  # type: ignore[no-untyped-def]
         return Response(
@@ -181,7 +182,7 @@ def test_a_failed_call_carries_no_invented_usage(tmp_path: Path) -> None:
     from agent_harness import providers
     from agent_harness.model_client import ModelClient, Response, Route
 
-    events: list[dict] = []
+    events: list[dict[str, Any]] = []
 
     def transport(route, messages, options):  # type: ignore[no-untyped-def]
         return Response(status=500, headers={}, body="upstream exploded")

@@ -275,7 +275,7 @@ def client(tmp_path: Path):  # type: ignore[no-untyped-def]
     audit = AuditStore(tmp_path / "audit.sqlite")
     store = EventStore(tmp_path / "harness.sqlite")
     with TestClient(create_api(store, token="tok", audit=audit)) as c:  # noqa: S106
-        c.audit = audit  # type: ignore[attr-defined]
+        c.audit = audit
         yield c
 
 

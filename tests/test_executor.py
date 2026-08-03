@@ -862,3 +862,89 @@ def test_with_nowhere_to_keep_it_the_item_still_fails_cleanly(
     assert outcome is not None and outcome.state == FAILED
     assert "patch kept at" not in outcome.reason
     assert any(e["outcome"] == "patch_malformed" for e in events)
+
+
+# ------------------------------------------------- what the reviewer sees
+
+
+#: A hunk header `git apply` refuses against an existing file, which the
+#: tolerance ladder rescues by inserting at line 1. The text says "this file
+#: was empty"; the result is an insertion above the existing content.
+ZERO_CONTEXT_DIFF = """\
+diff --git a/hello.txt b/hello.txt
+--- a/hello.txt
++++ b/hello.txt
+@@ -0,0 +1,1 @@
++a new first line
+"""
+
+
+class PromptCapturingModel(ScriptedModel):
+    """Keeps the prompt each role was given, so a test can assert on it."""
+
+    def __init__(self, replies: Mapping[str, str]) -> None:
+        super().__init__(replies)
+        self.prompts: dict[str, str] = {}
+
+    def __call__(
+        self, route: Route, messages: Sequence[Mapping[str, Any]], options: Mapping[str, Any]
+    ) -> Response:
+        role = str(route.options.get("role", route.model))
+        self.prompts[role] = str(messages[-1].get("content", ""))
+        return super().__call__(route, messages, options)
+
+
+def test_the_reviewer_sees_the_applied_diff_not_the_proposed_one(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The regression.
+
+    The tolerance ladder exists to rescue malformed patches, so a model's diff
+    text and the change it produces are routinely different. Reviewing the
+    text rejected good work for an artefact of the plumbing — and made the
+    gate unable to catch a diff that claims more than it did, which is the one
+    thing the review prompt says it is for.
+    """
+    executor, queue, transport = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": ZERO_CONTEXT_DIFF, "reviewer": "APPROVED\nfine"},
+    )
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": ZERO_CONTEXT_DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.state == DONE, outcome.reason
+    shown = capturing.prompts["reviewer"]
+    # The real change: an insertion, with the existing line as context.
+    assert "a new first line" in shown
+    assert "hello world" in shown, "the reviewer must see the surrounding context that survived"
+    # Not the model's claim that the file was created from empty.
+    assert "@@ -0,0" not in shown, "the reviewer must not be shown the proposed hunk header"
+
+
+def test_a_reviewer_can_tell_where_a_rescued_hunk_landed(repo: Path, tmp_path: Path) -> None:
+    """Placement is the thing the model's text cannot carry (#133). The
+    applied diff shows it, which is what makes rejecting misplacement possible
+    at all."""
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": ZERO_CONTEXT_DIFF, "reviewer": "APPROVED\nfine"},
+    )
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": ZERO_CONTEXT_DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    shown = capturing.prompts["reviewer"]
+    # The new line appears BEFORE the pre-existing one, and the diff says so.
+    assert shown.index("+a new first line") < shown.index("hello world")

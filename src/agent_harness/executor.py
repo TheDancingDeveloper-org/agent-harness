@@ -664,6 +664,14 @@ class Executor:
             self._abandon_branch(branch)
             return outcome
         self._emit(record, "applied", detail=how)
+        # What landed, not what was proposed. The tolerance ladder exists to
+        # rescue malformed patches, so the text a model produced and the change
+        # it produced are routinely different -- a `@@ -0,0` hunk that git
+        # apply would refuse becomes a real insertion with real context. The
+        # reviewer has to see the second one: reviewing the first rejects good
+        # work for an artefact of the plumbing, and, worse, makes the gate
+        # structurally unable to catch a diff that claims more than it did.
+        applied_diff = run_git(self.repo, "diff", "HEAD") or diff
         self._keepalive(record)
 
         # 5. Cheap checks BEFORE the expensive reviewer call. Paying a model
@@ -692,7 +700,7 @@ class Executor:
             REVIEWER,
             REVIEW_PROMPT.format(
                 brief=record.brief,
-                diff=diff[:20000],
+                diff=applied_diff[:20000],
                 checks="passed" if passed else failure,
             ),
         )

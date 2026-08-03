@@ -64,6 +64,8 @@ from .schemas import (
     PlanParseResult,
     PlanSyncRequest,
     PlanSyncResult,
+    PreflightCheck,
+    PreflightResult,
     ProjectList,
     ProjectSpec,
     ProjectSummary,
@@ -87,7 +89,6 @@ from .work import (
     DONE,
     FAILED,
     PENDING,
-    RUNNING,
     STOPPED,
     Project,
     WorkQueue,
@@ -163,6 +164,8 @@ def create_api(
     app.state.audit = audit
     app.state.fleet = fleet
     app.state.model_client = model_client
+    _APP_STATE["fleet"] = fleet
+    _APP_STATE["model_client"] = model_client
     app.state.token = token
 
     def require_token(
@@ -821,6 +824,12 @@ def create_api(
     )
     def start_project(
         project_id: str = PathParam(description="Project id."),
+        force: bool = Query(
+            False,
+            description="Start even when preflight fails. Deliberately explicit: the "
+            "checks exist because a fleet that cannot finish anything is "
+            "indistinguishable from one that can, until the bill arrives.",
+        ),
         _: None = Depends(require_token),
     ) -> ProjectSummary:
         """The only thing that lets a project claim work.
@@ -831,17 +840,61 @@ def create_api(
         Resuming is a decision, so it is a request.
         """
         queue = need_queue()
-        if queue.get_project(project_id) is None:
+        project = queue.get_project(project_id)
+        if project is None:
             raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+
+        report = _preflight(queue, project)
+        if not report.ready and not force:
+            # Refuses rather than setting a flag nobody acts on. Previously
+            # this branch set RUNNING with no fleet attached -- the comment
+            # right here said that "reads as working and is not", and it did
+            # it anyway.
+            raise HTTPException(
+                status_code=409,
+                detail=f"{project_id} is not ready to run — {report.summary()}. "
+                "Fix these, or pass force=true to start anyway and accept that "
+                "items may be unable to finish.",
+            )
+
         fleet_ = app.state.fleet
-        if fleet_ is not None:
-            # Starting workers sets control itself. Doing it here as well
-            # would leave a project marked running with nobody claiming when
-            # no fleet is attached -- which reads as working and is not.
-            fleet_.start(project_id)
-        else:
-            queue.set_control(RUNNING, reason=None, project_id=project_id)
+        if fleet_ is None:
+            raise HTTPException(
+                status_code=409,
+                detail="no worker pool is attached to this harness, so starting would "
+                "mark the project running with nothing able to claim. Run the harness "
+                "with a fleet, or use `agent-harness run` for a single worker.",
+            )
+        fleet_.start(project_id)
         return _project_summary(queue, project_id, app.state.fleet)
+
+    @app.get(
+        "/api/projects/{project_id}/preflight",
+        tags=["control"],
+        summary="Can this project actually finish an item?",
+        response_model=PreflightResult,
+    )
+    def project_preflight(
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> PreflightResult:
+        """Check before starting, and see exactly what is missing.
+
+        A queue resumed without a reviewer, a checkout or GitHub write access
+        claims work, spends the implementer's tokens, and fails every item --
+        while the API reports `running`.
+        """
+        queue = need_queue()
+        project = queue.get_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+        report = _preflight(queue, project)
+        return PreflightResult(
+            project_id=report.project_id,
+            ready=report.ready,
+            summary=report.summary(),
+            checks=[PreflightCheck(**c.as_dict()) for c in report.checks],
+        )
 
     @app.post(
         "/api/projects/{project_id}/stop",
@@ -1143,6 +1196,25 @@ def _audit_event_fields(row: dict[str, Any]) -> dict[str, Any]:
         "latency_s": row["latency_s"],
         "data": json.loads(row["data"] or "{}"),
     }
+
+
+def _preflight(queue: WorkQueue, project: Project) -> Any:
+    """Build a preflight report for a project, using whatever is configured."""
+    from .preflight import preflight_project
+
+    stored = queue.get_setting("role_map") or {}
+    client = _APP_STATE.get("model_client")
+    return preflight_project(
+        project,
+        has_fleet=_APP_STATE.get("fleet") is not None,
+        reviewer_route=(project.roles or stored).get("reviewer"),
+        reviewer_independent=client.reviewer_independence() if client is not None else None,
+    )
+
+
+#: Set by `create_api`. A module-level handle so helpers outside the closure
+#: can see the same wiring the routes do.
+_APP_STATE: dict[str, Any] = {}
 
 
 def _project_spec(project: Project) -> ProjectSpec:

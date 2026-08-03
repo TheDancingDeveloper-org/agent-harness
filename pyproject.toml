@@ -5,6 +5,10 @@ description = "Service-hosted, GUI-driven harness for role-routed coding-agent f
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    # Used by `run` for the model transport. It was declared only under the
+    # dev extra, so a production install had no HTTP client and failed at the
+    # first model call -- long after install, in the one command that matters.
+    "httpx>=0.27",
     "fastapi>=0.115",
     "jinja2>=3.1",
     "uvicorn>=0.30",
@@ -12,7 +16,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "httpx>=0.27",
+    # Starlette's TestClient needs a specific HTTP client, and which one
+    # changed: older releases wanted `httpx`, current ones want `httpx2`.
+    # Pinned rather than left open because a mismatch fails during fixture
+    # setup, before any endpoint is exercised, with an error naming the wrong
+    # package. tests/conftest.py turns that into one legible message.
+    "httpx2>=2.9",
     "mypy>=1.11",
     "pytest>=8.0",
     "ruff>=0.6",

@@ -301,7 +301,7 @@ def client(tmp_path: Path):  # type: ignore[no-untyped-def]
     model = FakeModel([json.dumps(PROPOSAL)] * 5)
     app = create_api(EventStore(tmp_path / "e.sqlite"), queue=q, token="tok", model_client=model)
     with TestClient(app) as c:  # noqa: S106
-        c.queue = q  # type: ignore[attr-defined]
+        c.queue = q
         yield c
 
 

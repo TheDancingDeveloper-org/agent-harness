@@ -178,6 +178,38 @@ def worker_identity() -> str:
     return f"{socket.gethostname()}:{os.getpid()}"
 
 
+def owner_is_gone(owner: str | None) -> bool:
+    """Is the process behind this claim provably dead?
+
+    Only ever answers True for a claim owned by **this host** whose pid no
+    longer exists. A claim from another machine is unknowable from here, and
+    guessing would let one node release another node's live work -- so it is
+    treated as alive, and the lease remains the mechanism that recovers it.
+
+    This is what makes a restart recoverable without waiting out a lease. A
+    lease expiring is the right answer to "the worker might still be alive";
+    it is a needlessly slow answer to "that pid does not exist".
+    """
+    if not owner or ":" not in owner:
+        return False
+    host, _, pid = owner.rpartition(":")
+    if host != socket.gethostname():
+        return False
+    try:
+        target = int(pid)
+    except ValueError:
+        return False
+    try:
+        # Signal 0 checks existence without touching the process.
+        os.kill(target, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        # It exists and belongs to somebody else. Alive is the safe answer.
+        return False
+    return False
+
+
 @dataclass
 class Project:
     """A stream of work with its own queue, control state and configuration.
@@ -946,6 +978,22 @@ class WorkQueue:
             return [WorkRecord.from_row(r) for r in rows]
         finally:
             conn.close()
+
+    def orphaned(self, project_id: str | None = None) -> list[WorkRecord]:
+        """Claims held by a process that is provably gone.
+
+        Distinct from `stale`, and the difference is the point: a stale claim
+        is one whose LEASE ran out, which is a timeout and therefore a guess.
+        An orphaned claim is one whose owning pid does not exist on this host,
+        which is a fact. It can be reclaimed immediately instead of sitting
+        unavailable for a full lease while the project reports it as work in
+        progress.
+        """
+        return [
+            record
+            for record in self.items(project_id=project_id)
+            if record.state == CLAIMED and owner_is_gone(record.owner)
+        ]
 
 
 #: Where the fleet-wide role map lives. A queue setting rather than a flag

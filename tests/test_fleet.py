@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import socket
 import threading
 import time
 from pathlib import Path
@@ -18,6 +20,7 @@ from agent_harness.work import (
     Project,
     WorkQueue,
     WorkRecord,
+    worker_identity,
 )
 
 
@@ -565,3 +568,122 @@ def test_a_project_update_resizes_a_running_pool(queue: WorkQueue, tmp_path: Pat
         assert wait_for(lambda: fleet.running().get("a") == 4), fleet.running()
     finally:
         fleet.stop_all()
+
+
+# --------------------------------------- claims a dead process left behind
+
+
+def test_a_claim_from_a_dead_process_is_reclaimed_at_the_next_start(
+    queue: WorkQueue,
+) -> None:
+    """The restart case. An item claimed by a process that is gone stayed
+    `claimed` with a live lease, so the project reported work in progress
+    that nothing was doing and the item was unavailable to everyone --
+    including a human -- until the lease ran out."""
+    queue.add([rec("T1")], project_id="a")
+    # A pid that cannot exist, on this host: what a previous process's claim
+    # looks like after a deploy.
+    dead = f"{socket.gethostname()}:{_never_a_pid()}"
+    queue.set_control(RUNNING, project_id="a")
+    queue.claim(dead, project_id="a")
+    assert queue.get("T1", project_id="a").state == "claimed"  # type: ignore[union-attr]
+
+    events: list[dict[str, Any]] = []
+    fleet = Fleet(
+        queue,
+        lambda pid: FakeExecutor(queue, pid, []),
+        poll_seconds=0.01,
+        on_event=events.append,
+    )
+    try:
+        fleet.start("a")
+        assert wait_for(lambda: queue.get("T1", project_id="a").state == "done")  # type: ignore[union-attr]
+        # And the recovery is observable, not silent.
+        assert [e for e in events if e["outcome"] == "claim_reclaimed"]
+    finally:
+        fleet.stop_all()
+
+
+def test_reclaiming_puts_it_back_to_pending_not_failed(queue: WorkQueue) -> None:
+    """The process is gone; nothing is known to be wrong with the ITEM. The
+    attempt is already counted, so a genuinely poisonous item still reaches
+    the exhaustion ceiling rather than looping forever."""
+    queue.add([rec("T1")], project_id="a")
+    queue.set_control(RUNNING, project_id="a")
+    queue.claim(f"{socket.gethostname()}:{_never_a_pid()}", project_id="a")
+
+    fleet = Fleet(queue, lambda pid: _Idle(), poll_seconds=0.01)
+    try:
+        fleet.start("a")
+        assert wait_for(lambda: queue.get("T1", project_id="a").state == PENDING)
+        item = queue.get("T1", project_id="a")
+        assert item is not None
+        assert item.attempts == 1, "the attempt must still count"
+        assert "no longer exists" in (item.last_error or "")
+    finally:
+        fleet.stop_all()
+
+
+def test_a_live_claim_is_never_reclaimed(queue: WorkQueue) -> None:
+    """This process is alive and holding the item. Reclaiming it would give
+    one item to two workers, which is worse than one stuck item."""
+    queue.add([rec("T1")], project_id="a")
+    queue.set_control(RUNNING, project_id="a")
+    queue.claim(worker_identity(), project_id="a")
+
+    fleet = Fleet(queue, lambda pid: _Idle(), poll_seconds=0.01)
+    try:
+        fleet.start("a")
+        time.sleep(0.1)
+        assert queue.get("T1", project_id="a").state == "claimed"  # type: ignore[union-attr]
+        assert queue.orphaned("a") == []
+    finally:
+        fleet.stop_all()
+
+
+def test_a_claim_from_another_host_is_left_to_its_lease(queue: WorkQueue) -> None:
+    """Unknowable from here. Releasing it could take an item away from a
+    worker on another machine that is alive and working on it."""
+    queue.add([rec("T1")], project_id="a")
+    queue.set_control(RUNNING, project_id="a")
+    queue.claim("some-other-machine:1", project_id="a")
+    assert queue.orphaned("a") == []
+
+
+def test_orphaned_and_stale_are_different_questions(queue: WorkQueue, tmp_path: Path) -> None:
+    """Stale means a lease ran out, which is a timeout and a guess. Orphaned
+    means the pid is gone, which is a fact."""
+    clock = [1000.0]
+    q = WorkQueue(str(tmp_path / "o.sqlite"), lease_seconds=100.0, now=lambda: clock[0])
+    q.add_project(Project(project_id="a", name="A"))
+    q.add([rec("T1"), rec("T2")], project_id="a")
+    q.set_control(RUNNING, project_id="a")
+    q.claim("some-other-machine:1", project_id="a")
+
+    # Leased to a host we cannot ask about: not orphaned...
+    assert q.orphaned("a") == []
+    assert q.stale("a") == []
+    # ...and stale only once the lease actually runs out.
+    clock[0] += 101
+    assert [r.item_id for r in q.stale("a")] == ["T1"]
+    assert q.orphaned("a") == []
+
+
+class _Idle:
+    """A worker that claims nothing, so a test can observe the reclaim alone."""
+
+    def serve(self, *, poll_seconds: float, stop: threading.Event) -> None:
+        stop.wait(5)
+
+
+def _never_a_pid() -> int:
+    """A pid that is not running. Searched rather than assumed, because a
+    hardcoded one is a flaky test waiting for the wrong process to exist."""
+    for candidate in range(4_000_000, 4_000_500):
+        try:
+            os.kill(candidate, 0)
+        except ProcessLookupError:
+            return candidate
+        except PermissionError:
+            continue
+    raise AssertionError("could not find an unused pid")

@@ -838,6 +838,7 @@ def create_api(
                     control=FleetControl(state=state, reason=reason),
                     previous_state=previous,
                     stale=len(queue.stale(project_id=project.project_id)),
+                    orphaned=len(queue.orphaned(project_id=project.project_id)),
                     workers=(
                         app.state.fleet.running().get(project.project_id, 0)
                         if app.state.fleet is not None
@@ -1479,6 +1480,7 @@ def _project_summary(queue: WorkQueue, project_id: str, fleet: Any | None = None
         control=FleetControl(state=state, reason=reason),
         previous_state=previous,
         stale=len(queue.stale(project_id=project_id)),
+        orphaned=len(queue.orphaned(project_id=project_id)),
         workers=(fleet.running().get(project_id, 0) if fleet is not None else 0),
         **_worker_health(fleet, project_id),
     )

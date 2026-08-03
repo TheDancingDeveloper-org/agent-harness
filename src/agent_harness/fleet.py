@@ -21,7 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .work import CLAIMED, FAILED, RUNNING, STOPPED, WorkQueue
+from .work import CLAIMED, FAILED, PENDING, RUNNING, STOPPED, WorkQueue
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +133,15 @@ class Fleet:
             if existing is not None and existing.size:
                 return existing.size
 
+            # Reconcile BEFORE any worker can claim. A pool that was stopped
+            # or killed can leave an item `claimed` by a dead process with an
+            # unexpired lease; starting again then dispatches around it, so
+            # the project reports work in progress that nothing is doing and
+            # the item is unavailable to everyone -- including a human -- for
+            # the rest of the lease. Doing it here rather than lazily means
+            # the new pool never races the orphan it is meant to recover.
+            self._reclaim_orphans(project_id)
+
             pool = ProjectPool(project_id=project_id)
             # Set control BEFORE the threads exist. A worker that starts while
             # the project still reads `stopped` claims nothing and sleeps a
@@ -194,6 +203,49 @@ class Fleet:
                     target,
                 )
             return target
+
+    def _reclaim_orphans(self, project_id: str) -> list[str]:
+        """Hand back claims whose owning process no longer exists.
+
+        Back to `pending`, not `failed`: nothing is known to be wrong with
+        the item. Its worker's process is gone -- a deploy, a kill, a crash --
+        and that is a statement about the process, not about the work. The
+        attempt has already been counted, so an item that really does kill
+        its worker still reaches the exhaustion ceiling rather than looping.
+
+        Only provably dead owners: a claim from another host is left to its
+        lease, because releasing one from here could take an item away from a
+        worker that is alive and working on it.
+        """
+        reclaimed = []
+        for record in self.queue.orphaned(project_id):
+            owner = record.owner
+            if self.queue.release(
+                record.item_id,
+                PENDING,
+                error=f"reclaimed: the process holding this item ({owner}) no longer exists",
+                owner=owner,
+                project_id=project_id,
+            ):
+                reclaimed.append(record.item_id)
+                self._emit(
+                    {
+                        "ts": self.now(),
+                        "kind": "work",
+                        "worker": owner,
+                        "item_id": record.item_id,
+                        "outcome": "claim_reclaimed",
+                        "detail": f"{owner} is gone; the item is claimable again",
+                        "project_id": project_id,
+                    }
+                )
+        if reclaimed:
+            log.info(
+                "project %s: reclaimed %s from processes that no longer exist",
+                project_id,
+                ", ".join(reclaimed),
+            )
+        return reclaimed
 
     def _add_workers(self, pool: ProjectPool, count: int) -> int:
         """Start `count` more workers. A failed start does not disturb its siblings."""

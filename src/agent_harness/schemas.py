@@ -264,6 +264,14 @@ class ProjectSummary(BaseModel):
     stale: int = Field(
         0, description="Claims whose lease expired without finishing -- the worker is gone."
     )
+    orphaned: int = Field(
+        0,
+        description="Claims held by a process that no longer exists. Distinct from "
+        "`stale`, and the distinction is the point: stale means a LEASE ran out, which "
+        "is a timeout and therefore a guess; orphaned means the owning pid is gone, "
+        "which is a fact. Orphans are reclaimed when the project next starts rather "
+        "than waiting out a lease as work nobody is doing.",
+    )
     workers: int = Field(
         0,
         description="Workers actually alive for this project. Distinct from the control "

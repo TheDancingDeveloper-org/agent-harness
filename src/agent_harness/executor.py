@@ -348,6 +348,85 @@ APPLY_LADDER: tuple[tuple[str, list[str]], ...] = (
     ("git apply --unidiff-zero", ["git", "apply", "--unidiff-zero", "-"]),
 )
 
+
+def _header_path(line: str) -> str:
+    """The path off a `---`/`+++` line, without git's trailing timestamp."""
+    return line[4:].split("\t", 1)[0].strip()
+
+
+def _stripped(path: str) -> str | None:
+    """The file `-p1` writes to: one leading component off, as git strips it.
+
+    None when that cannot be read off the header -- a quoted, escaped path or
+    one with no prefix at all. Not knowing which file a hunk targets is a
+    reason to say nothing about it, never a reason to guess.
+    """
+    if path.startswith('"') or "/" not in path:
+        return None
+    return path.partition("/")[2] or None
+
+
+def unplaceable_hunks(repo: Path, diff: str) -> list[str]:
+    """Hunks whose header claims a placement the working tree disproves.
+
+    `@@ -0,0 +...` says the old file has no lines at this point: the shape of
+    a file creation. Against a file that exists with content in it, that is
+    not a header with its counts slightly wrong -- it is false about the tree,
+    and it carries no information about *where* the new lines belong.
+
+    Measured, live: an implementer emitted `@@ -0,0 +1,4 @@` against a
+    `calc.py` opening with a module docstring. `git apply` refuses it, but
+    `--unidiff-zero` -- the rung that exists to forgive hand-written headers
+    -- takes the absent context at face value and inserts the lines at line 1,
+    above the docstring, which becomes a bare string expression and leaves
+    `__doc__` as None. The checks stay green, because Python does not care
+    where a string literal sits, so the item goes to review as a success with
+    damage the harness introduced rather than the model.
+
+    The difference from the headers the ladder is *for* is that this one is
+    checkable without applying anything, and no rung can recover what it threw
+    away. A creation the patch declares honestly (`--- /dev/null`, or `new
+    file mode`) is not this: git decides for itself whether the file is
+    already there, and refuses either way.
+
+    It does cost one honest case, measured: `git diff -U0` emits exactly this
+    header for a line prepended to a file that has content. Nothing in the
+    patch distinguishes that from a model that meant "somewhere in this file"
+    and wrote the emptiest header it knew, and one of the two is damage no
+    gate can see -- so both are refused and the implementer is asked again.
+    A prepend that carries one line of context is accepted by the first rung.
+    """
+    problems: list[str] = []
+    target: str | None = None
+    previous = ""
+    creating = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            target, creating = None, False
+        elif line.startswith("new file mode "):
+            creating = True
+        elif line.startswith("--- "):
+            creating = creating or _header_path(line) == "/dev/null"
+        elif line.startswith("+++ ") and previous.startswith("--- "):
+            # Paired with its `---` so that a *removed* line reading like a
+            # file header cannot re-target the hunks that follow it.
+            target = None if creating else _stripped(_header_path(line))
+        else:
+            header = _HUNK_HEADER.match(line)
+            if header is not None and target and (header.group(1), header.group(2)) == ("0", "0"):
+                path = repo / target
+                body = path.read_bytes() if path.is_file() else b""
+                if body:
+                    count = body.count(b"\n") + (0 if body.endswith(b"\n") else 1)
+                    problems.append(
+                        f"{target}: `{header.group(0)}` says the file is empty, but it has "
+                        f"{count} line(s) — say where these lines go, with a line of "
+                        "context or a header naming the line they follow"
+                    )
+        previous = line
+    return list(dict.fromkeys(problems))
+
+
 #: The fuzzy fallback, DISABLED by default. `patch` matches loosely, which
 #: means it can place a hunk in the WRONG location and report success --
 #: producing a plausible, wrong result rather than an honest failure.
@@ -376,6 +455,16 @@ def apply_diff(repo: Path, diff: str, *, allow_fuzzy: bool = False) -> tuple[boo
     `allow_fuzzy` enables the last-resort `patch` rung. Off by default,
     because a misplaced hunk that reports success is worse than a failure.
     """
+    unplaceable = unplaceable_hunks(repo, diff)
+    if unplaceable:
+        # Refused before the first rung rather than after the last, because
+        # the rungs below would "succeed" at this: `--unidiff-zero` inserts a
+        # `-0,0` hunk at line 1 of whatever file it names, and reports a clean
+        # apply. That is the same trade as the fuzzy rung above -- tolerance
+        # bought by discarding the evidence of where a hunk belongs -- and it
+        # is refused for the same reason, one rung earlier because here the
+        # patch is provably wrong before anything is run.
+        return False, "; ".join(unplaceable)
     ladder = (*APPLY_LADDER, FUZZY_RUNG) if allow_fuzzy else APPLY_LADDER
     errors = []
     for label, args in ladder:

@@ -793,6 +793,10 @@ class Executor:
                     "ts": self.now(),
                     "kind": "work",
                     "worker": self.owner,
+                    # An item's identity is (project_id, item_id), never
+                    # item_id alone. Emitting half of it made two projects'
+                    # `T1` one row to every reader of this stream.
+                    "project_id": self.project_id,
                     "item_id": record.item_id,
                     "issue": record.issue,
                     "outcome": stage,

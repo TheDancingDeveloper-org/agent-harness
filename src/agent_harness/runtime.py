@@ -49,6 +49,7 @@ def session_executor_factory(
     agent: AgentSpec | None = None,
     reviewer: Any | None = None,
     github_for: Callable[[str], Any] | None = None,
+    reviewer_for: Callable[[str], Any] | None = None,
     ui_base_url: str = "",
     on_event: Callable[[dict[str, Any]], None] | None = None,
     push: bool = True,
@@ -59,6 +60,13 @@ def session_executor_factory(
     exercised end to end without a session host, a model or a network — which
     is the only way the wiring gets tested at all, since every real component
     here costs money or credentials to touch.
+
+    `reviewer_for` builds the reviewer **per project**, and is what makes a
+    project's persisted role overrides reach execution. Passing one shared
+    `reviewer` to every project meant a project could configure its own
+    reviewer, pass preflight on it, and then have review routed to the fleet
+    model anyway — or fail outright when the fleet had no reviewer at all.
+    `reviewer` remains as the single-route fallback.
     """
 
     def build(project_id: str) -> SessionExecutor:
@@ -76,7 +84,7 @@ def session_executor_factory(
             Path(project.work_dir),
             agent=agent or AgentSpec(),
             checks=_checks_for(project),
-            reviewer=reviewer,
+            reviewer=(reviewer_for(project_id) if reviewer_for is not None else reviewer),
             github=(github_for(project.repo) if github_for and project.repo else None),
             base_branch=project.base_branch,
             ui_base_url=ui_base_url,

@@ -218,7 +218,7 @@ def _run(args: argparse.Namespace) -> int:
         with events_path.open("a") as handle:
             handle.write(_json.dumps(event) + "\n")
 
-    from .api import ROLE_MAP_KEY
+    from .work import ROLE_MAP_KEY
 
     # Seed the shared map from the command line, then read it back per call so
     # `PUT /api/roles` takes effect without a restart.
@@ -686,13 +686,13 @@ def _fleet_for_serve(
     import shlex
 
     from . import providers
-    from .api import ROLE_MAP_KEY
     from .fleet import Fleet
     from .github import GitHub
     from .model_client import ModelClient, Route
     from .runtime import session_executor_factory
     from .session_executor import AgentSpec
     from .session_host import HttpSessionHost
+    from .work import ROLE_MAP_KEY, effective_roles
 
     api_key = os.environ.get("HARNESS_API_KEY", "")
     host_token = os.environ.get("AIDEVENV_TOKEN", "") or api_key
@@ -712,8 +712,7 @@ def _fleet_for_serve(
         }
         queue.set_setting(ROLE_MAP_KEY, stored)
 
-    def live_routes() -> dict[str, Route]:
-        current = queue.get_setting(ROLE_MAP_KEY) or {}
+    def _routes(current: dict[str, Any]) -> dict[str, Route]:
         return {
             name: Route(
                 route["model"],
@@ -724,6 +723,29 @@ def _fleet_for_serve(
             for name, route in current.items()
             if route.get("model") and route.get("endpoint")
         }
+
+    def live_routes() -> dict[str, Route]:
+        """The fleet-wide map, re-read on every call so PUT /api/roles works."""
+        return _routes(queue.get_setting(ROLE_MAP_KEY) or {})
+
+    def reviewer_for(project_id: str) -> ModelClient:
+        """A reviewer client resolving through THIS project's effective map.
+
+        Built per project rather than shared, because a project's persisted
+        role overrides are a contract: preflight already approves a start on
+        the strength of them, so execution has to honour the same answer.
+        The provider is re-read per call, so a live re-route reaches a worker
+        that is already running.
+        """
+
+        def project_routes() -> dict[str, Route]:
+            return _routes(effective_roles(queue, project_id))
+
+        return ModelClient(
+            roles=project_routes(),
+            transport=_http_transport(api_key),
+            routes_provider=project_routes,
+        )
 
     routes = live_routes()
     if "reviewer" not in routes:
@@ -757,6 +779,7 @@ def _fleet_for_serve(
         ui_base_url=args.session_host,
         on_event=emit,
         push=not args.no_push,
+        reviewer_for=reviewer_for,
     )
     print(f"fleet: `{args.agent}` as sessions on {args.session_host}")
     print(f"events: {events_path}")

@@ -204,11 +204,19 @@ def preflight_project(
 
     # No reviewer means every review fails closed, so every item fails. That
     # is worse than not starting: it spends the implementer's tokens first.
+    #
+    # The detail names the model, because a project can override the fleet's
+    # reviewer and "a reviewer role is routed" is then true of two different
+    # answers. An operator checking a project before starting it wants to see
+    # which one this project will actually call.
+    reviewer_model = (reviewer_route or {}).get("model") if hasattr(reviewer_route, "get") else None
     checks.append(
         Check(
             "reviewer",
             reviewer_route is not None,
-            "a reviewer role is routed"
+            f"reviewer routed to {reviewer_model}"
+            if reviewer_model
+            else "a reviewer role is routed"
             if reviewer_route is not None
             else "no reviewer is routed; review fails closed, so every item would fail "
             "after paying for the implementation",

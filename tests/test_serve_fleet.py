@@ -267,3 +267,140 @@ def test_monitoring_only_is_still_supported(repo: Path, tmp_path: Path) -> None:
         refused = c.post("/api/projects/p/start?force=true", headers=hdr())
     assert refused.status_code == 409
     assert "no worker pool" in refused.json()["detail"]
+
+
+# ------------------------------------------ per-project reviewer routing
+
+
+def route_for(model: str, endpoint: str) -> dict[str, str]:
+    return {"model": model, "endpoint": endpoint, "provider": "generic"}
+
+
+def test_a_project_reviewer_override_reaches_the_executor(tmp_path: Path) -> None:
+    """A persisted override is a contract: preflight already approves a start
+    on the strength of it, so execution has to honour the same answer."""
+    from agent_harness.work import effective_roles
+
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue.set_setting(ROLE_MAP_KEY, {"reviewer": route_for("global-model", "https://global")})
+    queue.add_project(
+        Project(
+            project_id="p",
+            name="p",
+            work_dir=str(tmp_path),
+            roles={"reviewer": route_for("project-model", "https://project")},
+        )
+    )
+    queue.add_project(Project(project_id="q", name="q", work_dir=str(tmp_path)))
+
+    assert effective_roles(queue, "p")["reviewer"]["model"] == "project-model"
+    # A project with no override still gets the fleet's reviewer.
+    assert effective_roles(queue, "q")["reviewer"]["model"] == "global-model"
+
+
+def test_a_partial_override_inherits_the_roles_it_does_not_name(tmp_path: Path) -> None:
+    """`project.roles or stored` meant naming one role silently discarded
+    every other, and the executor then had no route for them at all."""
+    from agent_harness.work import effective_roles
+
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue.set_setting(
+        ROLE_MAP_KEY,
+        {
+            "reviewer": route_for("global-reviewer", "https://global"),
+            "planner": route_for("global-planner", "https://global"),
+        },
+    )
+    queue.add_project(
+        Project(
+            project_id="p",
+            name="p",
+            work_dir=str(tmp_path),
+            roles={"reviewer": route_for("project-reviewer", "https://project")},
+        )
+    )
+    effective = effective_roles(queue, "p")
+    assert effective["reviewer"]["model"] == "project-reviewer"
+    assert effective["planner"]["model"] == "global-planner"
+
+
+def test_a_project_only_reviewer_works_with_no_fleet_reviewer(tmp_path: Path) -> None:
+    """The case that used to fail after the agent and checks had been paid
+    for: preflight passed on the override, execution had no global route."""
+    from agent_harness.work import effective_roles
+
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue.add_project(
+        Project(
+            project_id="p",
+            name="p",
+            work_dir=str(tmp_path),
+            roles={"reviewer": route_for("project-model", "https://project")},
+        )
+    )
+    assert effective_roles(queue, "p")["reviewer"]["model"] == "project-model"
+
+
+def test_each_project_gets_its_own_reviewer_client(tmp_path: Path) -> None:
+    """Two projects, two reviewers. One shared client sent both to the same
+    model no matter what either had configured."""
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    for name, model in (("p", "model-p"), ("q", "model-q")):
+        queue.add_project(
+            Project(
+                project_id=name,
+                name=name,
+                work_dir=str(tmp_path),
+                roles={"reviewer": route_for(model, f"https://{name}")},
+            )
+        )
+
+    def reviewer_for(project_id: str) -> ModelClient:
+        from agent_harness.work import effective_roles
+
+        return ModelClient(
+            roles={
+                role: Route(r["model"], r["endpoint"], P.GENERIC)
+                for role, r in effective_roles(queue, project_id).items()
+            },
+            transport=lambda *_a, **_k: Response(200, {}, "{}"),
+            sleep=lambda _s: None,
+        )
+
+    factory = session_executor_factory(queue, host=object(), reviewer_for=reviewer_for, push=False)
+    assert factory("p").reviewer.route_for("reviewer").model == "model-p"
+    assert factory("q").reviewer.route_for("reviewer").model == "model-q"
+
+
+def test_preflight_reads_the_same_effective_map_the_executor_will(tmp_path: Path) -> None:
+    """Preflight and execution disagreeing is the whole failure: a project
+    approved on its own reviewer, then routed to a different one."""
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue.add_project(
+        Project(
+            project_id="p",
+            name="p",
+            repo="o/r",
+            work_dir=str(tmp_path),
+            plan_path="PLAN.md",
+            roles={"reviewer": route_for("project-model", "https://project")},
+        )
+    )
+    app = create_api(
+        EventStore(tmp_path / "e.sqlite"),
+        queue=queue,
+        token=TOKEN,
+        probes={
+            "git_probe": lambda _p: (True, "fine"),
+            "github_probe": lambda _p: (True, "fine"),
+        },
+    )
+    with TestClient(app) as c:
+        checks = {
+            check["name"]: check
+            for check in c.get(
+                "/api/projects/p/preflight", headers={"Authorization": f"Bearer {TOKEN}"}
+            ).json()["checks"]
+        }
+        assert checks["reviewer"]["ok"] is True
+        assert "project-model" in checks["reviewer"]["detail"]

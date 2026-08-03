@@ -18,7 +18,13 @@ from pydantic import BaseModel, Field, computed_field
 
 # --------------------------------------------------------------------- work
 
-WorkState = Literal["pending", "claimed", "done", "failed", "blocked"]
+#: Every state the queue can actually store. `exhausted` is the one that is
+#: easy to forget and the worst to omit: it is what the harness sets when an
+#: item has burned its attempt limit, so it marks precisely the rows that
+#: need a human. Leaving it out of the union did not hide those rows -- it
+#: made the list and detail endpoints fail response validation and return
+#: 500, so the safety mechanism broke the API exactly when it engaged.
+WorkState = Literal["pending", "claimed", "done", "failed", "blocked", "exhausted"]
 
 
 class LatestEvent(BaseModel):

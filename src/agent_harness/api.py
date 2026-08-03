@@ -96,17 +96,19 @@ from .work import (
     DONE,
     FAILED,
     PENDING,
+    ROLE_MAP_KEY,
     STOPPED,
     Project,
     WorkQueue,
     WorkRecord,
+    effective_roles,
 )
 
 WINDOWS = {"1h": 3600, "24h": 86400, "72h": 3 * 86400, "7d": 7 * 86400, "all": None}
 
-#: Where the live role map is stored. Shared through the queue's database
-#: because the API and the worker are different processes.
-ROLE_MAP_KEY = "role_map"
+# `ROLE_MAP_KEY` is imported from `work`, which now also owns the merge with
+# a project's overrides. Importing it re-exports it, so `from .api import
+# ROLE_MAP_KEY` keeps working for the callers that already do that.
 
 DESCRIPTION = """\
 Plans work, claims it, runs it as an agent in a terminal session, and records
@@ -180,10 +182,7 @@ def create_api(
     app.state.fleet = fleet
     app.state.model_client = model_client
     app.state.session_host = session_host
-    _APP_STATE["fleet"] = fleet
-    _APP_STATE["model_client"] = model_client
-    _APP_STATE["session_host"] = session_host
-    _APP_STATE["probes"] = dict(probes or {})
+    app.state.probes = dict(probes or {})
     app.state.token = token
 
     def require_token(
@@ -252,7 +251,7 @@ def create_api(
             counts=queue.counts(project_id=project_id),
             stale=[r.item_id for r in queue.stale(project_id=project_id)],
             items=[
-                _item_model(r, latest.get(r.item_id)) for r in queue.items(project_id=project_id)
+                _item_model(r, _latest_for(latest, r)) for r in queue.items(project_id=project_id)
             ],
         )
 
@@ -271,7 +270,7 @@ def create_api(
         record = need_queue().get(item_id, project_id=project_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
-        return _item_model(record, _latest_by_item(store).get(item_id))
+        return _item_model(record, _latest_for(_latest_by_item(store), record))
 
     @app.post(
         "/api/work",
@@ -920,7 +919,7 @@ def create_api(
         if project is None:
             raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
 
-        report = _preflight(queue, project)
+        report = _preflight(app, queue, project)
         if not report.ready and not force:
             # Refuses rather than setting a flag nobody acts on. Previously
             # this branch set RUNNING with no fleet attached -- the comment
@@ -964,7 +963,7 @@ def create_api(
         project = queue.get_project(project_id)
         if project is None:
             raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
-        report = _preflight(queue, project)
+        report = _preflight(app, queue, project)
         return PreflightResult(
             project_id=report.project_id,
             ready=report.ready,
@@ -1031,6 +1030,9 @@ def create_api(
             session_host_state = ReadinessProbe(configured=True, ok=ok, detail=detail)
             probe = lambda ok=ok, detail=detail: (ok, detail)  # noqa: E731
 
+        # The fleet-wide route, deliberately: this is the aggregate probe,
+        # and a project overriding its reviewer is reported in that project's
+        # own entry below rather than folded into a single fleet answer.
         stored = queue.get_setting(ROLE_MAP_KEY) or {}
         route = stored.get("reviewer") or {}
         client = app.state.model_client
@@ -1053,7 +1055,7 @@ def create_api(
 
         reports = []
         for project in projects:
-            report = _preflight(queue, project, session_host=probe)
+            report = _preflight(app, queue, project, session_host=probe)
             reports.append(
                 ProjectReadiness(
                     project_id=project.project_id,
@@ -1341,15 +1343,39 @@ def create_api(
     return app
 
 
-def _latest_by_item(store: EventStore) -> dict[str, dict[str, Any]]:
+def _latest_by_item(store: EventStore) -> dict[tuple[str | None, str], dict[str, Any]]:
     """Newest event per work item. One scan — doing it per item would be a
-    query per row."""
-    latest: dict[str, dict[str, Any]] = {}
+    query per row.
+
+    Keyed by `(project_id, item_id)`, because that is what an item *is*.
+    Keying by item id alone made two projects that each have a `T1` share one
+    entry, so the newer event from either was reported as both rows' latest —
+    and a client could deep-link one project's item to the other's live
+    terminal session.
+
+    Events written before the emitters carried a project id are kept under a
+    `None` project rather than applied to every project. They are a fallback
+    for the row that has nothing better, never an override for the row that
+    does: silently spreading them is the bug this replaced.
+    """
+    latest: dict[tuple[str | None, str], dict[str, Any]] = {}
     for event in store.recent(kind="work", limit=2000):
         item_id = event["data"].get("item_id")
-        if item_id and item_id not in latest:
-            latest[item_id] = event
+        if not item_id:
+            continue
+        key = (event["data"].get("project_id"), item_id)
+        if key not in latest:
+            latest[key] = event
     return latest
+
+
+def _latest_for(
+    latest: dict[tuple[str | None, str], dict[str, Any]], record: WorkRecord
+) -> dict[str, Any] | None:
+    scoped = latest.get((record.project_id, record.item_id))
+    if scoped is not None:
+        return scoped
+    return latest.get((None, record.item_id))
 
 
 def _audit_event_fields(row: dict[str, Any]) -> dict[str, Any]:
@@ -1375,30 +1401,41 @@ def _audit_event_fields(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _preflight(queue: WorkQueue, project: Project, session_host: Any | None = None) -> Any:
-    """Build a preflight report for a project, using whatever is configured.
+def _preflight(
+    app: FastAPI,
+    queue: WorkQueue,
+    project: Project,
+    session_host: Any | None = None,
+) -> Any:
+    """Build a preflight report for a project, using THIS app's wiring.
+
+    The app is passed rather than read from a module-level handle, and that
+    is the whole point of the signature. The handle meant the last app
+    constructed in a process owned every earlier app's readiness answers: an
+    instance could report another's worker pool, session host and probe
+    results, and a single response could say `mode: monitoring-only` while
+    every project in it was `ready_to_start`. Two apps in one process is not
+    exotic -- it is every test module and every embedded deployment.
 
     `session_host` is a *probe*, not the host: readiness over many projects
     would otherwise ask the same host the same question once per project.
     """
     from .preflight import preflight_project, session_host_probe
 
-    stored = queue.get_setting("role_map") or {}
-    client = _APP_STATE.get("model_client")
-    host = _APP_STATE.get("session_host")
+    client = app.state.model_client
+    host = app.state.session_host
     return preflight_project(
         project,
-        has_fleet=_APP_STATE.get("fleet") is not None,
-        reviewer_route=(project.roles or stored).get("reviewer"),
+        has_fleet=app.state.fleet is not None,
+        # The map the executor will actually resolve through, merged per
+        # role. Reading `project.roles or stored` meant a project naming one
+        # role discarded every other, so preflight approved an execution path
+        # that failed after the agent and the checks had already been paid for.
+        reviewer_route=effective_roles(queue, project.project_id).get("reviewer"),
         reviewer_independent=client.reviewer_independence() if client is not None else None,
         session_host=session_host or (session_host_probe(host) if host is not None else None),
-        **(_APP_STATE.get("probes") or {}),
+        **(app.state.probes or {}),
     )
-
-
-#: Set by `create_api`. A module-level handle so helpers outside the closure
-#: can see the same wiring the routes do.
-_APP_STATE: dict[str, Any] = {}
 
 
 def _project_spec(project: Project) -> ProjectSpec:

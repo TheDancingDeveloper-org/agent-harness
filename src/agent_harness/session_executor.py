@@ -669,6 +669,10 @@ class SessionExecutor:
                     "ts": self.now(),
                     "kind": "work",
                     "worker": self.owner,
+                    # An item's identity is (project_id, item_id), never
+                    # item_id alone. Emitting half of it let a client
+                    # deep-link one project's item to another's live session.
+                    "project_id": self.project_id,
                     "item_id": record.item_id,
                     "issue": record.issue,
                     "outcome": stage,

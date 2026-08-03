@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from agent_harness.api import create_api
 from agent_harness.events import MODEL_CALL, UNCLASSIFIED, WORK, Event
 from agent_harness.store import EventStore
-from agent_harness.work import CLAIMED, DONE, PENDING, WorkQueue, WorkRecord
+from agent_harness.work import CLAIMED, DONE, PENDING, RUNNING, Project, WorkQueue, WorkRecord
 from conftest import make_queue
 
 TOKEN = "test-token"  # noqa: S105 - a fixture, not a credential
@@ -656,3 +656,202 @@ def test_the_role_map_persists_for_a_worker_in_another_process(
 def test_roles_require_a_token(client: TestClient) -> None:
     assert client.get("/api/roles").status_code == 401
     assert client.put("/api/roles", json={"roles": {}}).status_code == 401
+
+
+# ------------------------------------------ items the harness gave up on
+
+
+def exhaust(queue: WorkQueue, item_id: str, project_id: str) -> None:
+    """Drive a real item through the actual attempt-limit transition.
+
+    Setting the state directly would test the schema against a value the
+    queue might never write; the bug was that the two disagreed.
+    """
+    for _ in range(4):
+        claimed = queue.claim("w", project_id=project_id)
+        if claimed is None:
+            break
+        queue.release(claimed.item_id, PENDING, error="boom", project_id=project_id)
+    queue.claim("w", project_id=project_id)  # the claim that gives up
+    record = queue.get(item_id, project_id=project_id)
+    assert record is not None and record.state == "exhausted", record
+
+
+def test_an_exhausted_item_is_listable_and_inspectable(client: TestClient, tmp_path: Path) -> None:
+    """The state that marks work needing a human must not be the state that
+    breaks the endpoints used to find it."""
+    queue = make_queue(str(tmp_path / "x.sqlite"), lease_seconds=100.0)
+    queue.add_project(Project(project_id="p", name="p", max_attempts=1))
+    queue.add([WorkRecord(item_id="T1", title="t", brief="b")], project_id="p")
+    queue.set_control(RUNNING, project_id="p")
+    exhaust(queue, "T1", "p")
+
+    with TestClient(create_api(EventStore(tmp_path / "e2.sqlite"), queue=queue, token=TOKEN)) as c:
+        listed = c.get("/api/work?project_id=p", headers=auth())
+        assert listed.status_code == 200, listed.text
+        row = next(i for i in listed.json()["items"] if i["item_id"] == "T1")
+        assert row["state"] == "exhausted"
+        assert row["attempts"] >= 1
+        assert "gave up" in (row["last_error"] or ""), "the reason must survive"
+
+        detail = c.get("/api/work/T1?project_id=p", headers=auth())
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["state"] == "exhausted"
+
+
+def test_an_exhausted_item_can_be_retried(client: TestClient, tmp_path: Path) -> None:
+    """Giving up is not permanent; it just needs somebody to say so."""
+    queue = make_queue(str(tmp_path / "x.sqlite"), lease_seconds=100.0)
+    queue.add_project(Project(project_id="p", name="p", max_attempts=1))
+    queue.add([WorkRecord(item_id="T1", title="t", brief="b")], project_id="p")
+    queue.set_control(RUNNING, project_id="p")
+    exhaust(queue, "T1", "p")
+
+    with TestClient(create_api(EventStore(tmp_path / "e2.sqlite"), queue=queue, token=TOKEN)) as c:
+        retried = c.post("/api/work/T1/retry?project_id=p", headers=auth())
+        assert retried.status_code == 200, retried.text
+        assert retried.json()["state"] == "pending"
+
+
+def test_the_documented_states_are_the_states_the_queue_writes(client: TestClient) -> None:
+    """The two drifted apart once and the symptom was a 500. Derived from
+    the queue's own constants so it cannot drift again silently."""
+    from agent_harness import work as work_module
+
+    stored = {
+        getattr(work_module, name)
+        for name in ("PENDING", "CLAIMED", "DONE", "FAILED", "BLOCKED", "EXHAUSTED")
+    }
+    schema = client.get("/openapi.json").json()["components"]["schemas"]["WorkItem"]
+    documented = set(schema["properties"]["state"]["enum"])
+    assert stored <= documented, (
+        f"states the queue writes and the schema rejects: {stored - documented}"
+    )
+
+
+# ------------------------------------ isolation between apps and projects
+
+
+def test_two_projects_with_the_same_item_id_see_only_their_own_events(
+    tmp_path: Path,
+) -> None:
+    """An item IS (project_id, item_id). Keying events by item id alone let a
+    client deep-link one project's row to another's live terminal session."""
+    store = EventStore(tmp_path / "e.sqlite")
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    for project in ("a", "b"):
+        queue.add([WorkRecord(item_id="T1", title="t", brief="b")], project_id=project)
+    store.append(
+        [
+            Event(
+                ts=1000.0,
+                kind=WORK,
+                source="events.jsonl",
+                worker="w",
+                outcome="agent_started",
+                data={"project_id": "a", "item_id": "T1", "session_id": "s-a"},
+            ),
+            Event(
+                ts=2000.0,  # newer, and belongs to b
+                kind=WORK,
+                source="events.jsonl",
+                worker="w",
+                outcome="review_rejected",
+                data={"project_id": "b", "item_id": "T1", "session_id": "s-b"},
+            ),
+        ]
+    )
+
+    with TestClient(create_api(store, queue=queue, token=TOKEN)) as c:
+        a = c.get("/api/work/T1?project_id=a", headers=auth()).json()
+        b = c.get("/api/work/T1?project_id=b", headers=auth()).json()
+        assert a["latest"]["session_id"] == "s-a"
+        assert a["latest"]["outcome"] == "agent_started"
+        assert b["latest"]["session_id"] == "s-b"
+
+        listed = c.get("/api/work?project_id=a", headers=auth()).json()["items"]
+        assert listed[0]["latest"]["session_id"] == "s-a"
+
+
+def test_an_event_with_no_project_is_a_fallback_not_an_override(tmp_path: Path) -> None:
+    """Events written before the emitters carried a project id must not be
+    spread across every project -- that is the bug, not the migration."""
+    store = EventStore(tmp_path / "e.sqlite")
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    for project in ("a", "b"):
+        queue.add([WorkRecord(item_id="T1", title="t", brief="b")], project_id=project)
+    store.append(
+        [
+            Event(ts=1000.0, kind=WORK, source="s", outcome="legacy", data={"item_id": "T1"}),
+            Event(
+                ts=2000.0,
+                kind=WORK,
+                source="s",
+                outcome="scoped",
+                data={"project_id": "a", "item_id": "T1"},
+            ),
+        ]
+    )
+    with TestClient(create_api(store, queue=queue, token=TOKEN)) as c:
+        # `a` has something better, so the legacy row does not override it.
+        assert c.get("/api/work/T1?project_id=a", headers=auth()).json()["latest"]["outcome"] == (
+            "scoped"
+        )
+        # `b` has nothing else, so the legacy row is still shown rather than lost.
+        assert c.get("/api/work/T1?project_id=b", headers=auth()).json()["latest"]["outcome"] == (
+            "legacy"
+        )
+
+
+def test_a_second_app_does_not_take_over_the_first_apps_readiness(tmp_path: Path) -> None:
+    """One app's safety gate must never be answered by another app's wiring.
+
+    The module-level handle meant the last app constructed in a process owned
+    every earlier app's preflight -- so a response could say `monitoring-only`
+    while reporting another instance's healthy worker pool.
+    """
+
+    def build(name: str, fleet: Any, checkout_ok: bool) -> Any:
+        queue = make_queue(str(tmp_path / f"{name}.sqlite"), lease_seconds=100.0)
+        queue.add_project(
+            Project(project_id="p", name="p", repo="o/r", work_dir=str(tmp_path), plan_path="x")
+        )
+        return create_api(
+            EventStore(tmp_path / f"{name}-e.sqlite"),
+            queue=queue,
+            token=TOKEN,
+            fleet=fleet,
+            probes={
+                "git_probe": lambda _p, ok=checkout_ok: (ok, "fine" if ok else "bad"),
+                "github_probe": lambda _p: (True, "fine"),
+            },
+        )
+
+    monitoring_only = build("a", None, True)
+    # Constructed second, with contradictory wiring. Under the bug this is
+    # the app whose fleet and probes answered for both.
+    build("b", object(), False)
+
+    with TestClient(monitoring_only) as c:
+        readiness = c.get("/api/readiness", headers=auth()).json()
+        assert readiness["mode"] == "monitoring-only"
+        blockers = " ".join(str(p) for p in readiness["projects"])
+        assert "bad" not in blockers, "the other app's failing probe answered for this one"
+
+        preflight = c.get("/api/projects/p/preflight", headers=auth()).json()
+        checks = {check["name"]: check for check in preflight["checks"]}
+        assert checks["workers"]["ok"] is False, "it reported another app's worker pool"
+        assert not any("bad" in str(check) for check in checks.values())
+
+
+def test_the_api_keeps_no_module_level_wiring() -> None:
+    """Enforced against the source. A module-level handle is how one app
+    started answering for another, and it is invisible until two exist."""
+    import re
+
+    from agent_harness import api as api_module
+
+    source = Path(api_module.__file__).read_text()
+    assert "_APP_STATE" not in source
+    module_dicts = re.findall(r"^_[A-Z_]+: dict\[str, Any\] = \{\}", source, re.MULTILINE)
+    assert module_dicts == [], f"mutable module-level state is back: {module_dicts}"

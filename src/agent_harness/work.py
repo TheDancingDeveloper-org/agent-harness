@@ -946,3 +946,31 @@ class WorkQueue:
             return [WorkRecord.from_row(r) for r in rows]
         finally:
             conn.close()
+
+
+#: Where the fleet-wide role map lives. A queue setting rather than a flag
+#: because the API and the workers are different processes, and re-routing a
+#: role live is the reason it is stored at all.
+ROLE_MAP_KEY = "role_map"
+
+
+def effective_roles(queue: WorkQueue, project_id: str) -> dict[str, Any]:
+    """The role map that actually applies to one project.
+
+    Merged **per role**, not all-or-nothing. A project that overrides only
+    its reviewer keeps the fleet's planner and implementer; the previous
+    `project.roles or stored` meant naming one role silently discarded every
+    other, and a project could pass preflight on its own reviewer and then
+    fail at execution with `no route for role`.
+
+    This is the one place the answer is computed, so preflight, readiness
+    reporting, reviewer-independence and the executor cannot disagree about
+    which model is going to be called.
+    """
+    stored = dict(queue.get_setting(ROLE_MAP_KEY) or {})
+    project = queue.get_project(project_id)
+    overrides = (project.roles if project else None) or {}
+    for role, route in overrides.items():
+        if route and route.get("model") and route.get("endpoint"):
+            stored[role] = route
+    return stored

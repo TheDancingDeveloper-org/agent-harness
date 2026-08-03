@@ -74,6 +74,10 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
 
 ## Documentation
 
+- **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how it fits together.**
+  Diagrams: the whole system, what an agent actually is, the components, the
+  life of a work item, failure classification, the audit layer, and project
+  isolation.
 - **[`docs/USAGE.md`](docs/USAGE.md) — start here.** A worked example end to end, with
   real output: write a plan, sync it, execute it, resume it, drive it from the API, and
   read the failures.
@@ -82,6 +86,10 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
   part:** it was written assuming one specific consumer, and the harness is now generic.
   Read it for the evidence and the reasoning, not the phase order, and see §0.1 for what
   changed.
+- [`docs/MULTI-PROJECT-PLAN.md`](docs/MULTI-PROJECT-PLAN.md) — project scoping, the GUI
+  that scoping makes possible, and project inception. Phases 0-2 are built.
+- [`docs/AUDIT-PLAN.md`](docs/AUDIT-PLAN.md) — the durable audit layer: what is worth
+  measuring and the rules that keep the numbers defensible.
 - [`docs/backlog.json`](docs/backlog.json) — the machine-readable backlog that seeds the
   GitHub issues.
 - [`AGENTS.md`](AGENTS.md) — binding rules of engagement for anyone, human or agent,

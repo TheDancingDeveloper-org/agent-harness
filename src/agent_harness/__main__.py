@@ -754,7 +754,9 @@ def _fleet_for_serve(args: argparse.Namespace, queue: Any) -> tuple[Any | None, 
     )
     print(f"fleet: `{args.agent}` as sessions on {args.session_host}")
     print(f"events: {events_path}")
-    return (Fleet(queue, factory, poll_seconds=args.poll), reviewer_client)
+    # The fleet emits into the same stream as the executors: a worker that
+    # dies is recorded next to the work it was doing, not in a separate log.
+    return (Fleet(queue, factory, poll_seconds=args.poll, on_event=emit), reviewer_client)
 
 
 if __name__ == "__main__":

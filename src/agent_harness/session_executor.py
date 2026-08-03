@@ -178,6 +178,7 @@ class SessionExecutor:
         self.push = push
         self.now = now
         self.owner = worker_identity()
+        self._partial: Outcome | None = None
 
     # ------------------------------------------------------------- driving
 
@@ -200,6 +201,11 @@ class SessionExecutor:
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
             self.queue.release(record.item_id, FAILED, error=str(exc), owner=self.owner)
+            partial = self._partial
+            if partial is not None and partial.item_id == record.item_id:
+                partial.state = FAILED
+                partial.reason = str(exc)
+                return partial
             return Outcome(record.item_id, FAILED, reason=str(exc))
         self.queue.release(
             record.item_id,
@@ -304,6 +310,13 @@ class SessionExecutor:
 
     def _execute(self, record: WorkRecord) -> Outcome:
         outcome = Outcome(record.item_id, FAILED)
+        # Kept on the instance so an unexpected failure can still report how
+        # far the item got. Fabricating a fresh Outcome in the handler threw
+        # that away, which mattered exactly when it was most wanted: after the
+        # draft-PR checkpoint, "it died during review with the work already
+        # committed" and "it died before touching anything" look identical
+        # from an empty stage list.
+        self._partial = outcome
         self._emit(record, "started")
 
         branch = f"{self.branch_prefix}{record.item_id.lower()}"
@@ -391,6 +404,30 @@ class SessionExecutor:
             self._emit(record, "checks_passed", session_id=session.id)
             self._keepalive(record)
 
+            # Checkpoint BEFORE the expensive gate.
+            #
+            # Review is the slowest and most failure-prone step, and it used
+            # to happen before anything was committed -- so a worker killed
+            # during it lost work that had already passed every cheap gate.
+            # Committing and pushing here means the candidate survives the
+            # worker: a draft PR is still there on restart, with its evidence,
+            # for a human or a later attempt.
+            #
+            # Draft, not ready: an unreviewed candidate must never present
+            # itself as reviewed. Marking it ready is what approval buys.
+            self._commit(tree, record, checkpoint=True)
+            outcome.stages.append("commit")
+            if self.push:
+                run_git(tree, "push", "-u", "origin", branch)
+                outcome.stages.append("push")
+            if self.github is not None and record.issue:
+                outcome.pr_url = self._open_pr(record, branch, base, draft=True)
+                if outcome.pr_url:
+                    outcome.stages.append("draft-pr")
+                    self._emit(
+                        record, "draft_pr_opened", detail=outcome.pr_url, session_id=session.id
+                    )
+
             verdict_text = self._review(record, tree, passed, failure)
             outcome.stages.append("review")
             verdict = APPROVED if verdict_text.strip().upper().startswith("APPROVED") else REJECTED
@@ -398,17 +435,19 @@ class SessionExecutor:
             self._emit(
                 record, f"review_{verdict}", detail=verdict_text[:2000], session_id=session.id
             )
+
+            # The verdict goes on the PR either way. A rejected draft that
+            # says why is a lead; a rejected draft that says nothing is
+            # litter someone has to reconstruct.
+            if outcome.pr_url and self.github is not None:
+                self._record_verdict(record, outcome.pr_url, verdict, verdict_text)
+
             if verdict != APPROVED:
                 outcome.reason = f"review rejected: {verdict_text.strip()[:500]}"
                 return outcome
 
-            self._commit(tree, record, verdict_text)
-            outcome.stages.append("commit")
-            if self.push:
-                run_git(tree, "push", "-u", "origin", branch)
-                outcome.stages.append("push")
-            if self.github is not None and record.issue:
-                outcome.pr_url = self._open_pr(record, branch, base, verdict_text)
+            if outcome.pr_url and self.github is not None:
+                self._mark_ready(record, outcome.pr_url)
                 outcome.stages.append("pr")
 
             outcome.state = DONE
@@ -494,27 +533,70 @@ class SessionExecutor:
                 shutil.rmtree(tree)
         run_git(self.repo, "worktree", "prune", check=False)
 
-    def _commit(self, tree: Path, record: WorkRecord, verdict: str) -> None:
+    def _commit(
+        self, tree: Path, record: WorkRecord, verdict: str = "", checkpoint: bool = False
+    ) -> None:
         run_git(tree, "add", "-A")
+        trailer = (
+            "Reviewed: not yet — this is a checkpoint taken after the cheap "
+            "gates passed and before review.\n"
+            if checkpoint
+            else f"Reviewer verdict:\n{verdict.strip()[:1500]}\n"
+        )
         message = (
             f"{record.title}\n\n"
             f"{record.brief.strip()[:1500]}\n\n"
-            f"Reviewer verdict:\n{verdict.strip()[:1500]}\n\n"
+            f"{trailer}\n"
             f"harness-item: {record.item_id}\n"
         )
         run_git(tree, "commit", "-m", message)
 
-    def _open_pr(self, record: WorkRecord, branch: str, base: str, verdict: str) -> str | None:
+    def _record_verdict(
+        self, record: WorkRecord, pr_url: str, verdict: str, verdict_text: str
+    ) -> None:
+        """Put the reviewer's verdict on the pull request.
+
+        Best-effort: a comment that fails must not lose work that succeeded.
+        """
+        if self.github is None:
+            return
+        body = f"**Review: {verdict.upper()}**\n\n{verdict_text.strip()[:5000]}"
+        try:
+            self.github.comment_pr(pr_url, body)
+        except Exception as exc:  # noqa: BLE001
+            self._emit(record, "pr_comment_failed", detail=str(exc))
+
+    def _mark_ready(self, record: WorkRecord, pr_url: str) -> None:
+        """Take the pull request out of draft. This is what approval buys.
+
+        If it fails the work is not lost -- the draft is still there, with the
+        approving verdict on it, and a human can press the button.
+        """
+        if self.github is None:
+            return
+        try:
+            self.github.mark_pr_ready(pr_url)
+        except Exception as exc:  # noqa: BLE001
+            self._emit(record, "pr_ready_failed", detail=str(exc))
+
+    def _open_pr(
+        self, record: WorkRecord, branch: str, base: str, *, draft: bool = True
+    ) -> str | None:
         github = self.github
         if github is None:  # pragma: no cover - guarded by the caller
             return None
         body = (
             f"{record.brief.strip()[:3000]}\n\n"
-            f"---\n\n**Reviewer verdict**\n\n{verdict.strip()[:3000]}\n\n"
+            "---\n\n"
+            "**Not yet reviewed.** Opened as a draft after the cheap gates passed, "
+            "so the work survives the worker that produced it. The reviewer's "
+            "verdict is posted as a comment, and approval takes it out of draft.\n\n"
             f"Closes #{record.issue}\n"
         )
         try:
-            url = github.create_pr(title=record.title, body=body, head=branch, base=base)
+            url = github.create_pr(
+                title=record.title, body=body, head=branch, base=base, draft=draft
+            )
             return str(url) if url else None
         except Exception as exc:  # noqa: BLE001 - a PR failure must not lose the work
             self._emit(record, "pr_failed", detail=str(exc))

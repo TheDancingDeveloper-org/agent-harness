@@ -94,29 +94,63 @@ class RetryPolicy:
         return base + base * jitter
 
 
+#: Roles whose calls are never blocked by another role's cap.
+#:
+#: The reviewer is here because of a specific, expensive failure: if an
+#: implementer exhausts a spend window and that parks the whole endpoint, the
+#: fleet ends up holding patches that passed every gate and cannot be
+#: reviewed, committed or merged. The money is already spent; withholding the
+#: cheap call that turns it into a pull request loses the work as well as the
+#: money.
+#:
+#: The planner is here for the same reason in reverse: it is the cheapest call
+#: and it gates every expensive one, so parking it wastes the budget that is
+#: left.
+RINGFENCED_ROLES = frozenset({"reviewer", "planner"})
+
+
 @dataclass
 class EndpointParks:
-    """Per-endpoint cooldowns, local to this process.
+    """Per-endpoint, per-role cooldowns, local to this process.
 
     Not shared, not persisted, not locked. That is the design, not an
     omission: a shared park is a global pause wearing a different name.
+
+    Keyed by role as well as endpoint so one role's cap cannot silently
+    withhold another's. A single per-endpoint park is indistinguishable from
+    a working fleet right up until you notice nothing has been reviewed for
+    an hour.
     """
 
-    _until: dict[str, float] = field(default_factory=dict)
+    _until: dict[tuple[str, str], float] = field(default_factory=dict)
 
-    def park(self, endpoint: str, seconds: float, now: float) -> float:
-        until = max(self._until.get(endpoint, 0.0), now + seconds)
-        self._until[endpoint] = until
+    def park(self, endpoint: str, seconds: float, now: float, role: str = "") -> float:
+        key = (endpoint, role)
+        until = max(self._until.get(key, 0.0), now + seconds)
+        self._until[key] = until
         return until
 
-    def remaining(self, endpoint: str, now: float) -> float:
-        return max(0.0, self._until.get(endpoint, 0.0) - now)
+    def remaining(self, endpoint: str, now: float, role: str = "") -> float:
+        """How long this role must wait on this endpoint.
+
+        A ringfenced role ignores parks belonging to other roles: it is
+        allowed to try and to be refused on its own merits, rather than being
+        pre-emptively silenced by somebody else's spending.
+        """
+        own = max(0.0, self._until.get((endpoint, role), 0.0) - now)
+        if role in RINGFENCED_ROLES:
+            return own
+        # Non-ringfenced roles also respect an endpoint-wide park, which is
+        # what a park with no role recorded means.
+        shared = max(0.0, self._until.get((endpoint, ""), 0.0) - now)
+        return max(own, shared)
 
     def clear(self, endpoint: str | None = None) -> None:
         if endpoint is None:
             self._until.clear()
         else:
-            self._until.pop(endpoint, None)
+            for key in [k for k in self._until if k[0] == endpoint]:
+                self._until.pop(key, None)
 
 
 @dataclass(frozen=True)
@@ -259,7 +293,7 @@ class ModelClient:
                 self.sleep(delay)
 
             # This process's own park on this endpoint, from an earlier cap.
-            parked = self.parks.remaining(route.endpoint, self.now())
+            parked = self.parks.remaining(route.endpoint, self.now(), role)
             if parked > 0:
                 self._emit(
                     role, route, "parked", None, attempt=attempt, detail=f"{parked:.0f}s remaining"
@@ -296,7 +330,7 @@ class ModelClient:
                     if verdict.kind == P.WINDOW_CAP
                     else self.policy.terminal_cap_park_seconds
                 )
-                self.parks.park(route.endpoint, park, self.now())
+                self.parks.park(route.endpoint, park, self.now(), role)
                 raise CapExhausted(
                     f"{route.model} via {route.endpoint}: {verdict.message or verdict.kind}",
                     kind=verdict.kind,

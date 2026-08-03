@@ -193,6 +193,164 @@ def test_an_executor_that_cannot_be_built_is_not_fatal(queue: WorkQueue) -> None
     fleet.stop_all()
 
 
+# ------------------------------------------------------------- resizing
+
+
+class Held:
+    """Which workers are inside an item, and the switch that lets them out."""
+
+    def __init__(self) -> None:
+        self.holding: list[str] = []
+        self.finished: list[str] = []
+        self.release = threading.Event()
+
+
+class HoldingExecutor:
+    """Claims one item and holds it, so a resize lands mid-item.
+
+    The alternative is sleeping and hoping, which either flakes or is slow.
+    Here `holding` says when every worker is genuinely inside an item and
+    `release` decides when they leave it.
+    """
+
+    def __init__(self, queue: WorkQueue, project_id: str, held: Held) -> None:
+        self.queue, self.project_id, self.held = queue, project_id, held
+
+    def serve(self, *, poll_seconds: float, stop: threading.Event) -> None:
+        owner = threading.current_thread().name
+        while not stop.is_set():
+            record = self.queue.claim(owner, project_id=self.project_id)
+            if record is None:
+                stop.wait(0.01)
+                continue
+            self.held.holding.append(owner)
+            self.held.release.wait(5)
+            self.held.finished.append(record.item_id)
+            self.queue.release(record.item_id, "done", owner=owner, project_id=self.project_id)
+
+
+def test_raising_max_workers_resizes_a_running_pool(queue: WorkQueue) -> None:
+    """The defect: the pool kept its original thread count until the project
+    was stopped and started again, so buying capacity for a busy project cost
+    a drain/restart cycle -- lifecycle risk taken to apply an integer."""
+    fleet = fleet_for(queue, [])
+    try:
+        assert fleet.start("b") == 1
+        queue.add_project(Project(project_id="b", name="B", max_workers=3))
+
+        assert fleet.resize("b") == 3, "the persisted budget was not applied"
+        assert wait_for(lambda: fleet.running().get("b") == 3)
+        assert queue.control(project_id="b")[0] == RUNNING
+    finally:
+        fleet.stop_all()
+
+
+def test_lowering_max_workers_never_interrupts_an_item(queue: WorkQueue) -> None:
+    """A shrink that killed a worker mid-item would destroy the context that
+    makes an agent's work resumable -- the same reason stopping drains."""
+    queue.add([rec("T1"), rec("T2")], project_id="a")  # project a runs two
+    held = Held()
+    fleet = Fleet(queue, lambda pid: HoldingExecutor(queue, pid, held), poll_seconds=0.01)
+    try:
+        fleet.start("a")
+        assert wait_for(lambda: len(held.holding) == 2)
+
+        assert fleet.resize("a", 1) == 2, "a worker still inside an item was written off"
+        assert held.finished == [], "an in-flight item was cut short"
+        assert fleet.running()["a"] == 2, "the count hid a worker that is still alive"
+        assert queue.control(project_id="a")[0] == RUNNING
+
+        held.release.set()
+        assert wait_for(lambda: fleet.running().get("a") == 1)
+        assert sorted(held.finished) == ["T1", "T2"], "the retired worker dropped its item"
+        assert queue.control(project_id="a")[0] == RUNNING
+    finally:
+        fleet.stop_all()
+
+
+def test_concurrent_resizes_do_not_overshoot(queue: WorkQueue) -> None:
+    """Two callers asking for three workers must not start three each. The
+    delta is computed under the fleet lock for exactly this."""
+    fleet = fleet_for(queue, [])
+    ready = threading.Barrier(4)
+
+    def bump() -> None:
+        ready.wait(5)
+        fleet.resize("a", 3)
+
+    try:
+        fleet.start("a")
+        threads = [threading.Thread(target=bump, daemon=True) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        ready.wait(5)
+        for thread in threads:
+            thread.join(5)
+
+        assert wait_for(lambda: fleet.running().get("a") == 3)
+        assert fleet.resize("a", 3) == 3, "asking for the size it already is changed it"
+    finally:
+        fleet.stop_all()
+
+
+def test_resizing_a_stopped_project_starts_nothing(queue: WorkQueue) -> None:
+    """Registering a project must never begin spending money on it, and a
+    resize arriving through a project update is still a registration."""
+    fleet = fleet_for(queue, [])
+    queue.add_project(Project(project_id="a", name="A", max_workers=4))
+
+    assert fleet.resize("a") == 0
+    assert fleet.running() == {}
+    assert queue.control(project_id="a")[0] == STOPPED
+
+
+def test_a_draining_pool_is_not_resized(queue: WorkQueue) -> None:
+    """Workers added underneath a drain outlive the stop that was supposed to
+    have finished: the finalizer joining the pool was handed the old list."""
+    entered = threading.Event()
+    finish = threading.Event()
+
+    class SlowExecutor:
+        def serve(self, *, poll_seconds: float, stop: threading.Event) -> None:
+            entered.set()
+            finish.wait(5)
+
+    fleet = Fleet(queue, lambda _pid: SlowExecutor(), poll_seconds=0.01)
+    fleet.start("a")
+    assert entered.wait(1)
+    fleet.request_stop("a", reason="deploying")
+
+    assert fleet.resize("a", 4) == 2, "a draining pool grew"
+    assert queue.control(project_id="a")[0] == "draining"
+    finish.set()
+    assert wait_for(lambda: queue.control(project_id="a")[0] == STOPPED)
+    assert fleet.running().get("a", 0) == 0
+
+
+def test_a_worker_that_cannot_be_started_leaves_its_siblings_alone(
+    queue: WorkQueue, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused thread is one worker's problem. Reported rather than logged,
+    because a pool quietly smaller than it was asked for looks like a pool
+    with nothing to do."""
+    fleet = fleet_for(queue, [])
+
+    def refuse(_pool: Any) -> Any:
+        raise RuntimeError("can't start new thread")
+
+    try:
+        fleet.start("b")
+        monkeypatch.setattr(fleet, "_spawn", refuse)
+
+        assert fleet.resize("b", 3) == 1
+        assert fleet.running().get("b") == 1, "a healthy worker was torn down"
+        assert queue.control(project_id="b")[0] == RUNNING
+        assert len(fleet.failures("b")) == 2
+        assert "can't start new thread" in fleet.failures("b")[0].error
+    finally:
+        fleet.stop_all()
+
+
 # ------------------------------------------------------------- max attempts
 
 

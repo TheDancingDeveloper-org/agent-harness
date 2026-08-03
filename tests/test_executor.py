@@ -25,6 +25,7 @@ from agent_harness.executor import (
     apply_diff,
     extract_diff,
     repo_context,
+    unplaceable_hunks,
     validate_diff,
 )
 from agent_harness.model_client import (
@@ -236,6 +237,79 @@ def test_a_strict_apply_really_does_reject_that_header(multiline_repo: Path) -> 
         text=True,
     )
     assert result.returncode != 0
+
+
+# The live failure. `git apply` refuses `-0,0` against a file that exists;
+# `--unidiff-zero` accepts it and puts the lines at line 1, above the module
+# docstring, which then stops being a docstring at all.
+UNPLACEABLE_DIFF = """\
+diff --git a/calc.py b/calc.py
+--- a/calc.py
++++ b/calc.py
+@@ -0,0 +1,2 @@
++def multiply(a, b):
++    return a * b
+"""
+
+
+@pytest.fixture
+def docstring_repo(repo: Path) -> Path:
+    (repo / "calc.py").write_text('"""A tiny module."""\n\n\ndef add(a, b):\n    return a + b\n')
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "add calc.py")
+    return repo
+
+
+def test_a_zero_context_hunk_against_an_existing_file_is_refused(docstring_repo: Path) -> None:
+    """`--unidiff-zero` "succeeds" here by inserting at line 1, and nothing
+    downstream can tell: Python does not care where a string literal sits, so
+    the checks stay green while `calc.__doc__` has quietly become None.
+
+    A `-0,0` header against a file with content in it is false about the tree
+    before anything is applied, and there is no placement in it to recover --
+    which is what separates it from the malformed headers the ladder exists
+    for."""
+    applied, how = apply_diff(docstring_repo, UNPLACEABLE_DIFF)
+
+    assert not applied, "a hunk with no verifiable placement was applied anyway"
+    assert "calc.py" in how and "-0,0" in how
+    assert (docstring_repo / "calc.py").read_text().startswith('"""A tiny module."""')
+
+
+def test_the_fuzzy_rung_does_not_rescue_it_either(docstring_repo: Path) -> None:
+    """Opting in to fuzz buys tolerance for whitespace damage, not a licence
+    to guess where a hunk that never said belongs."""
+    applied, how = apply_diff(docstring_repo, UNPLACEABLE_DIFF, allow_fuzzy=True)
+
+    assert not applied, how
+    assert (docstring_repo / "calc.py").read_text().startswith('"""A tiny module."""')
+
+
+def test_creating_a_new_file_is_still_a_zero_context_hunk_that_applies(repo: Path) -> None:
+    """The honest use of `-0,0`, and by far the common one. Refusing it would
+    stop the harness adding files at all."""
+    new_file = """\
+diff --git a/added.py b/added.py
+new file mode 100644
+--- /dev/null
++++ b/added.py
+@@ -0,0 +1,2 @@
++def multiply(a, b):
++    return a * b
+"""
+    applied, how = apply_diff(repo, new_file)
+
+    assert applied, how
+    assert (repo / "added.py").read_text().startswith("def multiply")
+
+
+def test_an_empty_file_can_still_be_filled_in(repo: Path) -> None:
+    """`-0,0` is the honest header for a file that really has no lines, so the
+    check is about content and not merely about the path existing."""
+    (repo / "blank.py").write_text("")
+    diff = UNPLACEABLE_DIFF.replace("calc.py", "blank.py")
+
+    assert unplaceable_hunks(repo, diff) == []
 
 
 def test_whitespace_damage_on_a_removal_line_is_not_rescued_by_default(
@@ -868,15 +942,18 @@ def test_with_nowhere_to_keep_it_the_item_still_fails_cleanly(
 # ------------------------------------------------- what the reviewer sees
 
 
-#: A hunk header `git apply` refuses against an existing file, which the
-#: tolerance ladder rescues by inserting at line 1. The text says "this file
-#: was empty"; the result is an insertion above the existing content.
+#: A context-free hunk `git apply` refuses and `--unidiff-zero` rescues -- the
+#: rung doing the most work in the ladder. Its header names a real position
+#: (after line 1), so the placement is honest; what the model's *text* does
+#: not contain is the surrounding code, which is why the reviewer is shown the
+#: applied diff instead. A `-0,0` header would not get this far: it is refused
+#: before the ladder, because nothing about it is checkable (#133).
 ZERO_CONTEXT_DIFF = """\
 diff --git a/hello.txt b/hello.txt
 --- a/hello.txt
 +++ b/hello.txt
-@@ -0,0 +1,1 @@
-+a new first line
+@@ -1,0 +2 @@
++a new last line
 """
 
 
@@ -923,10 +1000,10 @@ def test_the_reviewer_sees_the_applied_diff_not_the_proposed_one(
     assert outcome.state == DONE, outcome.reason
     shown = capturing.prompts["reviewer"]
     # The real change: an insertion, with the existing line as context.
-    assert "a new first line" in shown
+    assert "a new last line" in shown
     assert "hello world" in shown, "the reviewer must see the surrounding context that survived"
-    # Not the model's claim that the file was created from empty.
-    assert "@@ -0,0" not in shown, "the reviewer must not be shown the proposed hunk header"
+    # Not the model's context-free header, which carries none of that.
+    assert "@@ -1,0 +2" not in shown, "the reviewer must not be shown the proposed hunk header"
 
 
 def test_a_reviewer_can_tell_where_a_rescued_hunk_landed(repo: Path, tmp_path: Path) -> None:
@@ -947,8 +1024,9 @@ def test_a_reviewer_can_tell_where_a_rescued_hunk_landed(repo: Path, tmp_path: P
     executor.run_once()
 
     shown = capturing.prompts["reviewer"]
-    # The new line appears BEFORE the pre-existing one, and the diff says so.
-    assert shown.index("+a new first line") < shown.index("hello world")
+    # The new line appears AFTER the pre-existing one, and the diff says so.
+    # The model's text says only "one line, somewhere near the top".
+    assert shown.index(" hello world") < shown.index("+a new last line")
 
 
 # --------------------------------------------- what the implementer is shown

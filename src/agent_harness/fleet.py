@@ -51,18 +51,55 @@ class WorkerFailure:
     released: tuple[str, ...] = ()
 
 
+@dataclass(eq=False)
+class Worker:
+    """One worker thread and the switch that retires it on its own.
+
+    Per worker rather than per pool because shrinking a pool has to stop
+    *some* of it: with one shared event the only available answers were "keep
+    every worker" and "stop the project", which is why changing `max_workers`
+    used to need a stop/start cycle.
+    """
+
+    thread: threading.Thread
+    stop: threading.Event
+
+
 @dataclass
 class ProjectPool:
     """The workers running one project, and the switch that stops them."""
 
     project_id: str
-    threads: list[threading.Thread] = field(default_factory=list)
+    workers: list[Worker] = field(default_factory=list)
     stop: threading.Event = field(default_factory=threading.Event)
     draining: bool = False
+    #: Workers ever started, so a resized pool cannot name two threads alike.
+    launched: int = 0
+
+    @property
+    def threads(self) -> list[threading.Thread]:
+        return [worker.thread for worker in self.workers]
 
     @property
     def size(self) -> int:
-        return sum(1 for t in self.threads if t.is_alive())
+        return sum(1 for worker in self.workers if worker.thread.is_alive())
+
+    @property
+    def wanted(self) -> int:
+        """Workers not on their way out — the size the pool is aiming for.
+
+        Distinct from `size`, which counts threads that are still alive: a
+        worker retired by a resize stays alive until its in-flight item
+        reaches a boundary, and reporting it as wanted would make a second
+        resize retire a worker that is already leaving.
+        """
+        return sum(1 for worker in self.workers if not worker.stop.is_set())
+
+    def halt(self) -> None:
+        """Stop the whole pool, including anything a resize was retiring."""
+        self.stop.set()
+        for worker in self.workers:
+            worker.stop.set()
 
 
 class Fleet:
@@ -128,18 +165,112 @@ class Fleet:
             # the project still reads `stopped` claims nothing and sleeps a
             # full poll for no reason.
             self.queue.set_control(RUNNING, project_id=project_id)
-            for n in range(max(1, project.max_workers)):
-                thread = threading.Thread(
-                    target=self._worker,
-                    args=(project_id, pool.stop),
-                    name=f"harness-{project_id}-{n}",
-                    daemon=True,
-                )
-                pool.threads.append(thread)
-                thread.start()
+            for _ in range(max(1, project.max_workers)):
+                pool.workers.append(self._spawn(pool))
             self._pools[project_id] = pool
-            log.info("started %d worker(s) for project %s", len(pool.threads), project_id)
-            return len(pool.threads)
+            log.info("started %d worker(s) for project %s", len(pool.workers), project_id)
+            return len(pool.workers)
+
+    def resize(self, project_id: str, size: int | None = None) -> int:
+        """Change a running project's worker count in place.
+
+        Returns how many workers are alive when the call returns, which after
+        a shrink is still the old count: retired workers are asked to stop and
+        then joined, never interrupted, so they stay alive until their
+        in-flight item reaches a boundary. `running()` is the number that
+        falls; `max_workers` is what was asked for.
+
+        The alternative was a stop/start cycle for every capacity change, and
+        stopping a project to give it *more* workers means tearing down agents
+        that are mid-item for no reason — avoidable lifecycle risk in exchange
+        for a number that could have been applied live.
+
+        `size` defaults to the project's persisted `max_workers`, so
+        reconciling after an update is one call with nothing to pass.
+        Serialised with every other pool mutation by the fleet lock, and
+        idempotent: the delta is computed from the workers not already
+        leaving, so resizing to the size it already is does nothing.
+        """
+        project = self.queue.get_project(project_id)
+        if project is None:
+            raise KeyError(f"no project {project_id!r}")
+        # Zero workers while `running` is the false-running state the start
+        # preflight refuses to create; stopping a project is `stop`'s job.
+        target = max(1, project.max_workers if size is None else size)
+
+        failures: list[str] = []
+        retired: list[Worker] = []
+        with self._lock:
+            pool = self._pools.get(project_id)
+            if pool is None:
+                # Nothing to resize. The new budget is persisted and applies
+                # at the next start, which is what a stopped project needs.
+                return 0
+            if pool.draining or pool.stop.is_set():
+                # A pool on its way out must not have workers added underneath
+                # it: the finalizer joining it has already been handed the list
+                # of threads to wait for, so a new one would outlive the stop.
+                return pool.size
+            # Threads that have already exited are not capacity.
+            pool.workers = [worker for worker in pool.workers if worker.thread.is_alive()]
+            shortfall = target - pool.wanted
+            for _ in range(max(0, shortfall)):
+                try:
+                    pool.workers.append(self._spawn(pool))
+                except RuntimeError as exc:  # the OS refused another thread
+                    # Reported after the lock: a sibling that started fine is
+                    # working, and must not be torn down over this.
+                    failures.append(f"could not start a worker: {exc}")
+            # Newest first, so growing and then shrinking again leaves the
+            # long-lived workers in place rather than churning the pool.
+            for worker in reversed(pool.workers):
+                if len(retired) >= -shortfall:
+                    break
+                if not worker.stop.is_set():
+                    worker.stop.set()
+                    retired.append(worker)
+            live = pool.size
+
+        if retired:
+            threading.Thread(
+                target=self._join_retired,
+                args=(project_id, pool, retired),
+                name=f"harness-resize-{project_id}",
+                daemon=True,
+            ).start()
+        for message in failures:
+            self._died(project_id, None, message)
+        log.info("resized project %s to %d worker(s)", project_id, target)
+        return live
+
+    def _spawn(self, pool: ProjectPool) -> Worker:
+        """Start one worker with a stop switch of its own."""
+        pool.launched += 1
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=self._worker,
+            args=(pool.project_id, stop),
+            name=f"harness-{pool.project_id}-{pool.launched}",
+            daemon=True,
+        )
+        thread.start()
+        return Worker(thread=thread, stop=stop)
+
+    def _join_retired(self, project_id: str, pool: ProjectPool, retired: list[Worker]) -> None:
+        """Wait for shrunk-away workers off the caller's thread.
+
+        The join lasts as long as whatever item they are in the middle of, and
+        a resize that blocked for it would look like a hang to an HTTP caller
+        — while killing them instead would destroy the context that makes an
+        agent's work resumable, which is the same reason `stop` joins.
+        """
+        for worker in retired:
+            worker.thread.join()
+        leaving = {id(worker) for worker in retired}
+        with self._lock:
+            if self._pools.get(project_id) is pool:
+                pool.workers = [w for w in pool.workers if id(w) not in leaving]
+        log.info("retired %d worker(s) from project %s", len(retired), project_id)
 
     def stop(
         self, project_id: str, *, reason: str | None = None, timeout: float | None = None
@@ -157,8 +288,12 @@ class Fleet:
             self.queue.set_control(STOPPED, reason=reason, project_id=project_id)
             return
         self.queue.set_control(DRAINING, reason=reason, project_id=project_id)
-        pool.stop.set()
-        for thread in pool.threads:
+        # Under the lock, so a resize cannot append a worker between the halt
+        # and the join and leave one thread running after a completed stop.
+        with self._lock:
+            pool.halt()
+            threads = pool.threads
+        for thread in threads:
             thread.join(timeout=timeout)
         with self._lock:
             if self._pools.get(project_id) is pool:
@@ -180,7 +315,8 @@ class Fleet:
         # point after which the HTTP caller can truthfully be told no new work
         # will start.
         self.queue.set_control(DRAINING, reason=reason, project_id=project_id)
-        pool.stop.set()
+        with self._lock:
+            pool.halt()
         threading.Thread(
             target=self._finish_stop,
             args=(project_id, pool, reason),

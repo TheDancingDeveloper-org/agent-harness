@@ -243,6 +243,29 @@ def test_started_workers_actually_execute_the_backlog(served: Any) -> None:
     assert item["branch"] == "harness/t1"
 
 
+def test_changing_max_workers_resizes_the_running_pool(served: Any) -> None:
+    """The gap this closes: `max_workers` was persisted and then ignored until
+    the project was stopped and started again, so a capacity change on a busy
+    project cost a drain/restart cycle -- lifecycle risk taken to apply an
+    integer. Registering an update reconciles the live pool instead."""
+    served.post("/api/projects/p/start?force=true", headers=hdr())
+    assert wait_for(lambda: served.fleet.running().get("p", 0) == 1)
+
+    spec = served.get("/api/projects/p", headers=hdr()).json()["project"]
+    grown = served.post("/api/projects", headers=hdr(), json={**spec, "max_workers": 3})
+
+    assert grown.status_code == 200
+    assert grown.json()["project"]["max_workers"] == 3, "requested"
+    assert wait_for(lambda: served.fleet.running().get("p", 0) == 3), "live"
+    assert served.queue.control(project_id="p")[0] == "running"
+
+    served.post("/api/projects", headers=hdr(), json={**spec, "max_workers": 1})
+
+    assert wait_for(lambda: served.fleet.running().get("p", 0) == 1)
+    assert served.queue.control(project_id="p")[0] == "running", "a shrink is not a stop"
+    assert served.get("/api/projects/p", headers=hdr()).json()["workers"] == 1
+
+
 def test_stopping_drains_rather_than_kills(served: Any) -> None:
     served.post("/api/projects/p/start?force=true", headers=hdr())
     assert wait_for(lambda: served.fleet.running().get("p", 0) == 1)

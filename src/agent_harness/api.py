@@ -867,6 +867,16 @@ def create_api(
         It starts **stopped**. Registering a project must not begin spending
         money on it, and nothing here starts a worker -- only an explicit
         start does.
+
+        Updating a project that is **already running** reconciles its pool to
+        the new `max_workers`: extra workers are started, surplus ones stop
+        claiming and are joined once their in-flight item finishes, and no
+        session is interrupted. Persisting a number that only took effect at
+        the next start meant every capacity change cost a stop/start cycle --
+        lifecycle risk taken on a project whose agents are working, to apply
+        an integer. `workers` in the response is what is alive now, which
+        after a shrink is still the old count until those items reach a
+        boundary; `project.max_workers` is what was asked for.
         """
         queue = need_queue()
         queue.add_project(
@@ -884,6 +894,11 @@ def create_api(
                 min_free_disk_gb=spec.min_free_disk_gb,
             )
         )
+        fleet_ = app.state.fleet
+        if fleet_ is not None and hasattr(fleet_, "resize"):
+            # A no-op for a stopped project: there is no pool to reconcile,
+            # and the persisted budget is what the next start reads.
+            fleet_.resize(spec.project_id)
         return _project_summary(queue, spec.project_id, app.state.fleet)
 
     @app.get(

@@ -280,6 +280,71 @@ class ProjectList(BaseModel):
     projects: list[ProjectSummary]
 
 
+class ReadinessProbe(BaseModel):
+    """One capability, and whether it is actually available."""
+
+    configured: bool = Field(
+        description="Whether this deployment was given the thing at all. Absent by "
+        "configuration and present-but-broken are different problems with different "
+        "fixes, and a single boolean cannot tell them apart."
+    )
+    ok: bool = Field(description="Whether it answered. False whenever it is unconfigured.")
+    detail: str = Field(description="What was found, in words. Never a credential.")
+
+
+class ProjectReadiness(BaseModel):
+    project_id: str
+    ready_to_start: bool = Field(
+        description="Whether `POST /api/projects/{id}/start` would be accepted. Derived "
+        "from the same preflight the start action runs, so the two cannot disagree."
+    )
+    summary: str = Field(description="`ready`, or the blocking reasons joined.")
+    blockers: list[PreflightCheck] = Field(
+        default_factory=list, description="Checks that make the definition of done unreachable."
+    )
+    warnings: list[PreflightCheck] = Field(
+        default_factory=list,
+        description="Checks that reduce quality without making finishing impossible — "
+        "no verification commands, a reviewer sharing a vendor with the implementer.",
+    )
+
+
+class ExecutionReadiness(BaseModel):
+    """Whether this harness can execute anything, and why not.
+
+    Separate from `/healthz` on purpose. Health answers whether the service is
+    up, and a monitoring-only deployment is perfectly healthy while being
+    unable to run a single item — so a healthy service reads as an executable
+    fleet, and the only way to find out otherwise was to attempt a
+    state-changing start.
+
+    Nothing here writes: no worker is created, no session is started, no item
+    is claimed, and no state is mutated.
+    """
+
+    mode: Literal["supervised", "monitoring-only"] = Field(
+        description="`supervised` means a worker pool is attached and starting a project "
+        "can create workers. `monitoring-only` is a legitimate deployment — a dashboard "
+        "over someone else's harness — and starting is expected to refuse."
+    )
+    ready_to_start: bool = Field(
+        description="Whether at least one project could be started right now. False on a "
+        "monitoring-only deployment, and false when every project is blocked."
+    )
+    workers: ReadinessProbe = Field(description="Is there a worker pool at all?")
+    session_host: ReadinessProbe = Field(
+        description="The terminal-session host the agents run in. Probed with a read, so "
+        "it proves reachability AND that the token is accepted, without creating a session."
+    )
+    reviewer: ReadinessProbe = Field(
+        description="Is a reviewer role routed? Without one every review fails closed, so "
+        "every item fails after the implementation has been paid for."
+    )
+    projects: list[ProjectReadiness] = Field(
+        default_factory=list, description="Per project, because readiness is per project."
+    )
+
+
 # --------------------------------------------------------------------- plan
 
 

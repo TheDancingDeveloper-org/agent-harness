@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -309,6 +309,133 @@ def last_base_result_probe(checks: BaseChecks, project_id: str) -> Probe:
     return probe
 
 
+@dataclass(frozen=True)
+class Answer:
+    """What one model said when asked a trivial question."""
+
+    ok: bool
+    detail: str
+    seconds: float
+
+
+#: Asks one route's model for a minimal completion. Injected, like every
+#: other probe here, so a readiness gate can be tested without a network.
+Ask = Callable[[Any], Answer]
+
+
+@dataclass
+class RoleReachability:
+    """Which configured models actually answered, and which did not.
+
+    Three buckets rather than a boolean because the middle one is a different
+    decision: a model that answers late is usable and must not be refused,
+    while a model that does not answer at all can complete nothing.
+    """
+
+    answered: dict[str, str] = field(default_factory=dict)
+    slow: dict[str, str] = field(default_factory=dict)
+    silent: dict[str, str] = field(default_factory=dict)
+
+    def summary(self) -> str:
+        # Failures first: they are what the reader has to act on.
+        everything = {**self.silent, **self.slow, **self.answered}
+        return "; ".join(f"{role}: {detail}" for role, detail in everything.items())
+
+
+def remembered(ask: Ask, *, ttl: float = 60.0, now: Callable[[], float] = time.time) -> Ask:
+    """The same answer for a short while, per model and endpoint.
+
+    Readiness is polled — a dashboard refreshing every few seconds would
+    otherwise turn a reachability probe into a load generator against the
+    model endpoint, and bill for it. Whether an endpoint serves a model does
+    not change between two polls seconds apart, so it is asked at most once a
+    minute per route.
+    """
+    seen: dict[tuple[str, str], tuple[float, Answer]] = {}
+
+    def cached(route: Any) -> Answer:
+        key = (str(getattr(route, "model", "")), str(getattr(route, "endpoint", "")))
+        found = seen.get(key)
+        if found is not None and found[0] > now():
+            return found[1]
+        answer = ask(route)
+        seen[key] = (now() + ttl, answer)
+        return answer
+
+    return cached
+
+
+def role_reachability_probe(
+    routes: Mapping[str, Any],
+    ask: Ask,
+    *,
+    timeout: float = 10.0,
+    patience: float = 20.0,
+) -> Callable[[], RoleReachability]:
+    """Does each configured role's model actually answer?
+
+    Preflight used to check that a reviewer was *routed*, which is true of a
+    model that will never reply. An endpoint can advertise a model in
+    `/models` and serve nothing behind it; the harness then discovered that
+    once per item, after the planner and implementer had been paid for, at
+    the cost of the whole retry ladder — six attempts with escalating backoff
+    is fifteen to twenty minutes of wall clock, per item, spent establishing a
+    condition that was true before the run started.
+
+    In parallel, because the roles are independent and the point is to be
+    quick. `timeout` is the budget a healthy model is expected to meet;
+    `patience` is the deadline after which it is treated as no answer at all.
+    Between the two it is reported as slow and **not** failed: a model that
+    replies late is usable, and refusing it would be this gate overreaching.
+
+    Daemon threads, deliberately: an ask that never returns must not hold the
+    report open, and must not hold the *process* open either. A pooled worker
+    is joined at interpreter exit, which would make one wedged endpoint delay
+    every shutdown of the service.
+    """
+
+    def probe() -> RoleReachability:
+        report = RoleReachability()
+        answers: dict[str, Answer] = {}
+
+        def record(role: str, route: Any) -> None:
+            try:
+                answers[role] = ask(route)
+            except Exception as exc:  # noqa: BLE001 - a probe reports, it does not raise
+                answers[role] = Answer(False, f"could not be asked: {str(exc)[:160]}", 0.0)
+
+        threads = [
+            threading.Thread(
+                target=record, args=(role, route), name=f"harness-probe-{role}", daemon=True
+            )
+            for role, route in routes.items()
+        ]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + patience
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+
+        for role, route in routes.items():
+            model = str(getattr(route, "model", "?"))
+            answer = answers.get(role)
+            if answer is None:
+                report.silent[role] = f"{model} did not answer within {patience:g}s"
+            elif not answer.ok:
+                # Always named, whether or not the asker already did: a
+                # failure that does not say which model failed does not say
+                # what to change.
+                detail = answer.detail
+                report.silent[role] = detail if detail.startswith(model) else f"{model}: {detail}"
+            elif answer.seconds > timeout:
+                report.slow[role] = f"{answer.detail} after {answer.seconds:.0f}s"
+            else:
+                report.answered[role] = f"{answer.detail} in {answer.seconds:.1f}s"
+        return report
+
+    return probe
+
+
 def disk_space_probe(path: str, floor_gb: float = 0.0) -> tuple[bool, str]:
     """Free space on the volume holding a project's checkout."""
     try:
@@ -331,6 +458,7 @@ def preflight_project(
     has_fleet: bool,
     reviewer_route: Any = None,
     reviewer_independent: tuple[bool, str] | None = None,
+    role_probe: Callable[[], RoleReachability] | None = None,
     session_host: Probe | None = None,
     git_probe: Callable[[str], tuple[bool, str]] = _is_git_repo,
     github_probe: Callable[[str], tuple[bool, str]] = _gh_can_write,
@@ -409,6 +537,35 @@ def preflight_project(
             "after paying for the implementation",
         )
     )
+
+    if role_probe is not None:
+        reach = role_probe()
+        if reach.silent:
+            # Blocking, because a fleet whose reviewer cannot answer can
+            # complete nothing: every item runs to the last step and fails
+            # there, having already paid for the plan and the implementation.
+            checks.append(
+                Check(
+                    "role reachability",
+                    False,
+                    f"{reach.summary()} — the model is configured but not answering, "
+                    "so every item would fail at that stage after being paid for",
+                )
+            )
+        elif reach.answered or reach.slow:
+            checks.append(Check("role reachability", True, reach.summary()))
+        if reach.slow:
+            # A warning: a slow model is usable, and a preflight budget is not
+            # a statement about how long a real completion may take.
+            checks.append(
+                Check(
+                    "model latency",
+                    False,
+                    "; ".join(f"{role}: {detail}" for role, detail in reach.slow.items())
+                    + " — slow to answer a one-token prompt, so every call pays that first",
+                    blocking=False,
+                )
+            )
 
     if reviewer_independent is not None:
         independent, why = reviewer_independent

@@ -19,6 +19,8 @@ from agent_harness.model_client import (
     RetryExhausted,
     RetryPolicy,
     Route,
+    effective_routes,
+    routes_from_map,
 )
 
 MESSAGES = [{"role": "user", "content": "x"}]
@@ -513,3 +515,105 @@ def test_clearing_an_endpoint_clears_every_role_on_it() -> None:
 
     assert parks.remaining("https://api", 1000.0, "implementer") == 0.0
     assert parks.remaining("https://api", 1000.0, "reviewer") == 0.0
+
+
+# ----------------------------------------------- effective routes per project
+
+
+def test_a_project_overrides_one_role_and_inherits_the_rest() -> None:
+    """The defect this prevents: the map was chosen wholesale, so a project
+    naming only a reviewer lost the global planner, and the executor ignored
+    the project map entirely."""
+    merged = effective_routes(
+        {"planner": Route("global-planner", "https://g"), "reviewer": Route("global", "https://g")},
+        {"reviewer": Route("project", "https://p")},
+    )
+
+    assert merged["reviewer"].model == "project"
+    assert merged["planner"].model == "global-planner"
+
+
+def test_a_route_missing_half_of_itself_is_not_a_route() -> None:
+    """Dropped, so preflight reports the role as unrouted rather than the
+    first call failing after the item is claimed and paid for."""
+    routes = routes_from_map(
+        {
+            "reviewer": {"model": "m", "endpoint": "https://e", "provider": "generic"},
+            "planner": {"model": "m", "endpoint": ""},
+        }
+    )
+
+    assert set(routes) == {"reviewer"}
+    assert routes["reviewer"].provider is P.GENERIC
+
+
+def test_a_sibling_client_routes_elsewhere_but_shares_the_parks() -> None:
+    """One process, one endpoint: a spend cap belongs to the endpoint, not to
+    whichever project hit it first, so a per-project client must not get a
+    fresh set of parks to rediscover it with."""
+    transport = Recorder(ok(), ok())
+    client = build(transport, roles={"reviewer": Route("global", "https://a")})
+
+    sibling = client.routed_by(lambda: {"reviewer": Route("project", "https://a")})
+
+    assert sibling.parks is client.parks
+    assert sibling.run_id != client.run_id
+    sibling.call("reviewer", MESSAGES)
+    client.call("reviewer", MESSAGES)
+    assert [c.model for c in transport.calls] == ["project", "global"]
+
+
+# ---------------------------------------------------- does the model answer?
+
+
+def test_a_model_that_answers_is_asked_exactly_once() -> None:
+    """Not `call`: the ladder is six attempts with escalating backoff, which
+    is the cost this probe exists to avoid paying once per item."""
+    transport = Recorder(ok())
+    client = build(transport, roles={"reviewer": Route("m", "https://a")})
+
+    answered, detail = client.answers(Route("m", "https://a"), timeout=5.0)
+
+    assert answered is True
+    assert "m answered" in detail
+    assert len(transport.calls) == 1
+
+
+def test_an_advertised_but_unserved_model_is_reported_with_its_status() -> None:
+    """`claude-sonnet-4-6 returned HTTP 504` names the thing to change.
+    `not ready` does not."""
+    client = build(Recorder(fail(504)), roles={"reviewer": Route("claude-sonnet-4-6", "https://a")})
+
+    answered, detail = client.answers(Route("claude-sonnet-4-6", "https://a"))
+
+    assert answered is False
+    assert "claude-sonnet-4-6" in detail and "504" in detail
+
+
+def test_a_transport_that_raises_is_an_answer_too() -> None:
+    """A probe reports; it never raises into the readiness gate that asked."""
+
+    def boom(route: Route, messages: Any, options: Any) -> Response:
+        raise TimeoutError("timed out")
+
+    client = ModelClient(roles={}, transport=boom)
+
+    answered, detail = client.answers(Route("m", "https://a"))
+
+    assert answered is False
+    assert "TimeoutError" in detail
+
+
+def test_the_probe_asks_for_one_token_and_names_its_own_deadline() -> None:
+    """A probe inheriting the work timeout would take ten minutes to
+    establish that a model is not answering."""
+    seen: list[Mapping[str, Any]] = []
+
+    def record(route: Route, messages: Any, options: Any) -> Response:
+        seen.append(options)
+        return ok()
+
+    ModelClient(roles={}, transport=record).answers(Route("m", "https://a"), timeout=7.0)
+
+    assert seen[0]["max_tokens"] == 1
+    assert seen[0]["timeout"] == 7.0

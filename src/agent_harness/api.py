@@ -85,7 +85,9 @@ from .schemas import (
     ResolveQuestion,
     RetryResult,
     RoleMap,
+    RoleMapView,
     RoleRoute,
+    RoutedRole,
     ScopeRequest,
     SetFleetControl,
     StopProjectRequest,
@@ -113,6 +115,14 @@ WINDOWS = {"1h": 3600, "24h": 86400, "72h": 3 * 86400, "7d": 7 * 86400, "all": N
 #: Where the live role map is stored. Shared through the queue's database
 #: because the API and the worker are different processes.
 ROLE_MAP_KEY = "role_map"
+
+#: How long a healthy model has to answer preflight's one-token probe, and
+#: how long it has before it is treated as not answering at all. Anything in
+#: between is reported as slow and not refused — a late model is usable, and
+#: the harness has no business deciding otherwise about someone else's
+#: endpoint.
+MODEL_PROBE_TIMEOUT = 10.0
+MODEL_PROBE_PATIENCE = 20.0
 
 DESCRIPTION = """\
 Plans work, claims it, runs it as an agent in a terminal session, and records
@@ -156,6 +166,7 @@ def create_api(
     model_client: Any | None = None,
     session_host: Any | None = None,
     probes: Mapping[str, Any] | None = None,
+    executor_roles: Any | None = None,
 ) -> FastAPI:
     """Build the API.
 
@@ -169,6 +180,12 @@ def create_api(
     every probe injected precisely so a readiness gate could be tested; this
     layer used to hardcode the defaults, which put a real `gh` subprocess and
     a real filesystem read behind an HTTP route.
+
+    `executor_roles` says which roles the executor this deployment builds can
+    actually reach (`runtime.ExecutorRoles`). Without it the role map
+    advertises every configured route as live, which in session mode was
+    wrong for two of three stages: the agent process plans and implements,
+    and no `planner` or `implementer` route is ever called.
     """
     app = FastAPI(
         title="agent-harness",
@@ -188,8 +205,11 @@ def create_api(
     app.state.session_host = session_host
     # Everything preflight needs lives on THIS app. It used to be copied into
     # a module-level dictionary, so a second `create_api` in the same process
-    # silently took over the first's wiring.
+    # silently took over the first's wiring -- including, once roles were
+    # routed per project, which roles it believed its executor could reach.
     app.state.probes = dict(probes or {})
+    app.state.executor_roles = executor_roles
+    app.state.ask_model = _model_asker(model_client)
     app.state.base_checks = BaseChecks()
     app.state.token = token
 
@@ -343,7 +363,7 @@ def create_api(
                 detail=f"{item_id} is claimed by {record.owner} and its lease is live; "
                 "wait for the lease to expire rather than racing it",
             )
-        queue.requeue(item_id, project_id=project_id)
+        queue.release(item_id, PENDING, error=None, project_id=project_id)
         return RetryResult(ok=True, item_id=item_id, state="pending")
 
     @app.post(
@@ -867,16 +887,6 @@ def create_api(
         It starts **stopped**. Registering a project must not begin spending
         money on it, and nothing here starts a worker -- only an explicit
         start does.
-
-        Updating a project that is **already running** reconciles its pool to
-        the new `max_workers`: extra workers are started, surplus ones stop
-        claiming and are joined once their in-flight item finishes, and no
-        session is interrupted. Persisting a number that only took effect at
-        the next start meant every capacity change cost a stop/start cycle --
-        lifecycle risk taken on a project whose agents are working, to apply
-        an integer. `workers` in the response is what is alive now, which
-        after a shrink is still the old count until those items reach a
-        boundary; `project.max_workers` is what was asked for.
         """
         queue = need_queue()
         queue.add_project(
@@ -1075,6 +1085,11 @@ def create_api(
         item is claimed, no control state changes, and no credential is
         echoed — the session host is probed with a read, which proves both
         reachability and that the token is accepted.
+
+        It is not free: each routed model is asked for a one-token completion,
+        because a model that is configured and does not answer is the failure
+        this is for. The answer is remembered for a minute, so polling this
+        does not become a load generator against the endpoint.
         """
         queue = need_queue()
         fleet_ = app.state.fleet
@@ -1107,25 +1122,47 @@ def create_api(
             session_host_state = ReadinessProbe(configured=True, ok=ok, detail=detail)
             probe = lambda ok=ok, detail=detail: (ok, detail)  # noqa: E731
 
-        stored = queue.get_setting(ROLE_MAP_KEY) or {}
-        route = stored.get("reviewer") or {}
-        client = app.state.model_client
-        independence = client.reviewer_independence() if client is not None else None
-        reviewer_state = ReadinessProbe(
-            configured=bool(route.get("model")),
-            ok=bool(route.get("model")),
-            detail=(
-                f"reviewer routed to {route['model']}"
-                + (f"; {independence[1]}" if independence else "")
-                if route.get("model")
-                else "no reviewer is routed; every review fails closed, so every item "
-                "would fail after the implementation was paid for"
-            ),
-        )
-
         projects = [p for p in queue.projects() if project_id is None or p.project_id == project_id]
         if project_id is not None and not projects:
             raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+
+        # Global first, then per project — because a project may override the
+        # reviewer. Reading only the global route made this line contradict
+        # the project reports underneath it: it announced that nothing could
+        # be reviewed while every project routed a reviewer of its own.
+        from .model_client import reviewer_independence
+
+        global_routes = _role_routes(queue)
+        global_route = global_routes.get("reviewer")
+        overriding = sorted(
+            p.project_id
+            for p in projects
+            if (p.roles or {}).get("reviewer") and _role_routes(queue, p).get("reviewer")
+        )
+        # Not "some project can review": a reviewer nothing has is a reviewer
+        # the projects without one still fail closed on.
+        covered = global_route is not None or (bool(projects) and len(overriding) == len(projects))
+        if global_route is not None:
+            note = reviewer_independence(
+                global_routes, implemented_by=_executor_roles(app.state).implemented_by
+            )[1]
+            reviewer_detail = f"reviewer routed to {global_route.model}; {note}"
+            if overriding:
+                reviewer_detail += f"; overridden by project(s): {', '.join(overriding)}"
+        elif covered:
+            reviewer_detail = (
+                f"no global reviewer; every project routes its own: {', '.join(overriding)}"
+            )
+        else:
+            reviewer_detail = (
+                "no reviewer is routed; every review fails closed, so every item "
+                "would fail after the implementation was paid for"
+            )
+        reviewer_state = ReadinessProbe(
+            configured=global_route is not None or bool(overriding),
+            ok=covered,
+            detail=reviewer_detail,
+        )
 
         reports = []
         for project in projects:
@@ -1208,20 +1245,26 @@ def create_api(
     @app.get(
         "/api/roles",
         tags=["control"],
-        summary="Where each role's calls go",
-        response_model=RoleMap,
+        summary="Where each role's calls go, and which of them run",
+        response_model=RoleMapView,
     )
-    def get_roles(_: None = Depends(require_token)) -> RoleMap:
-        stored = need_queue().get_setting(ROLE_MAP_KEY) or {}
-        return RoleMap(roles={name: RoleRoute(**route) for name, route in stored.items()})
+    def get_roles(_: None = Depends(require_token)) -> RoleMapView:
+        """The map, annotated with what this deployment actually calls.
+
+        A route nothing calls is not a harmless extra: this endpoint is how an
+        operator answers "what am I paying for, and what is grading it?", and
+        in session mode two of its three answers described a model that is
+        never asked anything.
+        """
+        return _role_map_view(app.state, need_queue())
 
     @app.put(
         "/api/roles",
         tags=["control"],
         summary="Change the role map without a redeploy",
-        response_model=RoleMap,
+        response_model=RoleMapView,
     )
-    def set_roles(request: RoleMap, _: None = Depends(require_token)) -> RoleMap:
+    def set_roles(request: RoleMap, _: None = Depends(require_token)) -> RoleMapView:
         """Takes effect on the next model call.
 
         This is possible only because a call site names a **role**, never a
@@ -1230,6 +1273,11 @@ def create_api(
         cheaper tier, or the reviewer to a different vendor, while the fleet
         is running.
 
+        The response says which of the roles just stored are actually called.
+        Storing one that is not still succeeds — the non-session executor uses
+        it, and so may a later deployment — but it changes nothing about what
+        runs here, and echoing it back unqualified said otherwise.
+
         A reviewer on the same vendor as the implementer means some share of
         reviews is a model grading its own work. Nothing here enforces that;
         it is your call, and it is worth making deliberately.
@@ -1237,9 +1285,15 @@ def create_api(
         queue = need_queue()
         queue.set_setting(
             ROLE_MAP_KEY,
-            {name: route.model_dump() for name, route in request.roles.items()},
+            # Only the routing fields. `used` is computed from the deployment,
+            # not configured, and storing it would let a stale answer be read
+            # back later as though an operator had set it.
+            {
+                name: route.model_dump(include={"model", "endpoint", "provider"})
+                for name, route in request.roles.items()
+            },
         )
-        return request
+        return _role_map_view(app.state, queue)
 
     # ---------------------------------------------------------------- plan
 
@@ -1498,6 +1552,76 @@ def _audit_event_fields(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _role_routes(queue: WorkQueue, project: Project | None = None) -> dict[str, Any]:
+    """The routes a project will actually use.
+
+    The global map, with that project's own overrides applied **per role**.
+    Every reader goes through here because they used to disagree: preflight
+    took the project map *or* the global one and never merged them, while
+    readiness read only the global one — so a project could pass preflight on
+    its own reviewer override and then be executed against a different model,
+    or refused for the absence of a global route it does not need.
+
+    No API key is attached: these routes are for reading and reporting, and
+    the transport supplies the credential when a call is actually made.
+    """
+    from .model_client import effective_routes, routes_from_map
+
+    return effective_routes(
+        routes_from_map(queue.get_setting(ROLE_MAP_KEY) or {}),
+        routes_from_map(project.roles or {}) if project is not None else {},
+    )
+
+
+def _executor_roles(state: Any) -> Any:
+    """What the attached executor can reach. Everything, unless told otherwise."""
+    from .runtime import ExecutorRoles
+
+    roles = getattr(state, "executor_roles", None)
+    return roles if roles is not None else ExecutorRoles()
+
+
+def _model_asker(client: Any) -> Any:
+    """The thing preflight uses to ask a model whether it is there.
+
+    Remembered briefly: readiness is polled, and a probe on every poll would
+    make a dashboard a load generator against the model endpoint.
+    """
+    if client is None or not hasattr(client, "answers"):
+        return None
+    from .preflight import Answer, remembered
+
+    def ask(route: Any) -> Any:
+        started = time.time()
+        ok, detail = client.answers(route, timeout=MODEL_PROBE_PATIENCE)
+        return Answer(ok=ok, detail=detail, seconds=time.time() - started)
+
+    return remembered(ask)
+
+
+def _role_map_view(state: Any, queue: WorkQueue) -> RoleMapView:
+    """The global map, annotated with what this deployment will call."""
+    from .model_client import reviewer_independence
+
+    stored = queue.get_setting(ROLE_MAP_KEY) or {}
+    executor = _executor_roles(state)
+    independent, why = reviewer_independence(
+        _role_routes(queue), implemented_by=executor.implemented_by
+    )
+    return RoleMapView(
+        reviewer_independent=independent,
+        reviewer_note=why,
+        roles={
+            name: RoutedRole(
+                **RoleRoute(**route).model_dump(),
+                used=executor.calls_role(name),
+                unused_reason=executor.unused_reason(name),
+            )
+            for name, route in stored.items()
+        },
+    )
+
+
 def _preflight(
     state: Any,
     queue: WorkQueue,
@@ -1508,35 +1632,52 @@ def _preflight(
 ) -> Any:
     """Build a preflight report for a project, using whatever is configured.
 
-    `state` is the calling app's own `app.state`. It used to be a module-level
-    dictionary, which meant a second `create_api` silently overwrote the
-    first's wiring: app A would report app B's worker pool, session host and
-    probe results, while its top-level readiness fields still came from its
-    own state. A readiness gate that can be changed by an unrelated app in the
-    same process is not a gate.
-
     `session_host` is a *probe*, not the host: readiness over many projects
     would otherwise ask the same host the same question once per project.
     """
-    from .preflight import last_base_result_probe, preflight_project, session_host_probe
+    from .model_client import reviewer_independence
+    from .preflight import (
+        last_base_result_probe,
+        preflight_project,
+        role_reachability_probe,
+        session_host_probe,
+    )
 
-    stored = queue.get_setting("role_map") or {}
-    client = getattr(state, "model_client", None)
+    routes = _role_routes(queue, project)
+    executor = _executor_roles(state)
+    ask = getattr(state, "ask_model", None)
     host = getattr(state, "session_host", None)
-    base_checks = getattr(state, "base_checks", None)
-    return preflight_project(
-        project,
-        has_fleet=getattr(state, "fleet", None) is not None,
-        reviewer_route=(project.roles or stored).get("reviewer"),
-        reviewer_independent=client.reviewer_independence() if client is not None else None,
-        session_host=session_host or (session_host_probe(host) if host is not None else None),
-        checks_probe=(
-            last_base_result_probe(base_checks, project.project_id)
-            if check_base and base_checks is not None
+    # Only the roles this executor calls. Probing a route nothing will ever
+    # use spends tokens to answer a question about it, and could refuse a
+    # start over a model no item depends on.
+    reachable = {name: route for name, route in routes.items() if executor.calls_role(name)}
+    kwargs: dict[str, Any] = {
+        "has_fleet": getattr(state, "fleet", None) is not None,
+        "reviewer_route": routes.get("reviewer"),
+        "reviewer_independent": reviewer_independence(
+            routes, implemented_by=executor.implemented_by
+        ),
+        "role_probe": (
+            role_reachability_probe(
+                reachable,
+                ask,
+                timeout=MODEL_PROBE_TIMEOUT,
+                patience=MODEL_PROBE_PATIENCE,
+            )
+            if ask is not None and reachable
             else None
         ),
-        **(getattr(state, "probes", None) or {}),
-    )
+        "session_host": session_host or (session_host_probe(host) if host is not None else None),
+        "checks_probe": (
+            last_base_result_probe(state.base_checks, project.project_id)
+            if check_base and getattr(state, "base_checks", None) is not None
+            else None
+        ),
+    }
+    # Injected probes win, so a test can answer any of these without a
+    # network, a subprocess or a model.
+    kwargs.update(getattr(state, "probes", None) or {})
+    return preflight_project(project, **kwargs)
 
 
 def _project_spec(project: Project) -> ProjectSpec:

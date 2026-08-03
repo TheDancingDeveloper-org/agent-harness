@@ -138,8 +138,14 @@ def _http_transport(api_key: str) -> Any:
     client = httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0))
 
     def transport(route: Any, messages: Any, options: Any) -> Any:
+        asked = float(options.get("timeout") or 0.0)
         payload = {"model": route.model, "messages": list(messages)}
-        payload.update({k: v for k, v in options.items() if k != "role"})
+        # `timeout` instructs the transport; it is not a completion parameter,
+        # and sending it as one would have the provider reject the request.
+        # Preflight's reachability probe sets it, because a probe that
+        # inherited the work timeout would take ten minutes to establish that
+        # a model is not answering.
+        payload.update({k: v for k, v in options.items() if k not in ("role", "timeout")})
         response = client.post(
             f"{route.endpoint.rstrip('/')}/chat/completions",
             headers={
@@ -147,6 +153,11 @@ def _http_transport(api_key: str) -> Any:
                 "content-type": "application/json",
             },
             json=payload,
+            timeout=(
+                httpx.Timeout(asked, connect=min(30.0, asked))
+                if asked
+                else httpx.USE_CLIENT_DEFAULT
+            ),
         )
         return Response(response.status_code, dict(response.headers), response.text)
 
@@ -159,10 +170,9 @@ def _run(args: argparse.Namespace) -> int:
     import json as _json
     import shlex
 
-    from . import providers
     from .executor import Checks, Executor
     from .github import GitHub
-    from .model_client import ModelClient, Route
+    from .model_client import ModelClient, Route, routes_from_map
     from .work import RUNNING, WorkQueue, WorkRecord
 
     # With a session host the CLI agent does the implementing, so only the
@@ -282,16 +292,7 @@ def _run(args: argparse.Namespace) -> int:
         print(f"note: the stored role map had no route for {', '.join(filled)}; used the flags.")
 
     def live_routes() -> dict[str, Route]:
-        stored = queue.get_setting(ROLE_MAP_KEY) or {}
-        return {
-            name: Route(
-                route["model"],
-                route["endpoint"],
-                providers.PROVIDERS.get(route.get("provider", ""), providers.CLAW_BAY),
-                api_key=api_key,
-            )
-            for name, route in stored.items()
-        }
+        return routes_from_map(queue.get_setting(ROLE_MAP_KEY) or {}, api_key=api_key)
 
     # Nothing claims work until every role this run needs can be routed. The
     # alternative is finding out on the first model call -- after the project
@@ -322,7 +323,13 @@ def _run(args: argparse.Namespace) -> int:
     # enforced in none, so a reviewer could be the same model as the
     # implementer and nothing would mention it -- every review a model
     # grading its own work, invisibly.
-    independent, why = client.reviewer_independence()
+    #
+    # Against the implementer that actually runs: in session mode the agent
+    # process writes the code, so comparing the reviewer to the configured
+    # implementer route would be a verdict about a pairing that never happens.
+    independent, why = client.reviewer_independence(
+        implemented_by=args.agent if session_mode else ""
+    )
     print(("reviewer: " if independent else "WARNING: ") + why)
 
     executor: Any
@@ -683,7 +690,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     maintenance.start()
 
-    fleet, reviewer_client, host = _fleet_for_serve(args, queue_for_serve, audit=audit)
+    fleet, reviewer_client, host, executor_roles = _fleet_for_serve(
+        args, queue_for_serve, audit=audit
+    )
     if fleet is None:
         print(
             "monitoring only: no --session-host, so no worker pool is attached and "
@@ -704,6 +713,7 @@ def main(argv: list[str] | None = None) -> int:
                 # Readiness probes it with a read. Passing the client rather
                 # than the URL keeps the token out of the API layer.
                 session_host=host,
+                executor_roles=executor_roles,
             ),
             host=args.host,
             port=args.port,
@@ -720,10 +730,10 @@ def main(argv: list[str] | None = None) -> int:
 
 def _fleet_for_serve(
     args: argparse.Namespace, queue: Any, *, audit: Any | None = None
-) -> tuple[Any | None, Any | None, Any | None]:
+) -> tuple[Any | None, Any | None, Any | None, Any | None]:
     """The supervised half of `serve`: a fleet the API's start action can use.
 
-    Returns (None, None) for a monitoring-only deployment. That mode is
+    Returns all-None for a monitoring-only deployment. That mode is
     supported on purpose — a dashboard over someone else's harness should not
     need a session host, a model key or a checkout — and the API already
     refuses to start a project when nothing can claim.
@@ -732,18 +742,17 @@ def _fleet_for_serve(
     the API's start action does, and only after preflight passes.
     """
     if not args.session_host:
-        return (None, None, None)
+        return (None, None, None, None)
 
     import json as _json
     import shlex
 
-    from . import providers
     from .api import ROLE_MAP_KEY
     from .events import KINDS, MODEL_CALL, Event
     from .fleet import Fleet
     from .github import GitHub
-    from .model_client import ModelClient, Route
-    from .runtime import session_executor_factory
+    from .model_client import ModelClient, Route, effective_routes, routes_from_map
+    from .runtime import ExecutorRoles, session_executor_factory
     from .session_executor import AgentSpec
     from .session_host import HttpSessionHost
 
@@ -766,25 +775,29 @@ def _fleet_for_serve(
         queue.set_setting(ROLE_MAP_KEY, stored)
 
     def live_routes() -> dict[str, Route]:
-        current = queue.get_setting(ROLE_MAP_KEY) or {}
-        return {
-            name: Route(
-                route["model"],
-                route["endpoint"],
-                providers.PROVIDERS.get(route.get("provider", ""), providers.CLAW_BAY),
-                api_key=api_key,
-            )
-            for name, route in current.items()
-            if route.get("model") and route.get("endpoint")
-        }
+        return routes_from_map(queue.get_setting(ROLE_MAP_KEY) or {}, api_key=api_key)
+
+    def routes_for(project_id: str) -> dict[str, Route]:
+        """One project's effective map, read live on every call.
+
+        The project row is read here rather than closed over so that a role
+        override written through the API reaches a worker that is already
+        running — the same reason the global map is read per call.
+        """
+        project = queue.get_project(project_id)
+        return effective_routes(
+            live_routes(),
+            routes_from_map(getattr(project, "roles", None) or {}, api_key=api_key),
+        )
 
     routes = live_routes()
     if "reviewer" not in routes:
         # Not fatal, and not silent: preflight blocks the start with exactly
         # this reason, so the fleet may as well exist and say why now.
         print(
-            "warning: no reviewer is routed. Preflight will refuse to start any "
-            "project — set one with --reviewer/--endpoint or PUT /api/roles.",
+            "warning: no reviewer is routed globally. Preflight will refuse to start "
+            "any project that does not override one — set a global reviewer with "
+            "--reviewer/--endpoint or PUT /api/roles.",
             file=sys.stderr,
         )
     events_path = args.events or Path(args.db).with_name("events.jsonl")
@@ -849,11 +862,13 @@ def _fleet_for_serve(
     )
 
     host = HttpSessionHost(args.session_host, token=host_token)
+    agent = AgentSpec(command=tuple(shlex.split(args.agent)))
     factory = session_executor_factory(
         queue,
         host=host,
-        agent=AgentSpec(command=tuple(shlex.split(args.agent))),
+        agent=agent,
         reviewer=reviewer_client,
+        routes_for=routes_for,
         github_for=GitHub,
         ui_base_url=args.session_host,
         on_event=emit,
@@ -863,7 +878,14 @@ def _fleet_for_serve(
     print(f"events: {events_path}")
     # The fleet emits into the same stream as the executors: a worker that
     # dies is recorded next to the work it was doing, not in a separate log.
-    return (Fleet(queue, factory, poll_seconds=args.poll, on_event=emit), reviewer_client, host)
+    return (
+        Fleet(queue, factory, poll_seconds=args.poll, on_event=emit),
+        reviewer_client,
+        host,
+        # What this deployment will actually call, so the API can stop
+        # advertising the two roles the agent process does instead.
+        ExecutorRoles.for_session(agent),
+    )
 
 
 if __name__ == "__main__":

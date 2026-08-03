@@ -184,9 +184,16 @@ misconfigured one it tells you less than the line above.
 | `checkout` | The project's `work_dir` is missing or is not a git repository *inside this process's filesystem* — a container needs it mounted. |
 | `disk space` | The volume holding `work_dir` is below the project's configured `min_free_disk_gb` floor. Free and total GiB are included in the detail. |
 | `github write` | `gh` is missing, unauthenticated, or the account lacks push on that repo. |
-| `reviewer` | No reviewer route. `PUT /api/roles`, or restart with `--reviewer`/`--endpoint`. |
+| `reviewer` | No reviewer route, globally or on the project. `PUT /api/roles`, restart with `--reviewer`/`--endpoint`, or give the project its own `roles.reviewer`. |
+| `role reachability` | The route exists and the model does not answer it. The detail names the model and the status — an endpoint can advertise a model in `/models` and serve nothing behind it. Route the role somewhere that replies. |
 | `base checks` | A configured command failed on an unmodified base-branch worktree — fix the command or its prerequisites before starting. Also reported when no run has happened yet (`not_run`) or one is still going. |
 
+A project's `roles` override the global map **per role**: a project that names
+only a reviewer still inherits every other role, and the reviewer it names is
+the one its workers call.
+
 Warnings do not block a start and are still worth reading: `checks` means
-nothing verifies a diff before the reviewer sees it, and `reviewer
-independence` means some share of reviews is a model grading its own work.
+nothing verifies a diff before the reviewer sees it, `reviewer independence`
+means some share of reviews is a model grading its own work, and `model
+latency` means a model answered a one-token prompt slowly — usable, and every
+call pays that first.

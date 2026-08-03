@@ -372,6 +372,12 @@ This was previously documented in three places and enforced in none. It is
 deliberate choice, and blocking it would be the harness overruling an operator
 about their own budget. What it must not be is a surprise.
 
+It compares the reviewer to the implementer that **actually runs**. In session
+mode that is the agent process, not a routed model, so the verdict says so
+rather than comparing two routes that never meet: the configured `implementer`
+is never called there, and a warning about it would be about a pairing that
+does not exist.
+
 ---
 
 ## 7. Merge, and the only honest quality metric

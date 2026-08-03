@@ -230,9 +230,11 @@ def test_started_workers_actually_execute_the_backlog(served: Any) -> None:
 
     served.post("/api/projects/p/start?force=true", headers=hdr())
 
-    assert wait_for(
-        lambda: (served.queue.get("T1", project_id="p") or Project("x", "x")).state == DONE
-    ), "the item never finished"
+    def finished() -> bool:
+        record = served.queue.get("T1", project_id="p")
+        return record is not None and record.state == DONE
+
+    assert wait_for(finished), "the item never finished"
     assert served.host.created, "no terminal session was ever created"
     item = served.get("/api/work/T1?project_id=p", headers=hdr()).json()
     assert item["branch"] == "harness/t1"

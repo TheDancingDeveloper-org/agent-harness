@@ -105,6 +105,80 @@ def run_git(repo: Path, *args: str, check: bool = True) -> str:
     return result.stdout
 
 
+#: How much repository the implementer is shown. Big enough that a small
+#: project arrives whole, small enough not to dominate the prompt.
+DEFAULT_CONTEXT_BUDGET = 60_000
+
+#: Files that are never worth spending the budget on, whatever their size.
+_UNINTERESTING = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".gz", ".woff", ".woff2")
+
+
+def repo_context(
+    repo: Path,
+    record: Any = None,
+    *,
+    budget: int = DEFAULT_CONTEXT_BUDGET,
+    ref: str | None = None,
+) -> str:
+    """What the repository looks like, for a model that cannot read it.
+
+    The implementer is asked for a diff that "applies cleanly at the
+    repository root". Without this it was asked that while being shown
+    nothing, so it could not write context lines -- it did not know what they
+    were -- and emitted hunks claiming the file was empty. `--unidiff-zero`
+    then inserted them at line one, above module docstrings and imports, with
+    every check still green.
+
+    Files named in the brief come first and whole: they are the ones being
+    edited, and a patch against a file the model has only seen the name of is
+    a patch written blind. The rest fills the remaining budget smallest-first,
+    on the grounds that many small files tell a model more about a codebase's
+    conventions than one large one.
+
+    `ref` is the commit the patch will actually be applied to, and reading
+    from it rather than the working tree is the whole point: the tree still
+    holds the *previous* item's branch at this stage, so a model shown the
+    tree writes context lines for a file the patch will never meet.
+    """
+    read: Callable[[str], str]
+    try:
+        if ref:
+            tracked = [
+                p for p in run_git(repo, "ls-tree", "-r", "--name-only", ref).splitlines() if p
+            ]
+            read = lambda path: run_git(repo, "show", f"{ref}:{path}")  # noqa: E731
+        else:
+            tracked = [p for p in run_git(repo, "ls-files").splitlines() if p.strip()]
+            read = lambda path: (repo / path).read_text(encoding="utf-8")  # noqa: E731
+    except GitError:
+        return ""
+    if not tracked:
+        return ""
+
+    brief = " ".join(str(getattr(record, field, "") or "") for field in ("title", "brief")).lower()
+    candidates = [p for p in tracked if not p.lower().endswith(_UNINTERESTING)]
+    # Mentioned first, then smallest-first for whatever budget remains.
+    mentioned = [p for p in candidates if p.lower() in brief or Path(p).name.lower() in brief]
+    rest = sorted(
+        (p for p in candidates if p not in mentioned),
+        key=lambda p: (repo / p).stat().st_size if (repo / p).is_file() else 0,
+    )
+
+    parts = ["Files in this repository:", *(f"  {p}" for p in tracked), ""]
+    spent = sum(len(p) for p in parts)
+    for path in [*mentioned, *rest]:
+        try:
+            body = read(path)
+        except (OSError, UnicodeDecodeError, GitError):
+            continue  # binary or unreadable: its name in the listing is all it gets
+        block = f"--- {path} ---\n{body}\n"
+        if spent + len(block) > budget:
+            continue
+        parts.append(block)
+        spent += len(block)
+    return "\n".join(parts)
+
+
 def extract_diff(reply: str) -> str | None:
     """Pull a unified diff out of a model reply.
 
@@ -463,7 +537,14 @@ class Executor:
         self.on_event = on_event
         self.push = push
         self.now = now
-        self.context_provider = context_provider or (lambda _record: "")
+        # Defaults to showing the repository. An empty context meant asking a
+        # model for a patch that "applies cleanly" against files it had never
+        # seen, which it cannot do and which nothing said out loud.
+        self.context_provider = context_provider or self._default_context
+        #: The ref the current item's patch will be applied to. Resolved
+        #: before the implementer is called, because that is what it needs to
+        #: be looking at.
+        self._base: str | None = None
         # Where a patch that could not be applied is kept. Supplied, never
         # guessed: the core owns no directory layout. Without it the reply is
         # gone the moment the item fails, and the only way to see what the
@@ -587,9 +668,20 @@ class Executor:
                 "its lease expired and another worker re-claimed it"
             )
 
+    def _default_context(self, record: WorkRecord) -> str:
+        return repo_context(self.repo, record, ref=self._base)
+
     def _execute(self, record: WorkRecord) -> Outcome:
         outcome = Outcome(record.item_id, FAILED)
         self._emit(record, "started")
+
+        # Resolved first, and deliberately before the implementer is called:
+        # the working tree still holds the previous item's branch, so a model
+        # shown the tree writes context lines for a file its patch will never
+        # meet. The branch itself is still cut later, so an item that produces
+        # no usable diff leaves no branch behind.
+        base, stacked_on = self._base_for(record)
+        self._base = base
 
         # 1. Plan. Cheap, once per item, and the highest-leverage call.
         plan = self._call(record, PLANNER, PLAN_PROMPT.format(brief=record.brief))
@@ -639,7 +731,6 @@ class Executor:
         # 4. Apply, on a branch of its own, based on whatever this item
         #    actually depends on.
         branch = f"{self.branch_prefix}{record.item_id.lower()}"
-        base, stacked_on = self._base_for(record)
         self._prepare_branch(branch, base)
         outcome.branch = branch
         outcome.base = base

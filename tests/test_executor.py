@@ -24,6 +24,7 @@ from agent_harness.executor import (
     Executor,
     apply_diff,
     extract_diff,
+    repo_context,
     validate_diff,
 )
 from agent_harness.model_client import (
@@ -948,3 +949,66 @@ def test_a_reviewer_can_tell_where_a_rescued_hunk_landed(repo: Path, tmp_path: P
     shown = capturing.prompts["reviewer"]
     # The new line appears BEFORE the pre-existing one, and the diff says so.
     assert shown.index("+a new first line") < shown.index("hello world")
+
+
+# --------------------------------------------- what the implementer is shown
+
+
+def test_the_implementer_is_shown_the_repository(repo: Path, tmp_path: Path) -> None:
+    """The regression for #135.
+
+    The prompt asks for a diff that "applies cleanly at the repository root".
+    With an empty context that is not a hard task, it is an impossible one: a
+    model cannot write context lines for a file it has never seen, so it
+    writes hunks with none and the tolerance ladder guesses where they go.
+    """
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+    )
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    shown = capturing.prompts["implementer"]
+    assert "hello.txt" in shown, "the file listing must reach the implementer"
+    assert "hello world" in shown, "and so must the contents it is being asked to patch"
+
+
+def test_the_file_the_brief_names_is_included_whole(repo: Path) -> None:
+    (repo / "big.txt").write_text("x\n" * 5000)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "big")
+    record = WorkRecord(item_id="T1", title="Edit hello", brief="Change hello.txt greeting.")
+
+    context = repo_context(repo, record, budget=200)
+
+    # The budget is tiny, so only the file the brief names earns its place.
+    assert "hello world" in context
+    assert "--- big.txt ---" not in context
+    # The listing is always there: a model should know what exists even when
+    # the budget will not stretch to showing it.
+    assert "big.txt" in context
+
+
+def test_a_repository_with_no_tracked_files_yields_no_context(tmp_path: Path) -> None:
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    git(bare, "init", "-q", "-b", "main")
+    assert repo_context(bare) == ""
+
+
+def test_binary_files_are_listed_but_not_read(repo: Path) -> None:
+    (repo / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "logo")
+
+    context = repo_context(repo)
+
+    assert "logo.png" in context
+    assert "--- logo.png ---" not in context

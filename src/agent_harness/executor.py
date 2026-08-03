@@ -42,6 +42,7 @@ from typing import Any
 
 from .model_client import CapExhausted, ModelClient, RequestRefused
 from .work import (
+    DEFAULT_PROJECT,
     DONE,
     FAILED,
     PENDING,
@@ -434,8 +435,14 @@ class Executor:
         now: Callable[[], float] = time.time,
         context_provider: Callable[[WorkRecord], str] | None = None,
         artifacts: Path | None = None,
+        project_id: str = DEFAULT_PROJECT,
     ) -> None:
         self.queue = queue
+        # Which project's queue this worker serves. Items are keyed by
+        # (project_id, item_id), so a worker that does not say which project
+        # it is for claims from `default` -- which is nobody's project once
+        # more than one exists.
+        self.project_id = project_id
         self.client = client
         self.repo = Path(repo)
         self.checks = checks or Checks()
@@ -459,7 +466,7 @@ class Executor:
     def run_once(self) -> Outcome | None:
         """Claim one item and take it as far as it goes. None if nothing is
         available."""
-        record = self.queue.claim(self.owner)
+        record = self.queue.claim(self.owner, project_id=self.project_id)
         if record is None:
             return None
         try:
@@ -474,11 +481,23 @@ class Executor:
             # Out of budget. Hand the item back untouched rather than
             # burning an attempt on something that was never tried.
             self._emit(record, "budget_exhausted", detail=str(exc))
-            self.queue.release(record.item_id, PENDING, error=f"budget: {exc}", owner=self.owner)
+            self.queue.release(
+                record.item_id,
+                PENDING,
+                error=f"budget: {exc}",
+                owner=self.owner,
+                project_id=self.project_id,
+            )
             raise
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
-            self.queue.release(record.item_id, FAILED, error=str(exc), owner=self.owner)
+            self.queue.release(
+                record.item_id,
+                FAILED,
+                error=str(exc),
+                owner=self.owner,
+                project_id=self.project_id,
+            )
             return Outcome(record.item_id, FAILED, reason=str(exc))
         self.queue.release(
             record.item_id,
@@ -487,6 +506,7 @@ class Executor:
             branch=outcome.branch,
             pr_url=outcome.pr_url,
             owner=self.owner,
+            project_id=self.project_id,
         )
         return outcome
 
@@ -514,7 +534,7 @@ class Executor:
         then reported a result for someone else's item. Reading the answer is
         the whole point of asking.
         """
-        if not self.queue.heartbeat(record.item_id, self.owner):
+        if not self.queue.heartbeat(record.item_id, self.owner, project_id=self.project_id):
             raise ClaimLost(
                 f"{record.item_id} is no longer owned by {self.owner}; "
                 "its lease expired and another worker re-claimed it"
@@ -681,11 +701,13 @@ class Executor:
         candidates = [
             dependency
             for dependency in record.depends_on
-            if (found := self.queue.get(dependency)) and found.branch and found.state == DONE
+            if (found := self.queue.get(dependency, project_id=self.project_id))
+            and found.branch
+            and found.state == DONE
         ]
         if not candidates:
             return self.base_branch, None
-        first = self.queue.get(candidates[0])
+        first = self.queue.get(candidates[0], project_id=self.project_id)
         assert first is not None and first.branch is not None
         note = candidates[0]
         if len(candidates) > 1:

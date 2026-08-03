@@ -41,6 +41,7 @@ from .model_client import CapExhausted, ModelClient, RequestRefused
 from .reaper import DEFAULT_MAX_AGE_SECONDS, ReapReport, reap_abandoned_sessions
 from .session_host import Session, SessionHost
 from .work import (
+    DEFAULT_PROJECT,
     DONE,
     FAILED,
     PENDING,
@@ -161,8 +162,13 @@ class SessionExecutor:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         push: bool = True,
         now: Callable[[], float] = time.time,
+        project_id: str = DEFAULT_PROJECT,
     ) -> None:
         self.queue = queue
+        # Which project's queue this worker serves. Without it a worker in a
+        # multi-project fleet claims from `default` regardless of which
+        # project it was started for.
+        self.project_id = project_id
         self.devenv = devenv
         self.repo = Path(repo)
         self.agent = agent or AgentSpec()
@@ -183,7 +189,7 @@ class SessionExecutor:
     # ------------------------------------------------------------- driving
 
     def run_once(self) -> Outcome | None:
-        record = self.queue.claim(self.owner)
+        record = self.queue.claim(self.owner, project_id=self.project_id)
         if record is None:
             return None
         try:
@@ -198,12 +204,24 @@ class SessionExecutor:
         except CapExhausted as exc:
             self._emit(record, "budget_exhausted", detail=str(exc))
             self._orphan_session(record, f"budget exhausted: {exc}")
-            self.queue.release(record.item_id, PENDING, error=f"budget: {exc}", owner=self.owner)
+            self.queue.release(
+                record.item_id,
+                PENDING,
+                error=f"budget: {exc}",
+                owner=self.owner,
+                project_id=self.project_id,
+            )
             raise
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
             self._orphan_session(record, str(exc))
-            self.queue.release(record.item_id, FAILED, error=str(exc), owner=self.owner)
+            self.queue.release(
+                record.item_id,
+                FAILED,
+                error=str(exc),
+                owner=self.owner,
+                project_id=self.project_id,
+            )
             partial = self._partial
             if partial is not None and partial.item_id == record.item_id:
                 partial.state = FAILED
@@ -217,6 +235,7 @@ class SessionExecutor:
             branch=outcome.branch,
             pr_url=outcome.pr_url,
             owner=self.owner,
+            project_id=self.project_id,
         )
         return outcome
 
@@ -331,7 +350,7 @@ class SessionExecutor:
         then reported a result for someone else's item. Reading the answer is
         the whole point of asking.
         """
-        if not self.queue.heartbeat(record.item_id, self.owner):
+        if not self.queue.heartbeat(record.item_id, self.owner, project_id=self.project_id):
             raise ClaimLost(
                 f"{record.item_id} is no longer owned by {self.owner}; "
                 "its lease expired and another worker re-claimed it"
@@ -535,11 +554,13 @@ class SessionExecutor:
         candidates = [
             dependency
             for dependency in record.depends_on
-            if (found := self.queue.get(dependency)) and found.branch and found.state == DONE
+            if (found := self.queue.get(dependency, project_id=self.project_id))
+            and found.branch
+            and found.state == DONE
         ]
         if not candidates:
             return self.base_branch, None
-        first = self.queue.get(candidates[0])
+        first = self.queue.get(candidates[0], project_id=self.project_id)
         assert first is not None and first.branch is not None
         note = candidates[0]
         if len(candidates) > 1:

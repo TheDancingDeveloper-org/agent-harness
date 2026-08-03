@@ -502,6 +502,51 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8099)
     p_serve.add_argument(
+        "--session-host",
+        default=os.environ.get("AIDEVENV_URL", ""),
+        metavar="URL",
+        help="base URL of a session host. WITH this, the API can start work: a "
+        "worker pool is attached and each agent runs as a terminal session you can "
+        "attach to. WITHOUT it the service is monitoring-only — every read works "
+        "and starting a project is refused, because starting would mark it running "
+        "with nothing able to claim.",
+    )
+    p_serve.add_argument(
+        "--agent",
+        default="claude -p {prompt_file}",
+        metavar="CMD",
+        help="CLI agent to run per item. `{prompt_file}` is substituted.",
+    )
+    p_serve.add_argument(
+        "--endpoint",
+        default=os.environ.get("HARNESS_ENDPOINT", ""),
+        help="model API base URL for the reviewer. Only the reviewer needs a model "
+        "in this mode: the CLI agent does the implementing.",
+    )
+    p_serve.add_argument(
+        "--reviewer",
+        default="",
+        help="model for the reviewer role. Seeds the stored role map when it has "
+        "no reviewer; the stored map wins when it does, because re-routing a role "
+        "live is the point of storing it.",
+    )
+    p_serve.add_argument(
+        "--events",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="where the fleet appends its event stream. Defaults to events.jsonl beside --db.",
+    )
+    p_serve.add_argument(
+        "--no-push", action="store_true", help="commit locally but do not push or open PRs"
+    )
+    p_serve.add_argument(
+        "--poll",
+        type=float,
+        default=15.0,
+        help="seconds a worker waits before asking for work again when the queue is dry",
+    )
+    p_serve.add_argument(
         "--root-path",
         default=os.environ.get("HARNESS_ROOT_PATH", ""),
         metavar="PREFIX",
@@ -586,19 +631,130 @@ def main(argv: list[str] | None = None) -> int:
     )
     maintenance.start()
 
-    uvicorn.run(
-        create_api(
-            store,
-            queue=queue_for_serve,
-            token=token,
-            root_path=args.root_path,
-            audit=audit,
-        ),
-        host=args.host,
-        port=args.port,
-        log_level="info",
-    )
+    fleet, reviewer_client = _fleet_for_serve(args, queue_for_serve)
+    if fleet is None:
+        print(
+            "monitoring only: no --session-host, so no worker pool is attached and "
+            "starting a project will be refused.",
+            file=sys.stderr,
+        )
+
+    try:
+        uvicorn.run(
+            create_api(
+                store,
+                queue=queue_for_serve,
+                token=token,
+                root_path=args.root_path,
+                audit=audit,
+                fleet=fleet,
+                model_client=reviewer_client,
+            ),
+            host=args.host,
+            port=args.port,
+            log_level="info",
+        )
+    finally:
+        if fleet is not None:
+            # Drain rather than kill. An agent stopped mid-item loses the
+            # context that makes its work resumable, so in-flight work is
+            # joined and only new claims stop.
+            fleet.stop_all(reason="the harness process is stopping")
     return 0
+
+
+def _fleet_for_serve(args: argparse.Namespace, queue: Any) -> tuple[Any | None, Any | None]:
+    """The supervised half of `serve`: a fleet the API's start action can use.
+
+    Returns (None, None) for a monitoring-only deployment. That mode is
+    supported on purpose — a dashboard over someone else's harness should not
+    need a session host, a model key or a checkout — and the API already
+    refuses to start a project when nothing can claim.
+
+    **Nothing is started here.** Building the fleet creates no workers; only
+    the API's start action does, and only after preflight passes.
+    """
+    if not args.session_host:
+        return (None, None)
+
+    import json as _json
+    import shlex
+
+    from . import providers
+    from .api import ROLE_MAP_KEY
+    from .fleet import Fleet
+    from .github import GitHub
+    from .model_client import ModelClient, Route
+    from .runtime import session_executor_factory
+    from .session_executor import AgentSpec
+    from .session_host import HttpSessionHost
+
+    api_key = os.environ.get("HARNESS_API_KEY", "")
+    host_token = os.environ.get("AIDEVENV_TOKEN", "") or api_key
+
+    # Seed the reviewer route from the flags when the stored map has none.
+    # The stored map wins where it has an opinion: re-routing a role live
+    # through PUT /api/roles is the reason it exists.
+    stored = queue.get_setting(ROLE_MAP_KEY) or {}
+    if args.reviewer and args.endpoint and "reviewer" not in stored:
+        stored = {
+            **stored,
+            "reviewer": {
+                "model": args.reviewer,
+                "endpoint": args.endpoint,
+                "provider": "claw-bay",
+            },
+        }
+        queue.set_setting(ROLE_MAP_KEY, stored)
+
+    def live_routes() -> dict[str, Route]:
+        current = queue.get_setting(ROLE_MAP_KEY) or {}
+        return {
+            name: Route(
+                route["model"],
+                route["endpoint"],
+                providers.PROVIDERS.get(route.get("provider", ""), providers.CLAW_BAY),
+                api_key=api_key,
+            )
+            for name, route in current.items()
+            if route.get("model") and route.get("endpoint")
+        }
+
+    routes = live_routes()
+    if "reviewer" not in routes:
+        # Not fatal, and not silent: preflight blocks the start with exactly
+        # this reason, so the fleet may as well exist and say why now.
+        print(
+            "warning: no reviewer is routed. Preflight will refuse to start any "
+            "project — set one with --reviewer/--endpoint or PUT /api/roles.",
+            file=sys.stderr,
+        )
+    reviewer_client = ModelClient(
+        roles=routes,
+        transport=_http_transport(api_key),
+        routes_provider=live_routes,
+    )
+
+    events_path = args.events or Path(args.db).with_name("events.jsonl")
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def emit(event: dict[str, Any]) -> None:
+        with events_path.open("a") as handle:
+            handle.write(_json.dumps(event) + "\n")
+
+    factory = session_executor_factory(
+        queue,
+        host=HttpSessionHost(args.session_host, token=host_token),
+        agent=AgentSpec(command=tuple(shlex.split(args.agent))),
+        reviewer=reviewer_client,
+        github_for=GitHub,
+        ui_base_url=args.session_host,
+        on_event=emit,
+        push=not args.no_push,
+    )
+    print(f"fleet: `{args.agent}` as sessions on {args.session_host}")
+    print(f"events: {events_path}")
+    return (Fleet(queue, factory, poll_seconds=args.poll), reviewer_client)
 
 
 if __name__ == "__main__":

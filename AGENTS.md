@@ -78,6 +78,11 @@ uv run agent-harness --db harness.sqlite ingest --logs ~/.oxidex/logs
 HARNESS_TOKEN=dev uv run agent-harness --db harness.sqlite serve --port 8099
 ```
 
+Adding `--session-host URL` makes it **supervised**: the same API, plus a
+worker pool the API's start action can use. Without it, `serve` is
+monitoring-only and starting a project is refused — both modes are supported,
+and neither starts anything on its own.
+
 It has never run against a real fleet — see `README.md`. Do not describe it as proven.
 
 ## The API is a public surface

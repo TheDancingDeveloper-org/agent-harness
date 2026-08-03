@@ -29,7 +29,13 @@ from agent_harness.__main__ import _fleet_for_serve
 from agent_harness.api import ROLE_MAP_KEY, create_api
 from agent_harness.audit import AuditStore
 from agent_harness.fleet import Fleet
-from agent_harness.model_client import ModelClient, Response, Route
+from agent_harness.model_client import (
+    ModelClient,
+    Response,
+    Route,
+    effective_routes,
+    routes_from_map,
+)
 from agent_harness.runtime import NotExecutable, session_executor_factory
 from agent_harness.session_executor import AgentSpec, SessionExecutor
 from agent_harness.session_host import IDLE, RUNNING, Session
@@ -155,6 +161,99 @@ def test_building_creates_no_workers_and_claims_nothing(repo: Path, tmp_path: Pa
 
     assert queue.get("T1", project_id="p").state == "pending"  # type: ignore[union-attr]
     assert queue.control(project_id="p")[0] == STOPPED
+
+
+def test_each_project_is_reviewed_by_its_own_model(repo: Path, tmp_path: Path) -> None:
+    """`ProjectSpec.roles` is persisted and documented as a per-project
+    override, and preflight already decided on it. The factory injected the
+    one global client anyway, so a project could pass preflight on its own
+    reviewer and have the work reviewed by a different model -- or fail with
+    `no route for role reviewer` when the global map had none."""
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    for project_id, model in (("a", "reviewer-a"), ("b", "reviewer-b")):
+        queue.add_project(
+            Project(
+                project_id=project_id,
+                name=project_id,
+                work_dir=str(repo),
+                roles={"reviewer": {"model": model, "endpoint": "https://own"}},
+            )
+        )
+
+    def routes_for(project_id: str) -> dict[str, Route]:
+        project = queue.get_project(project_id)
+        return effective_routes(
+            {"reviewer": Route("global-reviewer", "https://global", P.GENERIC)},
+            routes_from_map((project.roles if project else None) or {}),
+        )
+
+    build = session_executor_factory(
+        queue, host=FakeHost(), reviewer=reviewer(), routes_for=routes_for
+    )
+
+    assert build("a").reviewer.route_for("reviewer").model == "reviewer-a"
+    assert build("b").reviewer.route_for("reviewer").model == "reviewer-b"
+
+
+def test_a_project_without_an_override_still_gets_the_global_reviewer(
+    repo: Path, tmp_path: Path
+) -> None:
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue.add_project(project_for(repo))
+
+    build = session_executor_factory(
+        queue,
+        host=FakeHost(),
+        reviewer=reviewer(),
+        routes_for=lambda _id: {"reviewer": Route("global-reviewer", "https://global", P.GENERIC)},
+    )
+
+    assert build("p").reviewer.route_for("reviewer").model == "global-reviewer"
+
+
+def test_serve_wires_the_project_map_all_the_way_to_the_executor(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The whole point of the override is that it reaches a model call. This
+    builds the fleet exactly as `serve` does, and asks the executor it would
+    hand a worker which model it will call."""
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue.add_project(
+        Project(
+            project_id="p",
+            name="P",
+            work_dir=str(repo),
+            roles={"reviewer": {"model": "project-model", "endpoint": "https://project"}},
+        )
+    )
+    queue.set_setting(
+        ROLE_MAP_KEY,
+        {
+            "reviewer": {
+                "model": "global-model",
+                "endpoint": "https://global",
+                "provider": "generic",
+            }
+        },
+    )
+    args = argparse.Namespace(
+        session_host="https://sessions.example",
+        reviewer="",
+        endpoint="",
+        events=tmp_path / "events.jsonl",
+        db=str(tmp_path / "w.sqlite"),
+        agent="claude -p {prompt_file}",
+        no_push=True,
+        poll=1.0,
+    )
+
+    fleet, _client, _host, roles = _fleet_for_serve(args, queue)
+
+    assert fleet is not None and roles is not None
+    executor = fleet.executor_factory("p")
+    assert executor.reviewer.route_for("reviewer").model == "project-model"
+    # ...and the deployment knows the agent does the implementing.
+    assert roles.calls_role("reviewer") and not roles.calls_role("implementer")
 
 
 def test_a_project_with_no_checkout_is_refused_at_build_time(tmp_path: Path) -> None:
@@ -311,7 +410,7 @@ def test_serve_event_sink_writes_live_telemetry_to_the_audit_store(tmp_path: Pat
         poll=1.0,
     )
 
-    fleet, client, _host = _fleet_for_serve(args, queue, audit=audit)
+    fleet, client, _host, _roles = _fleet_for_serve(args, queue, audit=audit)
     assert fleet is not None and client is not None
 
     fleet.on_event(

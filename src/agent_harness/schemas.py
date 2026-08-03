@@ -180,19 +180,55 @@ class RoleRoute(BaseModel):
     )
 
 
-class RoleMap(BaseModel):
-    reviewer_independent: bool = Field(
+class RoutedRole(RoleRoute):
+    """A route, and whether this deployment's executor ever calls it."""
+
+    used: bool = Field(
         True,
-        description="False when the reviewer is the same model, or the same vendor, as "
-        "the implementer -- some share of reviews is then a model grading its own work. "
-        "Reported rather than refused: running one model is a legitimate deliberate "
-        "choice, but it must not be a surprise.",
+        description="False when the active executor never calls this role, so the "
+        "route is configuration nothing acts on. In session mode the agent process "
+        "plans and implements with its own credentials and endpoint, and only the "
+        "reviewer is a routed model call -- an operator reading `implementer` here "
+        "would otherwise look for that spend in an audit log where it can never "
+        "appear.",
     )
-    reviewer_note: str = Field("", description="Why, in words.")
+    unused_reason: str = Field(
+        "", description="What does this role's work instead, in words. Empty when `used`."
+    )
+
+
+class RoleMap(BaseModel):
+    """The role map as it is set. Sent to `PUT /api/roles`."""
+
     roles: dict[str, RoleRoute] = Field(
         description="role -> where its calls go. Changing this takes effect on the next "
         "call: the call site names a ROLE, never a model, which is what makes the map "
         "changeable without a redeploy."
+    )
+
+
+class RoleMapView(BaseModel):
+    """The role map as it will actually be used.
+
+    Returned by both the read and the write, because a `PUT` that stores a
+    route nothing calls should say so in the same breath rather than echo it
+    back as if it had changed what runs.
+    """
+
+    reviewer_independent: bool = Field(
+        True,
+        description="False when the reviewer is the same model, or the same vendor, as "
+        "the implementer -- some share of reviews is then a model grading its own work. "
+        "Computed against the implementer the active executor *actually* uses, and by "
+        "the same code as preflight's `reviewer independence` check, so the two cannot "
+        "disagree. Reported rather than refused: running one model is a legitimate "
+        "deliberate choice, but it must not be a surprise.",
+    )
+    reviewer_note: str = Field("", description="Why, in words.")
+    roles: dict[str, RoutedRole] = Field(
+        description="role -> where its calls go, and whether anything calls it. This is "
+        "the global map; a project may override any role, in which case its own "
+        "preflight reports the route that project will use."
     )
 
 

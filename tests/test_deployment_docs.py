@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from agent_harness.__main__ import main
-from agent_harness.preflight import preflight_project
+from agent_harness.preflight import RoleReachability, preflight_project
 from agent_harness.schemas import ExecutionReadiness, ProjectReadiness, ReadinessProbe
 from agent_harness.work import Project
 
@@ -74,6 +74,7 @@ def test_every_blocker_the_document_tells_you_to_fix_can_actually_occur() -> Non
         has_fleet=False,
         reviewer_route=None,
         reviewer_independent=(False, "same vendor"),
+        role_probe=lambda: RoleReachability(silent={"reviewer": "m returned HTTP 504"}),
         session_host=lambda: (False, "refused"),
         checks_probe=lambda: (False, "base check failed"),
         disk_probe=lambda path, floor: (False, "disk is full"),
@@ -91,9 +92,10 @@ def test_the_warnings_named_as_non_blocking_really_are() -> None:
         has_fleet=True,
         reviewer_route={"model": "m"},
         reviewer_independent=(False, "same vendor"),
+        role_probe=lambda: RoleReachability(slow={"reviewer": "m answered after 14s"}),
         git_probe=lambda path: (True, path),
         github_probe=lambda repo: (True, repo),
         disk_probe=lambda path, floor: (True, "100 GiB free"),
     )
     assert report.ready, "a start would be refused for reasons the document calls warnings"
-    assert {"checks", "reviewer independence"} <= {c.name for c in report.warnings}
+    assert {"checks", "reviewer independence", "model latency"} <= {c.name for c in report.warnings}

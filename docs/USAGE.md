@@ -400,6 +400,13 @@ Takes effect on the next call, no restart. This is possible only because a
 call site names a **role**, never a model — so re-routing one is a data change
 rather than a code change.
 
+The response says which of those roles this deployment actually calls. In
+session mode the agent process plans and implements with its own credentials
+and endpoint, so `planner` and `implementer` come back `"used": false` with the
+command that does that work instead: they are stored, the non-session executor
+uses them, and nothing here will. A project can override any role for itself
+with `roles` on its registration; unnamed roles still come from this map.
+
 Worth doing deliberately: a reviewer on the same vendor as the implementer
 means some share of reviews is a model grading its own work. Nothing enforces
 that; it is your call.
@@ -471,7 +478,7 @@ GET  /api/events            paged by row id, not timestamp
 GET  /api/summary           enough for a status line
 GET  /api/control           is the fleet claiming work?
 POST /api/control           pause, drain or resume — never interrupts work
-GET  /api/roles             where each role's calls go
+GET  /api/roles             where each role's calls go, and which are called
 PUT  /api/roles             re-route a role, live
 GET  /api/readiness         can anything actually run, and why not
 GET  /healthz               open, cheap, needs no credential

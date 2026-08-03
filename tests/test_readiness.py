@@ -98,14 +98,17 @@ def build(
     fleet: Any = None,
     host: Any = None,
     reviewer: dict[str, str] | None = REVIEWER,
+    roles: dict[str, dict[str, str]] | None = None,
     projects: tuple[Project, ...] = (),
     probes: dict[str, Any] | None = None,
+    model_client: Any = None,
+    executor_roles: Any = None,
 ) -> Iterator[Any]:
     queue = WorkQueue(str(tmp_path / "w.sqlite"))
     for p in projects or (project(),):
         queue.add_project(p)
-    if reviewer:
-        queue.set_setting(ROLE_MAP_KEY, {"reviewer": reviewer})
+    if roles or reviewer:
+        queue.set_setting(ROLE_MAP_KEY, roles or {"reviewer": reviewer})
     store = EventStore(tmp_path / "e.sqlite")
     with TestClient(
         create_api(
@@ -115,6 +118,8 @@ def build(
             fleet=fleet,
             session_host=host,
             probes=OFFLINE if probes is None else probes,
+            model_client=model_client,
+            executor_roles=executor_roles,
         )
     ) as client:
         holder: Any = client
@@ -257,6 +262,177 @@ def test_one_project_can_be_asked_about_on_its_own(supervised: Any) -> None:
 
 def test_readiness_needs_a_token(monitoring: Any) -> None:
     assert monitoring.get("/api/readiness").status_code == 401
+
+
+# ------------------------------------------------- whose reviewer is it anyway
+
+
+def test_a_project_that_routes_its_own_reviewer_needs_no_global_one(tmp_path: Path) -> None:
+    """`ProjectSpec.roles` is persisted and documented as a per-project
+    override. Reading only the global map made the top-level answer contradict
+    the project report underneath it."""
+    own = project(roles={"reviewer": {"model": "project-model", "endpoint": "https://p"}})
+    client = next(
+        build(tmp_path, fleet=OneWorker(), host=ReadableHost(), reviewer=None, projects=(own,))
+    )
+
+    body = client.get("/api/readiness", headers=hdr()).json()
+
+    assert body["reviewer"]["ok"] is True
+    assert "every project routes its own" in body["reviewer"]["detail"]
+    assert body["projects"][0]["blockers"] == []
+
+
+def test_a_project_overriding_one_role_still_inherits_the_global_reviewer(
+    tmp_path: Path,
+) -> None:
+    """A partial project map is an override of the roles it names, not a
+    replacement of the map. Treating it as a replacement refused a project
+    whose reviewer was routed all along."""
+    partial = project(roles={"planner": {"model": "cheap", "endpoint": "https://a"}})
+    client = next(build(tmp_path, fleet=OneWorker(), host=ReadableHost(), projects=(partial,)))
+
+    body = client.get("/api/readiness", headers=hdr()).json()
+
+    assert [c["name"] for c in body["projects"][0]["blockers"]] == []
+
+
+# --------------------------------------------- what the deployment will call
+
+
+def session_mode() -> Any:
+    from agent_harness.runtime import ExecutorRoles
+    from agent_harness.session_executor import AgentSpec
+
+    return ExecutorRoles.for_session(AgentSpec(command=("claude", "-p", "{prompt_file}")))
+
+
+THREE_ROLES = {
+    "planner": {"model": "gpt-5.6", "endpoint": "https://c", "provider": "claw-bay"},
+    "implementer": {"model": "gpt-5.6", "endpoint": "https://c", "provider": "claw-bay"},
+    "reviewer": {"model": "claude-sonnet-4-6", "endpoint": "https://c", "provider": "claw-bay"},
+}
+
+
+def test_the_role_map_says_which_routes_the_executor_never_calls(tmp_path: Path) -> None:
+    """The map is how an operator answers "what am I paying for, and what is
+    grading it?". In session mode the agent process plans and implements with
+    its own credentials, so two of the three answers described a model that is
+    never asked anything -- and spend that would be looked for in an audit log
+    where it can never appear."""
+    client = next(build(tmp_path, roles=THREE_ROLES, executor_roles=session_mode()))
+
+    roles = client.get("/api/roles", headers=hdr()).json()["roles"]
+
+    assert roles["reviewer"]["used"] is True
+    assert roles["implementer"]["used"] is False
+    assert "claude -p" in roles["implementer"]["unused_reason"]
+    # And the configuration is still there: the non-session executor uses it.
+    assert roles["implementer"]["model"] == "gpt-5.6"
+
+
+def test_storing_a_route_nothing_calls_says_so_in_the_same_breath(tmp_path: Path) -> None:
+    """`PUT` used to succeed, echo the value back, and change nothing about
+    what runs."""
+    client = next(build(tmp_path, executor_roles=session_mode()))
+
+    body = client.put("/api/roles", headers=hdr(), json={"roles": THREE_ROLES}).json()
+
+    assert body["roles"]["planner"]["used"] is False
+    assert body["roles"]["reviewer"]["used"] is True
+
+
+def test_the_role_map_and_preflight_cannot_disagree_about_independence(
+    tmp_path: Path,
+) -> None:
+    """Two endpoints, one property, two answers: `/api/roles` reported
+    `reviewer_independent: true` while preflight reported the same property as
+    `ok: false` -- from the *configured* implementer, which session mode never
+    calls."""
+    client = next(
+        build(
+            tmp_path,
+            fleet=OneWorker(),
+            host=ReadableHost(),
+            roles=THREE_ROLES,
+            executor_roles=session_mode(),
+        )
+    )
+
+    advertised = client.get("/api/roles", headers=hdr()).json()
+    checks = client.get("/api/projects/p/preflight", headers=hdr()).json()["checks"]
+    independence = next(c for c in checks if c["name"] == "reviewer independence")
+
+    assert advertised["reviewer_independent"] == independence["ok"]
+    assert advertised["reviewer_note"] == independence["detail"]
+    # ...and it is about the thing that actually writes the code.
+    assert "claude -p" in independence["detail"]
+
+
+# ------------------------------------------- does the configured model answer
+
+
+class Unserved:
+    """A model client whose endpoint advertises a model it does not serve."""
+
+    def __init__(self, status: int = 504) -> None:
+        self.status = status
+        self.asked: list[str] = []
+
+    def answers(self, route: Any, *, timeout: float = 10.0) -> tuple[bool, str]:
+        self.asked.append(route.model)
+        return (False, f"{route.model} returned HTTP {self.status}")
+
+
+class Serving(Unserved):
+    def answers(self, route: Any, *, timeout: float = 10.0) -> tuple[bool, str]:
+        self.asked.append(route.model)
+        return (True, f"{route.model} answered")
+
+
+def test_a_reviewer_that_does_not_answer_refuses_the_start(tmp_path: Path) -> None:
+    """Preflight checked that a reviewer was *routed*, which is true of a
+    model that will never reply. Every item then ran to completion and failed
+    at the last step, having paid for the plan and the implementation."""
+    client = next(build(tmp_path, fleet=OneWorker(), host=ReadableHost(), model_client=Unserved()))
+
+    refused = client.post("/api/projects/p/start", headers=hdr())
+
+    assert refused.status_code == 409
+    assert "claude-sonnet-4-6" in refused.json()["detail"]
+    assert "504" in refused.json()["detail"]
+    assert client.queue.control(project_id="p")[0] != "running"
+
+
+def test_a_model_that_answers_leaves_the_start_alone(tmp_path: Path) -> None:
+    serving = Serving()
+    client = next(build(tmp_path, fleet=OneWorker(), host=ReadableHost(), model_client=serving))
+
+    body = client.get("/api/readiness", headers=hdr()).json()
+
+    assert body["projects"][0]["ready_to_start"] is True
+    assert serving.asked == ["claude-sonnet-4-6"]
+
+
+def test_only_the_roles_this_executor_calls_are_probed(tmp_path: Path) -> None:
+    """Spending tokens to ask whether a model the agent process replaces is
+    answering, and refusing a start over the answer, would be a gate about
+    nothing."""
+    serving = Serving()
+    client = next(
+        build(
+            tmp_path,
+            fleet=OneWorker(),
+            host=ReadableHost(),
+            roles=THREE_ROLES,
+            model_client=serving,
+            executor_roles=session_mode(),
+        )
+    )
+
+    client.get("/api/readiness", headers=hdr())
+
+    assert serving.asked == ["claude-sonnet-4-6"]
 
 
 # ------------------------------------------------------------- the probe

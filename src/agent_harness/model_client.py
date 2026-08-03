@@ -202,6 +202,101 @@ class Response:
     body: bytes | str
 
 
+def routes_from_map(
+    stored: Mapping[str, Mapping[str, Any]] | None,
+    *,
+    api_key: str | None = None,
+    default_provider: Provider = P.CLAW_BAY,
+) -> dict[str, Route]:
+    """The persisted role map, as routes.
+
+    One conversion, shared by `run`, by `serve` and by every readiness
+    report, so the map an operator reads is the map the fleet calls. A role
+    missing a model or an endpoint is dropped rather than half-built: it is
+    not a route, and preflight's job is to name it as missing rather than to
+    fail on the first call that uses it.
+    """
+    routes: dict[str, Route] = {}
+    for name, spec in (stored or {}).items():
+        model, endpoint = spec.get("model"), spec.get("endpoint")
+        if not model or not endpoint:
+            continue
+        routes[name] = Route(
+            str(model),
+            str(endpoint),
+            P.PROVIDERS.get(str(spec.get("provider", "")), default_provider),
+            api_key=api_key,
+        )
+    return routes
+
+
+def effective_routes(
+    global_routes: Mapping[str, Route], project_routes: Mapping[str, Route] | None
+) -> dict[str, Route]:
+    """The global role map with one project's overrides applied.
+
+    Per role, not wholesale. Choosing one map or the other was the defect:
+    a project that overrode only its reviewer passed preflight on that
+    override and was then executed against the *global* reviewer, or failed
+    with `no route for role reviewer` when the global map had none. A partial
+    project map inherits every role it does not name.
+    """
+    return {**global_routes, **(project_routes or {})}
+
+
+def reviewer_independence(
+    roles: Mapping[str, Route], *, implemented_by: str = ""
+) -> tuple[bool, str]:
+    """Whether the reviewer is independent of whatever wrote the code.
+
+    Returns (independent, why). This was documented in three places and
+    enforced in none, which meant a reviewer could be the same model as the
+    implementer and nothing would say so -- some share of reviews being a
+    model grading its own work, invisibly.
+
+    `implemented_by` names the thing that actually implements when it is not
+    a routed role: the agent command, in session mode. Comparing against the
+    *configured* implementer there describes a pairing that never happens --
+    session mode never calls that route -- so the verdict was about two
+    things that never meet.
+
+    Reported rather than refused: a single-model setup is a legitimate thing
+    to run deliberately, and blocking it would be the harness overruling an
+    operator about their own budget. What it must not be is a surprise.
+    """
+    reviewer = roles.get("reviewer")
+    if implemented_by:
+        if reviewer is None:
+            return (True, "no implementer/reviewer pair configured")
+        return (
+            True,
+            f"{reviewer.model} reviews work written by `{implemented_by}`, which this "
+            "harness does not route: the two are not the same model, and nothing here "
+            "knows which vendor is behind the agent",
+        )
+    implementer = roles.get("implementer")
+    if reviewer is None or implementer is None:
+        return (True, "no implementer/reviewer pair configured")
+    if reviewer.model == implementer.model:
+        return (
+            False,
+            f"reviewer and implementer are the same model ({reviewer.model}): "
+            "every review is a model grading its own work",
+        )
+    if reviewer.provider.name == implementer.provider.name:
+        return (
+            False,
+            f"reviewer and implementer share a provider ({reviewer.provider.name}): "
+            "reviews are independent of the model but not of the vendor",
+        )
+    return (True, f"{reviewer.model} reviews {implementer.model}")
+
+
+#: The cheapest question that proves a model is actually being served. An
+#: endpoint advertising a model in `/models` is not the same claim.
+PROBE_MESSAGES: tuple[Mapping[str, Any], ...] = ({"role": "user", "content": "ping"},)
+
+
 #: A transport is any callable that performs one request. Injected rather
 #: than imported so the retry logic is testable without a network, and so a
 #: caller can use whatever HTTP client it already has.
@@ -257,37 +352,73 @@ class ModelClient:
         self.run_id = run_id or uuid.uuid4().hex[:12]
         self._seq = itertools.count()
 
-    def reviewer_independence(self) -> tuple[bool, str]:
-        """Whether the reviewer is actually independent of the implementer.
+    def reviewer_independence(self, implemented_by: str = "") -> tuple[bool, str]:
+        """Whether this client's reviewer is independent of the implementer.
 
-        Returns (independent, why). This was documented in three places and
-        enforced in none, which meant a reviewer could be the same model as
-        the implementer and nothing would say so -- some share of reviews
-        being a model grading its own work, invisibly.
-
-        Reported rather than refused: a single-model setup is a legitimate
-        thing to run deliberately, and blocking it would be the harness
-        overruling an operator about their own budget. What it must not be is
-        a surprise.
+        The logic is a free function so that a caller holding a *project's*
+        effective map -- which this client's own map may not be -- gets the
+        same answer from the same code.
         """
+        return reviewer_independence(self.roles, implemented_by=implemented_by)
+
+    def routed_by(self, routes_provider: Callable[[], Mapping[str, Route]]) -> ModelClient:
+        """A sibling client that resolves routes differently.
+
+        Transport, retry policy, prices, telemetry and — deliberately — the
+        endpoint parks are shared: a spend cap belongs to the endpoint and
+        this process, not to whichever project happened to hit it first, and
+        a per-project copy of the parks would let every project rediscover
+        the same exhausted window at full price.
+
+        The run id is *not* shared. Two clients emitting the same (run_id,
+        seq) pair would make two different attempts indistinguishable to a
+        consumer deduplicating a replayed stream, which is exactly what that
+        identity exists to prevent.
+        """
+        return ModelClient(
+            roles=routes_provider(),
+            transport=self.transport,
+            policy=self.policy,
+            on_event=self.on_event,
+            prices=self.prices,
+            sleep=self.sleep,
+            now=self.now,
+            jitter=self.jitter,
+            parks=self.parks,
+            routes_provider=routes_provider,
+        )
+
+    def answers(self, route: Route, *, timeout: float = 10.0) -> tuple[bool, str]:
+        """Whether a route's model replies at all, in one request.
+
+        Deliberately not `call`: the ladder is six attempts with escalating
+        backoff, which is the ~20 minutes *per item* that discovering an
+        unusable model the expensive way costs. This asks once, briefly, and
+        reports what came back.
+
+        The detail names the model and the status, because
+        "claude-sonnet-4-6 returned HTTP 504" names the thing to change and
+        "not ready" does not. No parking and no telemetry: a probe must not
+        idle an endpoint for the fleet, and a readiness poll is not a model
+        call anybody should find in their cost rollup.
+        """
+        options = {**route.options, "max_tokens": 1, "timeout": timeout}
         try:
-            implementer = self.roles["implementer"]
-            reviewer = self.roles["reviewer"]
-        except KeyError:
-            return (True, "no implementer/reviewer pair configured")
-        if reviewer.model == implementer.model:
+            response = self.transport(route, PROBE_MESSAGES, options)
+        except Exception as exc:  # noqa: BLE001 - any failure is the same answer
             return (
                 False,
-                f"reviewer and implementer are the same model ({reviewer.model}): "
-                "every review is a model grading its own work",
+                f"{route.model} could not be reached at {route.endpoint}: "
+                f"{type(exc).__name__}: {str(exc)[:160]}",
             )
-        if reviewer.provider.name == implementer.provider.name:
-            return (
-                False,
-                f"reviewer and implementer share a provider ({reviewer.provider.name}): "
-                "reviews are independent of the model but not of the vendor",
-            )
-        return (True, f"{reviewer.model} reviews {implementer.model}")
+        if 200 <= response.status < 300:
+            return (True, f"{route.model} answered")
+        verdict = route.provider.classify(response.status, response.headers, response.body)
+        return (
+            False,
+            f"{route.model} returned HTTP {response.status}"
+            + (f": {verdict.message[:160]}" if verdict.message else ""),
+        )
 
     def route_for(self, role: str) -> Route:
         if self.routes_provider is not None:

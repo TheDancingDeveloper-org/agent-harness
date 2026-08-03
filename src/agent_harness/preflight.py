@@ -20,14 +20,19 @@ the last thing that should be trusted.
 
 from __future__ import annotations
 
+import logging
 import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 #: A probe answers one question about the world. Returning (ok, detail) rather
 #: than raising keeps a failing probe from looking like a broken harness.
@@ -203,6 +208,103 @@ def clean_checks_probe(project: Any, *, timeout: float = 900.0) -> Probe:
             # nothing to remove. The probe must not become another source of
             # orphaned trees.
             shutil.rmtree(temp, ignore_errors=True)
+
+    return probe
+
+
+BASE_RUNNING = "running"
+BASE_PASSED = "passed"
+BASE_FAILED = "failed"
+
+
+@dataclass
+class BaseCheckRun:
+    """One run of a project's check list against its base branch."""
+
+    project_id: str
+    state: str
+    started_at: float
+    finished_at: float | None = None
+    ok: bool | None = None
+    detail: str = ""
+
+
+class BaseChecks:
+    """Base-branch check runs, kept off the request thread.
+
+    Running the suite inside the HTTP request repeated the mistake `stop`
+    made: for any project the check is useful on, the suite takes minutes, so
+    the request outlives every proxy timeout and returns a transport error
+    while the build carries on with nowhere to report. The obvious response to
+    that error -- retry -- then started a *second* concurrent build instead of
+    joining the first.
+
+    So a run is started, joined if one is already going, and read back later.
+    The result is remembered, which is what lets preflight answer honestly
+    about a check list without rebuilding the world on every poll.
+    """
+
+    def __init__(self, now: Callable[[], float] = time.time) -> None:
+        self._now = now
+        self._lock = threading.Lock()
+        self._runs: dict[str, BaseCheckRun] = {}
+
+    def status(self, project_id: str) -> BaseCheckRun | None:
+        with self._lock:
+            return self._runs.get(project_id)
+
+    def start(self, project: Any, *, timeout: float = 900.0) -> BaseCheckRun:
+        """Begin a run, or return the one already in flight."""
+        project_id = str(getattr(project, "project_id", "default"))
+        with self._lock:
+            current = self._runs.get(project_id)
+            if current is not None and current.state == BASE_RUNNING:
+                # Joined, not duplicated. Two builds of the same tree are two
+                # worktrees and twice the disk for one answer.
+                return current
+            run = BaseCheckRun(project_id=project_id, state=BASE_RUNNING, started_at=self._now())
+            self._runs[project_id] = run
+        probe = clean_checks_probe(project, timeout=timeout)
+        threading.Thread(
+            target=self._execute,
+            args=(run, probe),
+            name=f"harness-base-checks-{project_id}",
+            daemon=True,
+        ).start()
+        return run
+
+    def _execute(self, run: BaseCheckRun, probe: Probe) -> None:
+        try:
+            ok, detail = probe()
+        except Exception as exc:  # noqa: BLE001 - a probe must not kill its thread
+            log.warning("base checks: %s raised", run.project_id, exc_info=True)
+            ok, detail = False, f"base checks could not run: {exc}"
+        with self._lock:
+            run.ok = ok
+            run.detail = detail
+            run.state = BASE_PASSED if ok else BASE_FAILED
+            run.finished_at = self._now()
+
+
+def last_base_result_probe(checks: BaseChecks, project_id: str) -> Probe:
+    """Report the most recent base-checks run, without starting one.
+
+    Never runs the suite itself: a read of readiness has to stay a read. An
+    answer that has not been obtained yet is reported as not-ready with the
+    call that would obtain it, which is more use than a check that blocks.
+    """
+
+    def probe() -> tuple[bool, str]:
+        run = checks.status(project_id)
+        if run is None:
+            return (
+                False,
+                "base checks have not been run; POST /api/projects/"
+                f"{project_id}/preflight/base to start one",
+            )
+        if run.state == BASE_RUNNING:
+            return (False, f"base checks started {run.started_at:.0f} and are still running")
+        return (bool(run.ok), run.detail)
 
     return probe
 

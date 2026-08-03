@@ -653,3 +653,48 @@ def test_a_failure_before_any_session_records_nothing(repo: Path, tmp_path: Path
     add_item(queue)
     executor.run_once()
     assert queue.abandoned_sessions() == []
+
+
+def test_an_agent_slower_than_the_lease_keeps_its_item(repo: Path, tmp_path: Path) -> None:
+    """The end-to-end shape of #123.
+
+    The lease used to be renewed only between stages, so an agent that thought
+    for longer than one lease had its item retired underneath it — and every
+    write the worker made afterwards was owner-scoped to an owner the row no
+    longer had, so the result vanished without a trace.
+
+    Here the agent takes several times the lease. Nothing else is unusual.
+    """
+    import time
+
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=0.3)
+    stolen: list[Any] = []
+
+    def slow_agent(cwd: Path) -> None:
+        # Longer than the lease, and then exactly what a second worker's claim
+        # scan does. An expired lease is harmless until someone acts on it.
+        time.sleep(1.2)
+        stolen.append(queue.claim("second-worker"))
+        add_multiply(cwd)
+
+    devenv = FakeDevEnv(agent=slow_agent)
+    executor = SessionExecutor(
+        queue,
+        devenv,
+        repo,
+        agent=AgentSpec(command=("claude", "-p", "{prompt_file}"), poll_seconds=0),
+        checks=Checks(),
+        reviewer=reviewer("APPROVED\nfine"),
+        worktrees=tmp_path / "trees",
+        push=False,
+    )
+    add_item(queue)
+
+    outcome = executor.run_once()
+
+    # The claim held, so the second worker found nothing to take.
+    assert stolen == [None]
+    assert outcome is not None
+    assert outcome.state == DONE, outcome.reason
+    record = queue.get("W1")
+    assert record is not None and record.state == DONE

@@ -38,6 +38,7 @@ from . import __version__
 from .audit import AuditStore
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
 from .maintenance import DEFAULT_RETENTION_DAYS, run_maintenance
+from .preflight import BaseChecks
 from .providers import MEANING
 from .reconcile import GitHubReconciler, items_by_pr
 from .schemas import (
@@ -50,6 +51,7 @@ from .schemas import (
     AuditHealth,
     AuditRollupRow,
     AuditRollups,
+    BaseCheckStatus,
     Baseline,
     BaselineList,
     BlockRequest,
@@ -186,6 +188,8 @@ def create_api(
     _APP_STATE["model_client"] = model_client
     _APP_STATE["session_host"] = session_host
     _APP_STATE["probes"] = dict(probes or {})
+    app.state.base_checks = BaseChecks()
+    _APP_STATE["base_checks"] = app.state.base_checks
     app.state.token = token
 
     def require_token(
@@ -248,7 +252,7 @@ def create_api(
                 configured=False,
                 reason="no work queue is attached to this harness",
             )
-        latest = _latest_by_item(store)
+        latest = _latest_by_item(store, app.state.audit)
         return WorkList(
             configured=True,
             counts=queue.counts(project_id=project_id),
@@ -273,7 +277,7 @@ def create_api(
         record = need_queue().get(item_id, project_id=project_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
-        return _item_model(record, _latest_by_item(store).get(item_id))
+        return _item_model(record, _latest_by_item(store, app.state.audit).get(item_id))
 
     @app.post(
         "/api/work",
@@ -986,6 +990,43 @@ def create_api(
             checks=[PreflightCheck(**c.as_dict()) for c in report.checks],
         )
 
+    @app.post(
+        "/api/projects/{project_id}/preflight/base",
+        tags=["control"],
+        summary="Start a base-branch check run",
+        response_model=BaseCheckStatus,
+        responses={404: {"description": "No such project"}},
+    )
+    def start_base_checks(
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> BaseCheckStatus:
+        """Run the project's check list against a clean base worktree.
+
+        Returns as soon as the run is *started*, because the run itself takes
+        as long as a build and a request that waits for one is a request that
+        dies at the first proxy timeout. Calling this while a run is in flight
+        joins it rather than starting a second.
+        """
+        queue = need_queue()
+        project = queue.get_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+        return _base_check_status(project_id, app.state.base_checks.start(project))
+
+    @app.get(
+        "/api/projects/{project_id}/preflight/base",
+        tags=["control"],
+        summary="The latest base-branch check run",
+        response_model=BaseCheckStatus,
+    )
+    def base_checks_status(
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> BaseCheckStatus:
+        """Poll a run started by the POST above."""
+        return _base_check_status(project_id, app.state.base_checks.status(project_id))
+
     @app.get(
         "/api/readiness",
         tags=["control"],
@@ -1366,15 +1407,44 @@ def create_api(
     return app
 
 
-def _latest_by_item(store: EventStore) -> dict[str, dict[str, Any]]:
+def _latest_by_item(store: EventStore, audit: Any | None = None) -> dict[str, dict[str, Any]]:
     """Newest event per work item. One scan — doing it per item would be a
-    query per row."""
+    query per row.
+
+    The audit store comes first when there is one. Under `serve` it is the
+    only sink the fleet writes to: nothing ingests `events.jsonl` into the
+    `EventStore`, so reading that alone reported `latest: null` for every item
+    forever, no matter how much work ran. The ingest store remains the source
+    for a harness run as a plain `ingest` + `serve` pair over log files.
+    """
+    if audit is not None:
+        rows = audit.latest_by_item()
+        if rows:
+            return {
+                item_id: {**row, "data": json.loads(row.get("data") or "{}")}
+                for item_id, row in rows.items()
+            }
     latest: dict[str, dict[str, Any]] = {}
     for event in store.recent(kind="work", limit=2000):
         item_id = event["data"].get("item_id")
         if item_id and item_id not in latest:
             latest[item_id] = event
     return latest
+
+
+def _base_check_status(project_id: str, run: Any | None) -> BaseCheckStatus:
+    """A base-check run as the wire model. `None` is a real state, not a 404:
+    "nobody has asked yet" is the answer to what a fresh process knows."""
+    if run is None:
+        return BaseCheckStatus(project_id=project_id, state="not_run")
+    return BaseCheckStatus(
+        project_id=run.project_id,
+        state=run.state,
+        ok=run.ok,
+        detail=run.detail,
+        started_at=run.started_at,
+        finished_at=run.finished_at,
+    )
 
 
 def _audit_event_fields(row: dict[str, Any]) -> dict[str, Any]:
@@ -1412,7 +1482,7 @@ def _preflight(
     `session_host` is a *probe*, not the host: readiness over many projects
     would otherwise ask the same host the same question once per project.
     """
-    from .preflight import clean_checks_probe, preflight_project, session_host_probe
+    from .preflight import last_base_result_probe, preflight_project, session_host_probe
 
     stored = queue.get_setting("role_map") or {}
     client = _APP_STATE.get("model_client")
@@ -1423,7 +1493,11 @@ def _preflight(
         reviewer_route=(project.roles or stored).get("reviewer"),
         reviewer_independent=client.reviewer_independence() if client is not None else None,
         session_host=session_host or (session_host_probe(host) if host is not None else None),
-        checks_probe=clean_checks_probe(project) if check_base else None,
+        checks_probe=(
+            last_base_result_probe(_APP_STATE["base_checks"], project.project_id)
+            if check_base and _APP_STATE.get("base_checks") is not None
+            else None
+        ),
         **(_APP_STATE.get("probes") or {}),
     )
 

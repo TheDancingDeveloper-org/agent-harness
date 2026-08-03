@@ -83,6 +83,9 @@ class PullRequest:
     url: str
     merged_at: float | None = None
     closed_at: float | None = None
+    #: The head branch. Carried so a pull request can be matched back to the
+    #: item that pushed it when the item's recorded URL was lost.
+    head: str = ""
 
 
 def _as_float(value: str | None) -> float | None:
@@ -130,7 +133,7 @@ class GitHubReconciler:
                 "--limit",
                 str(limit),
                 "--json",
-                "number,state,mergedAt,closedAt,mergeCommit,title,url",
+                "number,state,mergedAt,closedAt,mergeCommit,title,url,headRefName",
             ]
         )
         prs = []
@@ -146,6 +149,7 @@ class GitHubReconciler:
                     url=raw.get("url") or "",
                     merged_at=_parse_ts(raw.get("mergedAt")),
                     closed_at=_parse_ts(raw.get("closedAt")),
+                    head=raw.get("headRefName") or "",
                 )
             )
         return prs

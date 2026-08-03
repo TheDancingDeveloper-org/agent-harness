@@ -189,7 +189,8 @@ def test_one_repo_failing_does_not_stop_the_others(audit: AuditStore) -> None:
         def items(self):  # type: ignore[no-untyped-def]
             return []
 
-    counts, errors = reconcile_projects(audit, FakeQueue())
+    counts, errors, recovered = reconcile_projects(audit, FakeQueue())
     # Both were attempted; neither aborted the sweep.
     assert isinstance(counts, dict)
     assert isinstance(errors, list)
+    assert recovered == {}

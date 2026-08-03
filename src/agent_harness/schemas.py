@@ -376,6 +376,25 @@ class ExecutionReadiness(BaseModel):
     )
 
 
+class BaseCheckStatus(BaseModel):
+    """A base-branch check run, which happens off the request thread.
+
+    The suite takes as long as a build, so the request that starts it cannot
+    also wait for it. This is what you poll instead.
+    """
+
+    project_id: str
+    state: Literal["running", "passed", "failed", "not_run"] = Field(
+        description="`not_run` means no run has been started since this process came up."
+    )
+    ok: bool | None = Field(
+        None, description="Whether the checks passed. Null while running, or before any run."
+    )
+    detail: str = Field("", description="The command that failed, or what passed on which branch.")
+    started_at: float | None = None
+    finished_at: float | None = None
+
+
 class StopProjectRequest(BaseModel):
     """Optional context for stopping one project.
 

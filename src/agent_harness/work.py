@@ -24,6 +24,7 @@ import logging
 import os
 import socket
 import sqlite3
+import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -171,6 +172,91 @@ class ClaimLost(Exception):
     The correct response is to stop and release NOTHING -- the item is not
     ours to release.
     """
+
+
+class LeaseHeartbeat:
+    """Keep one claim alive for as long as its worker is working on it.
+
+    Renewing only at stage boundaries made the lease a bound on the longest
+    *stage*, not on how long a worker may be absent -- and the two stages that
+    matter, an agent thinking and a full check suite, are both routinely
+    longer than the lease. A single 915s agent run was enough: the lease
+    lapsed 15s before the agent returned, another worker's claim scan retired
+    the item underneath it, and the 15 minutes of work, the reason it ended
+    and its worktree were all lost, because every later write was owner-scoped
+    to an owner that no longer held the row.
+
+    So the heartbeat runs on its own thread for the whole attempt. It is a
+    daemon: a worker that dies takes its heartbeat with it, which is exactly
+    what makes the lease expire and the item recoverable. The point is to make
+    "slow" and "dead" distinguishable, and that only works if the stamping
+    stops when the process does.
+    """
+
+    def __init__(
+        self,
+        queue: WorkQueue,
+        item_id: str,
+        owner: str,
+        *,
+        project_id: str = DEFAULT_PROJECT,
+        interval: float | None = None,
+    ) -> None:
+        self.queue = queue
+        self.item_id = item_id
+        self.owner = owner
+        self.project_id = project_id
+        # A third of the lease, so two consecutive failed beats still leave
+        # room for a third before the claim actually lapses. The floor only
+        # bites for a lease short enough that the interval would busy-loop,
+        # and it tracks the lease rather than a fixed second so a deployment
+        # (or a test) with a short lease still beats often enough to keep it.
+        self.interval = interval if interval is not None else max(0.05, queue.lease_seconds / 3.0)
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def lost(self) -> bool:
+        """Whether a beat was refused, i.e. the claim is already gone."""
+        return self._lost.is_set()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"harness-lease-{self.item_id}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=timeout)
+
+    def __enter__(self) -> LeaseHeartbeat:
+        self.start()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.stop()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                held = self.queue.heartbeat(self.item_id, self.owner, project_id=self.project_id)
+            except Exception:  # noqa: BLE001 - a database blip is not a lost claim
+                # Deliberately not treated as a loss. Giving up the item on a
+                # transient sqlite error would throw away live work for a
+                # condition the next beat will very likely recover from.
+                log.warning("lease: could not beat for %s", self.item_id, exc_info=True)
+                continue
+            if not held:
+                self._lost.set()
+                return
 
 
 def worker_identity() -> str:
@@ -822,6 +908,41 @@ class WorkQueue:
                 sql += " AND owner = ?"
                 params.append(owner)
             cursor = conn.execute(sql, params)
+            applied = cursor.rowcount > 0
+            if not applied and owner is not None:
+                # Say it out loud. A discarded result used to be indis-
+                # tinguishable from a successful release, so an item that ended
+                # with no recorded outcome looked like a harness that simply
+                # forgot to write one.
+                log.warning(
+                    "release: %s/%s is no longer owned by %s, so its %r result was discarded",
+                    project_id,
+                    item_id,
+                    owner,
+                    state,
+                )
+            return applied
+        finally:
+            conn.close()
+
+    def record_pr_url(
+        self, item_id: str, pr_url: str, *, project_id: str = DEFAULT_PROJECT
+    ) -> bool:
+        """Attach a pull request to an item that has none.
+
+        Fills a hole and nothing more: `pr_url IS NULL` is part of the match,
+        so recovering a URL that was dropped can never overwrite one a worker
+        recorded correctly. Deliberately not `release` -- the item's state is
+        whatever it already is, and this is a fact about it rather than an
+        outcome for it.
+        """
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                "UPDATE work SET pr_url = ?, updated_at = ? "
+                "WHERE project_id = ? AND item_id = ? AND pr_url IS NULL",
+                (pr_url, self.now(), project_id, item_id),
+            )
             return cursor.rowcount > 0
         finally:
             conn.close()

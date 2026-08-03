@@ -292,7 +292,20 @@ def test_failing_checks_stop_before_the_reviewer(repo: Path, tmp_path: Path) -> 
     assert "review" not in outcome.stages
 
 
-def test_a_rejected_review_does_not_commit(repo: Path, tmp_path: Path) -> None:
+def test_a_rejected_review_fails_the_item_but_keeps_the_evidence(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The contract changed with the draft-PR checkpoint (T40), deliberately.
+
+    Work is now committed after the cheap gates and BEFORE review, because
+    review is the slowest and most failure-prone step and a worker killed
+    during it used to lose everything that had already passed.
+
+    So a rejected item still has a commit. What it must not have is any
+    claim of approval: the branch stays, the draft stays a draft, and the
+    verdict says why. A rejected attempt that keeps its evidence is a lead;
+    one that vanishes is work somebody has to redo to find the same answer.
+    """
     devenv = FakeDevEnv(agent=add_multiply)
     executor, queue = build(repo, tmp_path, devenv, verdict="REJECTED\nwrong function")
     add_item(queue)
@@ -300,7 +313,14 @@ def test_a_rejected_review_does_not_commit(repo: Path, tmp_path: Path) -> None:
     assert outcome is not None
     assert outcome.state == FAILED
     assert "wrong function" in outcome.reason
-    assert git(repo, "log", "--oneline", "harness/w1").count("\n") == 1  # base only
+    # The commit exists -- that is the checkpoint.
+    assert git(repo, "log", "--oneline", "harness/w1").count("\n") == 2
+    # ...and it does not claim to have been reviewed.
+    message = git(repo, "log", "-1", "--format=%B", "harness/w1")
+    assert "Reviewed: not yet" in message
+    assert "APPROVED" not in message
+    # The item never reached `pr` -- nothing was marked ready for review.
+    assert "pr" not in outcome.stages
 
 
 def test_no_reviewer_configured_is_a_rejection_not_an_approval(repo: Path, tmp_path: Path) -> None:
@@ -379,3 +399,100 @@ def test_dependent_work_is_stacked(repo: Path, tmp_path: Path) -> None:
     assert second.base == "harness/w1"
     final = git(repo, "show", "harness/w2:calc.py")
     assert "multiply" in final and "divide" in final
+
+
+# ------------------------------------------------ draft-PR checkpoint (T40)
+
+
+def test_a_worker_killed_during_review_loses_no_work(repo: Path, tmp_path: Path) -> None:
+    """T40's acceptance criterion, as the failure it prevents.
+
+    Review is the slowest, most failure-prone step. Before the checkpoint it
+    ran before anything was committed, so a worker killed during it lost
+    everything that had already passed the cheap gates -- and the next attempt
+    paid for all of it again.
+    """
+    devenv = FakeDevEnv(agent=add_multiply)
+
+    class DyingReviewer:
+        """Stands in for the worker being killed mid-review."""
+
+        def call(self, role: str, messages: object, **kw: object) -> str:
+            raise RuntimeError("worker killed during review")
+
+    queue = make_queue(str(tmp_path / "w.sqlite"))
+    executor = SessionExecutor(
+        queue,
+        devenv,
+        repo,
+        reviewer=DyingReviewer(),
+        worktrees=tmp_path / "trees",
+        push=False,
+    )
+    add_item(queue)
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.state == FAILED
+    # The commit survived the reviewer dying. That is the whole point.
+    assert "commit" in outcome.stages
+    assert git(repo, "log", "--oneline", "harness/w1").count("\n") == 2
+    assert "Reviewed: not yet" in git(repo, "log", "-1", "--format=%B", "harness/w1")
+
+
+def test_the_checkpoint_commit_never_claims_to_be_reviewed(repo: Path, tmp_path: Path) -> None:
+    """An unreviewed candidate presenting itself as reviewed is the one
+    outcome worse than losing it."""
+    devenv = FakeDevEnv(agent=add_multiply)
+    executor, queue = build(repo, tmp_path, devenv, verdict="APPROVED\nfine")
+    add_item(queue)
+    executor.run_once()
+
+    log = git(repo, "log", "--format=%B", "harness/w1")
+    checkpoint = [m for m in log.split("harness-item:") if "Reviewed: not yet" in m]
+    assert checkpoint, "no checkpoint commit was made"
+
+
+def test_an_approved_item_is_marked_ready_and_a_rejected_one_is_not(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Approval is what takes a draft out of draft. Nothing else does."""
+
+    class RecordingGitHub:
+        def __init__(self) -> None:
+            self.created: list[dict[str, object]] = []
+            self.ready: list[str] = []
+            self.comments: list[str] = []
+
+        def create_pr(self, *, title: str, body: str, head: str, base: str, draft: bool = False):  # type: ignore[no-untyped-def]
+            self.created.append({"head": head, "draft": draft})
+            return f"https://github.com/o/r/pull/{len(self.created)}"
+
+        def mark_pr_ready(self, pr: str) -> None:
+            self.ready.append(pr)
+
+        def comment_pr(self, pr: str, body: str) -> None:
+            self.comments.append(body)
+
+    for verdict, expect_ready in (("APPROVED\nfine", True), ("REJECTED\nno", False)):
+        devenv = FakeDevEnv(agent=add_multiply)
+        github = RecordingGitHub()
+        queue = make_queue(str(tmp_path / f"w-{expect_ready}.sqlite"))
+        executor = SessionExecutor(
+            queue,
+            devenv,
+            repo,
+            reviewer=reviewer(verdict),
+            github=github,
+            worktrees=tmp_path / f"trees-{expect_ready}",
+            push=False,
+        )
+        add_item(queue)
+        executor.run_once()
+
+        assert github.created, f"no PR opened for {verdict!r}"
+        assert github.created[0]["draft"] is True, "the checkpoint PR was not a draft"
+        # The verdict is on the PR either way -- a rejected draft that says
+        # why is a lead; one that says nothing is litter.
+        assert github.comments, "the verdict was never recorded on the PR"
+        assert bool(github.ready) is expect_ready

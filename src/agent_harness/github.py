@@ -216,24 +216,45 @@ class GitHub:
             ["gh", "issue", "comment", str(number), "-R", self.repo, "--body-file", "-"], stdin=text
         )
 
-    def create_pr(self, *, title: str, body: str, head: str, base: str) -> str:
-        return self._run(
-            [
-                "gh",
-                "pr",
-                "create",
-                "-R",
-                self.repo,
-                "--title",
-                title,
-                "--body",
-                body,
-                "--head",
-                head,
-                "--base",
-                base,
-            ]
-        ).strip()
+    def create_pr(self, *, title: str, body: str, head: str, base: str, draft: bool = False) -> str:
+        """Open a pull request.
+
+        `draft` matters: the harness opens one as a checkpoint after the cheap
+        gates and before review, so work survives the worker that produced it.
+        An unreviewed candidate must never present itself as reviewed, so it
+        stays a draft until a verdict says otherwise.
+        """
+        args = [
+            "gh",
+            "pr",
+            "create",
+            "-R",
+            self.repo,
+            "--title",
+            title,
+            "--body",
+            body,
+            "--head",
+            head,
+            "--base",
+            base,
+        ]
+        if draft:
+            args.append("--draft")
+        return self._run(args).strip()
+
+    def mark_pr_ready(self, pr: str) -> None:
+        """Take a pull request out of draft. What approval buys."""
+        self._run(["gh", "pr", "ready", pr, "-R", self.repo])
+
+    def comment_pr(self, pr: str, body: str) -> None:
+        """Put the reviewer's verdict where a human will read it.
+
+        On the pull request rather than only in the event log: a rejected
+        draft that says why is a lead, one that says nothing is litter
+        somebody has to reconstruct.
+        """
+        self._run(["gh", "pr", "comment", pr, "-R", self.repo, "--body", body])
 
     def close(self, number: int, comment: str | None = None) -> None:
         args = ["gh", "issue", "close", str(number), "-R", self.repo]

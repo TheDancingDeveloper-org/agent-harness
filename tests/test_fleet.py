@@ -220,6 +220,20 @@ def test_an_item_that_keeps_killing_its_worker_is_given_up_on(tmp_path: Path) ->
     assert "gave up after" in (record.last_error or "")
 
 
+def test_giving_up_keeps_the_last_retry_class(tmp_path: Path) -> None:
+    q = WorkQueue(str(tmp_path / "w.sqlite"))
+    q.add_project(Project(project_id="p", name="P", max_attempts=1))
+    q.set_control(RUNNING, project_id="p")
+    q.add([rec("T1")], project_id="p")
+    assert q.claim("w", project_id="p") is not None
+    q.release("T1", PENDING, error="reviewer retries exhausted; last was transient", project_id="p")
+
+    assert q.claim("w", project_id="p") is None
+    record = q.get("T1", project_id="p")
+    assert record is not None and record.state == EXHAUSTED
+    assert "last was transient" in (record.last_error or "")
+
+
 def test_raising_the_limit_rescues_exhausted_work(tmp_path: Path) -> None:
     """Giving up must be recoverable without editing the database by hand."""
     clock = [1000.0]

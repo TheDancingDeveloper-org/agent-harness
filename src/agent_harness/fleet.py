@@ -106,8 +106,15 @@ class Fleet:
 
         with self._lock:
             existing = self._pools.get(project_id)
-            if existing is not None and existing.size:
-                return existing.size
+            if existing is not None:
+                if existing.draining:
+                    # The pool remains registered until its background join
+                    # completes. Starting a replacement in that small window
+                    # would let the old finalizer set the new pool's control
+                    # state to STOPPED underneath it.
+                    return existing.size
+                if existing.size:
+                    return existing.size
 
             pool = ProjectPool(project_id=project_id)
             # Set control BEFORE the threads exist. A worker that starts while

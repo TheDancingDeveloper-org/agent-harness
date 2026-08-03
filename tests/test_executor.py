@@ -26,8 +26,14 @@ from agent_harness.executor import (
     extract_diff,
     validate_diff,
 )
-from agent_harness.model_client import ModelClient, Response, RetryPolicy, Route
-from agent_harness.work import DONE, FAILED, WorkQueue, WorkRecord
+from agent_harness.model_client import (
+    ModelClient,
+    Response,
+    RetryExhausted,
+    RetryPolicy,
+    Route,
+)
+from agent_harness.work import DONE, FAILED, PENDING, WorkQueue, WorkRecord
 from conftest import make_queue
 
 DIFF = """\
@@ -124,6 +130,34 @@ def add_item(queue: WorkQueue, item_id: str = "T1") -> None:
             )
         ]
     )
+
+
+def test_transient_retry_exhaustion_returns_an_item_to_pending(repo: Path, tmp_path: Path) -> None:
+    executor, queue, _transport = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+    )
+
+    def exhausted(*_args: object, **_kwargs: object) -> None:
+        raise RetryExhausted(
+            "planner retries exhausted; last was transient",
+            role="planner",
+            kind=P.TRANSIENT,
+            endpoint="https://api.example",
+            model="model-planner",
+        )
+
+    executor.client.call = exhausted  # type: ignore[method-assign]
+    add_item(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None and outcome.state == PENDING
+    record = queue.get("T1")
+    assert record is not None and record.state == PENDING
+    assert record.attempts == 1
+    assert "transient" in (record.last_error or "")
 
 
 # ------------------------------------------------------------ diff handling

@@ -215,14 +215,28 @@ def _run(args: argparse.Namespace) -> int:
 
     # Seed the shared map from the command line, then read it back per call so
     # `PUT /api/roles` takes effect without a restart.
-    if not queue.get_setting(ROLE_MAP_KEY):
-        queue.set_setting(
-            ROLE_MAP_KEY,
-            {
-                name: {"model": model, "endpoint": args.endpoint, "provider": "claw-bay"}
-                for name, model in roles.items()
-            },
+    from_cli = {
+        name: {"model": model, "endpoint": args.endpoint, "provider": "claw-bay"}
+        for name, model in roles.items()
+    }
+    stored_map = queue.get_setting(ROLE_MAP_KEY)
+    if not stored_map:
+        queue.set_setting(ROLE_MAP_KEY, from_cli)
+    elif stored_map != from_cli:
+        # The stored map wins, because re-routing a role live is the point of
+        # storing it -- but silently ignoring flags the operator just typed is
+        # its own kind of lie. Say which one is in force.
+        differing = sorted(
+            name
+            for name in set(stored_map) | set(from_cli)
+            if stored_map.get(name, {}).get("model") != from_cli.get(name, {}).get("model")
         )
+        if differing:
+            print(
+                "note: a stored role map is in force and overrides the command line "
+                f"for: {', '.join(differing)}. "
+                "PUT /api/roles to change it, or delete the database to reseed."
+            )
 
     def live_routes() -> dict[str, Route]:
         stored = queue.get_setting(ROLE_MAP_KEY) or {}
@@ -242,6 +256,13 @@ def _run(args: argparse.Namespace) -> int:
         on_event=emit,
         routes_provider=live_routes,
     )
+
+    # Said out loud, every run. This was documented in three places and
+    # enforced in none, so a reviewer could be the same model as the
+    # implementer and nothing would mention it -- every review a model
+    # grading its own work, invisibly.
+    independent, why = client.reviewer_independence()
+    print(("reviewer: " if independent else "WARNING: ") + why)
 
     executor: Any
     if session_mode:

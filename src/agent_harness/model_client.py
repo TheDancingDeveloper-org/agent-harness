@@ -193,6 +193,38 @@ class ModelClient:
         self.run_id = run_id or uuid.uuid4().hex[:12]
         self._seq = itertools.count()
 
+    def reviewer_independence(self) -> tuple[bool, str]:
+        """Whether the reviewer is actually independent of the implementer.
+
+        Returns (independent, why). This was documented in three places and
+        enforced in none, which meant a reviewer could be the same model as
+        the implementer and nothing would say so -- some share of reviews
+        being a model grading its own work, invisibly.
+
+        Reported rather than refused: a single-model setup is a legitimate
+        thing to run deliberately, and blocking it would be the harness
+        overruling an operator about their own budget. What it must not be is
+        a surprise.
+        """
+        try:
+            implementer = self.roles["implementer"]
+            reviewer = self.roles["reviewer"]
+        except KeyError:
+            return (True, "no implementer/reviewer pair configured")
+        if reviewer.model == implementer.model:
+            return (
+                False,
+                f"reviewer and implementer are the same model ({reviewer.model}): "
+                "every review is a model grading its own work",
+            )
+        if reviewer.provider.name == implementer.provider.name:
+            return (
+                False,
+                f"reviewer and implementer share a provider ({reviewer.provider.name}): "
+                "reviews are independent of the model but not of the vendor",
+            )
+        return (True, f"{reviewer.model} reviews {implementer.model}")
+
     def route_for(self, role: str) -> Route:
         if self.routes_provider is not None:
             live = self.routes_provider()

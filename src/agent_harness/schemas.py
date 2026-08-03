@@ -137,6 +137,14 @@ class RoleRoute(BaseModel):
 
 
 class RoleMap(BaseModel):
+    reviewer_independent: bool = Field(
+        True,
+        description="False when the reviewer is the same model, or the same vendor, as "
+        "the implementer -- some share of reviews is then a model grading its own work. "
+        "Reported rather than refused: running one model is a legitimate deliberate "
+        "choice, but it must not be a surprise.",
+    )
+    reviewer_note: str = Field("", description="Why, in words.")
     roles: dict[str, RoleRoute] = Field(
         description="role -> where its calls go. Changing this takes effect on the next "
         "call: the call site names a ROLE, never a model, which is what makes the map "
@@ -397,6 +405,70 @@ class ReconcileResult(BaseModel):
         "rate it appears in.",
     )
     errors: list[str] = Field(default_factory=list)
+
+
+class InceptionStart(BaseModel):
+    project_id: str
+    overview: str = Field(
+        description="A paragraph describing what you want. Not a plan -- the point is "
+        "that you do not have to write one."
+    )
+
+
+class ScopeRequest(BaseModel):
+    feedback: str | None = Field(
+        None,
+        description="What was wrong with the previous proposal. Revises it rather than "
+        "starting over, so points you already settled are not re-argued.",
+    )
+
+
+class OpenQuestion(BaseModel):
+    id: str
+    question: str
+    severity: Literal["blocking", "deferrable"] = Field(
+        description="`blocking` means the answer changes what gets built -- choosing "
+        "wrong means work is done and thrown away. `deferrable` means a reasonable "
+        "default holds. Blocking on EVERY question is worse than no gate: one cosmetic "
+        "question stalls the project and people answer carelessly to get past it."
+    )
+    why_it_matters: str = ""
+    answer: str | None = None
+    deferred_reason: str | None = Field(
+        None,
+        description="Deferring is answering 'not now', which is different from unasked. "
+        "It survives approval and stays visible on the plan.",
+    )
+    resolved_by: str | None = None
+
+
+class ProposalModel(BaseModel):
+    revision: int
+    created_at: float
+    goal: str = ""
+    assumptions: list[str] = Field(default_factory=list)
+    non_goals: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    phases: list[dict[str, Any]] = Field(default_factory=list)
+    questions: list[OpenQuestion] = Field(default_factory=list)
+    feedback: str | None = None
+    item_count: int = 0
+    blocking_open: int = Field(
+        0, description="Unanswered blocking questions. Approval is refused while > 0."
+    )
+
+
+class ResolveQuestion(BaseModel):
+    answer: str | None = None
+    defer_reason: str | None = Field(
+        None, description="Required to defer. Silence never resolves a question."
+    )
+    severity: Literal["blocking", "deferrable"] | None = Field(
+        None,
+        description="Overrule the model, in either direction. It proposes severity so "
+        "you are not triaging a flat list, but it does not decide what matters.",
+    )
+    who: str = "operator"
 
 
 class Baseline(BaseModel):

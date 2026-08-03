@@ -21,6 +21,98 @@ already there, already running, and already behind the Work tab.
 
 ---
 
+## 0b. Or don't write a plan — describe it and argue
+
+If you do not already have a plan, scope one. Nothing external exists during
+any of this: no repository, no issues, no branches, no queue rows.
+
+```bash
+# A paragraph, not a plan.
+curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/inception \
+  -H 'content-type: application/json' -d '{
+    "project_id": "widgets",
+    "overview": "A service that reconciles widgets from the upstream feed and
+                 exposes them over a small read API. It has to cope with the
+                 feed being late or wrong."
+  }'
+
+# Propose a scope.
+curl -sH "Authorization: Bearer $TOKEN" -X POST \
+  localhost:8099/api/inception/widgets/scope -d '{}' -H 'content-type: application/json'
+```
+
+```json
+{"revision": 1, "item_count": 14, "blocking_open": 2,
+ "goal": "…", "non_goals": ["A user interface"], "risks": ["The feed is undocumented"],
+ "questions": [
+   {"id": "Q1", "severity": "blocking", "question": "Which database?",
+    "why_it_matters": "The schema is written against it"},
+   {"id": "Q2", "severity": "deferrable", "question": "Metric or imperial units?"}]}
+```
+
+**Argue with it.** Feedback revises the previous proposal rather than starting
+over, so points you already settled are not re-argued:
+
+```bash
+curl -sH "Authorization: Bearer $TOKEN" -X POST \
+  localhost:8099/api/inception/widgets/scope -H 'content-type: application/json' \
+  -d '{"feedback": "drop the importer, we already have one; and this needs to
+                    survive the feed being unavailable for a day"}'
+```
+
+**Resolve the questions.** Answer, defer with a reason, or overrule the
+severity — the model proposes it so you are not triaging a flat list, but you
+decide what matters:
+
+```bash
+# Answer a blocking one.
+curl -sH "Authorization: Bearer $TOKEN" -X POST \
+  localhost:8099/api/inception/widgets/questions/Q1 \
+  -H 'content-type: application/json' -d '{"answer": "Postgres 16"}'
+
+# Defer a cosmetic one. A reason is required.
+curl -sH "Authorization: Bearer $TOKEN" -X POST \
+  localhost:8099/api/inception/widgets/questions/Q2 \
+  -H 'content-type: application/json' \
+  -d '{"defer_reason": "cosmetic, revisit at P2", "who": "sprooty"}'
+
+# Or decide the model over-weighted one.
+curl -sH "Authorization: Bearer $TOKEN" -X POST \
+  localhost:8099/api/inception/widgets/questions/Q1 \
+  -H 'content-type: application/json' -d '{"severity": "deferrable"}'
+```
+
+| | |
+|---|---|
+| `blocking` | The answer changes what gets built. **Approval is refused** until it is answered. |
+| `deferrable` | Worth knowing; a reasonable default holds. Approval proceeds. |
+
+Blocking on *every* question would be worse than no gate: one cosmetic
+question stalls the project, and the predictable adaptation is answering
+carelessly to get past it — which turns a real signal into noise while looking
+like diligence.
+
+Deferring is answering "not now", which is different from unasked. It records
+who and when, and **survives approval** into the plan rather than being cleared
+at the gate. Silence never resolves anything.
+
+```bash
+# The gate. 409 while a blocking question is open.
+curl -sH "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/inception/widgets/approve
+
+# The result is a PLAN.md, not database rows.
+curl -sH "Authorization: Bearer $TOKEN" \
+  'localhost:8099/api/inception/widgets/plan?name=Widgets' | jq -r .markdown > PLAN.md
+```
+
+That last point is the load-bearing one: writing straight to the queue would
+fork the pipeline into a generated path and a hand-written path that diverge
+forever. A plan document goes through the machinery below unchanged — including
+the parser that reports what it could **not** read, so a proposal the harness
+cannot consume is caught before it creates a single issue.
+
+---
+
 ## 1. Write a plan
 
 Keep writing plans the way you already do. Three shapes are recognised, all of

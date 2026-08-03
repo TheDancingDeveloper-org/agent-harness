@@ -85,6 +85,9 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
   Diagrams: the whole system, what an agent actually is, the components, the
   life of a work item, failure classification, the audit layer, and project
   isolation.
+- **[`docs/INTERNALS.md`](docs/INTERNALS.md) — a layer deeper.** What actually happens
+  inside: backlog building, triage and claiming, model routing, the retry ladder,
+  completion, review, and merge/revert reconciliation.
 - **[`docs/USAGE.md`](docs/USAGE.md) — start here.** A worked example end to end, with
   real output: write a plan, sync it, execute it, resume it, drive it from the API, and
   read the failures.
@@ -185,6 +188,13 @@ What it does own is a **documented API**: every route typed, every field
 described, and the schema served next to it.
 
 ```
+# Inception — describe a project, argue, approve
+POST /api/inception                   a paragraph, not a plan
+POST /api/inception/{id}/scope        propose, or revise with feedback
+POST /api/inception/{id}/questions/{q} answer · defer · re-grade
+POST /api/inception/{id}/approve      refused while a BLOCKING question is open
+GET  /api/inception/{id}/plan         the proposal as a PLAN.md
+
 # Projects — separate streams, no co-mingling
 GET  /api/projects                    every project, counts and control, one call
 POST /api/projects                    register one; it starts STOPPED

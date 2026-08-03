@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .model_client import CapExhausted, ModelClient, RequestRefused
+from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
 from .work import (
     DEFAULT_PROJECT,
     DONE,
@@ -350,6 +350,15 @@ class Checks:
         return True, ""
 
 
+def is_disk_exhaustion(detail: str) -> bool:
+    """Whether a command reported an explicit filesystem-capacity failure."""
+    lowered = detail.lower()
+    return any(
+        signature in lowered
+        for signature in ("no space left on device", "disk quota exceeded", "enospc")
+    )
+
+
 PLAN_PROMPT = """\
 You are planning one unit of work. Do not write code yet.
 
@@ -489,6 +498,16 @@ class Executor:
                 project_id=self.project_id,
             )
             raise
+        except RetryExhausted as exc:
+            self._emit(record, "retry_exhausted", detail=str(exc), error_class=exc.kind)
+            self.queue.release(
+                record.item_id,
+                PENDING,
+                error=str(exc),
+                owner=self.owner,
+                project_id=self.project_id,
+            )
+            return Outcome(record.item_id, PENDING, reason=str(exc))
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
             self.queue.release(
@@ -625,7 +644,12 @@ class Executor:
         passed, failure = self.checks.run(self.repo)
         outcome.stages.append("checks")
         if not passed:
-            self._emit(record, "checks_failed", detail=failure[:2000])
+            self._emit(
+                record,
+                "checks_failed",
+                detail=failure[:2000],
+                error_class="disk_exhausted" if is_disk_exhaustion(failure) else None,
+            )
             outcome.reason = failure
             self._abandon_branch(branch)
             return outcome
@@ -750,6 +774,9 @@ class Executor:
             f"Closes #{record.issue}\n"
         )
         try:
+            existing = getattr(github, "find_open_pr", lambda _head: None)(branch)
+            if existing:
+                return str(existing)
             url = github.create_pr(
                 title=record.title,
                 body=body,
@@ -782,7 +809,13 @@ class Executor:
             return None
         return str(path)
 
-    def _emit(self, record: WorkRecord, stage: str, detail: str | None = None) -> None:
+    def _emit(
+        self,
+        record: WorkRecord,
+        stage: str,
+        detail: str | None = None,
+        error_class: str | None = None,
+    ) -> None:
         if self.on_event is None:
             return
         # Telemetry is never load-bearing: a broken sink must not fail an
@@ -796,7 +829,9 @@ class Executor:
                     "item_id": record.item_id,
                     "issue": record.issue,
                     "outcome": stage,
+                    "error_class": error_class,
                     "detail": detail,
+                    "project_id": self.project_id,
                 }
             )
 

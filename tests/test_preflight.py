@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from agent_harness.preflight import preflight_project
+from agent_harness.preflight import clean_checks_probe, preflight_project
 from agent_harness.work import Project, WorkQueue
 
 
@@ -47,6 +47,7 @@ def run(p: Project, **kw: Any):  # type: ignore[no-untyped-def]
     kw.setdefault("reviewer_route", {"model": "m"})
     kw.setdefault("git_probe", ok_git)
     kw.setdefault("github_probe", ok_gh)
+    kw.setdefault("disk_probe", lambda path, floor: (True, f"100 GiB free at {path}"))
     return preflight_project(p, **kw)
 
 
@@ -86,6 +87,19 @@ def test_a_missing_checkout_blocks() -> None:
     assert "not a git repository" in report.summary()
 
 
+def test_disk_space_is_reported_and_a_configured_floor_blocks() -> None:
+    report = run(
+        project(min_free_disk_gb=50),
+        disk_probe=lambda path, floor: (
+            False,
+            f"12.0 GiB free on volume holding {path}; configured floor {floor:.1f} GiB",
+        ),
+    )
+    assert not report.ready
+    disk = next(c for c in report.checks if c.name == "disk space")
+    assert "12.0 GiB free" in disk.detail and "50.0 GiB" in disk.detail
+
+
 def test_an_unconfigured_project_names_everything_missing() -> None:
     """One 409 that lists all of it, not a game of whack-a-mole."""
     report = run(project(repo=None, work_dir=None), has_fleet=False, reviewer_route=None)
@@ -107,6 +121,43 @@ def test_a_dependent_reviewer_warns_rather_than_blocks() -> None:
     report = run(project(), reviewer_independent=(False, "same model"))
     assert report.ready
     assert any(c.name == "reviewer independence" for c in report.warnings)
+
+
+def test_the_opt_in_clean_base_probe_blocks_on_the_first_failed_check(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    import subprocess
+
+    subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "t"], check=True)
+    (repo / "base.txt").write_text("base\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+    p = project(work_dir=str(repo), checks=["false", "true"])
+
+    report = run(p, checks_probe=clean_checks_probe(p))
+
+    assert not report.ready
+    base = next(c for c in report.checks if c.name == "base checks")
+    assert "`false` failed on base branch" in base.detail
+
+
+def test_project_registration_rejects_shell_check_syntax(client: Any) -> None:
+    response = client.post(
+        "/api/projects",
+        headers=hdr(),
+        json={"project_id": "bad", "name": "bad", "checks": ["npm test && npm build"]},
+    )
+    assert response.status_code == 422
+    assert "argv, not shell" in response.text
+
+
+def test_start_can_opt_into_the_same_blocking_base_check(client: Any) -> None:
+    client.queue.add_project(project(checks=["false"]))
+    response = client.post("/api/projects/p/start?check_base=true", headers=hdr())
+    assert response.status_code == 409
+    assert "base checks" in response.json()["detail"]
 
 
 # --------------------------------------------------------------- the API

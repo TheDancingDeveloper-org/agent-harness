@@ -493,6 +493,36 @@ class AuditStore:
             return 0
         return int(self._connect().execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0])
 
+    def rate_limits_by_class(self, since: float | None = None) -> dict[str, int]:
+        """Classified live failures for the errors projection."""
+        if self.degraded:
+            return {}
+        sql = "SELECT error_class, COUNT(*) AS n FROM events WHERE error_class IS NOT NULL"
+        params: list[Any] = []
+        if since is not None:
+            sql += " AND ts >= ?"
+            params.append(since)
+        sql += " GROUP BY error_class ORDER BY n DESC"
+        return {r["error_class"]: r["n"] for r in self._connect().execute(sql, params)}
+
+    def group_counts(
+        self, field: str, since: float | None = None, rate_limits_only: bool = True
+    ) -> list[dict[str, Any]]:
+        """Counts for a bounded set of audit columns used by the API."""
+        if self.degraded:
+            return []
+        if field not in {"worker", "endpoint", "role", "model", "source"}:
+            raise ValueError(f"refusing to group by unindexed/unknown column {field!r}")
+        sql = f"SELECT {field} AS key, error_class, COUNT(*) AS n FROM events WHERE 1=1"
+        params: list[Any] = []
+        if rate_limits_only:
+            sql += " AND error_class IN ('rpm', 'window_cap', 'terminal_cap')"
+        if since is not None:
+            sql += " AND ts >= ?"
+            params.append(since)
+        sql += f" GROUP BY {field}, error_class ORDER BY n DESC"
+        return [dict(r) for r in self._connect().execute(sql, params)]
+
     def cost(
         self,
         since: float | None = None,

@@ -70,11 +70,14 @@ def test_every_blocker_the_document_tells_you_to_fix_can_actually_occur() -> Non
     assert documented, "the remedy table stopped being extractable"
 
     everything_missing = preflight_project(
-        Project(project_id="p", name="P", repo=None, work_dir=None, checks=[]),
+        Project(project_id="p", name="P", repo=None, work_dir="/w", checks=[]),
         has_fleet=False,
         reviewer_route=None,
         reviewer_independent=(False, "same vendor"),
         session_host=lambda: (False, "refused"),
+        checks_probe=lambda: (False, "base check failed"),
+        disk_probe=lambda path, floor: (False, "disk is full"),
+        git_probe=lambda path: (False, "missing checkout"),
     )
     real = {c.name for c in everything_missing.checks}
     assert documented <= real, f"documented blockers that cannot occur: {sorted(documented - real)}"
@@ -90,6 +93,7 @@ def test_the_warnings_named_as_non_blocking_really_are() -> None:
         reviewer_independent=(False, "same vendor"),
         git_probe=lambda path: (True, path),
         github_probe=lambda repo: (True, repo),
+        disk_probe=lambda path, floor: (True, "100 GiB free"),
     )
     assert report.ready, "a start would be refused for reasons the document calls warnings"
     assert {"checks", "reviewer independence"} <= {c.name for c in report.warnings}

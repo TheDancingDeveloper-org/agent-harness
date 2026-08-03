@@ -144,6 +144,29 @@ def test_stopping_leaves_the_other_projects_running(queue: WorkQueue) -> None:
         fleet.stop_all()
 
 
+def test_requesting_a_stop_returns_while_an_item_is_still_draining(queue: WorkQueue) -> None:
+    entered = threading.Event()
+    finish = threading.Event()
+
+    class SlowExecutor:
+        def serve(self, *, poll_seconds: float, stop: threading.Event) -> None:
+            entered.set()
+            finish.wait(5)
+
+    fleet = Fleet(queue, lambda _pid: SlowExecutor(), poll_seconds=0.01)
+    fleet.start("a")
+    assert entered.wait(1)
+
+    started = time.monotonic()
+    fleet.request_stop("a", reason="deploying")
+
+    assert time.monotonic() - started < 0.5
+    assert queue.control(project_id="a") == ("draining", "deploying")
+    assert fleet.running().get("a", 0) >= 1
+    finish.set()
+    assert wait_for(lambda: queue.control(project_id="a")[0] == STOPPED)
+
+
 def test_a_worker_that_dies_does_not_take_the_fleet_with_it(queue: WorkQueue) -> None:
     """Its claim is a lease, so whatever it held comes back on its own."""
 

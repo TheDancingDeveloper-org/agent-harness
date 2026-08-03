@@ -84,6 +84,7 @@ from .schemas import (
     RoleRoute,
     ScopeRequest,
     SetFleetControl,
+    StopProjectRequest,
     Summary,
     WaitingItem,
     WorkItem,
@@ -94,6 +95,7 @@ from .work import (
     BLOCKED,
     CLAIMED,
     DONE,
+    DRAINING,
     FAILED,
     PENDING,
     STOPPED,
@@ -873,6 +875,8 @@ def create_api(
                 plan_path=spec.plan_path,
                 roles={k: v.model_dump() for k, v in spec.roles.items()} if spec.roles else None,
                 max_workers=spec.max_workers,
+                max_attempts=spec.max_attempts,
+                min_free_disk_gb=spec.min_free_disk_gb,
             )
         )
         return _project_summary(queue, spec.project_id, app.state.fleet)
@@ -906,6 +910,11 @@ def create_api(
             "checks exist because a fleet that cannot finish anything is "
             "indistinguishable from one that can, until the bill arrives.",
         ),
+        check_base: bool = Query(
+            False,
+            description="Run configured checks on a clean base-branch worktree before "
+            "starting. Expensive and therefore opt-in.",
+        ),
         _: None = Depends(require_token),
     ) -> ProjectSummary:
         """The only thing that lets a project claim work.
@@ -920,7 +929,7 @@ def create_api(
         if project is None:
             raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
 
-        report = _preflight(queue, project)
+        report = _preflight(queue, project, check_base=check_base)
         if not report.ready and not force:
             # Refuses rather than setting a flag nobody acts on. Previously
             # this branch set RUNNING with no fleet attached -- the comment
@@ -952,6 +961,11 @@ def create_api(
     )
     def project_preflight(
         project_id: str = PathParam(description="Project id."),
+        check_base: bool = Query(
+            False,
+            description="Run configured checks on a clean base-branch worktree. "
+            "This is opt-in because it can be expensive.",
+        ),
         _: None = Depends(require_token),
     ) -> PreflightResult:
         """Check before starting, and see exactly what is missing.
@@ -964,7 +978,7 @@ def create_api(
         project = queue.get_project(project_id)
         if project is None:
             raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
-        report = _preflight(queue, project)
+        report = _preflight(queue, project, check_base=check_base)
         return PreflightResult(
             project_id=report.project_id,
             ready=report.ready,
@@ -984,6 +998,11 @@ def create_api(
             description="Limit to one project. Omit for all of them — each project costs "
             "one read of GitHub's permissions for its repo, so a large deployment "
             "polling this should name the project it cares about.",
+        ),
+        check_base: bool = Query(
+            False,
+            description="Run configured checks on clean base worktrees. "
+            "Expensive and therefore opt-in.",
         ),
         _: None = Depends(require_token),
     ) -> ExecutionReadiness:
@@ -1053,7 +1072,7 @@ def create_api(
 
         reports = []
         for project in projects:
-            report = _preflight(queue, project, session_host=probe)
+            report = _preflight(queue, project, session_host=probe, check_base=check_base)
             reports.append(
                 ProjectReadiness(
                     project_id=project.project_id,
@@ -1080,7 +1099,7 @@ def create_api(
         response_model=ProjectSummary,
     )
     def stop_project(
-        request: SetFleetControl | None = None,
+        request: StopProjectRequest | None = None,
         project_id: str = PathParam(description="Project id."),
         _: None = Depends(require_token),
     ) -> ProjectSummary:
@@ -1091,9 +1110,14 @@ def create_api(
         reason = request.reason if request else None
         fleet_ = app.state.fleet
         if fleet_ is not None:
-            # Joins in-flight work rather than killing it: an agent stopped
-            # mid-item loses the context that makes it resumable.
-            fleet_.stop(project_id, reason=reason)
+            # The HTTP request only initiates the drain. The fleet joins in
+            # the background: an agent stopped mid-item loses its context,
+            # while a request held open for that join lies to any proxy whose
+            # timeout expires first.
+            if hasattr(fleet_, "request_stop"):
+                fleet_.request_stop(project_id, reason=reason)
+            else:  # compatibility for injected minimal fleet implementations
+                fleet_.stop(project_id, reason=reason)
         else:
             queue.set_control(STOPPED, reason=reason, project_id=project_id)
         return _project_summary(queue, project_id, app.state.fleet)
@@ -1271,7 +1295,8 @@ def create_api(
         429s, how many meant *slow down* and how many meant *your budget is
         gone*?"""
         since = since_for(window)
-        by_class = store.rate_limits_by_class(since)
+        error_store = app.state.audit if app.state.audit is not None else store
+        by_class = error_store.rate_limits_by_class(since)
         classified = {c: by_class.get(c, 0) for c in RATE_LIMIT_CLASSES}
         return RateLimits(
             window=window,
@@ -1279,9 +1304,9 @@ def create_api(
             meaning={c: MEANING[c] for c in RATE_LIMIT_CLASSES},
             unclassified=by_class.get(UNCLASSIFIED, 0),
             total=sum(classified.values()),
-            by_worker=store.group_counts("worker", since),
-            by_endpoint=store.group_counts("endpoint", since),
-            by_role=store.group_counts("role", since),
+            by_worker=error_store.group_counts("worker", since),
+            by_endpoint=error_store.group_counts("endpoint", since),
+            by_role=error_store.group_counts("role", since),
         )
 
     @app.get(
@@ -1375,13 +1400,19 @@ def _audit_event_fields(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _preflight(queue: WorkQueue, project: Project, session_host: Any | None = None) -> Any:
+def _preflight(
+    queue: WorkQueue,
+    project: Project,
+    session_host: Any | None = None,
+    *,
+    check_base: bool = False,
+) -> Any:
     """Build a preflight report for a project, using whatever is configured.
 
     `session_host` is a *probe*, not the host: readiness over many projects
     would otherwise ask the same host the same question once per project.
     """
-    from .preflight import preflight_project, session_host_probe
+    from .preflight import clean_checks_probe, preflight_project, session_host_probe
 
     stored = queue.get_setting("role_map") or {}
     client = _APP_STATE.get("model_client")
@@ -1392,6 +1423,7 @@ def _preflight(queue: WorkQueue, project: Project, session_host: Any | None = No
         reviewer_route=(project.roles or stored).get("reviewer"),
         reviewer_independent=client.reviewer_independence() if client is not None else None,
         session_host=session_host or (session_host_probe(host) if host is not None else None),
+        checks_probe=clean_checks_probe(project) if check_base else None,
         **(_APP_STATE.get("probes") or {}),
     )
 
@@ -1412,6 +1444,8 @@ def _project_spec(project: Project) -> ProjectSpec:
         plan_path=project.plan_path,
         roles={k: RoleRoute(**v) for k, v in project.roles.items()} if project.roles else None,
         max_workers=project.max_workers,
+        max_attempts=project.max_attempts,
+        min_free_disk_gb=project.min_free_disk_gb,
     )
 
 
@@ -1427,6 +1461,11 @@ def _project_summary(queue: WorkQueue, project_id: str, fleet: Any | None = None
         previous_state=previous,
         stale=len(queue.stale(project_id=project_id)),
         workers=(fleet.running().get(project_id, 0) if fleet is not None else 0),
+        draining_items=(
+            [item.item_id for item in queue.items(project_id=project_id) if item.state == CLAIMED]
+            if state == DRAINING
+            else []
+        ),
         **_worker_health(fleet, project_id),
     )
 

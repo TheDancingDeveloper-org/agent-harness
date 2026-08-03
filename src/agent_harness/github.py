@@ -243,6 +243,33 @@ class GitHub:
             args.append("--draft")
         return self._run(args).strip()
 
+    def find_open_pr(self, head: str) -> str | None:
+        """Return the existing open pull request for a head branch, if any.
+
+        A draft PR is the durable pre-review checkpoint. Retrying its item
+        must adopt that checkpoint instead of attempting to create a duplicate
+        and then forgetting the original URL.
+        """
+        out = self._run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "-R",
+                self.repo,
+                "--state",
+                "open",
+                "--head",
+                head,
+                "--limit",
+                "1",
+                "--json",
+                "url",
+            ]
+        )
+        rows = json.loads(out or "[]")
+        return str(rows[0]["url"]) if rows else None
+
     def mark_pr_ready(self, pr: str) -> None:
         """Take a pull request out of draft. What approval buys."""
         self._run(["gh", "pr", "ready", pr, "-R", self.repo])

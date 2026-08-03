@@ -69,6 +69,36 @@ class RequestRefused(Exception):
         self.kind = kind
 
 
+class RetryExhausted(RuntimeError):
+    """The retryable attempt budget was spent without a successful response.
+
+    This is deliberately distinct from a generic ``RuntimeError``: callers
+    can hand the item back for a later item-level attempt while still treating
+    refusals and spend caps as terminal conditions.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        role: str,
+        kind: str | None,
+        endpoint: str,
+        model: str,
+        last: Classification | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.role = role
+        self.kind = kind
+        self.endpoint = endpoint
+        self.model = model
+        self.last = last
+
+
+# A descriptive alias for callers that want to spell out the common case.
+TransientExhausted = RetryExhausted
+
+
 @dataclass
 class RetryPolicy:
     """How this worker — and only this worker — backs off."""
@@ -275,8 +305,8 @@ class ModelClient:
         """Call `role`'s model. Returns the successful response.
 
         Raises `CapExhausted` if the endpoint is out of budget, `RequestRefused`
-        if the provider refused and retrying cannot help, or `RuntimeError`
-        once the attempt ladder is spent.
+        if the provider refused and retrying cannot help, or `RetryExhausted`
+        once the retryable attempt ladder is spent.
         """
         route = self.route_for(role)
         merged = {**route.options, **options}
@@ -344,9 +374,17 @@ class ModelClient:
                     kind=verdict.kind,
                 )
 
-        raise RuntimeError(
+        message = (
             f"{role}: {self.policy.max_attempts} attempts exhausted against "
             f"{route.model} via {route.endpoint}" + (f"; last was {last.kind}" if last else "")
+        )
+        raise RetryExhausted(
+            message,
+            role=role,
+            kind=last.kind if last else None,
+            endpoint=route.endpoint,
+            model=route.model,
+            last=last,
         )
 
     def _emit(

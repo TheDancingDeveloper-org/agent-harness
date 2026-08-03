@@ -36,11 +36,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .executor import APPROVED, REJECTED, Checks, Outcome, run_git
-from .model_client import CapExhausted, ModelClient, RequestRefused
+from .executor import APPROVED, REJECTED, Checks, Outcome, is_disk_exhaustion, run_git
+from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
 from .reaper import DEFAULT_MAX_AGE_SECONDS, ReapReport, reap_abandoned_sessions
 from .session_host import Session, SessionHost
 from .work import (
+    CLAIMED,
     DEFAULT_PROJECT,
     DONE,
     FAILED,
@@ -204,26 +205,58 @@ class SessionExecutor:
         except CapExhausted as exc:
             self._emit(record, "budget_exhausted", detail=str(exc))
             self._orphan_session(record, f"budget exhausted: {exc}")
+            partial = self._partial_for(record)
             self.queue.release(
                 record.item_id,
                 PENDING,
                 error=f"budget: {exc}",
+                branch=partial.branch if partial else None,
+                pr_url=partial.pr_url if partial else None,
                 owner=self.owner,
                 project_id=self.project_id,
             )
             raise
+        except RetryExhausted as exc:
+            # The call-level ladder is spent, not the item's life. Returning
+            # it to pending lets WorkQueue's per-project max_attempts retire a
+            # persistently bad item instead of making one provider wobble a
+            # permanent failure.
+            self._emit(
+                record,
+                "retry_exhausted",
+                detail=str(exc),
+                error_class=exc.kind,
+            )
+            self._orphan_session(record, str(exc))
+            partial = self._partial_for(record)
+            self.queue.release(
+                record.item_id,
+                PENDING,
+                error=str(exc),
+                branch=partial.branch if partial else None,
+                pr_url=partial.pr_url if partial else None,
+                owner=self.owner,
+                project_id=self.project_id,
+            )
+            if partial is not None:
+                partial.state = PENDING
+                partial.reason = str(exc)
+                return partial
+            return Outcome(record.item_id, PENDING, reason=str(exc))
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
             self._orphan_session(record, str(exc))
+            partial = self._partial_for(record)
             self.queue.release(
                 record.item_id,
                 FAILED,
                 error=str(exc),
+                branch=partial.branch if partial else None,
+                pr_url=partial.pr_url if partial else None,
                 owner=self.owner,
                 project_id=self.project_id,
             )
-            partial = self._partial
-            if partial is not None and partial.item_id == record.item_id:
+            if partial is not None:
                 partial.state = FAILED
                 partial.reason = str(exc)
                 return partial
@@ -238,6 +271,12 @@ class SessionExecutor:
             project_id=self.project_id,
         )
         return outcome
+
+    def _partial_for(self, record: WorkRecord) -> Outcome | None:
+        partial = self._partial
+        if partial is not None and partial.item_id == record.item_id:
+            return partial
+        return None
 
     def _orphan_session(self, record: WorkRecord, reason: str) -> None:
         """Own the session of an item that failed unexpectedly.
@@ -447,7 +486,13 @@ class SessionExecutor:
             outcome.stages.append("checks")
             if not passed:
                 outcome.reason = failure
-                self._emit(record, "checks_failed", detail=failure[:2000], session_id=session.id)
+                self._emit(
+                    record,
+                    "checks_failed",
+                    detail=failure[:2000],
+                    session_id=session.id,
+                    error_class="disk_exhausted" if is_disk_exhaustion(failure) else None,
+                )
                 return outcome
             self._emit(record, "checks_passed", session_id=session.id)
             self._keepalive(record)
@@ -505,7 +550,14 @@ class SessionExecutor:
             # The worktree goes whatever happened. Its branch survives, so a
             # rejected attempt is still inspectable; leaving the tree behind
             # would just accumulate copies of the repo.
+            worktree_bytes = self._worktree_bytes(tree)
             self._remove_worktree(tree, keep_branch=outcome.state == DONE)
+            self._emit(
+                record,
+                "worktree_removed",
+                detail=f"reclaimed {worktree_bytes} bytes",
+                worktree_bytes=worktree_bytes,
+            )
 
     # ------------------------------------------------------------- helpers
 
@@ -583,6 +635,57 @@ class SessionExecutor:
                 shutil.rmtree(tree)
         run_git(self.repo, "worktree", "prune", check=False)
 
+    @staticmethod
+    def _worktree_bytes(tree: Path) -> int:
+        """Allocated bytes, not logical size, without following symlinks."""
+        total = 0
+        try:
+            for path in tree.rglob("*"):
+                with contextlib.suppress(OSError):
+                    stat = path.lstat()
+                    total += getattr(stat, "st_blocks", 0) * 512
+        except OSError:
+            return total
+        return total
+
+    def reap_orphaned_worktrees(self) -> list[str]:
+        """Remove this repo's worktrees whose items are no longer claimed."""
+        removed: list[str] = []
+        listing = run_git(self.repo, "worktree", "list", "--porcelain", check=False)
+        for line in listing.splitlines():
+            if not line.startswith("worktree "):
+                continue
+            tree = Path(line.removeprefix("worktree "))
+            if tree.parent != self.worktrees:
+                continue
+            record = self.queue.get(tree.name, project_id=self.project_id)
+            if record is None:
+                record = next(
+                    (
+                        item
+                        for item in self.queue.items(project_id=self.project_id)
+                        if item.item_id.lower() == tree.name.lower()
+                    ),
+                    None,
+                )
+            if record is not None and record.state == CLAIMED and record.lease_until >= self.now():
+                # A live claim owns its worktree. An expired claim does not:
+                # the next claimant can build a fresh tree from the durable
+                # branch, while retaining this one only leaks the crashed
+                # worker's build output.
+                continue
+            size = self._worktree_bytes(tree)
+            self._remove_worktree(tree, keep_branch=True)
+            removed.append(tree.name)
+            if record is not None:
+                self._emit(
+                    record,
+                    "orphaned_worktree_reaped",
+                    detail=f"reclaimed {size} bytes",
+                    worktree_bytes=size,
+                )
+        return removed
+
     def _commit(
         self, tree: Path, record: WorkRecord, verdict: str = "", checkpoint: bool = False
     ) -> None:
@@ -644,6 +747,9 @@ class SessionExecutor:
             f"Closes #{record.issue}\n"
         )
         try:
+            existing = getattr(github, "find_open_pr", lambda _head: None)(branch)
+            if existing:
+                return str(existing)
             url = github.create_pr(
                 title=record.title, body=body, head=branch, base=base, draft=draft
             )
@@ -659,6 +765,8 @@ class SessionExecutor:
         detail: str | None = None,
         session_id: str | None = None,
         url: str | None = None,
+        error_class: str | None = None,
+        **data: Any,
     ) -> None:
         if self.on_event is None:
             return
@@ -672,10 +780,13 @@ class SessionExecutor:
                     "item_id": record.item_id,
                     "issue": record.issue,
                     "outcome": stage,
+                    "error_class": error_class,
                     "detail": detail,
                     # The deep link. This is what lets the UI put a human into
                     # the terminal that is asking them a question.
                     "session_id": session_id,
                     "session_url": url,
+                    "project_id": self.project_id,
+                    **data,
                 }
             )

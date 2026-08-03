@@ -58,6 +58,7 @@ KNOWN_OTHER_CLASSES = (
     "connection",
     "deadline",
     "empty_reply",
+    "disk_exhausted",
 )
 
 

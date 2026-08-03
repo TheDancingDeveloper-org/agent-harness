@@ -208,3 +208,14 @@ def test_dry_run_does_not_create_metadata_either() -> None:
     report = sync(GitHub("o/r", gh), [item(labels=["a:b"])], dry_run=True)
     assert report.labels_created == ["a:b"]  # reported...
     assert not [c for c in gh.calls if c[1:3] == ["label", "create"]]  # ...not made
+
+
+def test_an_open_pr_can_be_adopted_by_its_head_branch() -> None:
+    calls: list[list[str]] = []
+
+    def run(args: Sequence[str], stdin: str | None = None) -> str:
+        calls.append(list(args))
+        return json.dumps([{"url": "https://github.com/o/r/pull/9"}])
+
+    assert GitHub("o/r", run).find_open_pr("harness/t1") == "https://github.com/o/r/pull/9"
+    assert "--head" in calls[0] and "harness/t1" in calls[0]

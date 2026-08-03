@@ -76,7 +76,11 @@ def ok_gh(repo: str) -> tuple[bool, str]:
 #: Injected, so no test shells out to `gh` or reads a real checkout. Preflight
 #: takes every probe for exactly this reason; the API layer now passes them
 #: through instead of hardcoding a subprocess behind an HTTP route.
-OFFLINE = {"git_probe": ok_git, "github_probe": ok_gh}
+OFFLINE = {
+    "git_probe": ok_git,
+    "github_probe": ok_gh,
+    "disk_probe": lambda path, floor: (True, f"100 GiB free at {path}"),
+}
 
 
 def project(**kw: Any) -> Project:

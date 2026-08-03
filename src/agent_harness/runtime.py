@@ -42,6 +42,19 @@ class NotExecutable(RuntimeError):
     """
 
 
+SHELL_METACHARACTERS = ("&&", "||", "|", ";", ">")
+
+
+def validate_check_command(command: str) -> None:
+    """Reject shell syntax before it can be silently passed as argv."""
+    if any(token in command for token in SHELL_METACHARACTERS):
+        raise ValueError(
+            f"check commands are argv, not shell; {command!r} contains shell metacharacters"
+        )
+    if not shlex.split(command):
+        raise ValueError("check commands must not be empty")
+
+
 def session_executor_factory(
     queue: WorkQueue,
     *,
@@ -70,7 +83,7 @@ def session_executor_factory(
                 f"project {project_id!r} has no work_dir, so there is nothing to "
                 "make a worktree from"
             )
-        return SessionExecutor(
+        executor = SessionExecutor(
             queue,
             host,
             Path(project.work_dir),
@@ -84,6 +97,8 @@ def session_executor_factory(
             push=push,
             project_id=project_id,
         )
+        executor.reap_orphaned_worktrees()
+        return executor
 
     return build
 
@@ -94,4 +109,8 @@ def _checks_for(project: Project) -> Checks:
     `shlex`, never `shell=True`: these strings come from an API request, and
     a check command is not a place to accept arbitrary shell.
     """
-    return Checks(commands=[shlex.split(command) for command in (project.checks or [])])
+    commands = []
+    for command in project.checks or []:
+        validate_check_command(command)
+        commands.append(shlex.split(command))
+    return Checks(commands=commands)

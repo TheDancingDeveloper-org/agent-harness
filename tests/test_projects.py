@@ -243,12 +243,14 @@ def test_a_project_round_trips_its_configuration(queue: WorkQueue) -> None:
             base_branch="feat/mariadb-baseline",
             checks=["cargo test", "cargo clippy"],
             max_workers=3,
+            min_free_disk_gb=48,
         )
     )
     loaded = queue.get_project("ngms")
     assert loaded is not None
     assert loaded.repo == "TheDancingDeveloper-org/NGMS"
     assert loaded.checks == ["cargo test", "cargo clippy"]
+    assert loaded.min_free_disk_gb == 48
     assert loaded.base_branch == "feat/mariadb-baseline"
     assert loaded.max_workers == 3
 
@@ -356,12 +358,39 @@ def test_stopping_one_project_leaves_the_others_running(client) -> None:  # type
         client.post(f"/api/projects/{pid}/start?force=true", headers=hdr())
         client.queue.add([rec("T1")], project_id=pid)
 
-    client.post(
-        "/api/projects/a/stop", headers=hdr(), json={"state": "stopped", "reason": "deploying"}
-    )
+    client.post("/api/projects/a/stop", headers=hdr(), json={"reason": "deploying"})
 
     assert client.queue.claim("w", project_id="a") is None
     assert client.queue.claim("w", project_id="b") is not None
+
+
+@pytest.mark.parametrize(
+    ("send_body", "payload"),
+    [(False, None), (True, None), (True, {}), (True, {"reason": "deploying"})],
+)
+def test_stop_accepts_every_optional_body_shape(  # type: ignore[no-untyped-def]
+    client, send_body: bool, payload: object
+) -> None:
+    client.post("/api/projects", headers=hdr(), json={"project_id": "a", "name": "A"})
+    kwargs = {"json": payload} if send_body else {}
+
+    response = client.post("/api/projects/a/stop", headers=hdr(), **kwargs)
+
+    assert response.status_code == 200
+    if payload == {"reason": "deploying"}:
+        assert response.json()["control"]["reason"] == "deploying"
+
+
+def test_stop_rejects_the_fleet_control_shape(client) -> None:  # type: ignore[no-untyped-def]
+    client.post("/api/projects", headers=hdr(), json={"project_id": "a", "name": "A"})
+
+    response = client.post(
+        "/api/projects/a/stop",
+        headers=hdr(),
+        json={"state": "stopped", "reason": "old contract"},
+    )
+
+    assert response.status_code == 422
 
 
 def test_starting_an_unknown_project_is_a_404_not_a_silent_no_op(client) -> None:  # type: ignore[no-untyped-def]

@@ -17,15 +17,19 @@ logs.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import secrets
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 from .ingest import ingest
 from .sources import Source, harness_source
 from .store import EventStore
+
+log = logging.getLogger(__name__)
 
 
 def resolve_sources(args: argparse.Namespace) -> list[Source]:
@@ -631,7 +635,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     maintenance.start()
 
-    fleet, reviewer_client, host = _fleet_for_serve(args, queue_for_serve)
+    fleet, reviewer_client, host = _fleet_for_serve(args, queue_for_serve, audit=audit)
     if fleet is None:
         print(
             "monitoring only: no --session-host, so no worker pool is attached and "
@@ -667,7 +671,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _fleet_for_serve(
-    args: argparse.Namespace, queue: Any
+    args: argparse.Namespace, queue: Any, *, audit: Any | None = None
 ) -> tuple[Any | None, Any | None, Any | None]:
     """The supervised half of `serve`: a fleet the API's start action can use.
 
@@ -687,6 +691,7 @@ def _fleet_for_serve(
 
     from . import providers
     from .api import ROLE_MAP_KEY
+    from .events import KINDS, MODEL_CALL, Event
     from .fleet import Fleet
     from .github import GitHub
     from .model_client import ModelClient, Route
@@ -734,18 +739,66 @@ def _fleet_for_serve(
             "project — set one with --reviewer/--endpoint or PUT /api/roles.",
             file=sys.stderr,
         )
-    reviewer_client = ModelClient(
-        roles=routes,
-        transport=_http_transport(api_key),
-        routes_provider=live_routes,
-    )
-
     events_path = args.events or Path(args.db).with_name("events.jsonl")
     events_path.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(event: dict[str, Any]) -> None:
-        with events_path.open("a") as handle:
-            handle.write(_json.dumps(event) + "\n")
+        try:
+            with events_path.open("a") as handle:
+                handle.write(_json.dumps(event) + "\n")
+        except OSError:
+            # A broken convenience stream must not prevent the durable audit
+            # sink below from recording the event, or stop the work itself.
+            log.warning("events: could not append %s", events_path, exc_info=True)
+        if audit is None:
+            return
+        # The JSONL stream remains tail-able, but the audit database is the
+        # durable system of record used by every projection. Keep the sink
+        # translation here, at the deployment boundary, so the core remains
+        # generic about producers and their payloads.
+        kind = event.get("kind")
+        if kind not in KINDS:
+            kind = MODEL_CALL
+        known = {
+            "ts",
+            "kind",
+            "source",
+            "worker",
+            "role",
+            "model",
+            "endpoint",
+            "outcome",
+            "error_class",
+            "latency_s",
+        }
+        data = {k: v for k, v in event.items() if k not in known}
+        try:
+            audit.append(
+                [
+                    Event(
+                        ts=float(event.get("ts", time.time())),
+                        kind=kind,
+                        source="serve",
+                        worker=event.get("worker"),
+                        role=event.get("role"),
+                        model=event.get("model"),
+                        endpoint=event.get("endpoint"),
+                        outcome=event.get("outcome"),
+                        error_class=event.get("error_class"),
+                        latency_s=event.get("latency_s"),
+                        data=data,
+                    )
+                ]
+            )
+        except Exception:  # telemetry is never load-bearing
+            log.warning("audit: could not append live event", exc_info=True)
+
+    reviewer_client = ModelClient(
+        roles=routes,
+        transport=_http_transport(api_key),
+        on_event=emit,
+        routes_provider=live_routes,
+    )
 
     host = HttpSessionHost(args.session_host, token=host_token)
     factory = session_executor_factory(

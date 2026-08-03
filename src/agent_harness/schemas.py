@@ -14,11 +14,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 # --------------------------------------------------------------------- work
 
-WorkState = Literal["pending", "claimed", "done", "failed", "blocked"]
+WorkState = Literal["pending", "claimed", "done", "failed", "blocked", "exhausted"]
 
 
 class LatestEvent(BaseModel):
@@ -207,7 +207,11 @@ class ProjectSpec(BaseModel):
     work_dir: str | None = Field(None, description="Checkout the worktrees branch from.")
     base_branch: str = "main"
     checks: list[str] = Field(
-        default_factory=list, description="Commands run before the reviewer, cheapest first."
+        default_factory=list,
+        description=(
+            "Commands run before the reviewer, cheapest first. Each entry is an argv command "
+            "(shlex-split, no shell); shell operators such as &&, ||, |, ; and > are rejected."
+        ),
     )
     plan_path: str | None = None
     roles: dict[str, RoleRoute] | None = Field(
@@ -216,8 +220,30 @@ class ProjectSpec(BaseModel):
     max_workers: int = Field(
         1,
         description="Concurrency budget. Its purpose is that one project cannot "
-        "starve another, so it is per project rather than per fleet.",
+        "starve another, so it is per project rather than per fleet. Each worker owns "
+        "a worktree and its build output, so raising this also multiplies peak disk use.",
     )
+    min_free_disk_gb: float = Field(
+        0.0,
+        ge=0,
+        description="Minimum free GiB required on the volume holding work_dir. Zero "
+        "reports disk space without imposing a floor; a positive value blocks preflight.",
+    )
+    max_attempts: int = Field(
+        5,
+        ge=0,
+        description="Item-level attempts before repeatedly retryable work becomes exhausted. "
+        "Zero disables automatic retirement.",
+    )
+
+    @field_validator("checks")
+    @classmethod
+    def check_commands_are_argv(cls, commands: list[str]) -> list[str]:
+        from .runtime import validate_check_command
+
+        for command in commands:
+            validate_check_command(command)
+        return commands
 
 
 class ProjectSummary(BaseModel):
@@ -248,6 +274,11 @@ class ProjectSummary(BaseModel):
     )
     last_worker_error: str | None = Field(
         None, description="Why the most recent one died, and what it was holding."
+    )
+    draining_items: list[str] = Field(
+        default_factory=list,
+        description="Claimed items a draining project is waiting for. Empty outside a drain, "
+        "or once every in-flight item has reached its boundary.",
     )
 
 
@@ -342,6 +373,20 @@ class ExecutionReadiness(BaseModel):
     )
     projects: list[ProjectReadiness] = Field(
         default_factory=list, description="Per project, because readiness is per project."
+    )
+
+
+class StopProjectRequest(BaseModel):
+    """Optional context for stopping one project.
+
+    The target state is deliberately absent: the route already says stop.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(
+        None,
+        description="Why the project is being stopped. Omit when there is no operator note.",
     )
 
 

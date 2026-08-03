@@ -16,8 +16,8 @@ from typing import Any
 import pytest
 
 from agent_harness import providers as P
-from agent_harness.executor import Checks
-from agent_harness.model_client import ModelClient, Response, Route
+from agent_harness.executor import Checks, is_disk_exhaustion
+from agent_harness.model_client import ModelClient, Response, RetryExhausted, Route
 from agent_harness.session_executor import AgentSpec, SessionExecutor
 from agent_harness.session_host import IDLE, RUNNING, WAITING, Session
 from agent_harness.work import DONE, FAILED, WorkQueue, WorkRecord
@@ -177,6 +177,55 @@ def test_the_agent_runs_as_a_session_and_the_work_lands(repo: Path, tmp_path: Pa
     assert outcome.state == DONE, outcome.reason
     assert outcome.session_id == "sess-1"
     assert "multiply" in git(repo, "show", "harness/w1:calc.py")
+
+
+def test_completed_and_failed_items_remove_their_worktrees(repo: Path, tmp_path: Path) -> None:
+    for exit_code, item_id in ((0, "W1"), (1, "W2")):
+        executor, queue = build(repo, tmp_path, FakeDevEnv(agent=add_multiply, exit_code=exit_code))
+        add_item(queue, item_id=item_id)
+        executor.run_once()
+        assert not (tmp_path / "trees" / item_id).exists()
+
+
+def test_orphaned_worktrees_are_reaped_before_a_worker_starts(repo: Path, tmp_path: Path) -> None:
+    executor, queue = build(repo, tmp_path, FakeDevEnv())
+    add_item(queue, item_id="W1")
+    tree = tmp_path / "trees" / "W1"
+    tree.parent.mkdir()
+    git(repo, "worktree", "add", "-b", "harness/w1", str(tree), "main")
+    assert tree.exists()
+
+    assert executor.reap_orphaned_worktrees() == ["W1"]
+    assert not tree.exists()
+
+
+def test_an_expired_claim_does_not_protect_an_orphaned_worktree(repo: Path, tmp_path: Path) -> None:
+    clock = [1000.0]
+    queue = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=10.0, now=lambda: clock[0])
+    executor = SessionExecutor(
+        queue,
+        FakeDevEnv(),
+        repo,
+        reviewer=reviewer("APPROVED\nfine"),
+        worktrees=tmp_path / "trees",
+        push=False,
+        now=lambda: clock[0],
+    )
+    add_item(queue)
+    queue.set_control("running")
+    assert queue.claim("dead-worker") is not None
+    tree = tmp_path / "trees" / "W1"
+    tree.parent.mkdir()
+    git(repo, "worktree", "add", "-b", "harness/w1", str(tree), "main")
+    clock[0] += 11.0
+
+    assert executor.reap_orphaned_worktrees() == ["W1"]
+    assert not tree.exists()
+
+
+def test_out_of_disk_check_output_has_a_distinct_class() -> None:
+    assert is_disk_exhaustion("link failed: No space left on device (os error 28)")
+    assert not is_disk_exhaustion("assertion failed: expected 2")
 
 
 def test_the_agent_is_launched_with_the_prompt_file_in_its_own_worktree(
@@ -496,6 +545,42 @@ def test_an_approved_item_is_marked_ready_and_a_rejected_one_is_not(
         # why is a lead; one that says nothing is litter.
         assert github.comments, "the verdict was never recorded on the PR"
         assert bool(github.ready) is expect_ready
+
+
+def test_a_reviewer_failure_after_the_draft_keeps_its_checkpoint(
+    repo: Path, tmp_path: Path
+) -> None:
+    class RecordingGitHub:
+        def find_open_pr(self, head: str) -> None:
+            return None
+
+        def create_pr(self, **_kw: object) -> str:
+            return "https://github.com/o/r/pull/42"
+
+    executor, queue = build(
+        repo, tmp_path, FakeDevEnv(agent=add_multiply), github=RecordingGitHub()
+    )
+
+    def exhausted(*_args: object, **_kwargs: object) -> None:
+        raise RetryExhausted(
+            "reviewer retries exhausted; last was transient",
+            role="reviewer",
+            kind=P.TRANSIENT,
+            endpoint="https://e",
+            model="m",
+        )
+
+    executor.reviewer.call = exhausted  # type: ignore[method-assign,union-attr]
+    add_item(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None and outcome.state == "pending"
+    row = queue.get("W1")
+    assert row is not None
+    assert row.pr_url == "https://github.com/o/r/pull/42"
+    assert row.branch == "harness/w1"
+    assert row.attempts == 1
 
 
 # ------------------------------------------ a worker that dies mid-session

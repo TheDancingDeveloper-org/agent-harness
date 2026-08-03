@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -284,8 +285,36 @@ def client(tmp_path: Path):  # type: ignore[no-untyped-def]
 
     q = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
     store = EventStore(tmp_path / "e.sqlite")
-    with TestClient(create_api(store, queue=q, token="tok")) as c:  # noqa: S106
-        c.queue = q
+
+    class ReadyFleet:
+        """Stands in for a worker pool.
+
+        `start` refuses without one on purpose: marking a project RUNNING with
+        no pool attached is the false-running state the preflight gate exists
+        to prevent. These tests are about control semantics rather than
+        workers, so the pool is a stand-in and readiness is covered in
+        test_preflight.py.
+        """
+
+        def __init__(self) -> None:
+            self.started: list[str] = []
+
+        def start(self, project_id: str) -> int:
+            self.started.append(project_id)
+            q.set_control(RUNNING, project_id=project_id)
+            return 1
+
+        def stop(self, project_id: str, *, reason: str | None = None) -> None:
+            if project_id in self.started:
+                self.started.remove(project_id)
+            q.set_control(STOPPED, reason=reason, project_id=project_id)
+
+        def running(self) -> dict[str, int]:
+            return {p: 1 for p in self.started}
+
+    with TestClient(create_api(store, queue=q, token="tok", fleet=ReadyFleet())) as c:  # noqa: S106
+        holder: Any = c
+        holder.queue = q
         yield c
 
 
@@ -312,7 +341,10 @@ def test_start_is_the_only_thing_that_lets_a_project_claim(client) -> None:  # t
 
     assert client.queue.claim("w", project_id="a") is None
 
-    response = client.post("/api/projects/a/start", headers=hdr())
+    # force: these fixtures have no checkout, repo or reviewer, and this test
+    # is about control semantics rather than readiness. Preflight is covered
+    # in test_preflight.py.
+    response = client.post("/api/projects/a/start?force=true", headers=hdr())
     assert response.status_code == 200
     assert response.json()["control"]["state"] == RUNNING
     assert client.queue.claim("w", project_id="a") is not None
@@ -321,7 +353,7 @@ def test_start_is_the_only_thing_that_lets_a_project_claim(client) -> None:  # t
 def test_stopping_one_project_leaves_the_others_running(client) -> None:  # type: ignore[no-untyped-def]
     for pid in ("a", "b"):
         client.post("/api/projects", headers=hdr(), json={"project_id": pid, "name": pid})
-        client.post(f"/api/projects/{pid}/start", headers=hdr())
+        client.post(f"/api/projects/{pid}/start?force=true", headers=hdr())
         client.queue.add([rec("T1")], project_id=pid)
 
     client.post(
@@ -334,7 +366,7 @@ def test_stopping_one_project_leaves_the_others_running(client) -> None:  # type
 
 def test_starting_an_unknown_project_is_a_404_not_a_silent_no_op(client) -> None:  # type: ignore[no-untyped-def]
     """A typo in a project id must not look like success."""
-    assert client.post("/api/projects/nope/start", headers=hdr()).status_code == 404
+    assert client.post("/api/projects/nope/start?force=true", headers=hdr()).status_code == 404
 
 
 def test_the_overview_is_one_call(client) -> None:  # type: ignore[no-untyped-def]
@@ -353,7 +385,7 @@ def test_the_overview_says_what_a_project_was_doing_before_it_stopped(client) ->
     """'Was running' and 'was drained for a deploy' must stay distinguishable,
     or the restart destroys the operator's intent."""
     client.post("/api/projects", headers=hdr(), json={"project_id": "a", "name": "A"})
-    client.post("/api/projects/a/start", headers=hdr())
+    client.post("/api/projects/a/start?force=true", headers=hdr())
     client.queue.stop_all_on_boot(reason="process started")
 
     payload = client.get("/api/projects/a", headers=hdr()).json()

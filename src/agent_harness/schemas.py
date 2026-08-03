@@ -198,6 +198,31 @@ class ProjectSummary(BaseModel):
     )
 
 
+class PreflightCheck(BaseModel):
+    name: str
+    ok: bool
+    detail: str
+    blocking: bool = Field(
+        description="Blocking means the definition of done is unreachable, not merely "
+        "that quality suffers. Only blocking checks refuse a start."
+    )
+
+
+class PreflightResult(BaseModel):
+    """Whether a project can actually finish an item.
+
+    A queue resumed without a reviewer, a checkout or write access claims work,
+    spends money and fails everything -- while reporting `running`. The
+    expensive part is that a nonproductive fleet looks exactly like a
+    productive one until the bill arrives.
+    """
+
+    project_id: str
+    ready: bool
+    summary: str
+    checks: list[PreflightCheck] = Field(default_factory=list)
+
+
 class ProjectList(BaseModel):
     projects: list[ProjectSummary]
 

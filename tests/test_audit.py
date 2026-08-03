@@ -12,6 +12,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -275,7 +276,8 @@ def client(tmp_path: Path):  # type: ignore[no-untyped-def]
     audit = AuditStore(tmp_path / "audit.sqlite")
     store = EventStore(tmp_path / "harness.sqlite")
     with TestClient(create_api(store, token="tok", audit=audit)) as c:  # noqa: S106
-        c.audit = audit
+        holder: Any = c
+        holder.audit = audit
         yield c
 
 

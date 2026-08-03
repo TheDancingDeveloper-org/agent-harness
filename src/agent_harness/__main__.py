@@ -142,6 +142,7 @@ def _run(args: argparse.Namespace) -> int:
     import shlex
 
     from . import providers
+    from .checkpoint import GitBundleCheckpointStore
     from .executor import Checks, Executor
     from .github import GitHub
     from .model_client import ModelClient, Route
@@ -295,6 +296,9 @@ def _run(args: argparse.Namespace) -> int:
     print(("reviewer: " if independent else "WARNING: ") + why)
 
     executor: Any
+    checkpoint_store = (
+        GitBundleCheckpointStore(args.checkpoint_dir) if args.checkpoint_dir else None
+    )
     if session_mode:
         from .session_executor import AgentSpec, SessionExecutor
         from .session_host import HttpSessionHost
@@ -312,6 +316,7 @@ def _run(args: argparse.Namespace) -> int:
             ui_base_url=args.session_host,
             on_event=emit,
             push=not args.no_push,
+            checkpoint_store=checkpoint_store,
         )
     else:
         executor = Executor(
@@ -324,6 +329,7 @@ def _run(args: argparse.Namespace) -> int:
             on_event=emit,
             push=not args.no_push,
             artifacts=artifacts,
+            checkpoint_store=checkpoint_store,
         )
     # Typing `agent-harness run` IS the human deciding to start this project.
     # A project starts `stopped` so a restart never resumes on its own, but
@@ -426,6 +432,13 @@ def main(argv: list[str] | None = None) -> int:
         help="where to keep a patch that could not be applied, for inspection "
         "or replay. Defaults to an `artifacts` directory beside --events; "
         "pass an empty string to keep nothing.",
+    )
+    p_run.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        metavar="DIR",
+        help="durable internal storage for candidates that passed cheap gates. "
+        "Omit to retain them as private refs in the checkout; this never publishes them.",
     )
     p_run.add_argument(
         "--check",
@@ -536,6 +549,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="PATH",
         help="where the fleet appends its event stream. Defaults to events.jsonl beside --db.",
+    )
+    p_serve.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        metavar="DIR",
+        help="durable internal storage for pre-review Git bundles. Omit to use "
+        "private refs in each project's checkout.",
     )
     p_serve.add_argument(
         "--no-push", action="store_true", help="commit locally but do not push or open PRs"
@@ -687,6 +707,7 @@ def _fleet_for_serve(
 
     from . import providers
     from .api import ROLE_MAP_KEY
+    from .checkpoint import GitBundleCheckpointStore
     from .fleet import Fleet
     from .github import GitHub
     from .model_client import ModelClient, Route
@@ -757,6 +778,9 @@ def _fleet_for_serve(
         ui_base_url=args.session_host,
         on_event=emit,
         push=not args.no_push,
+        checkpoint_store=(
+            GitBundleCheckpointStore(args.checkpoint_dir) if args.checkpoint_dir else None
+        ),
     )
     print(f"fleet: `{args.agent}` as sessions on {args.session_host}")
     print(f"events: {events_path}")

@@ -11,7 +11,7 @@ that; you get a result or you get nothing.
       -> write the brief to a prompt file
       -> ask the session host to run `claude -p @prompt.md` (or codex, or …)
       -> WAIT, surfacing `waiting-for-input` rather than treating it as done
-      -> checks -> review -> commit -> push -> PR
+      -> checks -> private checkpoint -> review -> push -> PR
 
 Two things this design gets from the host for free, which are the reason for
 it: the session id deep-links to a terminal tab in the UI the user already
@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .checkpoint import CheckpointStore, GitRefCheckpointStore
 from .executor import APPROVED, REJECTED, Checks, Outcome, run_git
 from .model_client import CapExhausted, ModelClient, RequestRefused
 from .reaper import DEFAULT_MAX_AGE_SECONDS, ReapReport, reap_abandoned_sessions
@@ -163,6 +164,7 @@ class SessionExecutor:
         push: bool = True,
         now: Callable[[], float] = time.time,
         project_id: str = DEFAULT_PROJECT,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         self.queue = queue
         # Which project's queue this worker serves. Without it a worker in a
@@ -183,6 +185,7 @@ class SessionExecutor:
         self.on_event = on_event
         self.push = push
         self.now = now
+        self.checkpoint_store = checkpoint_store or GitRefCheckpointStore(now=now)
         self.owner = worker_identity()
         self._partial: Outcome | None = None
 
@@ -361,7 +364,7 @@ class SessionExecutor:
         # Kept on the instance so an unexpected failure can still report how
         # far the item got. Fabricating a fresh Outcome in the handler threw
         # that away, which mattered exactly when it was most wanted: after the
-        # draft-PR checkpoint, "it died during review with the work already
+        # checkpoint, "it died during review with the work already
         # committed" and "it died before touching anything" look identical
         # from an empty stage list.
         self._partial = outcome
@@ -452,31 +455,39 @@ class SessionExecutor:
             self._emit(record, "checks_passed", session_id=session.id)
             self._keepalive(record)
 
+            # The reviewer must see the actual candidate. Once committed,
+            # `git diff HEAD` is empty, so capture it before checkpointing.
+            review_diff = run_git(tree, "diff", "HEAD")
+
             # Checkpoint BEFORE the expensive gate.
             #
             # Review is the slowest and most failure-prone step, and it used
             # to happen before anything was committed -- so a worker killed
             # during it lost work that had already passed every cheap gate.
-            # Committing and pushing here means the candidate survives the
-            # worker: a draft PR is still there on restart, with its evidence,
-            # for a human or a later attempt.
+            # Committing and saving to the checkpoint store here means the
+            # candidate survives the worker without GitHub being involved:
+            # durability is an internal concern, publication is not.
             #
-            # Draft, not ready: an unreviewed candidate must never present
-            # itself as reviewed. Marking it ready is what approval buys.
+            # The commit message says it is unreviewed, because at this point
+            # it is. Replacing that message is what approval buys.
             self._commit(tree, record, checkpoint=True)
             outcome.stages.append("commit")
-            if self.push:
-                run_git(tree, "push", "-u", "origin", branch)
-                outcome.stages.append("push")
-            if self.github is not None and record.issue:
-                outcome.pr_url = self._open_pr(record, branch, base, draft=True)
-                if outcome.pr_url:
-                    outcome.stages.append("draft-pr")
-                    self._emit(
-                        record, "draft_pr_opened", detail=outcome.pr_url, session_id=session.id
-                    )
+            checkpoint = self.checkpoint_store.save(
+                tree,
+                project_id=self.project_id,
+                item_id=record.item_id,
+                attempt=record.attempts,
+            )
+            outcome.stages.append("checkpoint")
+            self._emit(
+                record,
+                "checkpointed",
+                detail=checkpoint.location,
+                session_id=session.id,
+            )
+            self._keepalive(record)
 
-            verdict_text = self._review(record, tree, passed, failure)
+            verdict_text = self._review(record, review_diff, passed, failure)
             outcome.stages.append("review")
             verdict = APPROVED if verdict_text.strip().upper().startswith("APPROVED") else REJECTED
             outcome.verdict = verdict
@@ -484,18 +495,20 @@ class SessionExecutor:
                 record, f"review_{verdict}", detail=verdict_text[:2000], session_id=session.id
             )
 
-            # The verdict goes on the PR either way. A rejected draft that
-            # says why is a lead; a rejected draft that says nothing is
-            # litter someone has to reconstruct.
-            if outcome.pr_url and self.github is not None:
-                self._record_verdict(record, outcome.pr_url, verdict, verdict_text)
-
             if verdict != APPROVED:
                 outcome.reason = f"review rejected: {verdict_text.strip()[:500]}"
                 return outcome
 
-            if outcome.pr_url and self.github is not None:
-                self._mark_ready(record, outcome.pr_url)
+            # Approval is the publication boundary. Replace the unreviewed
+            # message locally; the private checkpoint still names the exact
+            # pre-review commit for crash recovery and audit.
+            self._commit(tree, record, verdict=verdict_text, amend=True)
+            if self.push:
+                run_git(tree, "push", "-u", "origin", branch)
+                outcome.stages.append("push")
+            if self.github is not None and record.issue:
+                outcome.pr_url = self._open_pr(record, branch, base, verdict=verdict_text)
+            if outcome.pr_url:
                 outcome.stages.append("pr")
 
             outcome.state = DONE
@@ -530,13 +543,12 @@ class SessionExecutor:
             url=session.tab_url(self.ui_base_url) if self.ui_base_url else None,
         )
 
-    def _review(self, record: WorkRecord, tree: Path, passed: bool, failure: str) -> str:
+    def _review(self, record: WorkRecord, diff: str, passed: bool, failure: str) -> str:
         if self.reviewer is None:
             # Checked before the diff is computed: there is no point building
             # a diff nobody will read. Says so rather than silently treating
             # unreviewed work as approved.
             return "REJECTED\nNo reviewer is configured, so nothing has reviewed this."
-        diff = run_git(tree, "diff", "HEAD")
         prompt = REVIEW_PROMPT.format(
             brief=record.brief,
             diff=diff[:20000],
@@ -584,7 +596,12 @@ class SessionExecutor:
         run_git(self.repo, "worktree", "prune", check=False)
 
     def _commit(
-        self, tree: Path, record: WorkRecord, verdict: str = "", checkpoint: bool = False
+        self,
+        tree: Path,
+        record: WorkRecord,
+        verdict: str = "",
+        checkpoint: bool = False,
+        amend: bool = False,
     ) -> None:
         run_git(tree, "add", "-A")
         trailer = (
@@ -599,53 +616,31 @@ class SessionExecutor:
             f"{trailer}\n"
             f"harness-item: {record.item_id}\n"
         )
-        run_git(tree, "commit", "-m", message)
+        arguments = ["commit"]
+        if amend:
+            arguments.append("--amend")
+        run_git(tree, *arguments, "-m", message)
 
-    def _record_verdict(
-        self, record: WorkRecord, pr_url: str, verdict: str, verdict_text: str
-    ) -> None:
-        """Put the reviewer's verdict on the pull request.
+    def _open_pr(self, record: WorkRecord, branch: str, base: str, *, verdict: str) -> str | None:
+        """Publish an approved candidate. Only approval reaches this.
 
-        Best-effort: a comment that fails must not lose work that succeeded.
+        There is no draft stage any more: durability was the reason for one,
+        and the checkpoint store now provides it internally. A pull request
+        here always means a reviewer approved the work, so the verdict is
+        part of the proposal rather than a comment added afterwards.
         """
-        if self.github is None:
-            return
-        body = f"**Review: {verdict.upper()}**\n\n{verdict_text.strip()[:5000]}"
-        try:
-            self.github.comment_pr(pr_url, body)
-        except Exception as exc:  # noqa: BLE001
-            self._emit(record, "pr_comment_failed", detail=str(exc))
-
-    def _mark_ready(self, record: WorkRecord, pr_url: str) -> None:
-        """Take the pull request out of draft. This is what approval buys.
-
-        If it fails the work is not lost -- the draft is still there, with the
-        approving verdict on it, and a human can press the button.
-        """
-        if self.github is None:
-            return
-        try:
-            self.github.mark_pr_ready(pr_url)
-        except Exception as exc:  # noqa: BLE001
-            self._emit(record, "pr_ready_failed", detail=str(exc))
-
-    def _open_pr(
-        self, record: WorkRecord, branch: str, base: str, *, draft: bool = True
-    ) -> str | None:
         github = self.github
         if github is None:  # pragma: no cover - guarded by the caller
             return None
         body = (
             f"{record.brief.strip()[:3000]}\n\n"
             "---\n\n"
-            "**Not yet reviewed.** Opened as a draft after the cheap gates passed, "
-            "so the work survives the worker that produced it. The reviewer's "
-            "verdict is posted as a comment, and approval takes it out of draft.\n\n"
+            f"**Reviewer verdict**\n\n{verdict.strip()[:3000]}\n\n"
             f"Closes #{record.issue}\n"
         )
         try:
             url = github.create_pr(
-                title=record.title, body=body, head=branch, base=base, draft=draft
+                title=record.title, body=body, head=branch, base=base, draft=False
             )
             return str(url) if url else None
         except Exception as exc:  # noqa: BLE001 - a PR failure must not lose the work

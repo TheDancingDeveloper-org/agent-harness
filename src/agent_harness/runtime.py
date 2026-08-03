@@ -24,6 +24,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .checkpoint import CheckpointStore
 from .executor import Checks
 from .session_executor import AgentSpec, SessionExecutor
 from .work import Project, WorkQueue
@@ -52,6 +53,7 @@ def session_executor_factory(
     ui_base_url: str = "",
     on_event: Callable[[dict[str, Any]], None] | None = None,
     push: bool = True,
+    checkpoint_store: CheckpointStore | None = None,
 ) -> ExecutorFactory:
     """An executor factory backed by hosted terminal sessions.
 
@@ -83,6 +85,7 @@ def session_executor_factory(
             on_event=on_event,
             push=push,
             project_id=project_id,
+            checkpoint_store=checkpoint_store,
         )
 
     return build

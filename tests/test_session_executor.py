@@ -448,15 +448,16 @@ def test_the_checkpoint_commit_never_claims_to_be_reviewed(repo: Path, tmp_path:
     add_item(queue)
     executor.run_once()
 
-    log = git(repo, "log", "--format=%B", "harness/w1")
-    checkpoint = [m for m in log.split("harness-item:") if "Reviewed: not yet" in m]
-    assert checkpoint, "no checkpoint commit was made"
+    ref = git(repo, "for-each-ref", "--format=%(refname)", "refs/agent-harness").strip()
+    assert ref, "no private checkpoint ref was made"
+    assert "Reviewed: not yet" in git(repo, "log", "-1", "--format=%B", ref)
+    # The published branch carries the approving verdict, while the internal
+    # checkpoint remains the exact pre-review candidate.
+    assert "APPROVED" in git(repo, "log", "-1", "--format=%B", "harness/w1")
 
 
-def test_an_approved_item_is_marked_ready_and_a_rejected_one_is_not(
-    repo: Path, tmp_path: Path
-) -> None:
-    """Approval is what takes a draft out of draft. Nothing else does."""
+def test_only_an_approved_item_is_published(repo: Path, tmp_path: Path) -> None:
+    """Approval is the publication boundary. Rejection stays internal."""
 
     class RecordingGitHub:
         def __init__(self) -> None:
@@ -490,12 +491,10 @@ def test_an_approved_item_is_marked_ready_and_a_rejected_one_is_not(
         add_item(queue)
         executor.run_once()
 
-        assert github.created, f"no PR opened for {verdict!r}"
-        assert github.created[0]["draft"] is True, "the checkpoint PR was not a draft"
-        # The verdict is on the PR either way -- a rejected draft that says
-        # why is a lead; one that says nothing is litter.
-        assert github.comments, "the verdict was never recorded on the PR"
-        assert bool(github.ready) is expect_ready
+        assert bool(github.created) is expect_ready
+        if expect_ready:
+            assert github.created[0]["draft"] is False
+        assert github.ready == []
 
 
 # ------------------------------------------ a worker that dies mid-session

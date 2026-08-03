@@ -316,7 +316,7 @@ def test_a_failing_check_reports_the_output_not_just_failure(repo: Path, tmp_pat
     assert "the-actual-error" in outcome.reason
 
 
-def test_a_rejected_review_does_not_commit(repo: Path, tmp_path: Path) -> None:
+def test_a_rejected_review_keeps_only_a_private_checkpoint(repo: Path, tmp_path: Path) -> None:
     executor, queue, _ = build(
         repo,
         tmp_path,
@@ -331,6 +331,10 @@ def test_a_rejected_review_does_not_commit(repo: Path, tmp_path: Path) -> None:
     assert outcome.state == FAILED
     assert "wrong string" in outcome.reason
     assert git(repo, "branch", "--list", "harness/t1").strip() == ""
+    checkpoints = git(repo, "for-each-ref", "--format=%(refname)", "refs/agent-harness")
+    assert "checkpoints" in checkpoints
+    commit = git(repo, "rev-parse", checkpoints.strip()).strip()
+    assert "Reviewed: not yet" in git(repo, "log", "-1", "--format=%B", commit)
 
 
 def test_a_failed_attempt_leaves_the_tree_clean(repo: Path, tmp_path: Path) -> None:

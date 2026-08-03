@@ -219,10 +219,10 @@ class GitHub:
     def create_pr(self, *, title: str, body: str, head: str, base: str, draft: bool = False) -> str:
         """Open a pull request.
 
-        `draft` matters: the harness opens one as a checkpoint after the cheap
-        gates and before review, so work survives the worker that produced it.
-        An unreviewed candidate must never present itself as reviewed, so it
-        stays a draft until a verdict says otherwise.
+        The harness only calls this for a candidate a reviewer has approved:
+        durability before the expensive gate belongs to the checkpoint store,
+        not to GitHub. `draft` remains available to a deployment that wants
+        its own publication policy, and defaults to a real proposal.
         """
         args = [
             "gh",
@@ -244,15 +244,19 @@ class GitHub:
         return self._run(args).strip()
 
     def mark_pr_ready(self, pr: str) -> None:
-        """Take a pull request out of draft. What approval buys."""
+        """Take a pull request out of draft.
+
+        Unused by the executor now that publication follows approval, and
+        kept for a deployment whose publication adapter still opens drafts.
+        """
         self._run(["gh", "pr", "ready", pr, "-R", self.repo])
 
     def comment_pr(self, pr: str, body: str) -> None:
-        """Put the reviewer's verdict where a human will read it.
+        """Add a comment where a human will read it.
 
-        On the pull request rather than only in the event log: a rejected
-        draft that says why is a lead, one that says nothing is litter
-        somebody has to reconstruct.
+        On the pull request rather than only in the event log: a verdict that
+        says why is a lead, one that says nothing is litter somebody has to
+        reconstruct.
         """
         self._run(["gh", "pr", "comment", pr, "-R", self.repo, "--body", body])
 

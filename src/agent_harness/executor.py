@@ -7,17 +7,16 @@ anyone opening a log.
 
 The ordering is the part worth defending:
 
-    plan -> implement -> apply -> CHEAP CHECK -> review -> push -> PR
+    plan -> implement -> apply -> CHEAP CHECK -> CHECKPOINT -> review -> push -> PR
 
 **Cheap checks run before the expensive reviewer call.** A patch that does
 not apply, or does not compile, cannot be worth a review; spending a model
 call to be told so is paying the most expensive gate to catch what the
 cheapest one already caught.
 
-**The branch is pushed before the PR is opened, and both happen after the
-review passes.** Work that has survived every gate is durable before
-anything else can lose it — a killed worker after that point loses nothing,
-because the branch is on the remote.
+**A private checkpoint is taken before review.** The expensive gate cannot
+destroy work that passed the cheap ones, but neither a remote branch nor a
+pull request is created until review passes.
 
 **Nothing is ever committed to the default branch.** Every item produces a
 branch and a proposal, so a wrong answer is reviewable rather than landed.
@@ -40,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .checkpoint import CheckpointStore, GitRefCheckpointStore
 from .model_client import CapExhausted, ModelClient, RequestRefused
 from .work import (
     DEFAULT_PROJECT,
@@ -436,6 +436,7 @@ class Executor:
         context_provider: Callable[[WorkRecord], str] | None = None,
         artifacts: Path | None = None,
         project_id: str = DEFAULT_PROJECT,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         self.queue = queue
         # Which project's queue this worker serves. Items are keyed by
@@ -459,6 +460,10 @@ class Executor:
         # gone the moment the item fails, and the only way to see what the
         # model actually produced is to pay for it again.
         self.artifacts = Path(artifacts) if artifacts is not None else None
+        # A local private ref is the safe zero-configuration default. A
+        # deployment that needs a separate failure domain supplies a bundle
+        # store rooted on independently backed-up storage.
+        self.checkpoint_store = checkpoint_store or GitRefCheckpointStore(now=now)
         self.owner = worker_identity()
 
     # ------------------------------------------------------------- driving
@@ -632,7 +637,21 @@ class Executor:
         self._emit(record, "checks_passed")
         self._keepalive(record)
 
-        # 6. Review, by a different role -- and ideally a different vendor,
+        # 6. Checkpoint BEFORE the expensive gate. The commit is explicitly
+        # unreviewed and stays on a private ref even if the candidate branch
+        # is later abandoned. No external publisher is involved.
+        self._commit(record, verdict=None)
+        checkpoint = self.checkpoint_store.save(
+            self.repo,
+            project_id=self.project_id,
+            item_id=record.item_id,
+            attempt=record.attempts,
+        )
+        outcome.stages.extend(("commit", "checkpoint"))
+        self._emit(record, "checkpointed", detail=checkpoint.location)
+        self._keepalive(record)
+
+        # 7. Review, by a different role -- and ideally a different vendor,
         #    which `ModelClient.reviewer_independence()` now reports on rather
         #    than leaving to a comment nobody reads.
         verdict_text = self._call(
@@ -653,15 +672,14 @@ class Executor:
             self._abandon_branch(branch)
             return outcome
 
-        # 7. Commit, and make it durable before anything else can lose it.
-        self._commit(record, verdict_text)
-        outcome.stages.append("commit")
+        # Record the gate result in the candidate commit before publication.
+        self._commit(record, verdict_text, amend=True)
         if self.push:
             run_git(self.repo, "push", "-u", "origin", branch)
             outcome.stages.append("push")
             self._emit(record, "pushed", detail=branch)
 
-        # 8. Propose. Never land: a wrong answer must stay reviewable.
+        # 8. Publish. Never land: a wrong answer must stay reviewable.
         if self.github is not None and record.issue:
             outcome.pr_url = self._open_pr(record, branch, verdict_text, base)
             outcome.stages.append("pr")
@@ -730,15 +748,23 @@ class Executor:
         run_git(self.repo, "checkout", self.base_branch, check=False)
         run_git(self.repo, "branch", "-D", branch, check=False)
 
-    def _commit(self, record: WorkRecord, verdict: str) -> None:
+    def _commit(self, record: WorkRecord, verdict: str | None, *, amend: bool = False) -> None:
         run_git(self.repo, "add", "-A")
+        review = (
+            "Reviewed: not yet — durable checkpoint before the expensive gate."
+            if verdict is None
+            else f"Reviewer verdict:\n{verdict.strip()[:1500]}"
+        )
         message = (
             f"{record.title}\n\n"
             f"{record.brief.strip()[:1500]}\n\n"
-            f"Reviewer verdict:\n{verdict.strip()[:1500]}\n\n"
+            f"{review}\n\n"
             f"harness-item: {record.item_id}\n"
         )
-        run_git(self.repo, "commit", "-m", message)
+        arguments = ["commit"]
+        if amend:
+            arguments.append("--amend")
+        run_git(self.repo, *arguments, "-m", message)
 
     def _open_pr(self, record: WorkRecord, branch: str, verdict: str, base: str) -> str | None:
         github = self.github

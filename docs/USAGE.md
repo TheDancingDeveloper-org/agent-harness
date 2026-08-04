@@ -21,6 +21,169 @@ already there, already running, and already behind the Work tab.
 
 ---
 
+## 0a. The first run: no credentials, no network, no model
+
+Before configuring anything, watch an item go all the way through.
+
+```console
+$ agent-harness init --demo --into ./demo
+built the demo in /home/you/demo
+  repository   /home/you/demo/repo   (a real git repo, one commit)
+  plan         /home/you/demo/PLAN.md   (one item)
+  queue        /home/you/demo/queue.sqlite   (project `demo`, stopped)
+
+Nothing is running and nothing external has happened: no network call,
+no credential read, no GitHub anything. Run it with:
+
+  agent-harness --db /home/you/demo/queue.sqlite run --demo --project demo \
+      --work /home/you/demo/repo --events /home/you/demo/events.jsonl \
+      --no-push --limit 1 --check 'python -m unittest discover -s tests -q'
+```
+
+Run that second command and the item goes through every stage:
+
+```console
+T1 started
+T1 calling — planner
+T1 planner_targets — {"targets": [{"path": "calc/operations.py", …}], …}
+T1 context_selected — {"files": ["calc/operations.py", "tests/test_operations.py", …], …}
+T1 calling — implementer
+T1 applied — git apply
+T1 checks_passed
+T1 checkpointed — harness/t1
+T1 calling — reviewer
+T1 review_approved — APPROVED
+T1 done — harness/t1
+  ok  T1: plan -> implement -> apply -> checks -> commit -> review
+1/1 items completed
+```
+
+`git -C ./demo/repo log --oneline --all` shows the commit on its own branch,
+with `main` untouched. `./demo/events.jsonl` has every step.
+
+**What this proves.** The wiring: plan parses to work, the graph admits it, a
+worktree is made, a diff is validated and applied, the configured checks run
+*before* the reviewer, the reviewer's verdict is a gate, and every step is in
+the event stream. Only the transport is replaced — everything above it is the
+same code a real run uses.
+
+**What it does not prove.** Anything about a model, because there is no model.
+The three replies are fixed. A green demo and a working fleet are different
+claims, and this is the first one only. The scripted reviewer says so in its
+own approval text, so nobody reading the event stream mistakes it for a
+verdict.
+
+You will see one warning, and it is correct: all three roles are the same
+scripted "model", so the reviewer is not independent. In a real run that
+warning means a model is grading its own work.
+
+### 0a.1 Ask what a real run would need
+
+```console
+$ agent-harness --db ./demo/queue.sqlite doctor
+environment
+  ok    git: git at /usr/bin/git
+  ?     gh cli: gh at /usr/bin/gh; whether it can WRITE is not checked here …
+  ok    route presets: resolvable by name: chat-completions, claw-bay, generic
+  ok    dependency resolvers: declared: github-issue
+
+project demo
+  ok    checkout: /home/you/demo/repo
+  ok    disk space: 518.5 GiB free of 1831.7 GiB …
+  ok    checks: 1 check(s) run before review
+  ok    routes: planner=…, implementer=…, reviewer=…
+  ok    protocol and classifier: planner: generic / generic; …
+  warn  cost-cap classification: … the generic HTTP classifier … cannot tell a
+        spend cap from a burst limit …
+  warn  reviewer independence: reviewer and implementer are the same model …
+  ?     cost visibility: no price is known for: … so any total is a lower bound
+  ok    github mutations: no repo configured: nothing here can create an issue,
+        branch or pull request. Local work only.
+  ?     model reachability: not asked — it needs a network and a credential.
+        Pass --probe-models to ask. Not asking is not the same as answering.
+
+nothing blocks a start. Warnings and unknowns above are not passes: an unknown
+is a thing nobody has checked.
+```
+
+`doctor` exits `0` when nothing blocks and `1` when something does, so it is
+usable in a script. `--json` gives the same report machine-readably.
+
+**It contacts nothing.** Every line above is answered from the database, the
+filesystem and installed package metadata. `--probe-models` opts into the one
+question that needs a network, and needs `HARNESS_API_KEY` and `--endpoint` to
+do it. A `?` is never a pass — it is a thing nobody has checked.
+
+`doctor` and `preflight` overlap on purpose and share their probes, so the
+report cannot disagree with the gate that actually refuses a start. What
+`doctor` adds is the set of questions that do not block a start but change what
+you can believe about a run.
+
+---
+
+## 0a.2 Running against a local model
+
+Optional, and deliberately not part of the demo or of required CI: a local
+model is a *your machine* dependency, and the no-network path must not acquire
+one.
+
+The harness speaks OpenAI-compatible chat completions, so any server that does
+is usable. Using [Ollama](https://ollama.com) as the worked example:
+
+**You supply the server and the weights.** The harness downloads nothing,
+installs nothing and starts nothing. Install Ollama yourself, then pull a model
+yourself:
+
+```bash
+ollama pull qwen2.5-coder:7b
+ollama serve            # listens on 127.0.0.1:11434
+```
+
+**The endpoint shape is the base URL, without the path.** The
+`chat-completions` preset appends `/chat/completions` itself, because that is
+what every gateway's documentation prints:
+
+```bash
+export HARNESS_ENDPOINT=http://127.0.0.1:11434/v1
+export HARNESS_ROUTE_PRESET=chat-completions
+```
+
+**Authentication is not disabled — it is sent and ignored.** The preset always
+sends a bearer header, and Ollama does not check it. `HARNESS_API_KEY` must
+still be set to something non-empty, because the harness refuses to run without
+one rather than silently sending an empty credential to a server that might
+have wanted a real one:
+
+```bash
+export HARNESS_API_KEY=unused-locally
+```
+
+Then run normally:
+
+```bash
+agent-harness run --work ./target --no-push --check 'pytest -q' \
+    --planner qwen2.5-coder:7b \
+    --implementer qwen2.5-coder:7b \
+    --reviewer a-different-local-model
+```
+
+**What "offline" means here, exactly.** No traffic leaves your machine *for
+model calls*. It does not mean the harness is offline: `--repo` still reaches
+GitHub, and `reconcile` still does. For a genuinely airtight run use `--no-push`
+and configure no repo, which is what the demo does.
+
+**Two things to expect.** The reviewer should be a different model from the
+implementer, and running one local model for both means every review is a model
+grading its own work — the harness warns, and the warning is right. And the
+generic HTTP classifier cannot tell a local server's `429` or `500` apart from
+a spend cap, because nothing in HTTP can; on a local server there is no spend
+cap, so this matters less than it does against a gateway.
+
+None of this is covered by the no-network test suite, by design. It is an
+opt-in smoke test you run against a server you supplied.
+
+---
+
 ## 0b. Or don't write a plan — describe it and argue
 
 If you do not already have a plan, scope one. Nothing external exists during

@@ -1367,6 +1367,66 @@ def test_a_touched_file_too_large_to_show_the_reviewer_is_named(repo: Path, tmp_
     assert "--- hello.txt ---" not in shown
 
 
+def test_a_supporting_target_that_does_not_fit_is_named_not_fatal(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Losing the file the work is in is fatal; losing a supporting one is not.
+
+    Measured on rdpapp: the planner named the 634 KB file the change belonged
+    in — which fit — plus a 144 KB file and a document, which did not. Blocking
+    the item lost work over files nobody was going to edit.
+    """
+    (repo / "big.txt").write_text("x" * 400)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "a supporting file that will not fit")
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {
+            "planner": json.dumps(
+                {
+                    "plan": "Edit the greeting.",
+                    "targets": [
+                        {"path": "hello.txt", "reason": "the work is here"},
+                        {"path": "big.txt", "reason": "supporting"},
+                    ],
+                    "cannot_identify_target": None,
+                }
+            ),
+            "implementer": DIFF,
+            "reviewer": "APPROVED\nfine",
+        },
+    )
+    executor.context_policy = ContextPolicy(budget=300)
+    capturing = PromptCapturingModel(
+        {
+            "planner": json.dumps(
+                {
+                    "plan": "Edit the greeting.",
+                    "targets": [
+                        {"path": "hello.txt", "reason": "the work is here"},
+                        {"path": "big.txt", "reason": "supporting"},
+                    ],
+                    "cannot_identify_target": None,
+                }
+            ),
+            "implementer": DIFF,
+            "reviewer": "APPROVED\nfine",
+        }
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    shown = capturing.prompts["implementer"]
+    assert "hello world" in shown, "the file the work is in was still supplied"
+    assert "do not change them" in shown
+    assert "big.txt" in shown
+    record = queue.get("T1")
+    assert record is not None and record.state != "blocked"
+
+
 def test_the_planner_is_shown_what_files_exist(repo: Path, tmp_path: Path) -> None:
     """Its entire job is naming paths, and it was given only the brief.
 

@@ -1101,9 +1101,20 @@ Your plan:
 
 Repository context:
 {context}
-{checks}{prior}
+{unavailable}{checks}{prior}
 Reply with a single unified diff (`diff --git` / `---` / `+++` / `@@`) that
 applies cleanly at the repository root. No commentary outside the diff.
+"""
+
+#: Supporting targets the budget could not carry. Named rather than silently
+#: dropped, and paired with an instruction not to edit them — a model that
+#: knows a file exists but has not read it will otherwise write a plausible
+#: hunk against it, which is the failure this whole path exists to prevent.
+STARVED_PROMPT = """
+The planner also named these files, and they were too large to include. You
+have NOT seen them, so do not change them — if the task cannot be done without
+changing one, say so instead of guessing at its contents:
+{paths}
 """
 
 #: The gates, told to the writer as well as the marker. Empty when a project
@@ -1713,13 +1724,16 @@ class Executor:
             ),
         )
         starved = [path for path, reason in context.omitted if reason == TARGET_OVER_BUDGET]
-        if starved:
-            # The implementer is one line away from being asked to patch a file
-            # it has not been shown, and it will answer: models do not refuse
-            # for want of evidence. The diff would then be written against a
-            # guess and fail to apply, which reads in the log as a bad model
-            # and is not one. Stop here, before the call is paid for, and say
-            # what would have to change.
+        # The planner is asked to order its targets by importance, so the first
+        # usable one is the file the work is *in*; the rest are supporting.
+        # Losing the first is fatal — the implementer would be asked to change
+        # a file it has not been shown, and it will answer rather than refuse,
+        # because models do not decline for want of evidence. Losing a
+        # supporting file is not fatal, and blocking the item over it would
+        # make a large repository unworkable for the sake of a file nobody was
+        # going to edit.
+        primary = next((target.path for target in context.targets if target.usable), None)
+        if starved and (primary is None or primary in starved):
             outcome.reason = (
                 "the planner's target(s) "
                 + ", ".join(f"{path} ({self._size_of(path)})" for path in starved)
@@ -1755,6 +1769,7 @@ class Executor:
                 # gate still runs, and still refuses.
                 checks=self._checks_prompt(),
                 prior=self._prior_failure_prompt(record),
+                unavailable=self._starved_prompt(starved),
             ),
         )
         outcome.stages.append("implement")
@@ -2188,6 +2203,14 @@ class Executor:
             "\nNot included, so you have not seen them:\n" + "\n".join(missing) if missing else ""
         )
         return REVIEW_CONTEXT_PROMPT.format(files="\n".join(blocks), omitted=omitted)
+
+    def _starved_prompt(self, starved: Sequence[str]) -> str:
+        """Supporting targets that did not fit, named so they are not guessed at."""
+        if not starved:
+            return ""
+        return STARVED_PROMPT.format(
+            paths="\n".join(f"  {path} ({self._size_of(path)})" for path in starved)
+        )
 
     def _repo_listing(self) -> str:
         """The tracked paths, for the planner.

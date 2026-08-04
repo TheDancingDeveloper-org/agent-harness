@@ -99,9 +99,9 @@ flowchart TD
     select --> loop{"for each candidate"}
     loop --> attempts{"attempts ≥<br/>max_attempts?"}
     attempts -->|yes| exhaust["mark exhausted<br/>and keep looking"]
-    attempts -->|no| deps{"dependencies<br/>all done?<br/><i>within this project</i>"}
+    attempts -->|no| deps{"graph.readiness()<br/>every REQUIRED edge<br/>satisfied, no cycle?"}
     deps -->|no| loop
-    deps -->|yes| take["UPDATE → claimed<br/>owner, lease_until, attempts+1<br/>COMMIT"]
+    deps -->|yes| take["UPDATE → claimed<br/>owner, lease_until, attempts+1<br/>admitted_revision<br/>COMMIT"]
     take --> got["return the item"]
     loop -->|exhausted list| none2["return None"]
 
@@ -120,15 +120,83 @@ ordering — 8 workers over 200 items, asserting every item is claimed exactly
 once. It is the one invariant whose failure silently duplicates or destroys
 work rather than raising.
 
-**Dependencies resolve only inside a project.** An id means one thing here and
-another there; resolving across the boundary would let one project unblock on
-another's work. A dependency naming something absent from the queue is *not* a
-blocker — plans routinely reference work tracked elsewhere, and refusing would
-strand the item forever.
-
 **`LIMIT 200`** because the whole eligible backlog used to be loaded into
 memory inside the write transaction on every claim, holding the write lock
 longer the larger the backlog got.
+
+### The dependency graph decides admission
+
+`depends_on` is a list of strings on the wire, and each string is a **token**
+with a grammar. The token says what kind of thing is being waited for, and the
+kind is what makes the answer decidable:
+
+| Token | Target kind | Resolved against |
+|---|---|---|
+| `W1` | `local_work` | a work row in this project |
+| `external:RESOLVER:ID` | `external_reference` | a stored outcome from `RESOLVER` |
+| `decision:D9` | `human_decision` | a decision recorded as work here |
+| `project:OTHER/W1` | `cross_project_work` | a work row in `OTHER` |
+| `?W1` | any of the above, **advisory** | reported, never gating |
+
+Each edge carries its source, target kind and identity, required-versus-
+advisory, its resolver when external, a resolution state (`unresolved`,
+`blocked`, `satisfied`), the evidence for that state, its provenance, and the
+graph revision it was written at. That is the contract in
+[`COORDINATION-PLANE.md`](COORDINATION-PLANE.md) §8, implemented in
+`graph.py` rather than restated as a second, thinner design.
+
+**A required target the graph cannot resolve is a blocker.** This reverses the
+earlier rule, and the reversal is the point. A dependency absent from the queue
+used to be treated as satisfied because plans reference work tracked
+elsewhere — which is true, and which made a typo, an omitted item and a genuine
+external reference indistinguishable. All three ran immediately. An external
+reference is still perfectly legitimate; it just has to say so and have an
+answer from a resolver, and a resolver that knows one tool's format lives in
+`adapters/` and is imported only when a plan names it.
+
+**Dependencies still resolve only inside a project** unless the token says
+otherwise. An id means one thing here and another there, so crossing the
+boundary has to be spelled out as `project:OTHER/W1`.
+
+**Cycles are named as cycles.** Two items that each require the other were
+reported as "waiting", forever, one item at a time, with nothing saying the
+wait could never end. `graph.cycles()` finds the loops and the readiness
+explanation prints the path.
+
+**Local targets are derived on every read; external ones are stored.** A local
+edge's state comes straight from the work row, so it cannot go stale and there
+is no second copy of the answer to disagree with the queue. An external
+outcome is evidence obtained by I/O and has to be kept — but it is obtained by
+`resolve_external`, never inside the claim transaction, because I/O inside the
+write transaction that hands out work is how one slow ticket system stalls a
+fleet.
+
+### One revision, two checks
+
+The graph revision moves when the declared graph changes or a resolver reports
+something new — **not** when work merely finishes, which is work state.
+Re-ingesting an unchanged plan therefore leaves the revision exactly where it
+was, which is what stops a routine re-sync invalidating live claims.
+
+`claim` records the revision it admitted at on the work row. The executor
+re-runs *the same* `readiness()` call at the last cheap point before review
+spends money and the checkpoint makes anything durable — in both the direct
+API and hosted-session executors. Two implementations of "is it ready" would be
+two answers, and the one that disagreed would be the one that let ineligible
+work commit.
+
+When that second check fails, the agent is **not** killed: it has already
+reached a safe boundary, the branch is abandoned, the item returns to `pending`
+and a `dependency_invalidated` event records the reason with both revisions in
+it. It stays blocked until the dependency resolves or an operator records an
+explicit override — and an override is scoped to the revision it was granted
+at, so the next correction re-blocks the item.
+
+`GET /api/work/{item_id}/readiness` and `GET /api/graph` publish all of this,
+and `agent-harness graph report | export | rebuild` is the same information and
+the recovery procedure at the command line. The edge table is derived from
+`depends_on`, so it can be dropped and rebuilt; that is the whole of
+[`MIGRATION-graph.md`](MIGRATION-graph.md).
 
 ### Claims are leases
 

@@ -141,19 +141,109 @@ labels: area:api
 removed from the brief — an agent should read the specification, not the
 bookkeeping.
 
+### Dependencies say what kind of thing they are waiting for
+
+A dependency is not just an id. `depends on:` takes **tokens**, and the token
+says what sort of target it is:
+
+| Token | Means |
+|---|---|
+| `W1` | work in this project |
+| `external:RESOLVER:IDENTITY` | something outside the harness; `RESOLVER` answers for it |
+| `decision:D9` | a human decision, parked as work in this project |
+| `project:OTHER/W1` | work in a different project |
+| `?W1` | **advisory**: reported, never a blocker |
+
+```markdown
+depends on: W1, external:github-issue:owner/repo#42, decision:D9
+```
+
+**A required target the graph cannot resolve blocks the item.** This is the one
+behaviour worth reading twice, because it used to be the opposite. A dependency
+naming something absent from the queue was previously treated as satisfied, on
+the grounds that plans reference work tracked elsewhere — which is true, and
+which made a typo, an omitted item and a genuine external reference completely
+indistinguishable. All three ran immediately.
+
+So a genuine external reference now says so and gets a resolver, and everything
+else stops with a reason you can read:
+
+```bash
+curl -sH "Authorization: Bearer $TOKEN" \
+  'localhost:8099/api/work/W2/readiness?project_id=widgets' | jq -r .explanation
+# not ready at graph revision 4: local_work target 'W1x' is unresolved:
+# no item 'W1x' in project 'widgets'; a required target the graph cannot find
+# is a blocker, not an assumed external dependency
+```
+
+### Arrow notation, when there are enough edges to draw
+
+Repeating `depends on:` per item stops reading well past a handful of edges, so
+a plan can state its graph in one place instead:
+
+````markdown
+```dependencies
+W1 -> W2        # the arrow follows the work: W2 waits for W1
+W1 -> W3
+external:github-issue:owner/repo#42 -> W4
+```
+````
+
+The left side is the prerequisite. Both notations produce exactly the same
+edge, and the same token grammar applies on the left. An arrow naming an item
+the plan does not define is **reported**, not discarded — an arrow that lands
+nowhere is the one outcome worse than a refusal.
+
+### Reading and repairing the graph
+
+```bash
+agent-harness --db harness.sqlite graph report       # who is ready, and why not
+agent-harness --db harness.sqlite graph export --out graph.json
+agent-harness --db harness.sqlite graph rebuild      # re-derive edges from depends_on
+agent-harness --db harness.sqlite graph checkpoint   # before copying the file
+```
+
+`graph report` exits 4 when anything is held back, so it works as a gate in a
+script without parsing its text. It names cycles explicitly: two items that
+each wait for the other are invisible one at a time, because each merely looks
+like it is waiting.
+
+The export/rebuild pair is the supported backup and recovery procedure, and
+upgrading an existing database has a procedure of its own —
+[`docs/MIGRATION-graph.md`](MIGRATION-graph.md).
+
+If an item is blocked and you know better, the block lifts by decision rather
+than by editing the database:
+
+```bash
+curl -sH "Authorization: Bearer $TOKEN" -X POST \
+  'localhost:8099/api/work/W2/dependency-override?project_id=widgets' \
+  -d '{"reason": "tracked in the other repo", "who": "sam"}'
+```
+
+The edge keeps its real state; the override is recorded next to it, and it
+applies to **that graph revision only** — a later correction re-blocks the
+item rather than inheriting a judgement nobody made about it.
+
 ### What it could not read is part of the answer
 
 ```bash
 $ agent-harness plan examples/PLAN.md --repo owner/name --dry-run
-3 work items, 2 headings skipped as narrative
-would create missing labels: area:api
-would sync: created 3, updated 0, unchanged 0
+dependencies:
+  W4: external target(s) external:github-issue:owner/name#42 — needs a resolver
+4 work items, 3 headings skipped as narrative
+would create missing labels: area:api, area:docs
+would sync: created 4, updated 0, unchanged 0
 ```
 
-Those 2 skipped headings are `Widget service` and `Background` — narrative, as
-expected. **A large skip count relative to items means your plan does not use
-a recognised shape**, and the harness would rather tell you than quietly find
-three items in a fifty-item plan.
+Those 3 skipped headings are `Widget service`, `Background` and `Dependencies`
+— narrative and the graph block, as expected. **A large skip count relative to
+items means your plan does not use a recognised shape**, and the harness would
+rather tell you than quietly find three items in a fifty-item plan.
+
+The `dependencies:` block above it is the other half of the same idea: every
+line there is something that *will* hold work back, said before the issues
+exist rather than after the queue has stopped.
 
 ---
 

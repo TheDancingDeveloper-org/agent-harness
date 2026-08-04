@@ -61,6 +61,8 @@ trade and it is rejected.
 | Backlog manifest (seeds GitHub issues) | `docs/backlog.json` |
 | Event schema | `src/agent_harness/events.py` |
 | Event store (append-only) | `src/agent_harness/store.py` |
+| Typed dependency graph | `src/agent_harness/graph.py` — contract in `docs/COORDINATION-PLANE.md` §8 |
+| Queue schema migration | `docs/MIGRATION-graph.md` — backup, export, rebuild, rollback |
 | Log readers | `src/agent_harness/ingest.py` |
 | JSON API (no GUI) | `src/agent_harness/api.py` |
 | Session host client | `src/agent_harness/session_host.py` |

@@ -152,7 +152,11 @@ elsewhere — which is true, and which made a typo, an omitted item and a genuin
 external reference indistinguishable. All three ran immediately. An external
 reference is still perfectly legitimate; it just has to say so and have an
 answer from a resolver, and a resolver that knows one tool's format lives in
-`adapters/` and is imported only when a plan names it.
+`adapters/` and is imported only when a plan names it. Which module a resolver
+name belongs to is declared in the distribution's
+`agent_harness.dependency_resolvers` entry points — the same door route presets
+use, and for the same reason: a dotted module path written into `graph.py`
+would still be core knowing what a particular tracker is called.
 
 **Dependencies still resolve only inside a project** unless the token says
 otherwise. An id means one thing here and another there, so crossing the

@@ -230,6 +230,32 @@ def item_room(item_id: str) -> str:
     return f"{ITEM_ROOM_PREFIX}{item_id}"
 
 
+def _signature(stage: str, evidence: Mapping[str, Any]) -> str:
+    """A stable fingerprint of *what went wrong*, ignoring when.
+
+    Two failures with the same signature are the same failure happening
+    again, which is the single most useful thing a coordinator can know and
+    the one thing it could not previously tell: shown three identical
+    observations it answered three times, at model prices, having no notion
+    it had seen any of them before.
+
+    Deliberately excludes anything that moves on its own — attempt numbers,
+    episode, timestamps, worker identity — because a fingerprint that changes
+    every attempt makes every repetition look novel, which is the bug.
+    """
+    import hashlib
+
+    parts = [stage]
+    for key in ("check", "outcome", "verdict", "rungs", "base"):
+        parts.append(str(evidence.get(key, "")))
+    # Output is included but normalised: build tools print paths and line
+    # numbers that are stable, and durations and temp directories that are
+    # not. Keeping the first lines keeps the diagnosis and drops the noise.
+    output = str(evidence.get("output") or evidence.get("review") or "")
+    parts.append("\n".join(output.splitlines()[:20]))
+    return hashlib.sha256("\x00".join(parts).encode()).hexdigest()[:16]
+
+
 def _attachments(paths: Sequence[str]) -> tuple[Any, ...]:
     """Real files, referenced rather than inlined.
 
@@ -2614,6 +2640,9 @@ class Executor:
                         # of what needs changing", and escalated instead of
                         # routing around the problem. It was right to.
                         **{k: v for k, v in evidence.items() if k != "files"},
+                        # What went wrong, as a fingerprint. Lets a reader tell
+                        # "again" from "something new" without re-reasoning.
+                        "signature": _signature(stage, evidence),
                     },
                     attachments=_attachments(evidence.get("files") or ()),
                 )

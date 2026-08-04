@@ -1168,3 +1168,105 @@ def test_23e_a_sweep_reads_every_room_and_keeps_a_cursor_each(tmp_path: Path) ->
     # pays for the same conclusion on every cycle forever.
     second = sweep.run_once()
     assert sum(r.triggers for r in second) == 0
+
+
+# ============ 24. the same failure again is a signal, not another bill
+
+
+def test_24_three_identical_failures_cost_one_opinion_not_three(tmp_path: Path) -> None:
+    """Measured against a real model: shown three identical observations it
+    answered three times, in near-identical words, because nothing told it it
+    had seen any of them before. Repetition is the signal §6 exists for, and
+    paying for it once per occurrence is not how to notice it."""
+    from agent_harness.executor import item_room
+    from agent_harness.oversight_bridge import build_coordinator
+
+    queue, ledger, worker = _failing_fleet(tmp_path, ["false"])
+    for _ in range(3):
+        worker.run_once()
+        queue.requeue("R2")
+
+    model = ScriptedOversightModel(
+        json.dumps({"kind": "wait", "reason": "one failure is not yet a pattern"}),
+        json.dumps({"kind": "escalate", "reason": "same failure three times", "body": "look"}),
+    )
+    coordinator = build_coordinator(
+        queue,
+        "default",
+        db_path=str(tmp_path / "queue.sqlite"),
+        model=model,
+        ledger=ledger,
+    )
+
+    report = coordinator.run_once(item_room("R2"))
+
+    assert report.triggers == 3, "all three were read"
+    # The shape that matters: the FIRST is always assessed, because one
+    # failure may well be worth acting on. What is skipped is the middle —
+    # the same failure again, before it is often enough to mean anything new.
+    assert report.repeats == 1, "the second was recognised as the same failure again"
+    assert len(model.prompts) == 2, "three failures cost two opinions, not three"
+    assert report.escalated == 1
+
+    first, pattern = (json.loads(p) for p in model.prompts)
+    assert "identical_occurrences" not in first, "a first sighting is not a pattern"
+    assert pattern["identical_occurrences"] == 3, "and the second call knew it was one"
+
+
+def test_24b_a_different_failure_is_never_deduplicated(tmp_path: Path) -> None:
+    """The dangerous direction. Treating a new failure as a familiar one loses
+    it entirely, so the fingerprint must change when the diagnosis does."""
+    from agent_harness.executor import _signature
+
+    first = _signature("checks_failed", {"check": "cargo test", "output": "error[E0277]: ..."})
+    again = _signature("checks_failed", {"check": "cargo test", "output": "error[E0277]: ..."})
+    other = _signature("checks_failed", {"check": "cargo test", "output": "error[E0499]: ..."})
+    stage = _signature("apply_failed", {"check": "cargo test", "output": "error[E0277]: ..."})
+
+    assert first == again, "the same failure must fingerprint the same"
+    assert first != other, "a different error must not be mistaken for a familiar one"
+    assert first != stage
+
+
+def test_24c_a_worker_that_reports_no_signature_is_never_deduplicated(tmp_path: Path) -> None:
+    """An unknown failure must not be mistaken for a familiar one. A message
+    with no fingerprint — an older worker, or a stage that carries no
+    evidence — is always assessed."""
+    from agent_harness.executor import item_room
+    from agent_harness.oversight_bridge import build_coordinator
+
+    queue, ledger, worker = _failing_fleet(tmp_path, ["false"])
+    worker.run_once()
+    # Two messages that look identical and carry no fingerprint at all.
+    for n in range(2):
+        observe_raw(ledger, "something went wrong", "R2", item_room("R2"), f"nosig-{n}")
+
+    model = ScriptedOversightModel(
+        *[json.dumps({"kind": "wait", "reason": "no"})] * 5,
+    )
+    coordinator = build_coordinator(
+        queue,
+        "default",
+        db_path=str(tmp_path / "queue.sqlite"),
+        model=model,
+        ledger=ledger,
+    )
+    report = coordinator.run_once(item_room("R2"))
+
+    assert report.repeats == 0, "nothing without a fingerprint may be deduplicated"
+    assert len(model.prompts) == report.triggers
+
+
+def observe_raw(ledger: Any, body: str, item_id: str, room: str, key: str) -> None:
+    ledger.append(
+        Submission(
+            project_id="default",
+            room_id=room,
+            sender_id="worker-x",
+            sender_role="worker",
+            message_type="observation",
+            body=body,
+            item_id=item_id,
+            idempotency_key=key,
+        )
+    )

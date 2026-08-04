@@ -25,7 +25,7 @@ from pydantic import (
 
 # --------------------------------------------------------------------- work
 
-WorkState = Literal["pending", "claimed", "done", "failed", "blocked", "exhausted"]
+WorkState = Literal["pending", "claimed", "done", "failed", "blocked", "exhausted", "held"]
 
 
 class LatestEvent(BaseModel):
@@ -88,6 +88,17 @@ class WorkItem(BaseModel):
         "ceiling is measured from here, not from the current attempt, so an item that "
         "crashes in a loop cannot reset its own clock.",
     )
+    held_until: float = Field(
+        0.0,
+        description="When this item's hold gives up. Zero when it is not held.",
+    )
+    hold: HoldView | None = Field(
+        None,
+        description="The open question, when the item is `held`. This is a **state of the "
+        "item**, not a projection over recent events: it survives the worker dying, it is "
+        "answerable from any process, and while it is set no other worker can claim the "
+        "item.",
+    )
     disposition: str = Field(
         "",
         description="WHY the item is in `state`, from the Stage K taxonomy: "
@@ -137,6 +148,82 @@ class WorkList(BaseModel):
         "They are re-claimed automatically; a rising count means something is killing workers.",
     )
     items: list[WorkItem] = Field(default_factory=list)
+
+
+class HoldView(BaseModel):
+    """A question an item is waiting on, and how long it has been waiting."""
+
+    state: str = Field(description="`open`, `answered`, `expired` or `cancelled`.")
+    question: str = Field(
+        description="What is being asked. Never empty — a hold with no "
+        "question is indistinguishable from the hang it exists to be "
+        "distinguished from."
+    )
+    reason: str = ""
+    who_may_answer: str = Field(
+        "anyone",
+        description="Who the asker thinks should answer. **Recorded and reported, not "
+        "enforced**: this service has one bearer token, and claiming otherwise would be "
+        "a security guarantee it cannot keep.",
+    )
+    asked_at: float = 0.0
+    age_seconds: float = Field(
+        0.0,
+        description="How long this has been unanswered. The number issue #103 is about: "
+        "a silent-but-active session and a hang look identical until something can say "
+        "how long the silence has lasted.",
+    )
+    expires_at: float | None = Field(
+        None,
+        description="When the hold gives up and returns the item to `blocked` with the "
+        "question preserved. Null means it never does, which ties up a worker for ever.",
+    )
+    session_id: str | None = None
+    session_url: str | None = Field(
+        None, description="Deep link to the terminal that is asking, when there is one."
+    )
+    answered_at: float | None = None
+    answered_by: str | None = None
+    answer: str | None = None
+
+
+class AnswerRequest(BaseModel):
+    """A person's answer to a held item's question.
+
+    Structured data, or a message, and **never a prompt**. Nothing reads this
+    to work out what the human meant: a model interpreting an approval into a
+    routing decision is a gate decided by a model, and `AGENTS.md` rejects it.
+    """
+
+    resume_token: str = Field(
+        min_length=1,
+        description="The token issued with the question. It authorises an answer to "
+        "**that** question only, so a reply arriving after a timeout cannot land on "
+        "whatever the item is doing an hour later.",
+    )
+    text: str = Field("", description="A message, for a person to read.")
+    data: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Structured answer — a choice, a flag, an identifier. Recorded "
+        "verbatim and never interpreted.",
+    )
+    who: str = Field("", description="Who answered. Recorded with the answer, not verified.")
+
+
+class AnswerResult(BaseModel):
+    ok: bool
+    item_id: str
+    state: WorkState = Field(
+        description="`claimed`: the item goes back to the worker "
+        "that asked, with its worktree and context intact."
+    )
+    hold: HoldView
+
+
+class HoldList(BaseModel):
+    """Every unanswered question, oldest first — the order to work through."""
+
+    open: list[HoldView] = Field(default_factory=list)
 
 
 class RetryResult(BaseModel):

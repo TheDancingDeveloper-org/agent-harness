@@ -40,7 +40,37 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .work import BLOCKED, FAILED, PENDING
+# ------------------------------------------------------------ queue states
+
+# These live here rather than in `work.py` because both vocabularies below
+# refer to them, and `work.py` in turn refers to these vocabularies: one of
+# the three modules had to own the words, and the one whose entire subject is
+# "what happened" is the honest choice. `work.py` re-exports every name, so
+# `from .work import DONE` reads exactly as it always did.
+
+PENDING = "pending"
+CLAIMED = "claimed"
+DONE = "done"
+FAILED = "failed"
+BLOCKED = "blocked"
+#: Tried too many times and given up on. Distinct from `failed`, which is one
+#: attempt that did not work: `exhausted` says the harness will not try again
+#: without a human. Without it, an item that reliably kills its worker is
+#: re-claimed forever -- it sinks to the back of the queue on `attempts` and
+#: returns every cycle, spending real money each time, looking identical to
+#: an item that is merely busy.
+EXHAUSTED = "exhausted"
+#: Waiting on a person. Distinct from `blocked`, which is an operator parking
+#: an item, and distinct from `claimed`, which is a worker working on it: a
+#: held item has a worker attached and is making no progress on purpose, and
+#: the whole point of the state is that a silent session and a hung one stop
+#: looking the same (#103).
+#:
+#: **D12, resolved: a hold suspends the lease and keeps the claim.** The owner
+#: stays on the row so answering hands the item back to the worker that asked,
+#: with its worktree and context intact. `claim` never selects a held row, so
+#: no lease expiry can hand it to somebody else while a person is thinking.
+HELD = "held"
 
 # ---------------------------------------------------------- check outcomes
 
@@ -166,6 +196,9 @@ CLAIM_LOST = "claim_lost"
 #: expensive.
 ITEM_WALL_CLOCK = "item_wall_clock"
 ITEM_SPEND = "item_spend"
+#: A question went unanswered for longer than the hold allowed. The item is
+#: `blocked`, never `ready`: a hold that times out has not been approved.
+HOLD_EXPIRED = "hold_expired"
 
 REASON_KINDS = (
     CHECKS_FAILED,
@@ -182,6 +215,7 @@ REASON_KINDS = (
     CLAIM_LOST,
     ITEM_WALL_CLOCK,
     ITEM_SPEND,
+    HOLD_EXPIRED,
 )
 
 

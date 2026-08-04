@@ -1367,6 +1367,57 @@ def test_a_touched_file_too_large_to_show_the_reviewer_is_named(repo: Path, tmp_
     assert "--- hello.txt ---" not in shown
 
 
+def test_the_planner_is_shown_what_files_exist(repo: Path, tmp_path: Path) -> None:
+    """Its entire job is naming paths, and it was given only the brief.
+
+    Measured on rdpapp: an item whose brief described a surface rather than
+    quoting a path got back "I do not have the repository tree or actual file
+    paths", and the implementer was then handed relevance-guessed files
+    instead of the one the work was in.
+    """
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+    )
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    shown = capturing.prompts["planner"]
+    assert "Files in this repository:" in shown
+    assert "hello.txt" in shown
+    assert "hello world" not in shown, "paths only — reading them is the implementer's job"
+
+
+def test_a_listing_too_long_for_the_budget_says_how_much_is_missing(
+    repo: Path, tmp_path: Path
+) -> None:
+    for index in range(200):
+        (repo / f"file-{index:03}.txt").write_text("x")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "many files")
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+    )
+    executor.context_policy = ContextPolicy(budget=200)
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    assert "more not shown" in capturing.prompts["planner"]
+
+
 def test_a_retry_is_told_why_the_last_attempt_was_refused(repo: Path, tmp_path: Path) -> None:
     """Measured on rdpapp: three of four attempts at one item were refused by
     the same formatter, each unaware the last had been."""

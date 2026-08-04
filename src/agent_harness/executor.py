@@ -1069,7 +1069,7 @@ PLAN_PROMPT = """\
 You are planning one unit of work. Do not write code yet.
 
 {brief}
-
+{listing}
 Reply with one JSON object and no commentary:
 
 {{
@@ -1081,6 +1081,14 @@ Reply with one JSON object and no commentary:
 Order targets by importance. If the task is ambiguous, contradicts the
 codebase, or depends on something absent, return an empty targets list and put
 the reason in `cannot_identify_target` instead of inventing a path.
+"""
+
+#: The repository's tracked paths, for the role whose entire job is naming
+#: some of them. Paths only, never content: the planner has to know what
+#: exists, and the implementer is the one that needs to read it.
+PLAN_LISTING_PROMPT = """
+Files in this repository:
+{listing}
 """
 
 IMPLEMENT_PROMPT = """\
@@ -1635,7 +1643,11 @@ class Executor:
         if planner is not None:
             self._emit(record, "resumed", detail=f"{A.PLANNED} (mode={mode})")
         else:
-            planner_reply = self._call(record, PLANNER, PLAN_PROMPT.format(brief=record.brief))
+            planner_reply = self._call(
+                record,
+                PLANNER,
+                PLAN_PROMPT.format(brief=record.brief, listing=self._repo_listing()),
+            )
             planner = parse_planner_result(planner_reply)
             log.record(
                 self.project_id,
@@ -2176,6 +2188,37 @@ class Executor:
             "\nNot included, so you have not seen them:\n" + "\n".join(missing) if missing else ""
         )
         return REVIEW_CONTEXT_PROMPT.format(files="\n".join(blocks), omitted=omitted)
+
+    def _repo_listing(self) -> str:
+        """The tracked paths, for the planner.
+
+        The planner's whole job is to name files, and it was given only the
+        brief — so it could only name a path the brief had already quoted, and
+        anything else was either a guess or an honest `cannot_identify_target`.
+        Measured on rdpapp: an item that described a surface rather than a file
+        got "I do not have the repository tree or actual file paths", and the
+        implementer then received relevance-guessed files instead of the one
+        the work was in.
+
+        Paths only. The planner needs to know what exists; reading it is the
+        implementer's job and it has its own budget for that.
+        """
+        try:
+            tracked = [path for path in run_git(self.repo, "ls-files").splitlines() if path]
+        except GitError:
+            return ""
+        if not tracked:
+            return ""
+        lines: list[str] = []
+        spent = 0
+        for path in tracked:
+            line = f"  {path}\n"
+            if spent + len(line) > self.context_policy.budget:
+                lines.append(f"  … and {len(tracked) - len(lines)} more not shown\n")
+                break
+            lines.append(line)
+            spent += len(line)
+        return PLAN_LISTING_PROMPT.format(listing="".join(lines).rstrip("\n"))
 
     def _prior_failure_prompt(self, record: WorkRecord) -> str:
         """Why the last attempt was refused, for the attempt replacing it.

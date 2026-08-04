@@ -78,6 +78,7 @@ def test_every_blocker_the_document_tells_you_to_fix_can_actually_occur() -> Non
         session_host=lambda: (False, "refused"),
         checks_probe=lambda: (False, "base check failed"),
         disk_probe=lambda path, floor: (False, "disk is full"),
+        clean_probe=lambda path: (True, "clean"),
         git_probe=lambda path: (False, "missing checkout"),
     )
     real = {c.name for c in everything_missing.checks}
@@ -96,6 +97,7 @@ def test_the_warnings_named_as_non_blocking_really_are() -> None:
         git_probe=lambda path: (True, path),
         github_probe=lambda repo: (True, repo),
         disk_probe=lambda path, floor: (True, "100 GiB free"),
+        clean_probe=lambda path: (True, "clean"),
     )
     assert report.ready, "a start would be refused for reasons the document calls warnings"
     assert {"checks", "reviewer independence", "model latency"} <= {c.name for c in report.warnings}

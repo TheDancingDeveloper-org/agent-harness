@@ -61,6 +61,11 @@ def _plan(args: argparse.Namespace) -> int:
     from .github import GitHub, GitHubError, sync
     from .plan import parse_plan_file
 
+    if not args.repo and not args.dry_run:
+        print("--repo OWNER/NAME is required to sync", file=sys.stderr)
+        print("Pass --dry-run to parse and report without contacting GitHub.", file=sys.stderr)
+        return 2
+
     plan = parse_plan_file(args.path)
     if not plan.items:
         print(f"{args.path}: no work items found.", file=sys.stderr)
@@ -95,6 +100,13 @@ def _plan(args: argparse.Namespace) -> int:
             print(f"  {line}", file=sys.stderr)
 
     print(f"{len(items)} work items, {len(plan.skipped)} headings skipped as narrative")
+    if not args.repo:
+        # Everything above is the local answer, and it is the whole answer
+        # anyone asks a dry run for: what could the parser read, and what will
+        # hold work back. There is nothing further to report without a repo.
+        for item in items:
+            print(f"  {item.id}: {item.title}")
+        return 0
     try:
         report = sync(GitHub(args.repo), items, dry_run=args.dry_run)
     except GitHubError as exc:
@@ -433,13 +445,25 @@ def _run(args: argparse.Namespace) -> int:
     roles = {"planner": args.planner, "implementer": args.implementer, "reviewer": args.reviewer}
     if session_mode:
         roles = {"reviewer": args.reviewer}
-    missing = [name for name, model in roles.items() if not model]
+    # A role with no flag is only missing if the STORED map cannot supply it
+    # either. Asking the flags alone made the flags simultaneously required to
+    # start and inert once given: a database holding a complete three-role map
+    # with fallback chains still refused with "no model configured", naming the
+    # very roles it had routes for (#153).
+    from .api import ROLE_MAP_KEY
+
+    stored_roles = WorkQueue(args.db).get_setting(ROLE_MAP_KEY) or {}
+    missing = [
+        name
+        for name, model in roles.items()
+        if not model and not (stored_roles.get(name, {}) or {}).get("model")
+    ]
     if missing:
         print(f"no model configured for: {', '.join(missing)}", file=sys.stderr)
         print(
             "Every role needs one, and the reviewer should be a DIFFERENT vendor "
             "from the implementer — otherwise some share of reviews is a model "
-            "grading its own work.",
+            "grading its own work. Pass the flags, or PUT /api/roles.",
             file=sys.stderr,
         )
         return 2
@@ -574,6 +598,7 @@ def _run(args: argparse.Namespace) -> int:
             "provider": "claw-bay",
         }
         for name, model in roles.items()
+        if model
     }
     stored_map = queue.get_setting(ROLE_MAP_KEY) or {}
     # MERGED, per role, not chosen wholesale. A stored route wins for the role
@@ -581,7 +606,11 @@ def _run(args: argparse.Namespace) -> int:
     # but a map holding only `reviewer` used to suppress the planner and
     # implementer the operator had just typed, and the run then failed its
     # first item with `no route for role 'planner'` after claiming it.
-    merged = {**from_cli, **stored_map}
+    # `--reroute` inverts it: the operator is saying the command line is the
+    # correction, not the seed. Without it, changing a model on a database that
+    # has ever run meant editing the settings table by hand or deleting the
+    # queue, which are both worse than the problem.
+    merged = {**stored_map, **from_cli} if args.reroute else {**from_cli, **stored_map}
     if merged != stored_map:
         queue.set_setting(ROLE_MAP_KEY, merged)
     overridden = sorted(
@@ -590,14 +619,23 @@ def _run(args: argparse.Namespace) -> int:
         if name in stored_map and stored_map[name].get("model") != from_cli[name]["model"]
     )
     if overridden:
-        print(
-            "note: a stored role map is in force and overrides the command line "
-            f"for: {', '.join(overridden)}. "
-            "PUT /api/roles to change it, or delete the database to reseed."
+        # Logged, not printed. This changes which model a run calls, so it
+        # belongs on the same stream as the rest of the run's narration —
+        # stdout is block-buffered into a pipe or a file, so the note arrived
+        # out of order when it arrived at all, and was lost entirely when the
+        # process was killed. Two runs were spent on a model the operator had
+        # explicitly replaced on the command line (#153).
+        was = {name: stored_map[name].get("model") for name in overridden}
+        asked = {name: from_cli[name]["model"] for name in overridden}
+        log.warning(
+            "a stored role map overrides the command line: %s. "
+            "The flags seed the map on first use only; after that the stored map wins. "
+            "Pass --reroute to make the command line win, or PUT /api/roles.",
+            "; ".join(f"{name}={was[name]} (you asked for {asked[name]})" for name in overridden),
         )
     filled = sorted(set(from_cli) - set(stored_map))
     if stored_map and filled:
-        print(f"note: the stored role map had no route for {', '.join(filled)}; used the flags.")
+        log.info("the stored role map had no route for %s; used the flags", ", ".join(filled))
 
     preset = _resolved_preset(args.preset)
     if preset is None:
@@ -626,6 +664,21 @@ def _run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+
+    # Before anything claims, and before the first model call: a headless run
+    # works in place and begins each attempt by discarding the working tree, so
+    # a dirty checkout is uncommitted work about to be destroyed. Refusing is
+    # the only safe default; --allow-dirty is how you say it is disposable.
+    # Session mode does not apply — it works in its own worktree.
+    if not session_mode and args.work and (Path(args.work) / ".git").exists():
+        from .preflight import _is_clean_tree
+
+        clean, why = _is_clean_tree(str(args.work))
+        if not clean and not args.allow_dirty:
+            print(f"refusing to start: {why}", file=sys.stderr)
+            return 2
+        if not clean:
+            log.warning("--allow-dirty: %s", why)
 
     if demo_mode:
         from .demo import demo_transport
@@ -877,7 +930,16 @@ def main(argv: list[str] | None = None) -> int:
 
     p_plan = sub.add_parser("plan", help="sync a plan .md into a GitHub backlog")
     p_plan.add_argument("path", type=Path, help="the plan markdown file")
-    p_plan.add_argument("--repo", required=True, metavar="OWNER/NAME")
+    # Not required with --dry-run: a dry run contacts GitHub for nothing and
+    # writes nothing, so demanding an owner/name meant inventing a repository
+    # that does not exist in order to ask a purely local question — what can
+    # the parser read? (#148)
+    p_plan.add_argument(
+        "--repo",
+        metavar="OWNER/NAME",
+        help="the GitHub repository to sync into. Required unless --dry-run, "
+        "which parses and reports without contacting anything.",
+    )
     p_plan.add_argument(
         "--dry-run", action="store_true", help="report what would change without writing"
     )
@@ -1134,6 +1196,24 @@ def main(argv: list[str] | None = None) -> int:
         "external effect before it happens. Empty takes the project's setting, "
         "then the default. The pre-review git checkpoint is unaffected by all "
         "three (or $HARNESS_DURABILITY).",
+    )
+    p_run.add_argument(
+        "--reroute",
+        action="store_true",
+        help="make the role flags win over the stored role map, and store them. "
+        "Without this the flags SEED the map on first use and are ignored ever "
+        "after, because a stored route is how `PUT /api/roles` re-routes a live "
+        "deployment — so on a database that has run before, --implementer does "
+        "nothing unless you pass this.",
+    )
+    p_run.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="run against a checkout that has uncommitted or untracked files. A "
+        "headless run works IN PLACE and discards the working tree before each "
+        "attempt — tracked changes are reverted and untracked files are deleted, "
+        "neither recoverably — so a dirty checkout is refused by default. Pass "
+        "this only when the tree is genuinely disposable.",
     )
     p_run.add_argument(
         "--context-budget",

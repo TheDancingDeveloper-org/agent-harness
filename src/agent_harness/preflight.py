@@ -98,6 +98,44 @@ def _is_git_repo(path: str) -> tuple[bool, str]:
     return (True, path)
 
 
+def _is_clean_tree(path: str) -> tuple[bool, str]:
+    """Whether the checkout holds work the harness would destroy.
+
+    A headless run works **in place**: every attempt begins by discarding the
+    working tree — `git checkout -- .` then `git clean -fd` — so it can put the
+    item's branch on a known state. That is right for the harness's own
+    leftovers and catastrophic for a person's: a modified tracked file is
+    reverted, and an untracked one is deleted, neither recoverably.
+
+    Nothing said so until a real import nearly lost 136 uncommitted files
+    including two whole crates (#147). So it is a refusal, before the first
+    claim, rather than a sentence in a document.
+    """
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["git", "-C", path, "status", "--porcelain"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover - defensive
+        return (False, f"could not read the checkout's status: {exc}")
+    if result.returncode != 0:
+        return (False, f"could not read the checkout's status: {result.stderr.strip()[:200]}")
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return (True, "clean")
+    modified = sum(1 for line in lines if not line.startswith("??"))
+    untracked = len(lines) - modified
+    return (
+        False,
+        f"{modified} uncommitted change(s) and {untracked} untracked path(s) in {path}. "
+        "A run discards both — tracked files are reverted and untracked ones are "
+        "DELETED — so this work would be lost and could not be recovered. Commit or "
+        "stash it, or pass --allow-dirty if it is genuinely disposable.",
+    )
+
+
 def _gh_can_write(repo: str) -> tuple[bool, str]:
     """Whether `gh` can actually write to the repo.
 
@@ -464,6 +502,8 @@ def preflight_project(
     github_probe: Callable[[str], tuple[bool, str]] = _gh_can_write,
     checks_probe: Probe | None = None,
     disk_probe: Callable[[str, float], tuple[bool, str]] = disk_space_probe,
+    clean_probe: Callable[[str], tuple[bool, str]] = _is_clean_tree,
+    allow_dirty: bool = False,
 ) -> Preflight:
     """Everything that must hold before this project can produce a pull request."""
     checks: list[Check] = []
@@ -501,6 +541,20 @@ def preflight_project(
     if work_dir:
         ok, detail = git_probe(work_dir)
         checks.append(Check("checkout", ok, detail))
+        # Only worth asking of something that is a git checkout at all —
+        # otherwise the answer is a confusing second failure about the same
+        # fact the check above already reported.
+        if ok:
+            clean_ok, clean_detail = clean_probe(work_dir)
+            checks.append(
+                Check(
+                    "clean checkout",
+                    clean_ok or allow_dirty,
+                    clean_detail
+                    if clean_ok
+                    else f"{clean_detail}{' Allowed by --allow-dirty.' if allow_dirty else ''}",
+                )
+            )
         disk_ok, disk_detail = disk_probe(
             work_dir, float(getattr(project, "min_free_disk_gb", 0.0) or 0.0)
         )

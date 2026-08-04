@@ -8,6 +8,7 @@ outside until the bill arrives.
 
 from __future__ import annotations
 
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ import pytest
 
 from agent_harness.preflight import (
     Answer,
+    _is_clean_tree,
     clean_checks_probe,
     preflight_project,
     remembered,
@@ -55,6 +57,7 @@ def run(p: Project, **kw: Any):  # type: ignore[no-untyped-def]
     kw.setdefault("git_probe", ok_git)
     kw.setdefault("github_probe", ok_gh)
     kw.setdefault("disk_probe", lambda path, floor: (True, f"100 GiB free at {path}"))
+    kw.setdefault("clean_probe", lambda path: (True, "clean"))
     return preflight_project(p, **kw)
 
 
@@ -329,3 +332,77 @@ def test_force_is_available_but_must_be_asked_for(client: Any) -> None:
     # Still refused here -- no fleet exists at all, which force cannot conjure.
     assert response.status_code == 409
     assert "no worker pool" in response.json()["detail"]
+
+
+# ------------------------------- a checkout a run would destroy (#147)
+
+
+def _repo(path: Path) -> Path:
+    """A real git repository, because this probe reads real git output."""
+    path.mkdir(parents=True, exist_ok=True)
+    for argv in (
+        ["init", "-q", "-b", "main"],
+        ["config", "user.email", "t@t"],
+        ["config", "user.name", "t"],
+    ):
+        subprocess.run(["git", "-C", str(path), *argv], check=True, capture_output=True)
+    (path / "tracked.txt").write_text("one\n")
+    subprocess.run(["git", "-C", str(path), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "-q", "-m", "initial"], check=True, capture_output=True
+    )
+    return path
+
+
+def test_a_clean_checkout_passes(tmp_path: Path) -> None:
+    ok, detail = _is_clean_tree(str(_repo(tmp_path / "r")))
+    assert ok
+    assert detail == "clean"
+
+
+def test_an_untracked_file_is_reported_as_about_to_be_deleted(tmp_path: Path) -> None:
+    """The measured near-miss: 136 uncommitted files, two of them whole crates,
+    in a checkout a headless run was about to `git clean -fd`."""
+    repo = _repo(tmp_path / "r")
+    (repo / "new-crate").mkdir()
+    (repo / "new-crate" / "lib.rs").write_text("pub fn f() {}\n")
+
+    ok, detail = _is_clean_tree(str(repo))
+
+    assert not ok
+    assert "1 untracked path(s)" in detail
+    assert "DELETED" in detail, "the word matters — this is not recoverable"
+    assert "--allow-dirty" in detail
+
+
+def test_a_modified_tracked_file_is_reported_as_about_to_be_reverted(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "r")
+    (repo / "tracked.txt").write_text("two\n")
+
+    ok, detail = _is_clean_tree(str(repo))
+
+    assert not ok
+    assert "1 uncommitted change(s)" in detail
+
+
+def test_a_dirty_checkout_blocks_a_start(tmp_path: Path) -> None:
+    report = run(project(), clean_probe=lambda path: (False, "3 uncommitted change(s)"))
+
+    assert not report.ready
+    assert any(c["name"] == "clean checkout" and not c["ok"] for c in report.as_dict()["checks"])
+
+
+def test_allow_dirty_lets_it_start_and_still_says_what_is_at_risk(tmp_path: Path) -> None:
+    """Overridable, never silent: the detail survives into the report so the
+    decision is auditable rather than merely made."""
+    report = run(
+        project(),
+        clean_probe=lambda path: (False, "3 uncommitted change(s)"),
+        allow_dirty=True,
+    )
+
+    assert report.ready
+    check = next(c for c in report.as_dict()["checks"] if c["name"] == "clean checkout")
+    assert check["ok"]
+    assert "3 uncommitted change(s)" in check["detail"]
+    assert "Allowed by --allow-dirty" in check["detail"]

@@ -12,6 +12,7 @@ model is called and no repository is touched.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +30,13 @@ def route(model: str, endpoint: str = ENDPOINT) -> dict[str, str]:
     return {"model": model, "endpoint": endpoint, "provider": "claw-bay"}
 
 
-def run_cli(db: Path, work: Path, **flags: str) -> int:
+def run_cli(db: Path, work: Path, **flags: Any) -> int:
     argv = ["--db", str(db), "run", "--repo", "owner/name", "--work", str(work)]
     for name, value in flags.items():
-        argv += [f"--{name.replace('_', '-')}", value]
+        flag = f"--{name.replace('_', '-')}"
+        # Store-true flags carry no value; passing one turns the next argument
+        # into a positional and argparse then blames the wrong thing.
+        argv += [flag] if value is True else [flag, value]
     return main(argv)
 
 
@@ -66,29 +70,73 @@ def test_a_partial_stored_map_is_filled_from_the_command_line(cli: Path) -> None
     assert stored["reviewer"]["model"] == "claude-sonnet-4-6"
 
 
-def test_a_stored_route_still_overrides_the_flag_for_its_own_role(cli: Path, capsys: Any) -> None:
+def test_a_stored_route_still_overrides_the_flag_for_its_own_role(cli: Path, caplog: Any) -> None:
     """Merging must not become "the command line wins" -- re-routing a role
-    live is the reason the map is stored at all."""
+    live is the reason the map is stored at all.
+
+    The note goes to the LOG, not stdout (#153): it changes which model a run
+    calls, and stdout is block-buffered into a pipe, so the warning arrived out
+    of order when it arrived at all and vanished entirely when the process was
+    killed. Two runs were spent on a model the operator had replaced."""
     db = cli / "harness.sqlite"
     WorkQueue(str(db)).set_setting(ROLE_MAP_KEY, {"reviewer": route("stored-reviewer")})
 
-    run_cli(db, cli, planner="p", implementer="i", reviewer="typed-reviewer", endpoint=ENDPOINT)
+    with caplog.at_level(logging.WARNING, logger="agent_harness.__main__"):
+        run_cli(db, cli, planner="p", implementer="i", reviewer="typed-reviewer", endpoint=ENDPOINT)
 
     stored = WorkQueue(str(db)).get_setting(ROLE_MAP_KEY) or {}
     assert stored["reviewer"]["model"] == "stored-reviewer"
-    out = capsys.readouterr().out
-    assert "overrides the command line" in out and "reviewer" in out
+    assert "overrides the command line" in caplog.text
+    assert "stored-reviewer" in caplog.text and "typed-reviewer" in caplog.text
+    assert "--reroute" in caplog.text, "and how to make the command line win"
 
 
-def test_the_roles_the_flags_supplied_are_reported(cli: Path, capsys: Any) -> None:
+def test_the_roles_the_flags_supplied_are_reported(cli: Path, caplog: Any) -> None:
     db = cli / "harness.sqlite"
     WorkQueue(str(db)).set_setting(ROLE_MAP_KEY, {"reviewer": route("claude-sonnet-4-6")})
 
-    run_cli(db, cli, planner="p", implementer="i", reviewer="claude-sonnet-4-6", endpoint=ENDPOINT)
+    with caplog.at_level(logging.INFO, logger="agent_harness.__main__"):
+        run_cli(
+            db, cli, planner="p", implementer="i", reviewer="claude-sonnet-4-6", endpoint=ENDPOINT
+        )
 
-    out = capsys.readouterr().out
-    assert "no route for" in out
-    assert "planner" in out and "implementer" in out
+    assert "no route for" in caplog.text
+    assert "planner" in caplog.text and "implementer" in caplog.text
+
+
+def test_reroute_makes_the_command_line_win_and_stores_it(cli: Path) -> None:
+    """Without this, changing a model on a database that has ever run meant
+    editing the settings table by hand or deleting the queue (#153)."""
+    db = cli / "harness.sqlite"
+    WorkQueue(str(db)).set_setting(ROLE_MAP_KEY, {"reviewer": route("stored-reviewer")})
+
+    run_cli(
+        db,
+        cli,
+        planner="p",
+        implementer="i",
+        reviewer="typed-reviewer",
+        endpoint=ENDPOINT,
+        reroute=True,
+    )
+
+    stored = WorkQueue(str(db)).get_setting(ROLE_MAP_KEY) or {}
+    assert stored["reviewer"]["model"] == "typed-reviewer"
+
+
+def test_a_complete_stored_map_needs_no_role_flags_at_all(cli: Path) -> None:
+    """The flags were simultaneously required to start and inert once given: a
+    database holding a complete map still refused with "no model configured",
+    naming the very roles it had routes for (#153)."""
+    db = cli / "harness.sqlite"
+    WorkQueue(str(db)).set_setting(
+        ROLE_MAP_KEY,
+        {"planner": route("p"), "implementer": route("i"), "reviewer": route("r")},
+    )
+
+    code = run_cli(db, cli, endpoint=ENDPOINT)
+
+    assert code == 0
 
 
 def test_an_unusable_stored_route_refuses_before_anything_is_claimed(

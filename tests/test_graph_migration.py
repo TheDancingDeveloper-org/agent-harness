@@ -177,7 +177,7 @@ def test_export_is_plain_json_carrying_every_edge_and_its_provenance(tmp_path: P
     assert {row["item_id"] for row in project["work"]} == {"T1", "T2", "T3", "T4"}
     assert {row["item_id"]: row["branch"] for row in project["work"]}["T1"] == "harness/t1"
     edges = {(e["source_item"], e["target_id"]): e for e in project["edges"]}
-    assert edges[("T3", "T2")]["provenance"] == "rebuild"
+    assert edges[("T3", "T2")]["provenance"] == "work.depends_on"
     assert edges[("T3", "T2")]["required"] is True
     assert edges[("T4", "T404")]["target_kind"] == "local_work"
     # Leases and owners are deliberately absent: a lease held by a process
@@ -237,6 +237,25 @@ def test_a_stored_resolver_outcome_survives_a_rebuild(tmp_path: Path) -> None:
     assert edge.target_kind == EXTERNAL_REFERENCE
     assert edge.state == SATISFIED
     assert "closed on 2026-08-01" in edge.evidence
+
+
+def test_rebuilding_an_intact_graph_moves_nothing(tmp_path: Path) -> None:
+    """Rebuild has to be safe to run whenever anyone is unsure.
+
+    A rebuild that moved the revision every time would invalidate every live
+    claim as a side effect of an operator checking their work.
+    """
+    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    queue.add_project(Project(project_id="p", name="P"))
+    queue.set_control("running", project_id="p")
+    queue.add(
+        [WorkRecord(item_id="A", title="a"), WorkRecord(item_id="B", title="b", depends_on=["A"])],
+        "p",
+    )
+    revision = queue.graph.revision("p")
+
+    assert queue.graph.rebuild("p") == {"p": revision}
+    assert queue.graph.revision("p") == revision
 
 
 def test_an_edge_whose_source_no_longer_exists_is_removed_by_rebuild(tmp_path: Path) -> None:

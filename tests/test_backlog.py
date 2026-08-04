@@ -2,6 +2,16 @@
 
 These checks mirror what ``gh issue create`` will reject: unknown labels, unknown
 milestones, missing fields.
+
+The file is now **historical** — `docs/backlog-seed-2026-08-02.json`, the manifest
+that seeded the issues on that date. GitHub is the tracker (D1) and the seed carries
+no state field, so it cannot report one. These tests still run because the file is
+still the record of what was created, and a record that no longer parses is not a
+record. They are not, and must not become, a check on what is currently open.
+
+`MILESTONES` below is the superseded `HARNESS-PLAN.md` phase order. It is kept
+because the items in this file were filed under it, not because anything new
+should be.
 """
 
 from __future__ import annotations
@@ -11,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BACKLOG = REPO_ROOT / "docs" / "backlog.json"
+BACKLOG = REPO_ROOT / "docs" / "backlog-seed-2026-08-02.json"
 
 LABELS = {
     "area:model-client",

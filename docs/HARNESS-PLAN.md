@@ -511,7 +511,7 @@ No functional code. Stand up where the work is tracked.
 | Repo | `TheDancingDeveloper-org/agent-harness`, **private**, GitHub Actions enabled |
 | Labels | 13. `area:model-client`, `area:dispatch`, `area:gui`, `area:store`, `area:github`, `area:ci`, `area:docs`; `type:epic`, `type:task`, `type:decision`, `type:spike`; `risk:high`, `blocked`. **No `phase:*`** — milestones already carry phase, and two encodings of one fact drift. |
 | Milestones | `P0`…`P4` |
-| Issues | From `docs/backlog.json` via the Appendix B script |
+| Issues | From `docs/backlog-seed-2026-08-02.json` via the Appendix B script |
 | Project | Projects v2 board, fields `Phase`, `Area`, `Size`, `Risk` |
 | Docs | `README.md` (honest pre-alpha status), `AGENTS.md`, this plan |
 | Branch protection | `main`: PR required, `lint`/`test` required, linear history |
@@ -530,7 +530,7 @@ labelled, milestoned and on the board.
   set this backlog uses, not the total.
 
 `Size` on the board is deliberately unset: it is a judgement per item and is not derivable
-from `backlog.json`.
+from `backlog-seed-2026-08-02.json`.
 
 ---
 
@@ -701,7 +701,7 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
 
 ## Appendix B — Backlog
 
-The authoritative, machine-readable manifest is **`docs/backlog.json`** — id, title, body,
+The authoritative, machine-readable manifest is **`docs/backlog-seed-2026-08-02.json`** — id, title, body,
 labels and milestone for every item.
 
 ### Creation script
@@ -710,7 +710,7 @@ labels and milestone for every item.
 R=TheDancingDeveloper-org/agent-harness
 python3 - <<'EOF' > /tmp/mk-harness-issues.sh
 import json, shlex
-for it in json.load(open('docs/backlog.json')):
+for it in json.load(open('docs/backlog-seed-2026-08-02.json')):
     print("gh issue create -R $R "
           f"--title {shlex.quote(it['title'])} "
           f"--body {shlex.quote(it['body'])} "

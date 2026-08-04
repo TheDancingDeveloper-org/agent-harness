@@ -68,7 +68,8 @@ alternative protocols are test-only and production still names the unified diff
 as its sole format, which is what proposal §4.1 requires (no protocol removed
 before the report exists).
 
-The decision is recorded as **D10 in `docs/backlog.json`**, following the
+The decision is recorded as **D10 in `docs/backlog-seed-2026-08-02.json`**
+(named `docs/backlog.json` when Stage E1 wrote it; renamed in Stage F), following the
 repository's existing `type:decision` convention for D1–D9. There is no ADR
 directory and one should not be created.
 

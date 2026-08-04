@@ -174,8 +174,9 @@ flowchart LR
     role -->|reviewer| r4["judge the change"]
 
     r1 & r2 & r3 & r4 --> map["live role map<br/>stored in the queue DB"]
-    map --> route["Route: model · endpoint · provider"]
-    route --> transport["injected transport<br/><i>you own the HTTP</i>"]
+    map --> route["Route: model · endpoint · preset"]
+    route --> preset["preset:<br/>protocol · auth · reader · classifier"]
+    preset --> transport["injected transport<br/><i>you own the HTTP</i>"]
 
     api["PUT /api/roles"] -.->|"takes effect next call"| map
 ```
@@ -192,6 +193,91 @@ testable without a network, and you keep whatever HTTP client you already have.
 **A stored map overrides the command line.** That is the point of storing it,
 but silently ignoring flags someone just typed is its own kind of lie, so a run
 names which roles the command line lost.
+
+### Route presets: adding a vendor without touching core
+
+A `Provider` classified failures. The CLI's transport separately assumed one
+gateway's completion path, one authentication header and one response envelope.
+Neither knew about the other, which had two consequences: "add a vendor" meant
+editing the transport function, and changing the classifier changed nothing
+about what went on the wire.
+
+They are separate concerns now. A route names, explicitly or through a preset:
+
+| Part | What it decides | Core default |
+|---|---|---|
+| request adapter | URL, method, payload keys | `JsonChatRequest()` — POST the endpoint exactly as configured |
+| authentication strategy | which header carries the credential | `BearerAuth()` — `Authorization: Bearer …`, omitted when there is no key |
+| response reader | where the text and the token counts are | `JsonResponseReader()` — conservative; no text path, so it declines rather than guessing |
+| failure classifier | what a rejection means for control flow | `GENERIC` — HTTP only |
+| model, endpoint | on the route itself | — |
+| price reference | what the price table calls this model | the model id |
+
+A **preset** is one name for all four. The core preset is `generic` and it makes
+no vendor-specific claim; every other one is an adapter or a plugin, and
+`protocols.py` never imports one. It resolves them **by name**, in this order,
+loading only the name that was asked for:
+
+1. `protocols.register(preset)` — built in this process;
+2. `HARNESS_ROUTE_PRESETS="name=module:attribute,…"` — named in configuration;
+3. an `agent_harness.route_presets` entry point — published by an installed
+   distribution.
+
+The third is how this distribution's own `chat-completions` and `claw-bay`
+presets are reached, which is deliberate: if the shipped ones took a shortcut
+through an import, "addable without editing core" would be true only for the
+vendors we happen to ship.
+
+```python
+# somepackage/presets.py — in anyone's package
+from agent_harness.protocols import BearerAuth, JsonChatRequest, JsonResponseReader, RoutePreset
+from agent_harness.providers import VendorEnvelopeProvider
+
+PRESET = RoutePreset(
+    name="somevendor",
+    request=JsonChatRequest(path="/v2/generate", model_key="model_id", messages_key="turns"),
+    auth=BearerAuth(header="x-api-key", scheme=""),      # no scheme word
+    reader=JsonResponseReader(text_paths=("result.reply",), usage_key="counters"),
+    classifier=VendorEnvelopeProvider(vendor_field="problem", quota_categories=("budget",)),
+)
+```
+
+```toml
+# ...declared once, in that package's pyproject
+[project.entry-points."agent_harness.route_presets"]
+somevendor = "somepackage.presets:PRESET"
+```
+
+```json
+// ...and named by a route. PUT /api/roles
+{"roles": {"implementer": {"model": "m", "endpoint": "https://…", "preset": "somevendor"}}}
+```
+
+Nothing in `model_client.py`, `providers.py` or `protocols.py` changes for that,
+and `tests/test_route_conformance.py` runs a preset registered from outside
+through the whole conformance suite to keep it that way.
+
+**`provider` versus `preset`.** The older `provider` field only ever chose a
+*classifier* — the wire shape came from whichever transport the deployment had
+wired in — so it still does exactly that: the named preset's classifier is
+taken, and the protocol comes from the deployment default (`run --preset` /
+`serve --preset`, default `chat-completions`). A role map written before this
+existed therefore calls the same URL with the same credential and classifies
+the same way. `preset` wins where both are given.
+
+**Host detection is a suggestion and nothing else.** `protocols.suggest(endpoint)`
+will look at a hostname and say which preset is probably meant, and the CLI
+prints it at startup. It never chooses one. Hosts are proxied, renamed,
+self-hosted and shared; a protocol nobody configured is a request sent to a URL
+nobody chose, and the first symptom would be a failure the classifier cannot
+explain.
+
+**An unknown preset name is loud, not substituted.** A route naming one that
+does not resolve logs a warning and falls back to the generic classifier — a
+role map is edited live, and one misspelling must not take down the readiness
+report that would show the operator what they typed. The CLI is stricter: it
+resolves its default preset before anything claims work, and refuses with the
+list of declared names rather than discovering the problem on the first call.
 
 ---
 

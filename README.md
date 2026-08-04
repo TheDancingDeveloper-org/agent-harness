@@ -39,6 +39,7 @@ reliability.
 | `executor` | The same loop for direct API calls, plus the diff-apply tolerance ladder and checks |
 | `session_host` | Client for whatever owns the PTY sessions (AIDevEnv is the reference) |
 | `providers` | Classifies failures — burst limit vs spent window vs spent cap vs refused |
+| `protocols` | What a route is made of: wire protocol, auth, response reader, classifier — resolved by name |
 | `model_client` | Routes roles to models; per-worker jittered retry; per-endpoint parking |
 | `store` / `ingest` / `sources` | Append-only SQLite event store, idempotent ingest |
 | `api` | Documented HTTP API + Swagger. No GUI — the session host renders it |
@@ -60,6 +61,13 @@ limiter exists to reject.
 So: classify first, never retry a cap, keep all reaction per-worker and per-endpoint, and
 jitter the backoff. See `providers.py` and `model_client.py` — the reasoning is in the
 docstrings, with the live evidence that corrected it twice.
+
+**Classifying a failure is not the same job as speaking to an endpoint.** They were one
+thing here once: `Provider` read error envelopes while the CLI's transport separately
+assumed one gateway's path, header and response shape. Neither knew about the other, so
+"add a provider" meant editing the transport. They are separate now — a route names a
+preset, a preset supplies both — and adding a vendor is a module nobody in core imports.
+See `protocols.py`.
 
 **A claim is a lease, not a lock.** A lock held by a process that died is a lock nobody can
 release, and the usual workaround — a human clearing stale state — is exactly the
@@ -161,16 +169,17 @@ agent that stops to ask something surfaces as `waiting_for_input` rather than lo
 ### Calling models directly
 
 ```python
-from agent_harness import providers
 from agent_harness.model_client import ModelClient, Route
 
 client = ModelClient(
     roles={
-        "planner": Route("a-strong-model", "https://api.example", providers.CLAW_BAY),
-        "implementer": Route("a-cheaper-model", "https://api.example", providers.CLAW_BAY),
+        "planner": Route("a-strong-model", "https://api.example/v1", preset="chat-completions"),
+        "implementer": Route(
+            "a-cheaper-model", "https://api.example/v1", preset="chat-completions"
+        ),
         # Reviewer independence: a different vendor, so a model is not
         # grading its own work.
-        "reviewer": Route("another-vendor", "https://api.example", providers.CLAW_BAY),
+        "reviewer": Route("another-vendor", "https://other.example/v1", preset="claw-bay"),
     },
     transport=my_http_call,  # you own the HTTP; this owns the policy
     on_event=lambda e: log.write(json.dumps(e) + "\n"),
@@ -182,8 +191,12 @@ client.call("implementer", messages)  # names a ROLE, never a model
 `transport` is injected rather than imported, so the retry logic is testable without a
 network and you can keep whatever HTTP client you already have.
 
-If your provider is not one of the two shipped, write a `classify` — `GENERIC` works, but
-it cannot tell a spend cap from a burst limit, because nothing in HTTP can.
+A route names a **preset**: the wire protocol, the authentication strategy, the
+response/usage reader and the failure classifier, as one name. Omit it and you get the
+generic one, which claims nothing about any vendor — and cannot tell a spend cap from a
+burst limit, because nothing in HTTP can. Adding a vendor is a new preset registered by
+name; no core module changes, and nothing in core imports it. See
+[`docs/INTERNALS.md`](docs/INTERNALS.md#route-presets-adding-a-vendor-without-touching-core).
 
 ### The API
 

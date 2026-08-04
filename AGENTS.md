@@ -7,7 +7,8 @@ Binding guidance for anyone, human or agent, working in this repository.
 It is **not tied to any project, language or workload**, and must not become so. That is an
 owner ruling, not a preference.
 
-Concretely, in the core (`providers`, `model_client`, `store`, `ingest`, `sources`, `app`):
+Concretely, in the core (`providers`, `protocols`, `model_client`, `store`, `ingest`,
+`sources`, `app`):
 
 - no hardcoded log paths, file layouts or directory conventions;
 - no numbers belonging to one workload — a baseline is *supplied*, never built in;
@@ -59,6 +60,7 @@ trade and it is rejected.
 | Sample plan | `examples/PLAN.md` |
 | The original plan | `docs/HARNESS-PLAN.md` (superseded in part) |
 | Backlog manifest (seeds GitHub issues) | `docs/backlog.json` |
+| What a route is made of, and how a vendor is added | `src/agent_harness/protocols.py` |
 | Event schema | `src/agent_harness/events.py` |
 | Event store (append-only) | `src/agent_harness/store.py` |
 | Log readers | `src/agent_harness/ingest.py` |

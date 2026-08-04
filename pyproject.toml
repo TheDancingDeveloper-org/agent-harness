@@ -38,6 +38,13 @@ agent-harness = "agent_harness.__main__:main"
 chat-completions = "agent_harness.adapters.chat_completions:PRESET"
 claw-bay = "agent_harness.adapters.claw_bay:PRESET"
 
+# Dependency resolvers, on the same terms. A `depends on:
+# external:NAME:IDENTITY` token names one of these; `graph.py` reads the
+# metadata and imports only the adapter that name belongs to. Core never
+# learns an external tracker's format.
+[project.entry-points."agent_harness.dependency_resolvers"]
+github-issue = "agent_harness.adapters.github_issue:resolver"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

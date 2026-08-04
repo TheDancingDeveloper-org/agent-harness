@@ -299,10 +299,100 @@ def validate_diff(diff: str) -> list[PatchProblem]:
             )
             counting = False
     if counting and (old_left or new_left):
+        # Short at end of input, which is two different faults wearing one
+        # symptom, and they must not be treated alike.
+        #
+        # A context line counts on BOTH sides. So a header that over-counted
+        # trailing context -- the common model error, observed on four
+        # consecutive runs -- is short by the SAME amount on each side, its
+        # body is complete and internally consistent, and `recount_hunks`
+        # repairs it exactly.
+        #
+        # A reply genuinely cut off mid-hunk loses a mix of `+`, `-` and
+        # context, so the two shortfalls differ. Recounting that would make
+        # the header agree with a partial body and the patch would apply --
+        # landing, say, a deletion whose replacement never arrived. That is
+        # the "succeeds in the wrong place" failure the ladder refuses
+        # elsewhere, so it stays fatal.
+        recountable = old_left == new_left
         problems.append(
-            PatchProblem(hunk_line, "the patch ends mid-hunk — the reply was truncated")
+            PatchProblem(
+                hunk_line,
+                f"the last hunk supplies {old_left} fewer source and {new_left} fewer result "
+                "line(s) than its header declares, and the patch then ends"
+                + ("" if recountable else " — the reply was cut off mid-hunk"),
+                fatal=not recountable,
+            )
         )
     return problems
+
+
+def recount_hunks(diff: str) -> str:
+    """Rewrite each hunk header's line counts from the body beneath it.
+
+    A model that miscounts its own hunk is the single most common way a
+    correct patch is thrown away. Measured: four consecutive runs of one item
+    produced a byte-for-byte correct body under `@@ -1,10 +1,21 @@` for a file
+    with nine lines -- one too many on each side, because the trailing newline
+    was counted as a line. `git apply` parses by the declared counts, reaches
+    the end of input a line early, and reports `corrupt patch`. Neither
+    `--unidiff-zero` nor `patch --fuzz` helps: there is nothing to be tolerant
+    *with* once the parser has run out of input.
+
+    This is safe in a way the tolerance ladder is not, and the distinction
+    matters. The body is the truth -- the counts are a derivable property of
+    it, so recomputing them guesses at nothing. Contrast a `@@ -0,0` header
+    against a file that has content (#133), where the header carried the only
+    statement about *where* the lines belong: there, nothing could be
+    recomputed, and the patch is refused instead.
+
+    Headers that are already right are rewritten to the same values, so this
+    is a no-op on a well-formed diff.
+    """
+    lines = diff.splitlines(keepends=True)
+    out: list[str] = []
+    pending: int | None = None  # index in `out` of a header awaiting its counts
+    old = new = 0
+
+    def flush() -> None:
+        if pending is None:
+            return
+        header = _HUNK_HEADER.match(out[pending])
+        if header is None:  # pragma: no cover - only reached via a bad index
+            return
+        # Only when they actually disagree. A header written `@@ -1 +1 @@` is
+        # correct and means one line; rewriting it to `@@ -1,1 +1,1 @@` would
+        # change a byte of every well-formed patch for no reason.
+        declared_old = int(header.group(2) or 1)
+        declared_new = int(header.group(4) or 1)
+        if (declared_old, declared_new) == (old, new):
+            return
+        tail = out[pending][header.end() :]
+        out[pending] = f"@@ -{header.group(1)},{old} +{header.group(3)},{new} @@{tail}"
+
+    for line in lines:
+        if _HUNK_HEADER.match(line):
+            flush()
+            out.append(line)
+            pending, old, new = len(out) - 1, 0, 0
+            continue
+        if pending is not None:
+            if line.startswith("+"):
+                new += 1
+            elif line.startswith("-"):
+                old += 1
+            elif line.startswith((" ", "\n")) or line.strip() == "":
+                # A context line. An empty line in a diff is a context line
+                # whose single leading space some models drop.
+                old += 1
+                new += 1
+            else:
+                # A file header or trailing commentary: this hunk is over.
+                flush()
+                pending = None
+        out.append(line)
+    flush()
+    return "".join(out)
 
 
 #: How much of a damaged patch goes into the event, and how much of it around
@@ -466,25 +556,32 @@ def apply_diff(repo: Path, diff: str, *, allow_fuzzy: bool = False) -> tuple[boo
         # patch is provably wrong before anything is run.
         return False, "; ".join(unplaceable)
     ladder = (*APPLY_LADDER, FUZZY_RUNG) if allow_fuzzy else APPLY_LADDER
+    # Every rung gets the patch as written first, then with its hunk counts
+    # recomputed. Recounting is not tolerance -- the counts are derivable from
+    # the body, so nothing is guessed -- but it goes second so a diff that was
+    # already correct is applied exactly as the model wrote it.
+    recounted = recount_hunks(diff)
+    variants = [("", diff)] if recounted == diff else [("", diff), (" (recounted)", recounted)]
     errors = []
     for label, args in ladder:
-        try:
-            result = subprocess.run(  # noqa: S603 - fixed argv, no shell
-                args if args[0] != "git" else ["git", "-C", str(repo), *args[1:]],
-                input=diff,
-                capture_output=True,
-                text=True,
-                cwd=str(repo),
-            )
-        except FileNotFoundError:
-            # `patch` is not installed everywhere. Missing it costs the last
-            # rung, not the whole apply.
-            errors.append(f"{label}: not available")
-            continue
-        if result.returncode == 0:
-            return True, label
-        detail = (result.stderr or result.stdout).strip().splitlines()
-        errors.append(f"{label}: {detail[-1]}" if detail else label)
+        for suffix, candidate in variants:
+            try:
+                result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+                    args if args[0] != "git" else ["git", "-C", str(repo), *args[1:]],
+                    input=candidate,
+                    capture_output=True,
+                    text=True,
+                    cwd=str(repo),
+                )
+            except FileNotFoundError:
+                # `patch` is not installed everywhere. Missing it costs the
+                # rung, not the whole apply -- and not the other variant.
+                errors.append(f"{label}: not available")
+                break
+            if result.returncode == 0:
+                return True, label + suffix
+            detail = (result.stderr or result.stdout).strip().splitlines()
+            errors.append(f"{label}{suffix}: {detail[-1]}" if detail else label + suffix)
     return False, "; ".join(dict.fromkeys(errors))
 
 

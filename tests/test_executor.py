@@ -24,6 +24,7 @@ from agent_harness.executor import (
     Executor,
     apply_diff,
     extract_diff,
+    recount_hunks,
     repo_context,
     unplaceable_hunks,
     validate_diff,
@@ -818,10 +819,26 @@ def test_the_most_commonly_rescued_damage_is_not_called_fatal() -> None:
     assert not [p for p in validate_diff(MINIMAL_HEADER_DIFF) if p.fatal]
 
 
-def test_a_truncated_patch_is_recognised_as_truncated() -> None:
+def test_a_patch_cut_off_mid_hunk_is_still_refused() -> None:
+    """This fixture is the dangerous shape: its `+` replacement never arrived,
+    so a recounted header would apply the deletion alone. It must stay fatal.
+
+    Told apart from a miscounted header by the shortfalls differing: a context
+    line counts on both sides, so over-counting context is short by the same
+    amount on each, while a reply cut off loses a mix.
+    """
     problems = validate_diff(TRUNCATED_DIFF)
     assert problems and problems[0].fatal
-    assert "truncated" in problems[0].detail
+    assert "cut off mid-hunk" in problems[0].detail
+
+
+def test_a_header_that_merely_over_counts_context_is_not_fatal() -> None:
+    """The live case, four runs running: a complete body under a header that
+    counted the file's trailing newline. Recountable, so not refused."""
+    problems = validate_diff(OVERCOUNTED_DIFF)
+
+    assert problems and not problems[0].fatal
+    assert "cut off" not in problems[0].detail
 
 
 def test_a_line_with_no_diff_prefix_is_recognised() -> None:
@@ -1090,3 +1107,74 @@ def test_binary_files_are_listed_but_not_read(repo: Path) -> None:
 
     assert "logo.png" in context
     assert "--- logo.png ---" not in context
+
+
+# ------------------------------------------------ hunk headers that miscount
+
+
+#: The live failure, four runs running. The body is byte-for-byte correct;
+#: the header claims one line too many on each side, because the model counted
+#: the file's trailing newline as a line. `git apply` parses by the declared
+#: counts, reaches the end of input early, and calls the patch corrupt.
+OVERCOUNTED_DIFF = """\
+diff --git a/hello.txt b/hello.txt
+--- a/hello.txt
++++ b/hello.txt
+@@ -1,2 +1,3 @@
+ hello world
++a second line
+"""
+
+
+def test_a_header_that_over_declares_is_recounted_and_applied(repo: Path) -> None:
+    """The regression. No rung of the ladder rescued this: tolerance needs
+    something to be tolerant *with*, and the parser has already run out of
+    input."""
+    applied, how = apply_diff(repo, OVERCOUNTED_DIFF)
+
+    assert applied, how
+    assert "recounted" in how
+    assert (repo / "hello.txt").read_text() == "hello world\na second line\n"
+
+
+def test_the_unrecounted_patch_really_is_rejected(repo: Path) -> None:
+    """Guards the test above: if git accepted it as written, the fix would
+    look load-bearing when it is not."""
+    result = subprocess.run(
+        ["git", "-C", str(repo), "apply", "-"],
+        input=OVERCOUNTED_DIFF,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "corrupt patch" in (result.stderr or "")
+
+
+def test_a_correct_diff_is_applied_exactly_as_written(repo: Path) -> None:
+    """Recounting is second, not first: a well-formed patch must not be
+    rewritten on its way in."""
+    applied, how = apply_diff(repo, DIFF)
+
+    assert applied
+    assert how == "git apply", "a correct diff should not have needed recounting"
+
+
+def test_recounting_leaves_a_correct_header_alone() -> None:
+    assert recount_hunks(DIFF) == DIFF
+
+
+def test_recounting_fixes_both_sides_of_the_header() -> None:
+    recounted = recount_hunks(OVERCOUNTED_DIFF)
+
+    assert "@@ -1,1 +1,2 @@" in recounted
+
+
+def test_recounting_does_not_move_anything(repo: Path) -> None:
+    """The counts are a derivable property of the body, so this guesses at
+    nothing -- unlike a `-0,0` header, where the placement was the only thing
+    the header carried and there is nothing to recompute (#133)."""
+    recounted = recount_hunks(OVERCOUNTED_DIFF)
+
+    assert [line for line in recounted.splitlines() if line.startswith(("+", "-", " "))] == [
+        line for line in OVERCOUNTED_DIFF.splitlines() if line.startswith(("+", "-", " "))
+    ]

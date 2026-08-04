@@ -176,12 +176,24 @@ success is not.**
 
 Three things are ready for whoever picks this up:
 
-1. **Push, open a pull request, and get the branch reviewed.** Twenty-nine
-   commits on one local branch is the same liability the status document
-   described in July, one order of magnitude larger.
+1. **Push, open a pull request, and get the branch reviewed.** Twenty-six
+   commits on one local branch — forty-eight counting the four merged branches'
+   own history — is the same liability the status document described in July,
+   one order of magnitude larger.
 2. **Close the session-mode gaps in H and L together.** They are one gap.
 3. **Run #84 / T43.** It is the only open decision that a single deterministic
    run would settle, and D9 has been waiting on it.
 
 **"No failures observed" is not equivalent to "the requirement was
 exercised."**
+
+## Correction, 2026-08-04
+
+§8 first said **twenty-nine** commits. The figure was wrong and was corrected
+the same day, before this report had been read by anybody: `git log
+--first-parent 01be448..3dbb764` counts **26**, and `git log 01be448..3dbb764`
+counts **48** including the commits that arrived with the four merged stage
+branches. The superseded claim is retained here rather than only overwritten,
+per [`README.md`](README.md).
+
+Nothing else in this report depends on that number, and no measurement changed.

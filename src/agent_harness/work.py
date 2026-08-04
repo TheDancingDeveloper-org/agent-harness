@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS projects (
     -- Stage K: `check command -> argv believed to clear it`. Recorded when a
     -- check fails, never run.
     fixes       TEXT NOT NULL DEFAULT '{}',
+    -- Stage H: how often an attempt at this project is made durable.
+    durability  TEXT NOT NULL DEFAULT '',
     plan_path   TEXT,
     roles       TEXT,
     max_workers INTEGER NOT NULL DEFAULT 1,
@@ -330,6 +332,9 @@ class Project:
     #: `ruff format --check` reports. Recorded when the check fails and
     #: **never run** — see `outcomes.CheckResult.fix`.
     fixes: dict[str, list[str]] = field(default_factory=dict)
+    #: How often this project's attempts are made durable: `exit`, `boundary`
+    #: or `sync`. Empty takes the deployment's default. See `attempts.py`.
+    durability: str = ""
     plan_path: str | None = None
     roles: dict[str, Any] | None = None
     max_workers: int = 1
@@ -343,6 +348,7 @@ class Project:
         data = dict(row)
         data["checks"] = json.loads(data.get("checks") or "[]")
         data["fixes"] = json.loads(data.get("fixes") or "{}")
+        data["durability"] = data.get("durability") or ""
         data["roles"] = json.loads(data["roles"]) if data.get("roles") else None
         return cls(**data)
 
@@ -487,6 +493,8 @@ class WorkQueue:
             # Stage K. Additive; an older build ignores it and a project that
             # declares no fix reads as `{}`.
             "fixes": "TEXT NOT NULL DEFAULT '{}'",
+            # Stage H, additive on the same terms.
+            "durability": "TEXT NOT NULL DEFAULT ''",
         },
         # Stage G. Additive, so a rollback to an older build still reads every
         # column it knows and simply ignores this one. The migration plan is
@@ -604,13 +612,13 @@ class WorkQueue:
         try:
             conn.execute(
                 "INSERT INTO projects (project_id, name, repo, work_dir, base_branch, "
-                "checks, fixes, plan_path, roles, max_workers, max_attempts, "
+                "checks, fixes, durability, plan_path, roles, max_workers, max_attempts, "
                 "min_free_disk_gb, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET "
                 "name=excluded.name, repo=excluded.repo, work_dir=excluded.work_dir, "
                 "base_branch=excluded.base_branch, checks=excluded.checks, "
-                "fixes=excluded.fixes, "
+                "fixes=excluded.fixes, durability=excluded.durability, "
                 "plan_path=excluded.plan_path, roles=excluded.roles, "
                 "max_workers=excluded.max_workers, max_attempts=excluded.max_attempts, "
                 "min_free_disk_gb=excluded.min_free_disk_gb, "
@@ -623,6 +631,7 @@ class WorkQueue:
                     project.base_branch,
                     json.dumps(project.checks),
                     json.dumps(project.fixes),
+                    project.durability,
                     project.plan_path,
                     json.dumps(project.roles) if project.roles else None,
                     project.max_workers,

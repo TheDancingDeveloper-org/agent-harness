@@ -68,6 +68,7 @@ trade and it is rejected.
 | Event store (append-only) | `src/agent_harness/store.py` |
 | Typed dependency graph | `src/agent_harness/graph.py` — contract in `docs/COORDINATION-PLANE.md` §8 |
 | What a gate answered, and what stopped an item | `src/agent_harness/outcomes.py` — **not** `providers.py`, which is what a *provider* answered |
+| Where an attempt got to, durably | `src/agent_harness/attempts.py` — a fixed stage list, **not** a workflow engine |
 | Queue schema migration | `docs/MIGRATION-graph.md` — backup, export, rebuild, rollback |
 | Log readers | `src/agent_harness/ingest.py` |
 | JSON API (no GUI) | `src/agent_harness/api.py` |

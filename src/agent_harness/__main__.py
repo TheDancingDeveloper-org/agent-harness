@@ -656,11 +656,17 @@ def _run(args: argparse.Namespace) -> int:
             project_id=args.project,
         )
     else:
+        # The flag wins, then the project's own setting, then the default.
+        # Named in that order because a run someone typed a mode onto is a run
+        # they meant to type it onto.
+        project = queue.get_project(args.project)
+        durability = args.durability or (project.durability if project else "") or None
         executor = Executor(
             queue,
             client,
             args.work,
             checks=checks,
+            durability=durability,
             github=GitHub(args.repo) if args.repo else None,
             base_branch=args.base,
             on_event=emit,
@@ -1081,6 +1087,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_run.add_argument(
         "--dry-run", action="store_true", help="show what would run, call nothing, change nothing"
+    )
+    p_run.add_argument(
+        "--durability",
+        default=os.environ.get("HARNESS_DURABILITY", ""),
+        choices=("", "exit", "boundary", "sync"),
+        help="how often an attempt is made durable, so a killed worker resumes "
+        "rather than re-paying for the planner and the implementer. `exit` "
+        "writes nothing until the attempt ends; `boundary` (the default) writes "
+        "one row per stage; `sync` also records the intent to perform each "
+        "external effect before it happens. Empty takes the project's setting, "
+        "then the default. The pre-review git checkpoint is unaffected by all "
+        "three (or $HARNESS_DURABILITY).",
     )
     p_run.add_argument(
         "--demo",

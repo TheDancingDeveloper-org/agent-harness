@@ -343,7 +343,7 @@ def select_repo_context(
         # context selection into arbitrary access outside the repository. Git
         # stores the link target, not the pointed-to bytes; the implementer
         # needs neither, so links stay visible in the listing only.
-        if not ref and (repo / path).is_symlink():
+        if (repo / path).is_symlink():
             omitted.append((path, "symbolic link content is not supplied"))
             continue
         try:

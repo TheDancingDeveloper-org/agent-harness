@@ -182,4 +182,12 @@ def _checks_for(project: Project) -> Checks:
     for command in project.checks or []:
         validate_check_command(command)
         commands.append(shlex.split(command))
-    return Checks(commands=commands)
+    # A declared fix is argv too, and gets the same refusal: it is recorded
+    # rather than run today, but a string that would be unsafe to run is
+    # unsafe to store as runnable.
+    fixes: dict[str, list[str]] = {}
+    for command, fix in (project.fixes or {}).items():
+        if not fix:
+            continue
+        fixes[command] = list(fix)
+    return Checks(commands=commands, fixes=fixes)

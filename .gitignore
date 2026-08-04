@@ -11,3 +11,6 @@ build/
 *.sqlite-wal
 *.sqlite-shm
 .env
+
+# Session-local agent scratch; the worktrees under here are separate checkouts.
+.claude/

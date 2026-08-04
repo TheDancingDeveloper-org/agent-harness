@@ -107,6 +107,9 @@ CREATE TABLE IF NOT EXISTS projects (
     work_dir    TEXT,
     base_branch TEXT NOT NULL DEFAULT 'main',
     checks      TEXT NOT NULL DEFAULT '[]',
+    -- Stage K: `check command -> argv believed to clear it`. Recorded when a
+    -- check fails, never run.
+    fixes       TEXT NOT NULL DEFAULT '{}',
     plan_path   TEXT,
     roles       TEXT,
     max_workers INTEGER NOT NULL DEFAULT 1,
@@ -320,6 +323,11 @@ class Project:
     work_dir: str | None = None
     base_branch: str = "main"
     checks: list[str] = field(default_factory=list)
+    #: `check command -> argv believed to clear it`. Declared, because only
+    #: the person who wrote the check knows that `ruff format` fixes what
+    #: `ruff format --check` reports. Recorded when the check fails and
+    #: **never run** — see `outcomes.CheckResult.fix`.
+    fixes: dict[str, list[str]] = field(default_factory=dict)
     plan_path: str | None = None
     roles: dict[str, Any] | None = None
     max_workers: int = 1
@@ -332,6 +340,7 @@ class Project:
     def from_row(cls, row: sqlite3.Row) -> Project:
         data = dict(row)
         data["checks"] = json.loads(data.get("checks") or "[]")
+        data["fixes"] = json.loads(data.get("fixes") or "{}")
         data["roles"] = json.loads(data["roles"]) if data.get("roles") else None
         return cls(**data)
 
@@ -467,6 +476,9 @@ class WorkQueue:
         "projects": {
             "max_attempts": "INTEGER NOT NULL DEFAULT 5",
             "min_free_disk_gb": "REAL NOT NULL DEFAULT 0",
+            # Stage K. Additive; an older build ignores it and a project that
+            # declares no fix reads as `{}`.
+            "fixes": "TEXT NOT NULL DEFAULT '{}'",
         },
         # Stage G. Additive, so a rollback to an older build still reads every
         # column it knows and simply ignores this one. The migration plan is
@@ -584,12 +596,13 @@ class WorkQueue:
         try:
             conn.execute(
                 "INSERT INTO projects (project_id, name, repo, work_dir, base_branch, "
-                "checks, plan_path, roles, max_workers, max_attempts, min_free_disk_gb, "
-                "created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "checks, fixes, plan_path, roles, max_workers, max_attempts, "
+                "min_free_disk_gb, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET "
                 "name=excluded.name, repo=excluded.repo, work_dir=excluded.work_dir, "
                 "base_branch=excluded.base_branch, checks=excluded.checks, "
+                "fixes=excluded.fixes, "
                 "plan_path=excluded.plan_path, roles=excluded.roles, "
                 "max_workers=excluded.max_workers, max_attempts=excluded.max_attempts, "
                 "min_free_disk_gb=excluded.min_free_disk_gb, "
@@ -601,6 +614,7 @@ class WorkQueue:
                     project.work_dir,
                     project.base_branch,
                     json.dumps(project.checks),
+                    json.dumps(project.fixes),
                     project.plan_path,
                     json.dumps(project.roles) if project.roles else None,
                     project.max_workers,

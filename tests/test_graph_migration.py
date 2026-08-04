@@ -138,22 +138,25 @@ def test_an_upgraded_but_unrebuilt_database_holds_dependent_work_rather_than_adm
     direction. An unbuilt graph is an unknown graph, and Stage G's whole rule
     is that unknown is a blocker rather than an assumed pass.
 
-    T3 depends on T2, which IS done -- so under the old rule it would be
-    claimable immediately after the upgrade. It is not, because the edge that
-    proves it has not been derived yet, and the readiness explanation says so
-    rather than leaving the operator guessing.
+    "No edges" would otherwise read exactly like "no dependencies", so every
+    dependent item in an existing backlog would be admitted on the strength of
+    a graph nobody had built.
     """
     path = legacy_database(tmp_path / "w.sqlite")
     queue = WorkQueue(path, lease_seconds=100.0)
 
     assert queue.graph.edges(DEFAULT_PROJECT) == []
-    assert queue.readiness("T3").ready is True, (
-        "with no edges at all the item is unblocked; the risk is the reverse case"
-    )
+    stale = queue.readiness("T3")
+    assert stale.ready is False
+    assert stale.reasons[0].kind == "stale_graph"
+    assert "graph rebuild" in stale.reasons[0].explanation
+    # An item that declares nothing is unaffected: it has no edges because it
+    # has no dependencies, and that is not the same thing.
+    assert queue.readiness("T1").ready is True
 
-    # ...and the moment the graph IS derived, the real answer appears.
+    # ...and the moment the graph IS derived, the real answers appear.
     queue.graph.rebuild()
-    assert queue.readiness("T3").ready is True
+    assert queue.readiness("T3").ready is True, "T2 is done, so T3 really is ready"
     blocked = queue.readiness("T4")
     assert blocked.ready is False
     assert "no item 'T404'" in blocked.reasons[0].explanation

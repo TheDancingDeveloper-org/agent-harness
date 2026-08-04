@@ -47,10 +47,15 @@ by inspecting the tables, on every open, and is therefore idempotent:
   `agent-harness graph rebuild` runs.
 
 That last point is the one that can surprise someone. It is deliberate, and it
-fails safe in the direction the stage requires: an item with `depends_on`
-entries and no edges is **not ready**, because an unbuilt graph is an unknown
-graph, and Stage G's whole rule is that unknown is a blocker rather than an
-assumed pass. See §5.
+fails safe in the direction the stage requires: an item whose `depends_on` is
+non-empty and which has **no edges** is not ready, and its readiness
+explanation says `stale_graph` and tells you to run `graph rebuild`. An
+unbuilt graph is an unknown graph, and Stage G's whole rule is that unknown is
+a blocker rather than an assumed pass.
+
+An item that declares no dependencies is unaffected — it has no edges because
+it has nothing to wait for, which is not the same thing, and the two are
+distinguished by reading `depends_on` rather than by guessing. See §5.
 
 ## 3. Backup, before anything
 
@@ -141,8 +146,10 @@ blocker. Concretely:
 - a genuine external dependency must say so — `external:<resolver>:<identity>`
   in the plan — and must have a recorded resolver outcome before it counts as
   satisfied;
-- after an in-place upgrade with no rebuild, items with dependencies are held
-  until `graph rebuild` runs or the plan is re-ingested.
+- after an in-place upgrade with no rebuild, **items that declare dependencies
+  are held** until `graph rebuild` runs or the plan is re-ingested; their
+  readiness reason is `stale_graph` and names the command. Items with no
+  declared dependencies are unaffected.
 
 Before upgrading a database with a live backlog, run:
 

@@ -654,7 +654,10 @@ class ReadinessReasonModel(BaseModel):
 
     kind: str = Field(
         description="`dependency` for an unsatisfied edge, `cycle` for a loop that can "
-        "never resolve. Present so a client can branch on something other than English."
+        "never resolve, `stale_graph` for an item that declares dependencies the edge "
+        "table does not hold yet (a database upgraded in place before "
+        "`agent-harness graph rebuild` ran). Present so a client can branch on something "
+        "other than English."
     )
     explanation: str = Field(description="The reason in words, safe to show a human.")
     target_kind: TargetKind | None = Field(None, description="Kind of the target involved.")

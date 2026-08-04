@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .graph import LOCAL_WORK
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
 from .work import (
     DEFAULT_PROJECT,
@@ -1367,11 +1368,17 @@ class Executor:
         # once, minutes ago; correcting a plan while work is in flight is a
         # normal thing for an operator to do, and an item that is no longer
         # eligible must not land on the strength of a stale check.
-        unmet = self.queue.unmet_dependencies(record.item_id, project_id=self.project_id)
-        if unmet:
+        #
+        # Deliberately the same `readiness` call admission made, over the same
+        # authoritative graph revision, so the two cannot drift apart. The
+        # agent is NOT killed: it has already finished, the branch is
+        # abandoned, and the item returns to pending with the reason recorded.
+        admission = self.queue.readiness(record.item_id, project_id=self.project_id)
+        if not admission.ready:
             outcome.reason = (
-                f"{record.item_id} now depends on {', '.join(unmet)}, which "
-                "is not done; the candidate is discarded and the item goes back to pending"
+                f"{record.item_id} was admitted at graph revision "
+                f"{record.admitted_revision} and {admission.explain()}; the candidate is "
+                "discarded and the item goes back to pending"
             )
             self._emit(record, "dependency_invalidated", detail=outcome.reason)
             outcome.state = PENDING
@@ -1456,9 +1463,10 @@ class Executor:
         hidden.
         """
         candidates = [
-            dependency
-            for dependency in record.depends_on
-            if (found := self.queue.get(dependency, project_id=self.project_id))
+            spec.target_id
+            for spec in record.dependency_specs()
+            if spec.target_kind == LOCAL_WORK
+            and (found := self.queue.get(spec.target_id, project_id=self.project_id))
             and found.branch
             and found.state == DONE
         ]

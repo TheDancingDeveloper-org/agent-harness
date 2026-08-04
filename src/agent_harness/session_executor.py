@@ -39,6 +39,22 @@ from typing import Any
 from .executor import APPROVED, REJECTED, Checks, Outcome, is_disk_exhaustion, run_git
 from .graph import LOCAL_WORK
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
+from .outcomes import (
+    AGENT_TIMEOUT,
+    BUDGET_EXHAUSTED,
+    CLAIM_LOST,
+    COMPLETED,
+    CRASHED,
+    DEPENDENCY_INVALIDATED,
+    NO_TARGET,
+    PROVIDER_EXHAUSTED,
+    REFUSED,
+    REVIEW_REJECTED,
+    WITHHELD,
+    WORKER_ERROR,
+    Stop,
+    stop_for,
+)
 from .reaper import DEFAULT_MAX_AGE_SECONDS, ReapReport, reap_abandoned_sessions
 from .session_host import Session, SessionHost
 from .work import (
@@ -218,7 +234,7 @@ class SessionExecutor:
             # Deliberately no release: the item is not ours to finish. The
             # new owner is working on it right now, and reporting anything
             # here would overwrite a live claim.
-            self._emit(record, "claim_lost", detail=str(exc))
+            self._emit(record, "claim_lost", detail=str(exc), error_class=CLAIM_LOST)
             self._orphan_session(record, f"claim lost: {exc}")
             return None
         except CapExhausted as exc:
@@ -233,6 +249,8 @@ class SessionExecutor:
                 pr_url=partial.pr_url if partial else None,
                 owner=self.owner,
                 consume_attempt=False,
+                disposition=WITHHELD,
+                reason_kind=BUDGET_EXHAUSTED,
                 project_id=self.project_id,
             )
             raise
@@ -249,6 +267,7 @@ class SessionExecutor:
             )
             self._orphan_session(record, str(exc))
             partial = self._partial_for(record)
+            stop = Stop(WITHHELD, PROVIDER_EXHAUSTED, detail=str(exc))
             self.queue.release(
                 record.item_id,
                 PENDING,
@@ -256,17 +275,21 @@ class SessionExecutor:
                 branch=partial.branch if partial else None,
                 pr_url=partial.pr_url if partial else None,
                 owner=self.owner,
+                disposition=stop.disposition,
+                reason_kind=stop.reason_kind,
                 project_id=self.project_id,
             )
             if partial is not None:
                 partial.state = PENDING
                 partial.reason = str(exc)
+                partial.stop = stop
                 return partial
-            return Outcome(record.item_id, PENDING, reason=str(exc))
+            return Outcome(record.item_id, PENDING, reason=str(exc), stop=stop)
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
             self._orphan_session(record, str(exc))
             partial = self._partial_for(record)
+            stop = Stop(CRASHED, WORKER_ERROR, detail=str(exc))
             self.queue.release(
                 record.item_id,
                 FAILED,
@@ -274,13 +297,16 @@ class SessionExecutor:
                 branch=partial.branch if partial else None,
                 pr_url=partial.pr_url if partial else None,
                 owner=self.owner,
+                disposition=stop.disposition,
+                reason_kind=stop.reason_kind,
                 project_id=self.project_id,
             )
             if partial is not None:
                 partial.state = FAILED
                 partial.reason = str(exc)
+                partial.stop = stop
                 return partial
-            return Outcome(record.item_id, FAILED, reason=str(exc))
+            return Outcome(record.item_id, FAILED, reason=str(exc), stop=stop)
         self.queue.release(
             record.item_id,
             outcome.state,
@@ -288,6 +314,9 @@ class SessionExecutor:
             branch=outcome.branch,
             pr_url=outcome.pr_url,
             owner=self.owner,
+            consume_attempt=outcome.stop.consumes_attempt if outcome.stop else True,
+            disposition=outcome.disposition,
+            reason_kind=outcome.reason_kind,
             project_id=self.project_id,
         )
         return outcome
@@ -493,10 +522,17 @@ class SessionExecutor:
                     reason=outcome.reason,
                     session_url=session.tab_url(self.ui_base_url) if self.ui_base_url else None,
                 )
+                # Nothing judged the work: the agent never finished, and it
+                # is still holding the item in a session deliberately left
+                # alive. The state is unchanged from before this taxonomy
+                # existed -- moving it to pending would let a second worker
+                # claim a tree a live agent is still writing to.
+                outcome.stop = Stop(CRASHED, AGENT_TIMEOUT, detail=outcome.reason)
                 return outcome
             if finished.exit_code != 0:
                 outcome.reason = f"agent exited {finished.exit_code}"
                 self._emit(record, "agent_failed", detail=outcome.reason, session_id=session.id)
+                outcome.stop = Stop(CRASHED, WORKER_ERROR, detail=outcome.reason)
                 return outcome
             self._emit(record, "agent_finished", session_id=session.id)
 
@@ -508,20 +544,34 @@ class SessionExecutor:
             if not diff.strip() and not run_git(tree, "status", "--porcelain").strip():
                 outcome.reason = "the agent made no changes"
                 self._emit(record, "no_changes", session_id=session.id)
+                outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
                 return outcome
             outcome.stages.append("changes")
 
-            passed, failure = self.checks.run(tree)
+            checked = self.checks.run(tree)
+            failure = checked.detail
             outcome.stages.append("checks")
-            if not passed:
+            if not checked.ok:
+                stop = stop_for(checked)
                 outcome.reason = failure
                 self._emit(
                     record,
                     "checks_failed",
                     detail=failure[:2000],
                     session_id=session.id,
-                    error_class="disk_exhausted" if is_disk_exhaustion(failure) else None,
+                    error_class=(
+                        "disk_exhausted" if is_disk_exhaustion(failure) else stop.reason_kind
+                    ),
                 )
+                if checked.fix:
+                    self._emit(
+                        record,
+                        "fix_available",
+                        detail="`" + " ".join(checked.fix) + "` is declared to clear this",
+                        session_id=session.id,
+                    )
+                outcome.stop = stop
+                outcome.state = stop.state
                 return outcome
             self._emit(record, "checks_passed", session_id=session.id)
             self._keepalive(record)
@@ -547,6 +597,9 @@ class SessionExecutor:
                     detail=outcome.reason,
                     session_id=session.id,
                 )
+                # Withheld, not failed. The graph moved under a live claim;
+                # nothing judged the work.
+                outcome.stop = Stop(WITHHELD, DEPENDENCY_INVALIDATED, detail=outcome.reason)
                 outcome.state = PENDING
                 return outcome
 
@@ -575,7 +628,7 @@ class SessionExecutor:
                         record, "draft_pr_opened", detail=outcome.pr_url, session_id=session.id
                     )
 
-            verdict_text = self._review(record, tree, passed, failure)
+            verdict_text = self._review(record, tree, True, "")
             outcome.stages.append("review")
             verdict = APPROVED if verdict_text.strip().upper().startswith("APPROVED") else REJECTED
             outcome.verdict = verdict
@@ -591,6 +644,7 @@ class SessionExecutor:
 
             if verdict != APPROVED:
                 outcome.reason = f"review rejected: {verdict_text.strip()[:500]}"
+                outcome.stop = Stop(REFUSED, REVIEW_REJECTED, detail=outcome.reason)
                 return outcome
 
             if outcome.pr_url and self.github is not None:
@@ -598,6 +652,7 @@ class SessionExecutor:
                 outcome.stages.append("pr")
 
             outcome.state = DONE
+            outcome.stop = Stop(COMPLETED)
             self._emit(record, "done", detail=outcome.pr_url or branch, session_id=session.id)
             return outcome
         finally:

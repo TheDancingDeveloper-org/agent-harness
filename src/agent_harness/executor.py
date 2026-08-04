@@ -52,6 +52,7 @@ from .outcomes import (
     BUDGET_EXHAUSTED,
     CLAIM_LOST,
     COMPLETED,
+    CONTEXT_UNAVAILABLE,
     CRASHED,
     DECIDED,
     DEPENDENCY_INVALIDATED,
@@ -198,7 +199,19 @@ def run_git(repo: Path, *args: str, check: bool = True) -> str:
 
 #: How much repository the implementer is shown. Big enough that a small
 #: project arrives whole, small enough not to dominate the prompt.
+#:
+#: A **default**, not a constant: a repository whose files are larger than this
+#: cannot be worked on at all until it is raised, and no number chosen here is
+#: right for every project. `run --context-budget` and `HARNESS_CONTEXT_BUDGET`
+#: set it.
 DEFAULT_CONTEXT_BUDGET = 60_000
+
+#: Why a file was left out, as tokens rather than prose. The difference is
+#: load-bearing: running out of room for context nobody asked for is normal,
+#: and being unable to supply a file the planner *named* means the implementer
+#: is about to be asked to edit something it cannot see.
+TARGET_OVER_BUDGET = "named target exceeds remaining content budget"
+BUDGET_SPENT = "content budget exhausted"
 
 #: Files that are never worth spending the budget on, whatever their size.
 _UNINTERESTING = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".gz", ".woff", ".woff2")
@@ -447,14 +460,7 @@ def select_repo_context(
         block = f"--- {path} ---\n{body}\n"
         if spent + len(block) > policy.budget:
             truncated = True
-            omitted.append(
-                (
-                    path,
-                    "named target exceeds remaining content budget"
-                    if explicit
-                    else "content budget exhausted",
-                )
-            )
+            omitted.append((path, TARGET_OVER_BUDGET if explicit else BUDGET_SPENT))
             continue
         parts.append(block)
         supplied.append(path)
@@ -1652,6 +1658,34 @@ class Executor:
                 sort_keys=True,
             ),
         )
+        starved = [path for path, reason in context.omitted if reason == TARGET_OVER_BUDGET]
+        if starved:
+            # The implementer is one line away from being asked to patch a file
+            # it has not been shown, and it will answer: models do not refuse
+            # for want of evidence. The diff would then be written against a
+            # guess and fail to apply, which reads in the log as a bad model
+            # and is not one. Stop here, before the call is paid for, and say
+            # what would have to change.
+            outcome.reason = (
+                "the planner's target(s) "
+                + ", ".join(f"{path} ({self._size_of(path)})" for path in starved)
+                + f" do not fit the context budget of {context.budget} characters, "
+                "so the implementer would be asked to change a file it cannot see. "
+                "Raise --context-budget (or HARNESS_CONTEXT_BUDGET), or split the file."
+            )
+            self._emit(record, "context_unavailable", detail=outcome.reason)
+            outcome.stop = Stop(
+                ESCALATED,
+                CONTEXT_UNAVAILABLE,
+                detail=outcome.reason,
+                state=BLOCKED,
+                # A ceiling this deployment set stopped it; the item did not
+                # fail. Spending an attempt on the same file every claim would
+                # exhaust it for a condition no attempt can change.
+                consumes_attempt=False,
+            )
+            outcome.state = BLOCKED
+            return outcome
         reply = self._call(
             record,
             IMPLEMENTER,
@@ -2048,6 +2082,19 @@ class Executor:
         if len(candidates) > 1:
             note = f"{candidates[0]}; NOT stacked on {', '.join(candidates[1:])}"
         return first.branch, note
+
+    def _size_of(self, path: str) -> str:
+        """How big a file the budget could not fit, for the message that says so.
+
+        A number nobody can read is not evidence, and "does not fit" without
+        one leaves the reader guessing whether the budget is off by a little or
+        by two orders of magnitude. Unreadable is reported as unknown rather
+        than as zero: a size of 0 would be a measurement, and this is not one.
+        """
+        try:
+            return f"{(self.repo / path).stat().st_size} bytes"
+        except OSError:
+            return "size unknown"
 
     def _prepare_branch(self, branch: str, base: str | None = None) -> None:
         """A clean tree at `base`, on a branch of this item's own.

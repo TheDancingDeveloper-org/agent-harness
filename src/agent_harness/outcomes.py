@@ -199,6 +199,13 @@ ITEM_SPEND = "item_spend"
 #: A question went unanswered for longer than the hold allowed. The item is
 #: `blocked`, never `ready`: a hold that times out has not been approved.
 HOLD_EXPIRED = "hold_expired"
+#: The harness could not show the implementer a file the planner named, because
+#: that file alone is larger than the whole context budget. Kept apart from
+#: `NO_TARGET`, which is the planner failing to find one: here the target is
+#: known and correct, and the *harness* cannot supply it. Retrying changes
+#: nothing — the file is the size it is — so it needs a person to raise the
+#: budget or split the file, which is why it escalates.
+CONTEXT_UNAVAILABLE = "context_unavailable"
 
 REASON_KINDS = (
     CHECKS_FAILED,
@@ -216,6 +223,7 @@ REASON_KINDS = (
     ITEM_WALL_CLOCK,
     ITEM_SPEND,
     HOLD_EXPIRED,
+    CONTEXT_UNAVAILABLE,
 )
 
 

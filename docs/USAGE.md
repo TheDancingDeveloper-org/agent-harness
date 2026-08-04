@@ -1163,7 +1163,42 @@ curl -sH "Authorization: Bearer $TOKEN" 'localhost:8099/api/work/T4' \
 can branch on it: `checks_failed`, `check_escalated`, `check_transient`,
 `review_rejected`, `patch_rejected`, `no_target`, `worker_error`,
 `provider_exhausted`, `budget_exhausted`, `dependency_invalidated`,
-`agent_timeout`, `claim_lost`.
+`agent_timeout`, `claim_lost`, `item_wall_clock`, `item_spend`,
+`hold_expired`, `context_unavailable`.
+
+### 6a.1 When the target does not fit in the prompt
+
+The implementer is shown a bounded slice of the repository — 60,000 characters
+by default, the file the planner named first and a relevance-ordered fallback
+after it. A repository whose relevant file is *larger than the whole budget*
+therefore has a target that cannot be supplied at all.
+
+That used to proceed anyway: the target was dropped, the fallback filled the
+space with whatever else was nearby, and the implementer was asked to change a
+file it had never seen. It answers — models do not refuse for want of evidence
+— and the diff then fails to apply, which reads in the log as a bad model and
+is not one.
+
+Now the item stops **before** the implementer is called:
+
+```json
+{"state": "blocked", "disposition": "escalated",
+ "reason_kind": "context_unavailable", "attempts": 0,
+ "last_error": "the planner's target(s) crates/gateway/src/main.rs (612334 bytes)
+                do not fit the context budget of 60000 characters, …"}
+```
+
+It costs no attempt, because no attempt could have succeeded and retrying will
+not make the file smaller. Two things fix it, and both are yours to choose:
+
+```bash
+agent-harness run --context-budget 400000 …    # or $HARNESS_CONTEXT_BUDGET
+```
+
+or split the file. The ceiling that actually matters is the model's context
+window, which the harness does not know and will not guess — a budget large
+enough to overflow it turns a working item into a provider error, so raise it
+deliberately rather than to the maximum.
 
 ### 6b. A check has five answers, not two
 
@@ -1350,6 +1385,7 @@ durable stage.
 | `HARNESS_ENDPOINT` | `run`, `serve` | Model API base URL. |
 | `HARNESS_ROUTE_PRESET` | `run`, `serve` | Default route preset (`--preset`) for roles that name none: the wire protocol, the authentication header, the response reader and a failure classifier, as one name. Default `chat-completions`. |
 | `HARNESS_ROUTE_PRESETS` | all | Extra presets to make resolvable, as `name=module:attribute` pairs. For a preset that lives in your own code rather than in an installed distribution's entry points. |
+| `HARNESS_CONTEXT_BUDGET` | `run` | How many characters of repository the implementer is shown (`--context-budget`, default 60000). A file bigger than this cannot be supplied at all — see [§6a.1](#6a1-when-the-target-does-not-fit-in-the-prompt). |
 | `HARNESS_ROOT_PATH` | `serve` | Prefix when behind a proxy, e.g. `/api/harness`. |
 | `AIDEVENV_URL` | `run`, `serve` | Session host, enabling attachable agents. In `serve` it is what makes the deployment supervised rather than monitoring-only. |
 | `AIDEVENV_TOKEN` | `run`, `serve` | Session host token. |

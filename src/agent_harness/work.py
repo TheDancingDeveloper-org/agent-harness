@@ -30,6 +30,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from .attempts import DEFAULT_MODE as DEFAULT_DURABILITY
+from .attempts import AttemptLog
 from .graph import (
     WORK_DECLARATION,
     DependencyGraph,
@@ -398,6 +400,7 @@ class WorkQueue:
         now: Any = time.time,
         *,
         resolvers: Mapping[str, Resolver] | None = None,
+        durability: str = DEFAULT_DURABILITY,
     ) -> None:
         self.path = path
         self.lease_seconds = lease_seconds
@@ -406,10 +409,15 @@ class WorkQueue:
         #: this queue's connection factory so admission can evaluate the graph
         #: inside the very transaction that hands out the work.
         self.graph = DependencyGraph(self._connect, now=now, resolvers=resolvers)
+        #: Where each attempt got to. Same file for the same reason: a
+        #: resumable position that can disappear independently of the item it
+        #: belongs to will one day point at work the queue has forgotten.
+        self.attempts_log = AttemptLog(self._connect, mode=durability, now=now)
         self._migrate()
         with self._connect() as conn:
             conn.executescript(SCHEMA)
             self.graph.create_schema(conn)
+            self.attempts_log.migrate(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
@@ -910,14 +918,26 @@ class WorkQueue:
                 )
                 if not admission.ready:
                     continue
+                # D11, resolved 2026-08-04: **a resumed attempt continues
+                # the existing one.** A crash is not a failure of the work, so
+                # re-claiming an item that left a durable position keeps its
+                # attempt number, and `max_attempts` goes on bounding genuine
+                # failures rather than crashes. The consequence is named
+                # rather than hidden: an item that crashes in a loop is then
+                # bounded by a wall-clock or spend budget and by nothing else.
+                resuming = self.attempts_log.has_resumable_work(
+                    project_id, record.item_id, record.attempts
+                )
                 conn.execute(
                     "UPDATE work SET state = ?, owner = ?, lease_until = ?, "
-                    "attempts = attempts + 1, admitted_revision = ?, updated_at = ? "
+                    "attempts = CASE WHEN ? THEN attempts ELSE attempts + 1 END, "
+                    "admitted_revision = ?, updated_at = ? "
                     "WHERE project_id = ? AND item_id = ?",
                     (
                         CLAIMED,
                         owner,
                         now + self.lease_seconds,
+                        resuming,
                         revision,
                         now,
                         project_id,
@@ -928,7 +948,8 @@ class WorkQueue:
                 record.state = CLAIMED
                 record.owner = owner
                 record.lease_until = now + self.lease_seconds
-                record.attempts += 1
+                if not resuming:
+                    record.attempts += 1
                 record.admitted_revision = revision
                 return record
             conn.execute("COMMIT")
@@ -1110,6 +1131,13 @@ class WorkQueue:
                 "updated_at = ? WHERE project_id = ? AND item_id = ?",
                 (PENDING, self.now(), project_id, item_id),
             )
+            if cursor.rowcount > 0:
+                # And every durable position with it. "Retry this" means from
+                # the start, against the current plan -- not resumed into the
+                # verdict the operator is retrying. Keeping the position here
+                # would make a retry indistinguishable from a resume, and the
+                # rejected item would be re-rejected without a model call.
+                self.attempts_log.forget_item(project_id, item_id)
             return cursor.rowcount > 0
         finally:
             conn.close()

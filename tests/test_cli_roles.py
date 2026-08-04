@@ -17,8 +17,9 @@ from typing import Any
 
 import pytest
 
-from agent_harness.__main__ import main
+from agent_harness.__main__ import _http_transport, main
 from agent_harness.api import ROLE_MAP_KEY
+from agent_harness.model_client import Route
 from agent_harness.work import WorkQueue
 
 ENDPOINT = "https://models.example/v1"
@@ -125,3 +126,30 @@ def test_with_no_stored_map_the_flags_are_seeded(cli: Path) -> None:
         "implementer": "i",
         "reviewer": "r",
     }
+
+
+@pytest.mark.parametrize(
+    ("wire_error", "normalized"),
+    [
+        ("timeout", TimeoutError),
+        ("network", ConnectionError),
+    ],
+)
+def test_http_transport_normalizes_wire_errors_for_model_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    wire_error: str,
+    normalized: type[Exception],
+) -> None:
+    import httpx
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        request = httpx.Request("POST", ENDPOINT)
+        if wire_error == "timeout":
+            raise httpx.ReadTimeout("late", request=request)
+        raise httpx.ConnectError("offline", request=request)
+
+    monkeypatch.setattr(httpx.Client, "post", fail)
+    transport = _http_transport("test-key")
+
+    with pytest.raises(normalized):
+        transport(Route("model", ENDPOINT), [], {})

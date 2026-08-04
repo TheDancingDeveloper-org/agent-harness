@@ -7,17 +7,17 @@ anyone opening a log.
 
 The ordering is the part worth defending:
 
-    plan -> implement -> apply -> CHEAP CHECK -> review -> push -> PR
+    plan -> implement -> apply -> CHEAP CHECK -> checkpoint -> draft PR -> review
 
 **Cheap checks run before the expensive reviewer call.** A patch that does
 not apply, or does not compile, cannot be worth a review; spending a model
 call to be told so is paying the most expensive gate to catch what the
 cheapest one already caught.
 
-**The branch is pushed before the PR is opened, and both happen after the
-review passes.** Work that has survived every gate is durable before
-anything else can lose it — a killed worker after that point loses nothing,
-because the branch is on the remote.
+**The branch is checkpointed and pushed before the expensive reviewer
+call.** Work that has passed the cheap gates is durable before a reviewer
+timeout or worker death can lose it. The pull request remains a draft and is
+explicitly marked unreviewed until the reviewer approves it.
 
 **Nothing is ever committed to the default branch.** Every item produces a
 branch and a proposal, so a wrong answer is reviewable rather than landed.
@@ -781,6 +781,7 @@ class Executor:
         # model actually produced is to pay for it again.
         self.artifacts = Path(artifacts) if artifacts is not None else None
         self.owner = worker_identity()
+        self._partial: Outcome | None = None
         self._heartbeat: LeaseHeartbeat | None = None
 
     # ------------------------------------------------------------- driving
@@ -820,33 +821,51 @@ class Executor:
             # Out of budget. Hand the item back untouched rather than
             # burning an attempt on something that was never tried.
             self._emit(record, "budget_exhausted", detail=str(exc))
+            partial = self._partial_for(record)
             self.queue.release(
                 record.item_id,
                 PENDING,
                 error=f"budget: {exc}",
+                branch=partial.branch if partial else None,
+                pr_url=partial.pr_url if partial else None,
                 owner=self.owner,
+                consume_attempt=False,
                 project_id=self.project_id,
             )
             raise
         except RetryExhausted as exc:
             self._emit(record, "retry_exhausted", detail=str(exc), error_class=exc.kind)
+            partial = self._partial_for(record)
             self.queue.release(
                 record.item_id,
                 PENDING,
                 error=str(exc),
+                branch=partial.branch if partial else None,
+                pr_url=partial.pr_url if partial else None,
                 owner=self.owner,
                 project_id=self.project_id,
             )
+            if partial is not None:
+                partial.state = PENDING
+                partial.reason = str(exc)
+                return partial
             return Outcome(record.item_id, PENDING, reason=str(exc))
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
+            partial = self._partial_for(record)
             self.queue.release(
                 record.item_id,
                 FAILED,
                 error=str(exc),
+                branch=partial.branch if partial else None,
+                pr_url=partial.pr_url if partial else None,
                 owner=self.owner,
                 project_id=self.project_id,
             )
+            if partial is not None:
+                partial.state = FAILED
+                partial.reason = str(exc)
+                return partial
             return Outcome(record.item_id, FAILED, reason=str(exc))
         self.queue.release(
             record.item_id,
@@ -858,6 +877,12 @@ class Executor:
             project_id=self.project_id,
         )
         return outcome
+
+    def _partial_for(self, record: WorkRecord) -> Outcome | None:
+        partial = self._partial
+        if partial is not None and partial.item_id == record.item_id:
+            return partial
+        return None
 
     def run(self, limit: int | None = None) -> list[Outcome]:
         """Work items until there are none left, or `limit` is reached."""
@@ -903,6 +928,9 @@ class Executor:
 
     def _execute(self, record: WorkRecord) -> Outcome:
         outcome = Outcome(record.item_id, FAILED)
+        # Retained so a reviewer-side exception can still return the durable
+        # checkpoint's branch/PR to the queue and caller.
+        self._partial = outcome
         self._emit(record, "started")
 
         # Resolved first, and deliberately before the implementer is called:
@@ -1014,7 +1042,7 @@ class Executor:
         self._keepalive(record)
 
         # The graph is re-checked here, at the last cheap point before review
-        # spends money and commit makes anything durable. `claim` checked it
+        # spends money and the checkpoint makes anything durable. `claim` checked it
         # once, minutes ago; correcting a plan while work is in flight is a
         # normal thing for an operator to do, and an item that is no longer
         # eligible must not land on the strength of a stale check.
@@ -1022,13 +1050,31 @@ class Executor:
         if unmet:
             outcome.reason = (
                 f"{record.item_id} now depends on {', '.join(unmet)}, which "
-                "is not done; the work is kept on its branch and the item goes back to pending"
+                "is not done; the candidate is discarded and the item goes back to pending"
             )
             self._emit(record, "dependency_invalidated", detail=outcome.reason)
             outcome.state = PENDING
+            self._abandon_branch(branch)
             return outcome
 
-        # 6. Review, by a different role -- and ideally a different vendor,
+        # 6. Checkpoint BEFORE the expensive gate, matching session mode.
+        #    Review is the slowest and most failure-prone call. Work that has
+        #    passed every cheap gate must survive a worker dying during it,
+        #    but must not present itself as reviewed until approval exists.
+        self._commit(record, checkpoint=True)
+        outcome.stages.append("commit")
+        self._emit(record, "checkpointed", detail=branch)
+        if self.push:
+            run_git(self.repo, "push", "-u", "origin", branch)
+            outcome.stages.append("push")
+            self._emit(record, "pushed", detail=branch)
+        if self.github is not None and record.issue:
+            outcome.pr_url = self._open_pr(record, branch, base, draft=True)
+            if outcome.pr_url:
+                outcome.stages.append("draft-pr")
+                self._emit(record, "draft_pr_opened", detail=outcome.pr_url)
+
+        # 7. Review, by a different role -- and ideally a different vendor,
         #    which `ModelClient.reviewer_independence()` now reports on rather
         #    than leaving to a comment nobody reads.
         verdict_text = self._call(
@@ -1044,22 +1090,16 @@ class Executor:
         verdict = APPROVED if verdict_text.strip().upper().startswith("APPROVED") else REJECTED
         outcome.verdict = verdict
         self._emit(record, f"review_{verdict}", detail=verdict_text[:2000])
+        if outcome.pr_url and self.github is not None:
+            self._record_verdict(record, outcome.pr_url, verdict, verdict_text)
         if verdict != APPROVED:
             outcome.reason = f"review rejected: {verdict_text.strip()[:500]}"
-            self._abandon_branch(branch)
             return outcome
 
-        # 7. Commit, and make it durable before anything else can lose it.
-        self._commit(record, verdict_text)
-        outcome.stages.append("commit")
-        if self.push:
-            run_git(self.repo, "push", "-u", "origin", branch)
-            outcome.stages.append("push")
-            self._emit(record, "pushed", detail=branch)
-
-        # 8. Propose. Never land: a wrong answer must stay reviewable.
-        if self.github is not None and record.issue:
-            outcome.pr_url = self._open_pr(record, branch, verdict_text, base)
+        # 8. Approval takes the durable draft out of draft. Never land: a
+        #    wrong answer must stay reviewable.
+        if outcome.pr_url and self.github is not None:
+            self._mark_ready(record, outcome.pr_url)
             outcome.stages.append("pr")
 
         outcome.state = DONE
@@ -1126,23 +1166,34 @@ class Executor:
         run_git(self.repo, "checkout", self.base_branch, check=False)
         run_git(self.repo, "branch", "-D", branch, check=False)
 
-    def _commit(self, record: WorkRecord, verdict: str) -> None:
+    def _commit(self, record: WorkRecord, verdict: str = "", checkpoint: bool = False) -> None:
         run_git(self.repo, "add", "-A")
+        trailer = (
+            "Reviewed: not yet — this is a checkpoint taken after the cheap "
+            "gates passed and before review.\n"
+            if checkpoint
+            else f"Reviewer verdict:\n{verdict.strip()[:1500]}\n"
+        )
         message = (
             f"{record.title}\n\n"
             f"{record.brief.strip()[:1500]}\n\n"
-            f"Reviewer verdict:\n{verdict.strip()[:1500]}\n\n"
+            f"{trailer}\n"
             f"harness-item: {record.item_id}\n"
         )
         run_git(self.repo, "commit", "-m", message)
 
-    def _open_pr(self, record: WorkRecord, branch: str, verdict: str, base: str) -> str | None:
+    def _open_pr(
+        self, record: WorkRecord, branch: str, base: str, *, draft: bool = True
+    ) -> str | None:
         github = self.github
         if github is None:  # pragma: no cover - guarded by the caller
             return None
         body = (
             f"{record.brief.strip()[:3000]}\n\n"
-            f"---\n\n**Reviewer verdict**\n\n{verdict.strip()[:3000]}\n\n"
+            "---\n\n**Not yet reviewed.** Opened as a draft after the cheap "
+            "gates passed so the work survives the worker that produced it. "
+            "The reviewer's verdict is posted as a comment, and approval "
+            "takes it out of draft.\n\n"
             f"Closes #{record.issue}\n"
         )
         try:
@@ -1154,11 +1205,31 @@ class Executor:
                 body=body,
                 head=branch,
                 base=base,
+                draft=draft,
             )
             return str(url) if url else None
         except Exception as exc:  # noqa: BLE001 - a PR failure must not lose the work
             self._emit(record, "pr_failed", detail=str(exc))
             return None
+
+    def _record_verdict(
+        self, record: WorkRecord, pr_url: str, verdict: str, verdict_text: str
+    ) -> None:
+        if self.github is None:
+            return
+        body = f"**Review: {verdict.upper()}**\n\n{verdict_text.strip()[:5000]}"
+        try:
+            self.github.comment_pr(pr_url, body)
+        except Exception as exc:  # noqa: BLE001
+            self._emit(record, "pr_comment_failed", detail=str(exc))
+
+    def _mark_ready(self, record: WorkRecord, pr_url: str) -> None:
+        if self.github is None:
+            return
+        try:
+            self.github.mark_pr_ready(pr_url)
+        except Exception as exc:  # noqa: BLE001
+            self._emit(record, "pr_ready_failed", detail=str(exc))
 
     def _preserve_patch(self, record: WorkRecord, diff: str) -> str | None:
         """Keep a patch that failed, and return where it went.

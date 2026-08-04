@@ -146,19 +146,27 @@ def _http_transport(api_key: str) -> Any:
         # inherited the work timeout would take ten minutes to establish that
         # a model is not answering.
         payload.update({k: v for k, v in options.items() if k not in ("role", "timeout")})
-        response = client.post(
-            f"{route.endpoint.rstrip('/')}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {route.api_key or api_key}",
-                "content-type": "application/json",
-            },
-            json=payload,
-            timeout=(
-                httpx.Timeout(asked, connect=min(30.0, asked))
-                if asked
-                else httpx.USE_CLIENT_DEFAULT
-            ),
-        )
+        try:
+            response = client.post(
+                f"{route.endpoint.rstrip('/')}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {route.api_key or api_key}",
+                    "content-type": "application/json",
+                },
+                json=payload,
+                timeout=(
+                    httpx.Timeout(asked, connect=min(30.0, asked))
+                    if asked
+                    else httpx.USE_CLIENT_DEFAULT
+                ),
+            )
+        except httpx.TimeoutException as exc:
+            # ModelClient has a vendor-neutral transport contract. Normalize
+            # httpx's hierarchy here so a real wire timeout follows the same
+            # per-worker retry path as an injected transport timeout.
+            raise TimeoutError(str(exc)) from exc
+        except httpx.NetworkError as exc:
+            raise ConnectionError(str(exc)) from exc
         return Response(response.status_code, dict(response.headers), response.text)
 
     return transport

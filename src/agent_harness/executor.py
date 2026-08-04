@@ -213,6 +213,25 @@ DEFAULT_CONTEXT_BUDGET = 60_000
 TARGET_OVER_BUDGET = "named target exceeds remaining content budget"
 BUDGET_SPENT = "content budget exhausted"
 
+#: The stages a worker reports into the coordination room. Every one is a
+#: setback a person watching the run would react to, and every one is named
+#: in `COORDINATION-PLANE.md` §6 as an oversight trigger. Successes are
+#: absent on purpose: a coordinator reading `checks_passed` pays a model to
+#: conclude that nothing is wrong.
+LEDGER_TRIGGERS = frozenset(
+    {
+        "checks_failed",
+        "apply_failed",
+        "review_rejected",
+        "no_diff",
+        "no_changes",
+        "context_unavailable",
+        "held",
+        "budget_exhausted",
+        "agent_timeout",
+    }
+)
+
 #: Files that are never worth spending the budget on, whatever their size.
 _UNINTERESTING = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".gz", ".woff", ".woff2")
 
@@ -1248,6 +1267,7 @@ class Executor:
         now: Callable[[], float] = time.time,
         context_provider: Callable[[WorkRecord], str] | None = None,
         context_policy: ContextPolicy | None = None,
+        ledger: Any | None = None,
         artifacts: Path | None = None,
         project_id: str = DEFAULT_PROJECT,
         durability: str | None = None,
@@ -1278,6 +1298,15 @@ class Executor:
         # seen, which it cannot do and which nothing said out loud.
         self.context_provider = context_provider
         self.context_policy = context_policy or ContextPolicy()
+        #: Where this worker reports setbacks so a coordinator can read them.
+        #: None is the ordinary case and changes nothing.
+        self.ledger = ledger
+        #: Which go at this item the worker is on. `attempts` cannot serve:
+        #: `requeue` resets it to zero deliberately, so three consecutive
+        #: failures of the same item all reported as attempt 0, deduplicated
+        #: to a single message, and a coordinator saw one bad day instead of
+        #: the pattern it exists to notice. Measured, not theorised.
+        self._episode = 0
         #: The ref the current item's patch will be applied to. Resolved
         #: before the implementer is called, because that is what it needs to
         #: be looking at.
@@ -2436,23 +2465,74 @@ class Executor:
         detail: str | None = None,
         error_class: str | None = None,
     ) -> None:
-        if self.on_event is None:
+        if self.on_event is not None:
+            # Telemetry is never load-bearing: a broken sink must not fail an
+            # item that otherwise succeeded.
+            with contextlib.suppress(Exception):
+                self.on_event(
+                    {
+                        "ts": self.now(),
+                        "kind": "work",
+                        "worker": self.owner,
+                        "item_id": record.item_id,
+                        "issue": record.issue,
+                        "outcome": stage,
+                        "error_class": error_class,
+                        "detail": detail,
+                        "project_id": self.project_id,
+                    }
+                )
+        self._say(record, stage, detail)
+
+    def _say(self, record: WorkRecord, stage: str, detail: str | None) -> None:
+        """Report a setback into the coordination room, if there is one.
+
+        A coordinator can only act on what it was told, and until now no
+        worker told it anything: the ledger existed and nothing in the run
+        loop had ever written to it. These are the stages
+        `COORDINATION-PLANE.md` §6 names as triggers — failure, exhaustion,
+        lack of progress — and they are the ones a person watching would
+        react to.
+
+        Successes are deliberately absent. A coordinator that reads every
+        `checks_passed` pays a model to conclude that nothing is wrong, once
+        per item, forever.
+        """
+        if stage == "started":
+            self._episode += 1
+        if self.ledger is None or stage not in LEDGER_TRIGGERS:
             return
-        # Telemetry is never load-bearing: a broken sink must not fail an
-        # item that otherwise succeeded.
+        from .coordination import GENERAL_ROOM, Submission
+
+        # Never load-bearing, for the same reason telemetry is not: the
+        # coordination plane is designed to be safe when absent, so a broken
+        # ledger must not turn a working item into a failed one.
         with contextlib.suppress(Exception):
-            self.on_event(
-                {
-                    "ts": self.now(),
-                    "kind": "work",
-                    "worker": self.owner,
-                    "item_id": record.item_id,
-                    "issue": record.issue,
-                    "outcome": stage,
-                    "error_class": error_class,
-                    "detail": detail,
-                    "project_id": self.project_id,
-                }
+            self.ledger.append(
+                Submission(
+                    project_id=self.project_id,
+                    room_id=GENERAL_ROOM,
+                    sender_id=self.owner,
+                    sender_role="worker",
+                    message_type="observation",
+                    body=f"{stage}: {(detail or '').strip()[:2000]}",
+                    item_id=record.item_id,
+                    attempt=record.attempts,
+                    # One message per (worker, item, episode, stage). A
+                    # resumed attempt re-reaching a stage it already reported
+                    # is the same observation, so replay cannot make the room
+                    # look busier than the fleet is — while three separate
+                    # goes at one item stay three separate observations.
+                    idempotency_key=(
+                        f"worker:{self.owner}:{self.project_id}:{record.item_id}:"
+                        f"{self._episode}:{stage}"
+                    ),
+                    payload={
+                        "stage": stage,
+                        "attempts": record.attempts,
+                        "episode": self._episode,
+                    },
+                )
             )
 
 

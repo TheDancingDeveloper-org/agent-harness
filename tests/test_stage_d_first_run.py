@@ -16,6 +16,8 @@ with ones that fail the test if they are called at all.
 from __future__ import annotations
 
 import json
+import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -500,3 +502,77 @@ def test_the_demo_diff_is_computed_from_the_tree_not_hardcoded(tmp_path: Path) -
     second = demo_module._diff_for(repo)
     assert first != second
     assert "# rewritten" in second
+
+
+# ------------------------------------------------- the docs, against the CLI
+
+
+DOCS = Path(__file__).resolve().parent.parent / "docs"
+README = Path(__file__).resolve().parent.parent / "README.md"
+
+
+def test_the_documented_first_run_commands_are_the_ones_that_exist(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A first-run document is read by someone who cannot yet run the system.
+
+    That makes it the worst place for a flag that no longer exists: the reader
+    has no way to tell, and the failure is their first impression. So every
+    flag `USAGE.md` §0a puts on `init` and `run --demo` is asserted against the
+    parser's own help.
+    """
+    usage = (DOCS / "USAGE.md").read_text()
+    first_run = usage.split("## 0a.")[1].split("## 0b.")[0]
+    # `git log --oneline --all`, `ollama pull` and friends are somebody
+    # else's flags; this test is about ours.
+    first_run = "\n".join(
+        line
+        for line in first_run.splitlines()
+        if not re.search(r"\b(git|ollama|pip|export)\b", line)
+    )
+
+    with pytest.raises(SystemExit):
+        main(["--help"])
+    top_help = capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        main(["init", "--help"])
+    init_help = capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        main(["run", "--help"])
+    run_help = capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        main(["doctor", "--help"])
+    doctor_help = capsys.readouterr().out
+    known = top_help + init_help + run_help + doctor_help
+
+    documented = set(re.findall(r"(?<![\w-])(--[a-z]+(?:-[a-z]+)*)", first_run))
+    unknown = sorted(flag for flag in documented if flag not in known)
+    assert not unknown, f"USAGE.md §0a names flags the CLI does not have: {unknown}"
+
+
+def test_the_command_the_demo_prints_is_the_command_that_works(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`init` prints a command. Run exactly that, parsed from the output.
+
+    Not the argv the test would have written — the text a human copies. A demo
+    whose printed command has a typo in it is a demo that does not work.
+    """
+    target = tmp_path / "demo"
+    assert main(["init", "--demo", "--into", str(target)]) == 0
+    printed = next(
+        line.strip()
+        for line in capsys.readouterr().out.splitlines()
+        if line.strip().startswith("agent-harness ")
+    )
+    argv = shlex.split(printed)
+    assert argv[0] == "agent-harness"
+    assert main(argv[1:]) == 0
+
+
+def test_the_readme_distinguishes_tested_from_observed_from_proven() -> None:
+    """Stage D §8.4's honesty requirement, as a test rather than a promise."""
+    readme = README.read_text()
+    for word in ("**tested**", "**observed**", "**proven**"):
+        assert word in readme
+    assert "No failures observed" in readme

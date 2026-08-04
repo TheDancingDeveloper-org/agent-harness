@@ -56,6 +56,8 @@ trade and it is rejected.
 | Thing | Location |
 |---|---|
 | How to use it | `docs/USAGE.md` — worked example, real output |
+| The first run, needing no credentials | `agent-harness init --demo`; `src/agent_harness/demo.py` |
+| What is configured and what is missing | `agent-harness doctor`; `src/agent_harness/doctor.py` — reports, spends nothing |
 | How to deploy it | `docs/DEPLOYMENT.md` — the two serve modes, and a non-destructive smoke test |
 | Sample plan | `examples/PLAN.md` |
 | The original plan | `docs/HARNESS-PLAN.md` (superseded in part) |

@@ -18,7 +18,7 @@
 > | Merged | all four stage branches, plus seven further stages |
 > | Gates | `pytest` **1063 passed**, ruff, format and full-project strict `mypy` all clean |
 > | Stage 8 | still blocked, and still not startable from this repository |
-> | Pushed | **nothing.** Twenty-nine commits, all local. |
+> | Pushed | **nothing.** 26 commits on the branch (48 counting the merged branches' own history), all local. |
 >
 > Delivered since the freeze: **F** (integration), **D** (first run — the
 > deferral was lifted by explicit go-ahead), **K** (outcome and check

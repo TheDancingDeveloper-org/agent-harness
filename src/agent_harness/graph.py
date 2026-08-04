@@ -79,6 +79,9 @@ EDGE_STATES = (UNRESOLVED, BLOCKED, SATISFIED)
 #: something other than English.
 REASON_DEPENDENCY = "dependency"
 REASON_CYCLE = "cycle"
+#: The item declares dependencies the edge table does not hold -- an upgraded
+#: database whose graph has not been rebuilt yet.
+REASON_STALE = "stale_graph"
 
 #: Resolver names the core will load on demand, and the module that provides
 #: each. Only the *name* lives here; nothing in this module imports an adapter
@@ -822,7 +825,10 @@ class DependencyGraph:
             revision = self.revision(project_id, conn=connection)
             reasons: list[ReadinessReason] = []
             advisory: list[ReadinessReason] = []
-            for edge in self.edges(project_id, item_id, conn=connection):
+            edges = self.edges(project_id, item_id, conn=connection)
+            if not edges:
+                reasons.extend(self._stale_graph_reason(connection, project_id, item_id))
+            for edge in edges:
                 if edge.state == SATISFIED:
                     continue
                 reason = ReadinessReason(
@@ -889,6 +895,44 @@ class DependencyGraph:
         finally:
             if owned:
                 connection.close()
+
+    def _stale_graph_reason(
+        self, conn: sqlite3.Connection, project_id: str, item_id: str
+    ) -> list[ReadinessReason]:
+        """A blocker for an item that declares dependencies the graph has not
+        derived yet.
+
+        This is the upgrade case. A database upgraded in place has an empty
+        edge table until work is re-added or `graph rebuild` runs, and "no
+        edges" would otherwise read exactly like "no dependencies" -- so
+        every dependent item in an existing backlog would be admitted on the
+        strength of a graph nobody had built. An unbuilt graph is an unknown
+        graph, and unknown is a blocker.
+
+        Only reached when the item has no edges at all, so the ordinary case
+        (an item that genuinely declares nothing) costs one indexed lookup.
+        """
+        row = conn.execute(
+            "SELECT depends_on FROM work WHERE project_id = ? AND item_id = ?",
+            (project_id, item_id),
+        ).fetchone()
+        if row is None:
+            return []
+        declared = json.loads(row["depends_on"] or "[]")
+        if not declared:
+            return []
+        return [
+            ReadinessReason(
+                kind=REASON_STALE,
+                explanation=(
+                    f"{item_id} declares {', '.join(declared)} but the dependency graph "
+                    "holds no edges for it, so nothing here can say whether those are "
+                    "done; run `agent-harness graph rebuild`"
+                ),
+                state=UNRESOLVED,
+                evidence=", ".join(declared),
+            )
+        ]
 
     def record_override(
         self,

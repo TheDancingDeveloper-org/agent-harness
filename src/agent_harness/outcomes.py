@@ -159,6 +159,13 @@ BUDGET_EXHAUSTED = "budget_exhausted"
 DEPENDENCY_INVALIDATED = "dependency_invalidated"
 AGENT_TIMEOUT = "agent_timeout"
 CLAIM_LOST = "claim_lost"
+#: The item passed a ceiling **this deployment** declared for it. Kept apart
+#: from `BUDGET_EXHAUSTED`, which is a *provider* saying our account is out of
+#: budget: one is a local policy decision and the other is in the never-retry
+#: set, and conflating them would park a shared endpoint because one item was
+#: expensive.
+ITEM_WALL_CLOCK = "item_wall_clock"
+ITEM_SPEND = "item_spend"
 
 REASON_KINDS = (
     CHECKS_FAILED,
@@ -173,6 +180,8 @@ REASON_KINDS = (
     DEPENDENCY_INVALIDATED,
     AGENT_TIMEOUT,
     CLAIM_LOST,
+    ITEM_WALL_CLOCK,
+    ITEM_SPEND,
 )
 
 

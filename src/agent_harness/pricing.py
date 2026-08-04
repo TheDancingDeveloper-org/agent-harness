@@ -207,3 +207,25 @@ def usage_fields(body: bytes | str | None, model: str | None, table: PriceTable)
     holding a route asks that route's reader and then `price_fields`.
     """
     return price_fields(extract_usage(body), model, table)
+
+
+def cost_of(data: Mapping[str, Any]) -> float | None:
+    """What one model-call event cost, or None when nobody can say.
+
+    None rather than zero, and that is the rule the whole cost story rests on:
+    a default of zero is a *measurement* claiming the call was free, and an
+    unpriced model would then quietly make every total look better than it is.
+
+    Lives here rather than in `audit.py` because the audit rollup and the
+    per-item budget must agree about what a call cost, and two copies of this
+    arithmetic would eventually disagree.
+    """
+    price_in = data.get("price_in_per_mtok")
+    price_out = data.get("price_out_per_mtok")
+    if price_in is None and price_out is None:
+        return None
+    tokens_in = data.get("tokens_in") or 0
+    tokens_out = data.get("tokens_out") or 0
+    return (tokens_in / 1_000_000) * (price_in or 0.0) + (tokens_out / 1_000_000) * (
+        price_out or 0.0
+    )

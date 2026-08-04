@@ -1179,6 +1179,47 @@ The **pre-review git checkpoint is unaffected by all three.** The mode governs
 the attempt *record*; the commit before the expensive gate happens regardless,
 and no mode can remove it.
 
+### 6d. Bounding what one item may cost you
+
+```json
+{"max_item_seconds": 3600, "max_item_spend_usd": 2.50}
+```
+
+Both default to **zero, meaning unlimited**, so upgrading changes nothing. Per
+item, `PATCH`-style overrides live on the work row; zero there means "take the
+project's".
+
+The lease bounds a worker's *absence*. These bound an item's *duration* and its
+*spend*, which a heartbeat says nothing about — an item that heartbeats forever
+is indistinguishable from one making progress, and it is the failure mode a
+seven-day run is most likely to produce.
+
+**Exceeding a ceiling stops the item at the next boundary**, never mid-stage.
+Stopping in flight destroys the agent's context and leaves a half-finished
+worktree. The item lands in `blocked`, with `disposition: escalated` and
+`reason_kind: item_wall_clock` or `item_spend`, and **does not consume an
+attempt** — a policy stopped it; it did not fail.
+
+**A spend ceiling is not a provider cost cap.** `window_cap` and `terminal_cap`
+are a provider saying your *account* is out of budget and are in the
+never-retry set. This is you saying *one item* has had enough. A budget stop
+therefore **does not park the endpoint**, and a test asserts that.
+
+**Unknown cost is not zero cost.** A call whose price nobody knows — an unpriced
+model, or session-mode traffic that never went through `ModelClient` (#128) —
+is counted as *unpriced*, not as free. While any call is unpriced:
+
+- `spend_usd` on the item is a **lower bound**, and says so;
+- `unpriced_calls` is non-zero;
+- the spend ceiling is reported as **unenforceable** in the event stream, not
+  quietly treated as met — stopping an item on a number nobody can defend would
+  be worse than not stopping it;
+- the **wall-clock ceiling is still enforced**, because it can always be
+  measured.
+
+`doctor` reports the ceilings before anything runs, and warns when there are
+none: unlimited is safe on upgrade and unsafe unattended.
+
 ---
 
 ## Configuration reference

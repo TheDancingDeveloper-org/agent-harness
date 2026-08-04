@@ -1322,6 +1322,50 @@ def test_a_target_that_cannot_be_shown_stops_the_item_before_the_implementer(
     assert item.attempts == 0, "a ceiling this deployment set is not the item failing"
 
 
+def test_the_implementer_is_told_which_checks_will_judge_it(repo: Path, tmp_path: Path) -> None:
+    """The reviewer was told what the checks said; the writer was told nothing.
+
+    Measured on rdpapp: a correct change — the right function, in the right
+    place, with both tests — was refused by `cargo fmt --all -- --check`, a
+    command the model was never shown. That costs an attempt and two model
+    calls to discover something the harness knew before it asked.
+    """
+    checks = Checks(commands=[["cargo", "fmt", "--all", "--", "--check"]])
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+        checks=checks,
+    )
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    assert "cargo fmt --all -- --check" in capturing.prompts["implementer"]
+
+
+def test_a_project_with_no_checks_says_nothing_about_them(repo: Path, tmp_path: Path) -> None:
+    """No checks configured must read exactly as it did before."""
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+    )
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    assert "run on your diff" not in capturing.prompts["implementer"]
+
+
 def test_the_implementer_is_shown_the_repository(repo: Path, tmp_path: Path) -> None:
     """The regression for #135.
 

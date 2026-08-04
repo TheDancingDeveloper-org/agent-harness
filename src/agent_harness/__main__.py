@@ -519,7 +519,7 @@ def _run(args: argparse.Namespace) -> int:
         else (args.artifacts if str(args.artifacts) else None)
     )
 
-    def emit(event: dict[str, Any]) -> None:
+    def write_event(event: dict[str, Any]) -> None:
         with events_path.open("a") as handle:
             handle.write(_json.dumps(event) + "\n")
         # Also say it out loud. Every stage transition used to go only to the
@@ -527,6 +527,26 @@ def _run(args: argparse.Namespace) -> int:
         # and a legitimate 210-second backoff after a gateway error looked
         # exactly like a wedged process to the person watching.
         log.info("%s", _describe(event))
+
+    emit = write_event
+    if getattr(args, "otel", False):
+        # Lazily, and only when asked. Core never imports this; the CLI is
+        # the door, which is what makes "add a telemetry backend without
+        # editing the harness" true rather than aspirational.
+        from .adapters.otlp import Exporter
+
+        telemetry = Exporter()
+        # The file write happens first and its exceptions propagate. The
+        # event store is the source of truth; exporting must never come
+        # between an event and the record of it.
+        emit = telemetry.tap(write_event)
+        if telemetry.available:
+            print(f"telemetry: exporting spans to {telemetry.endpoint}")
+        else:
+            print(
+                "telemetry: --otel was passed but no OTEL_EXPORTER_OTLP_ENDPOINT is set, "
+                "so nothing is exported and nothing else changes"
+            )
 
     from .api import ROLE_MAP_KEY
 
@@ -1087,6 +1107,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_run.add_argument(
         "--dry-run", action="store_true", help="show what would run, call nothing, change nothing"
+    )
+    p_run.add_argument(
+        "--otel",
+        action="store_true",
+        help="also project this run's events to OpenTelemetry spans. Needs "
+        "$OTEL_EXPORTER_OTLP_ENDPOINT and the OpenTelemetry SDK; without "
+        "either it says so once and changes nothing else. **Export only** — "
+        "the event stream stays the single source of truth, and a span is "
+        "never read back to answer a question the events could answer.",
     )
     p_run.add_argument(
         "--durability",

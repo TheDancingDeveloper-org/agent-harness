@@ -75,6 +75,15 @@ plugins = ["pydantic.mypy"]
 files = ["src", "tests"]
 strict = true
 
+# The OpenTelemetry SDK is an OPTIONAL dependency of one adapter and is
+# deliberately not installed: "the harness runs identically without it" is a
+# property the whole test suite asserts by running without it. mypy would
+# otherwise fail on the imports inside the `try` that exists precisely because
+# the package may be absent.
+[[tool.mypy.overrides]]
+module = ["opentelemetry.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

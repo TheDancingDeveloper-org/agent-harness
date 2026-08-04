@@ -32,6 +32,7 @@ works without spending money to find out.
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 import subprocess
 import time
@@ -113,6 +114,288 @@ DEFAULT_CONTEXT_BUDGET = 60_000
 _UNINTERESTING = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".gz", ".woff", ".woff2")
 
 
+@dataclass(frozen=True)
+class PlannerTarget:
+    """One file the planner expects the implementer to change."""
+
+    path: str
+    reason: str
+    usable: bool = True
+    uncertainty: str | None = None
+
+
+@dataclass(frozen=True)
+class PlannerResult:
+    """Validated planner guidance, never authority to edit a path."""
+
+    plan: str
+    targets: tuple[PlannerTarget, ...] = ()
+    cannot_identify_target: str | None = None
+    uncertainties: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ContextPolicy:
+    """Configured repository-context policy.
+
+    Core deliberately has no list of workload build directories. Deployments
+    can name generated paths here; an empty file needs no such convention and
+    is omitted automatically unless the planner explicitly targets it.
+    """
+
+    budget: int = DEFAULT_CONTEXT_BUDGET
+    generated_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ContextSelection:
+    """The observable result of selecting implementer context."""
+
+    text: str
+    files: tuple[str, ...]
+    budget: int
+    characters: int
+    truncated: bool
+    omitted: tuple[tuple[str, str], ...]
+    fallback_relevance: bool
+    targets: tuple[PlannerTarget, ...]
+
+
+def parse_planner_result(reply: str) -> PlannerResult:
+    """Parse the planner's structured response without trusting it.
+
+    A legacy or malformed answer remains useful as prose, but it is explicitly
+    marked uncertain and supplies no target paths. This keeps a formatting
+    failure from becoming arbitrary file-read authority.
+    """
+    candidate = reply.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*\n(.*?)```", candidate, re.DOTALL)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    try:
+        raw = json.loads(candidate)
+    except (TypeError, ValueError):
+        detail = "planner response was not valid structured JSON"
+        return PlannerResult(
+            plan=reply.strip() or "The planner returned no implementation plan.",
+            cannot_identify_target=detail,
+            uncertainties=(detail,),
+        )
+    if not isinstance(raw, dict):
+        detail = "planner response must be a JSON object"
+        return PlannerResult(plan=str(raw), cannot_identify_target=detail, uncertainties=(detail,))
+
+    uncertainties: list[str] = []
+    plan = raw.get("plan")
+    if not isinstance(plan, str) or not plan.strip():
+        uncertainties.append("planner result has no non-empty `plan`")
+        plan = "The planner returned no usable implementation plan."
+    cannot = raw.get("cannot_identify_target")
+    if cannot is not None and (not isinstance(cannot, str) or not cannot.strip()):
+        uncertainties.append("`cannot_identify_target` must be null or a non-empty string")
+        cannot = "planner did not provide a valid target-identification result"
+
+    targets: list[PlannerTarget] = []
+    target_rows = raw.get("targets", [])
+    if not isinstance(target_rows, list):
+        uncertainties.append("planner `targets` must be a list")
+        target_rows = []
+    for index, row in enumerate(target_rows):
+        if not isinstance(row, dict):
+            uncertainties.append(f"planner target {index} is not an object")
+            continue
+        path, reason = row.get("path"), row.get("reason")
+        if not isinstance(path, str) or not path.strip():
+            uncertainties.append(f"planner target {index} has no non-empty path")
+            continue
+        if not isinstance(reason, str) or not reason.strip():
+            uncertainties.append(f"planner target {path!r} has no non-empty reason")
+            continue
+        targets.append(PlannerTarget(path.strip(), reason.strip()))
+    if cannot and targets:
+        uncertainties.append("planner named targets while also saying it could not identify one")
+    if not cannot and not targets:
+        uncertainties.append("planner neither named a target nor explained why it could not")
+        cannot = "planner did not identify a target"
+    return PlannerResult(
+        plan=plan.strip(),
+        targets=tuple(targets),
+        cannot_identify_target=cannot,
+        uncertainties=tuple(uncertainties),
+    )
+
+
+def _normalise_target(repo: Path, path: str) -> tuple[str | None, str | None]:
+    """Return a repository-relative target, or an explicit uncertainty."""
+    raw = Path(path)
+    if raw.is_absolute():
+        return None, "absolute paths are outside the repository contract"
+    root = repo.resolve()
+    candidate = (root / raw).resolve(strict=False)
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return None, "path escapes the repository"
+    normalised = relative.as_posix()
+    if normalised in {"", "."}:
+        return None, "path identifies the repository, not a file"
+    return normalised, None
+
+
+def _configured_generated(path: str, configured: Sequence[str]) -> bool:
+    candidate = Path(path)
+    return any(
+        candidate == Path(prefix) or Path(prefix) in candidate.parents for prefix in configured
+    )
+
+
+def select_repo_context(
+    repo: Path,
+    record: Any = None,
+    *,
+    planner: PlannerResult | None = None,
+    policy: ContextPolicy | None = None,
+    ref: str | None = None,
+) -> ContextSelection:
+    """Select target-first repository context and retain selection evidence."""
+    policy = policy or ContextPolicy()
+    planner = planner or PlannerResult(
+        plan="No structured planner result was supplied.",
+        cannot_identify_target="no structured planner result was supplied",
+    )
+    read: Callable[[str], str]
+    try:
+        if ref:
+            tracked = [
+                p for p in run_git(repo, "ls-tree", "-r", "--name-only", ref).splitlines() if p
+            ]
+            read = lambda path: run_git(repo, "show", f"{ref}:{path}")  # noqa: E731
+        else:
+            tracked = [p for p in run_git(repo, "ls-files").splitlines() if p.strip()]
+            read = lambda path: (repo / path).read_text(encoding="utf-8")  # noqa: E731
+    except GitError:
+        return ContextSelection("", (), policy.budget, 0, False, (), False, ())
+    if not tracked:
+        return ContextSelection("", (), policy.budget, 0, False, (), False, ())
+
+    tracked_set = set(tracked)
+    validated: list[PlannerTarget] = []
+    named: list[str] = []
+    omitted: list[tuple[str, str]] = []
+    for target in planner.targets:
+        path, problem = _normalise_target(repo, target.path)
+        if problem or path is None:
+            validated.append(PlannerTarget(target.path, target.reason, False, problem))
+            omitted.append((target.path, problem or "invalid target"))
+            continue
+        if path not in tracked_set:
+            problem = "target is missing from the selected repository revision"
+            validated.append(PlannerTarget(path, target.reason, False, problem))
+            omitted.append((path, problem))
+            continue
+        try:
+            if not ref and not (repo / path).is_file():
+                raise OSError("target is not a regular file")
+        except OSError as exc:
+            problem = str(exc)
+            validated.append(PlannerTarget(path, target.reason, False, problem))
+            omitted.append((path, problem))
+            continue
+        validated.append(PlannerTarget(path, target.reason))
+        if path not in named:
+            named.append(path)
+
+    # Planner targets are first. Surrounding context is a deterministic path
+    # relevance fallback, not a claim that the heuristic knows the answer.
+    brief = " ".join(
+        [
+            str(getattr(record, "title", "") or ""),
+            str(getattr(record, "brief", "") or ""),
+            planner.plan,
+            *(f"{target.path} {target.reason}" for target in validated),
+        ]
+    ).lower()
+    terms = {term for term in re.findall(r"[a-z0-9][a-z0-9_.-]+", brief) if len(term) > 2}
+
+    def relevance(path: str) -> tuple[int, int, str]:
+        components = set(re.findall(r"[a-z0-9][a-z0-9_.-]+", path.lower()))
+        return (-len(terms & components), len(path), path)
+
+    fallback = sorted(
+        (
+            path
+            for path in tracked
+            if path not in named and not path.lower().endswith(_UNINTERESTING)
+        ),
+        key=relevance,
+    )
+
+    parts: list[str] = []
+    supplied: list[str] = []
+    spent = 0
+    truncated = False
+    for path in [*named, *fallback]:
+        explicit = path in named
+        if not explicit and _configured_generated(path, policy.generated_paths):
+            omitted.append((path, "configured generated artefact"))
+            continue
+        # Reading a worktree symlink follows it, which could turn an innocent
+        # context selection into arbitrary access outside the repository. Git
+        # stores the link target, not the pointed-to bytes; the implementer
+        # needs neither, so links stay visible in the listing only.
+        if not ref and (repo / path).is_symlink():
+            omitted.append((path, "symbolic link content is not supplied"))
+            continue
+        try:
+            body = read(path)
+        except (OSError, UnicodeDecodeError, GitError):
+            omitted.append((path, "binary or unreadable"))
+            continue
+        if not explicit and not body:
+            omitted.append((path, "empty file"))
+            continue
+        block = f"--- {path} ---\n{body}\n"
+        if spent + len(block) > policy.budget:
+            truncated = True
+            omitted.append(
+                (
+                    path,
+                    "named target exceeds remaining content budget"
+                    if explicit
+                    else "content budget exhausted",
+                )
+            )
+            continue
+        parts.append(block)
+        supplied.append(path)
+        spent += len(block)
+
+    # Listing comes after file content and is bounded by the same budget. It
+    # is orientation, not a reason to evict a file the planner named.
+    heading = "Files in this repository:\n"
+    listing = heading
+    for path in tracked:
+        line = f"  {path}\n"
+        if spent + len(listing) + len(line) > policy.budget:
+            truncated = True
+            break
+        listing += line
+    if spent + len(listing) <= policy.budget:
+        parts.append(listing)
+        spent += len(listing)
+
+    return ContextSelection(
+        text="\n".join(parts),
+        files=tuple(supplied),
+        budget=policy.budget,
+        characters=spent,
+        truncated=truncated,
+        omitted=tuple(omitted),
+        fallback_relevance=bool(fallback),
+        targets=tuple(validated),
+    )
+
+
 def repo_context(
     repo: Path,
     record: Any = None,
@@ -140,43 +423,12 @@ def repo_context(
     holds the *previous* item's branch at this stage, so a model shown the
     tree writes context lines for a file the patch will never meet.
     """
-    read: Callable[[str], str]
-    try:
-        if ref:
-            tracked = [
-                p for p in run_git(repo, "ls-tree", "-r", "--name-only", ref).splitlines() if p
-            ]
-            read = lambda path: run_git(repo, "show", f"{ref}:{path}")  # noqa: E731
-        else:
-            tracked = [p for p in run_git(repo, "ls-files").splitlines() if p.strip()]
-            read = lambda path: (repo / path).read_text(encoding="utf-8")  # noqa: E731
-    except GitError:
-        return ""
-    if not tracked:
-        return ""
-
-    brief = " ".join(str(getattr(record, field, "") or "") for field in ("title", "brief")).lower()
-    candidates = [p for p in tracked if not p.lower().endswith(_UNINTERESTING)]
-    # Mentioned first, then smallest-first for whatever budget remains.
-    mentioned = [p for p in candidates if p.lower() in brief or Path(p).name.lower() in brief]
-    rest = sorted(
-        (p for p in candidates if p not in mentioned),
-        key=lambda p: (repo / p).stat().st_size if (repo / p).is_file() else 0,
-    )
-
-    parts = ["Files in this repository:", *(f"  {p}" for p in tracked), ""]
-    spent = sum(len(p) for p in parts)
-    for path in [*mentioned, *rest]:
-        try:
-            body = read(path)
-        except (OSError, UnicodeDecodeError, GitError):
-            continue  # binary or unreadable: its name in the listing is all it gets
-        block = f"--- {path} ---\n{body}\n"
-        if spent + len(block) > budget:
-            continue
-        parts.append(block)
-        spent += len(block)
-    return "\n".join(parts)
+    return select_repo_context(
+        repo,
+        record,
+        policy=ContextPolicy(budget=budget),
+        ref=ref,
+    ).text
 
 
 def extract_diff(reply: str) -> str | None:
@@ -669,10 +921,17 @@ You are planning one unit of work. Do not write code yet.
 
 {brief}
 
-Write a short plan: which files you expect to change, what the change is, and
-how it will be verified. If the task cannot be done as stated — because it is
-ambiguous, contradicts the codebase, or depends on something absent — say so
-plainly and explain what is missing instead of inventing a way forward.
+Reply with one JSON object and no commentary:
+
+{{
+  "plan": "a short implementation and verification plan",
+  "targets": [{{"path": "relative/path", "reason": "why it is a target"}}],
+  "cannot_identify_target": null
+}}
+
+Order targets by importance. If the task is ambiguous, contradicts the
+codebase, or depends on something absent, return an empty targets list and put
+the reason in `cannot_identify_target` instead of inventing a path.
 """
 
 IMPLEMENT_PROMPT = """\
@@ -748,6 +1007,7 @@ class Executor:
         push: bool = True,
         now: Callable[[], float] = time.time,
         context_provider: Callable[[WorkRecord], str] | None = None,
+        context_policy: ContextPolicy | None = None,
         artifacts: Path | None = None,
         project_id: str = DEFAULT_PROJECT,
     ) -> None:
@@ -770,7 +1030,8 @@ class Executor:
         # Defaults to showing the repository. An empty context meant asking a
         # model for a patch that "applies cleanly" against files it had never
         # seen, which it cannot do and which nothing said out loud.
-        self.context_provider = context_provider or self._default_context
+        self.context_provider = context_provider
+        self.context_policy = context_policy or ContextPolicy()
         #: The ref the current item's patch will be applied to. Resolved
         #: before the implementer is called, because that is what it needs to
         #: be looking at.
@@ -898,8 +1159,26 @@ class Executor:
                 "its lease expired and another worker re-claimed it"
             )
 
-    def _default_context(self, record: WorkRecord) -> str:
-        return repo_context(self.repo, record, ref=self._base)
+    def _context_for(self, record: WorkRecord, planner: PlannerResult) -> ContextSelection:
+        if self.context_provider is not None:
+            text = self.context_provider(record)
+            return ContextSelection(
+                text=text,
+                files=(),
+                budget=len(text),
+                characters=len(text),
+                truncated=False,
+                omitted=(),
+                fallback_relevance=False,
+                targets=planner.targets,
+            )
+        return select_repo_context(
+            self.repo,
+            record,
+            planner=planner,
+            policy=self.context_policy,
+            ref=self._base,
+        )
 
     def _execute(self, record: WorkRecord) -> Outcome:
         outcome = Outcome(record.item_id, FAILED)
@@ -914,18 +1193,61 @@ class Executor:
         self._base = base
 
         # 1. Plan. Cheap, once per item, and the highest-leverage call.
-        plan = self._call(record, PLANNER, PLAN_PROMPT.format(brief=record.brief))
+        planner_reply = self._call(record, PLANNER, PLAN_PROMPT.format(brief=record.brief))
+        planner = parse_planner_result(planner_reply)
+        self._emit(
+            record,
+            "planner_targets",
+            detail=json.dumps(
+                {
+                    "targets": [
+                        {"path": target.path, "reason": target.reason}
+                        for target in planner.targets
+                    ],
+                    "cannot_identify_target": planner.cannot_identify_target,
+                    "uncertainties": list(planner.uncertainties),
+                },
+                sort_keys=True,
+            ),
+        )
         outcome.stages.append("plan")
         self._keepalive(record)
 
         # 2. Implement.
+        context = self._context_for(record, planner)
+        self._emit(
+            record,
+            "context_selected",
+            detail=json.dumps(
+                {
+                    "planner_targets": [
+                        {
+                            "path": target.path,
+                            "reason": target.reason,
+                            "usable": target.usable,
+                            "uncertainty": target.uncertainty,
+                        }
+                        for target in context.targets
+                    ],
+                    "files": list(context.files),
+                    "character_budget": context.budget,
+                    "characters": context.characters,
+                    "truncated": context.truncated,
+                    "omitted": [
+                        {"path": path, "reason": reason} for path, reason in context.omitted
+                    ],
+                    "fallback_relevance": context.fallback_relevance,
+                },
+                sort_keys=True,
+            ),
+        )
         reply = self._call(
             record,
             IMPLEMENTER,
             IMPLEMENT_PROMPT.format(
                 brief=record.brief,
-                plan=plan,
-                context=self.context_provider(record),
+                plan=planner.plan,
+                context=context.text,
             ),
         )
         outcome.stages.append("implement")

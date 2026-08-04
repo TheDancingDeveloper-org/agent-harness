@@ -114,6 +114,11 @@ CREATE TABLE IF NOT EXISTS projects (
     fixes       TEXT NOT NULL DEFAULT '{}',
     -- Stage H: how often an attempt at this project is made durable.
     durability  TEXT NOT NULL DEFAULT '',
+    -- Stage L. Per-item ceilings for this project. Zero is unlimited, which
+    -- is the default, which is why an upgrade changes nothing. Whether that
+    -- is the right default for an unattended run is D14, and it is open.
+    max_item_seconds   REAL NOT NULL DEFAULT 0,
+    max_item_spend_usd REAL NOT NULL DEFAULT 0,
     plan_path   TEXT,
     roles       TEXT,
     max_workers INTEGER NOT NULL DEFAULT 1,
@@ -152,6 +157,20 @@ CREATE TABLE IF NOT EXISTS work (
     -- nothing has finished with yet.
     disposition TEXT NOT NULL DEFAULT '',
     reason_kind TEXT NOT NULL DEFAULT '',
+    -- Stage L. Per-item ceilings; zero means "take the project's", which is
+    -- itself zero by default, which is unlimited. Three levels, one spelling.
+    budget_seconds    REAL NOT NULL DEFAULT 0,
+    budget_spend_usd  REAL NOT NULL DEFAULT 0,
+    -- What this item has cost, accumulated across attempts, and how many of
+    -- its calls nobody could price. While `unpriced_calls` is non-zero,
+    -- `spend_usd` is a LOWER BOUND and the spend ceiling is unenforceable --
+    -- unknown cost is never zero cost.
+    spend_usd     REAL NOT NULL DEFAULT 0,
+    unpriced_calls INTEGER NOT NULL DEFAULT 0,
+    -- When work on this item first began. Not the current attempt's start:
+    -- the wall-clock ceiling bounds the ITEM, and an item that crashes in a
+    -- loop would otherwise reset its own clock on every re-claim.
+    first_started_at REAL NOT NULL DEFAULT 0,
     updated_at  REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, item_id)
 );
@@ -335,6 +354,11 @@ class Project:
     #: How often this project's attempts are made durable: `exit`, `boundary`
     #: or `sync`. Empty takes the deployment's default. See `attempts.py`.
     durability: str = ""
+    #: Per-item ceilings for this project. Zero is unlimited, and unlimited is
+    #: the default so an existing deployment upgrades unchanged. D14 asks
+    #: whether that should stay true for an unattended run; it is open.
+    max_item_seconds: float = 0.0
+    max_item_spend_usd: float = 0.0
     plan_path: str | None = None
     roles: dict[str, Any] | None = None
     max_workers: int = 1
@@ -377,6 +401,16 @@ class WorkRecord:
     #: dispositions, and is why the empty string is not one of them.
     disposition: str = ""
     reason_kind: str = ""
+    #: Per-item ceilings. Zero means "take the project's".
+    budget_seconds: float = 0.0
+    budget_spend_usd: float = 0.0
+    #: What this item has cost across every attempt, and how many calls nobody
+    #: could price. A non-zero `unpriced_calls` makes `spend_usd` a lower
+    #: bound and the spend ceiling unenforceable.
+    spend_usd: float = 0.0
+    unpriced_calls: int = 0
+    #: When work on this item first began, across attempts.
+    first_started_at: float = 0.0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> WorkRecord:
@@ -495,6 +529,8 @@ class WorkQueue:
             "fixes": "TEXT NOT NULL DEFAULT '{}'",
             # Stage H, additive on the same terms.
             "durability": "TEXT NOT NULL DEFAULT ''",
+            "max_item_seconds": "REAL NOT NULL DEFAULT 0",
+            "max_item_spend_usd": "REAL NOT NULL DEFAULT 0",
         },
         # Stage G. Additive, so a rollback to an older build still reads every
         # column it knows and simply ignores this one. The migration plan is
@@ -508,6 +544,13 @@ class WorkQueue:
             # sixth disposition.
             "disposition": "TEXT NOT NULL DEFAULT ''",
             "reason_kind": "TEXT NOT NULL DEFAULT ''",
+            # Stage L. All zero-defaulted, so an existing database upgrades
+            # to "unlimited, nothing spent yet" -- no behaviour change.
+            "budget_seconds": "REAL NOT NULL DEFAULT 0",
+            "budget_spend_usd": "REAL NOT NULL DEFAULT 0",
+            "spend_usd": "REAL NOT NULL DEFAULT 0",
+            "unpriced_calls": "INTEGER NOT NULL DEFAULT 0",
+            "first_started_at": "REAL NOT NULL DEFAULT 0",
         },
     }
 
@@ -612,13 +655,16 @@ class WorkQueue:
         try:
             conn.execute(
                 "INSERT INTO projects (project_id, name, repo, work_dir, base_branch, "
-                "checks, fixes, durability, plan_path, roles, max_workers, max_attempts, "
+                "checks, fixes, durability, max_item_seconds, max_item_spend_usd, "
+                "plan_path, roles, max_workers, max_attempts, "
                 "min_free_disk_gb, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET "
                 "name=excluded.name, repo=excluded.repo, work_dir=excluded.work_dir, "
                 "base_branch=excluded.base_branch, checks=excluded.checks, "
                 "fixes=excluded.fixes, durability=excluded.durability, "
+                "max_item_seconds=excluded.max_item_seconds, "
+                "max_item_spend_usd=excluded.max_item_spend_usd, "
                 "plan_path=excluded.plan_path, roles=excluded.roles, "
                 "max_workers=excluded.max_workers, max_attempts=excluded.max_attempts, "
                 "min_free_disk_gb=excluded.min_free_disk_gb, "
@@ -632,6 +678,8 @@ class WorkQueue:
                     json.dumps(project.checks),
                     json.dumps(project.fixes),
                     project.durability,
+                    project.max_item_seconds,
+                    project.max_item_spend_usd,
                     project.plan_path,
                     json.dumps(project.roles) if project.roles else None,
                     project.max_workers,
@@ -940,7 +988,14 @@ class WorkQueue:
                 conn.execute(
                     "UPDATE work SET state = ?, owner = ?, lease_until = ?, "
                     "attempts = CASE WHEN ? THEN attempts ELSE attempts + 1 END, "
-                    "admitted_revision = ?, updated_at = ? "
+                    "admitted_revision = ?, "
+                    # Stamped once and never again. The wall-clock ceiling
+                    # bounds the ITEM, so an item that crashes in a loop must
+                    # not reset its own clock on every re-claim -- which is
+                    # exactly the failure D11's ruling left for this to catch.
+                    "first_started_at = CASE WHEN first_started_at > 0 "
+                    "THEN first_started_at ELSE ? END, "
+                    "updated_at = ? "
                     "WHERE project_id = ? AND item_id = ?",
                     (
                         CLAIMED,
@@ -948,6 +1003,7 @@ class WorkQueue:
                         now + self.lease_seconds,
                         resuming,
                         revision,
+                        now,
                         now,
                         project_id,
                         record.item_id,
@@ -960,6 +1016,7 @@ class WorkQueue:
                 if not resuming:
                     record.attempts += 1
                 record.admitted_revision = revision
+                record.first_started_at = record.first_started_at or now
                 return record
             conn.execute("COMMIT")
             return None
@@ -1116,6 +1173,65 @@ class WorkQueue:
                     state,
                 )
             return applied
+        finally:
+            conn.close()
+
+    def add_spend(
+        self,
+        item_id: str,
+        usd: float,
+        unpriced: int = 0,
+        *,
+        project_id: str = DEFAULT_PROJECT,
+    ) -> None:
+        """Fold one attempt's spend into the item's running total.
+
+        Accumulated across attempts on purpose: a per-item ceiling that reset
+        on every re-claim would bound one attempt, and the thing worth bounding
+        is the item. Added rather than replaced, so a resumed attempt's cost
+        lands on top of what the crashed one already spent rather than
+        pretending that money was never spent.
+        """
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE work SET spend_usd = spend_usd + ?, "
+                "unpriced_calls = unpriced_calls + ?, updated_at = ? "
+                "WHERE project_id = ? AND item_id = ?",
+                (usd, unpriced, self.now(), project_id, item_id),
+            )
+        finally:
+            conn.close()
+
+    def set_item_budget(
+        self,
+        item_id: str,
+        *,
+        seconds: float | None = None,
+        spend_usd: float | None = None,
+        project_id: str = DEFAULT_PROJECT,
+    ) -> bool:
+        """Override this item's ceilings. Zero means "take the project's"."""
+        sets: list[str] = []
+        params: list[Any] = []
+        if seconds is not None:
+            sets.append("budget_seconds = ?")
+            params.append(float(seconds))
+        if spend_usd is not None:
+            sets.append("budget_spend_usd = ?")
+            params.append(float(spend_usd))
+        if not sets:
+            return False
+        sets.append("updated_at = ?")
+        params.extend([self.now(), project_id, item_id])
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                f"UPDATE work SET {', '.join(sets)} "  # noqa: S608 - fixed column names
+                "WHERE project_id = ? AND item_id = ?",
+                params,
+            )
+            return cursor.rowcount > 0
         finally:
             conn.close()
 

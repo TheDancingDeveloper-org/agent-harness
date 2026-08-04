@@ -382,6 +382,47 @@ def _is_priced(route: Any) -> bool:
         return False
 
 
+def _budget_findings(project: Any) -> list[Finding]:
+    """What this project is permitted to spend, before it spends it.
+
+    §8.2 of the extension proposal asks for exactly this: an operator should
+    be able to read the ceilings without waiting to discover them. Unlimited
+    is reported as a finding rather than as silence — it is the default, it is
+    safe on upgrade, and it is the wrong answer for a seven-day unattended run
+    (**D14**, open).
+    """
+    from .budgets import Budget
+
+    budget = Budget(
+        seconds=float(getattr(project, "max_item_seconds", 0.0) or 0.0),
+        spend_usd=float(getattr(project, "max_item_spend_usd", 0.0) or 0.0),
+    )
+    if not budget.bounded:
+        return [
+            Finding(
+                "item budgets",
+                WARN,
+                "no per-item ceiling: one item may run for any length of time and spend "
+                "any amount. Safe on upgrade and unsafe unattended — set "
+                "max_item_seconds and/or max_item_spend_usd.",
+            )
+        ]
+    findings = [Finding("item budgets", OK, budget.describe())]
+    if budget.spend_usd:
+        findings.append(
+            Finding(
+                "spend ceiling enforceability",
+                UNKNOWN,
+                "a spend ceiling can only be enforced over calls whose price is known. "
+                "Session-mode traffic bypasses ModelClient entirely (#128) and an "
+                "unpriced model reports no cost, and in both cases the item's recorded "
+                "spend is a LOWER BOUND. Whether this project will hit that is not "
+                "knowable before it runs; the item reports it when it does.",
+            )
+        )
+    return findings
+
+
 def _github_finding(project: Any) -> Finding:
     """Whether this project can mutate anything on GitHub.
 
@@ -464,6 +505,7 @@ def diagnose(queue: Any, projects: list[Any], *, ask: Any = None) -> Report:
         found.findings.extend(_route_findings(routes, needed=NEEDED_ROLES))
         found.findings.extend(_reviewer_findings(routes, implemented_by=""))
         found.findings.extend(_observability_findings(project, routes))
+        found.findings.extend(_budget_findings(project))
         found.findings.append(_github_finding(project))
         found.findings.extend(_model_findings(routes, ask, NEEDED_ROLES))
         report.projects.append(found)

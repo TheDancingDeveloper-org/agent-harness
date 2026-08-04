@@ -63,6 +63,31 @@ class WorkItem(BaseModel):
         "A block is a decision someone made, not a failure the harness had -- reading "
         "it out of `last_error` would make the two indistinguishable.",
     )
+    budget_seconds: float = Field(
+        0.0,
+        description="Wall-clock ceiling for this item alone, overriding the project's. "
+        "Zero means take the project's, which itself defaults to unlimited.",
+    )
+    budget_spend_usd: float = Field(
+        0.0, description="Spend ceiling for this item alone. Zero takes the project's."
+    )
+    spend_usd: float = Field(
+        0.0,
+        description="What this item has cost across every attempt, from the calls whose "
+        "price is known. A **lower bound** whenever `unpriced_calls` is non-zero.",
+    )
+    unpriced_calls: int = Field(
+        0,
+        description="Model calls whose cost nobody could determine. While this is "
+        "non-zero the spend ceiling cannot be enforced, and `spend_usd` is a lower "
+        "bound rather than a total. Unknown cost is never zero cost.",
+    )
+    first_started_at: float = Field(
+        0.0,
+        description="When work on this item first began, across attempts. The wall-clock "
+        "ceiling is measured from here, not from the current attempt, so an item that "
+        "crashes in a loop cannot reset its own clock.",
+    )
     disposition: str = Field(
         "",
         description="WHY the item is in `state`, from the Stage K taxonomy: "
@@ -337,6 +362,32 @@ class ProjectSpec(BaseModel):
             "that silently repaired what it was meant to catch could not be trusted to "
             "have caught anything; applying it is a separate decision. The key must be "
             "one of `checks`, verbatim."
+        ),
+    )
+    max_item_seconds: float = Field(
+        0.0,
+        ge=0,
+        description=(
+            "Wall-clock ceiling for ONE item, in seconds, across all its attempts. "
+            "Zero is unlimited and is the default, so an existing deployment upgrades "
+            "with no behaviour change. The lease bounds a worker's *absence*; this "
+            "bounds an item's *duration*, and a heartbeat proves a process is alive "
+            "without proving it is making progress. Exceeding it stops the item at the "
+            "next boundary — never mid-stage — as `blocked` / `escalated` / "
+            "`item_wall_clock`."
+        ),
+    )
+    max_item_spend_usd: float = Field(
+        0.0,
+        ge=0,
+        description=(
+            "Spend ceiling for ONE item, across all its attempts. Zero is unlimited. "
+            "**This is not a provider cost cap** and is never classified as one: "
+            "`window_cap` and `terminal_cap` are a provider's statement about your "
+            "account and are in the never-retry set, while this is your statement "
+            "about one item. Exceeding it does not park the endpoint. An item whose "
+            "spend cannot be measured is reported as unmeasurable and the ceiling is "
+            "reported as unenforceable — unknown cost is never treated as zero."
         ),
     )
     durability: str = Field(

@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from .events import Event
+from .pricing import cost_of
 
 log = logging.getLogger(__name__)
 
@@ -119,21 +120,10 @@ CREATE TABLE IF NOT EXISTS baselines (
 """
 
 
-def _cost_of(data: dict[str, Any]) -> float | None:
-    """Cost from tokens and the prices supplied with them.
-
-    Returns None unless a price is actually known. A default of zero would be
-    a measurement claiming the call was free.
-    """
-    price_in = data.get("price_in_per_mtok")
-    price_out = data.get("price_out_per_mtok")
-    if price_in is None and price_out is None:
-        return None
-    tokens_in = data.get("tokens_in") or 0
-    tokens_out = data.get("tokens_out") or 0
-    return (tokens_in / 1_000_000) * (price_in or 0.0) + (tokens_out / 1_000_000) * (
-        price_out or 0.0
-    )
+#: Cost from tokens and the prices supplied with them; None when nobody can
+#: say. Imported rather than re-implemented so the audit rollup and the
+#: per-item budget cannot disagree about what a call cost.
+_cost_of = cost_of
 
 
 class AuditStore:

@@ -42,6 +42,10 @@ from pathlib import Path
 from typing import Any
 
 from . import attempts as A
+from .budgets import SPEND as BUDGET_SPEND
+from .budgets import WALL_CLOCK as BUDGET_WALL_CLOCK
+from .budgets import Budget, BudgetExceeded, Spend, budget_for
+from .budgets import check as budget_check
 from .graph import LOCAL_WORK
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
 from .outcomes import (
@@ -52,8 +56,11 @@ from .outcomes import (
     DECIDED,
     DEPENDENCY_INVALIDATED,
     ESCALATE,
+    ESCALATED,
     FAIL,
     FIX_AVAILABLE,
+    ITEM_SPEND,
+    ITEM_WALL_CLOCK,
     NO_TARGET,
     PASSED,
     PATCH_REJECTED,
@@ -68,6 +75,7 @@ from .outcomes import (
     stop_for,
 )
 from .work import (
+    BLOCKED,
     DEFAULT_PROJECT,
     DONE,
     FAILED,
@@ -78,6 +86,10 @@ from .work import (
     WorkRecord,
     worker_identity,
 )
+
+#: Which reason kind each ceiling reports. Named here so the executor never
+#: has to branch on a ceiling string.
+BUDGET_REASON = {BUDGET_WALL_CLOCK: ITEM_WALL_CLOCK, BUDGET_SPEND: ITEM_SPEND}
 
 PLANNER = "planner"
 IMPLEMENTER = "implementer"
@@ -1181,6 +1193,11 @@ class Executor:
         self.owner = worker_identity()
         self._partial: Outcome | None = None
         self._heartbeat: LeaseHeartbeat | None = None
+        #: This attempt's spend, folded from the model client's own events.
+        #: Reset per item in `run_once`.
+        self._spend = Spend()
+        self._budget_cache: Budget | None = None
+        self._unenforceable_said: set[str] = set()
 
     # ------------------------------------------------------------- driving
 
@@ -1207,6 +1224,11 @@ class Executor:
         record = self.queue.claim(self.owner, project_id=self.project_id)
         if record is None:
             return None
+        # Per item, not per worker: two items in one process must not share a
+        # spend total or inherit each other's ceilings.
+        self._spend = Spend()
+        self._budget_cache = None
+        self._unenforceable_said = set()
         try:
             outcome = self._execute_with_heartbeat(record)
         except ClaimLost as exc:
@@ -1222,6 +1244,7 @@ class Executor:
             # Out of budget. Hand the item back untouched rather than
             # burning an attempt on something that was never tried.
             self._emit(record, "budget_exhausted", detail=str(exc))
+            self._persist_spend(record)
             self.queue.attempts_log.flush(self.durability)
             partial = self._partial_for(record)
             self.queue.release(
@@ -1237,9 +1260,49 @@ class Executor:
                 project_id=self.project_id,
             )
             raise
+        except BudgetExceeded as exc:
+            # A budget stop is not a failure of the work and not an exhausted
+            # attempt ladder. It is a policy decision this deployment made,
+            # and it needs a person to raise the ceiling or let the item go --
+            # so it lands in `blocked`, with the ceiling named.
+            #
+            # It deliberately does NOT park the endpoint. `WINDOW_CAP` and
+            # `TERMINAL_CAP` are a provider's statement about our budget and
+            # belong in the never-retry set; this is our statement about one
+            # item, and parking a shared endpoint because one item was
+            # expensive would be that conflation made real.
+            self._emit(
+                record,
+                "budget_exceeded",
+                detail=exc.detail,
+                error_class=BUDGET_REASON[exc.ceiling],
+            )
+            self._persist_spend(record)
+            self.queue.attempts_log.flush(self.durability)
+            stop = Stop(ESCALATED, BUDGET_REASON[exc.ceiling], detail=exc.detail)
+            partial = self._partial_for(record)
+            self.queue.release(
+                record.item_id,
+                stop.state or BLOCKED,
+                error=exc.detail,
+                branch=partial.branch if partial else None,
+                pr_url=partial.pr_url if partial else None,
+                owner=self.owner,
+                consume_attempt=False,
+                disposition=stop.disposition,
+                reason_kind=stop.reason_kind,
+                project_id=self.project_id,
+            )
+            if partial is not None:
+                partial.state = BLOCKED
+                partial.reason = exc.detail
+                partial.stop = stop
+                return partial
+            return Outcome(record.item_id, BLOCKED, reason=exc.detail, stop=stop)
         except RetryExhausted as exc:
             self._emit(record, "retry_exhausted", detail=str(exc), error_class=exc.kind)
             self.queue.attempts_log.flush(self.durability)
+            self._persist_spend(record)
             partial = self._partial_for(record)
             # A provider that would not answer is not this item's fault, so
             # the disposition says `withheld`. The attempt is still consumed,
@@ -1266,6 +1329,7 @@ class Executor:
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
             self.queue.attempts_log.flush(self.durability)
+            self._persist_spend(record)
             partial = self._partial_for(record)
             # Crashed, not refused. Nothing was decided about the item; an
             # exception happened while deciding, and a human reading the
@@ -1292,6 +1356,7 @@ class Executor:
         # A failed attempt's record is as useful as a successful one's -- more
         # so, since it is the one somebody will read.
         self.queue.attempts_log.flush(self.durability)
+        self._persist_spend(record)
         # A decision was reached, so the attempt stops being resumable. Only a
         # worker that was KILLED leaves a position to continue from; one that
         # reached a verdict decided, and resuming into that decision would make
@@ -1320,6 +1385,20 @@ class Executor:
         )
         return outcome
 
+    def _persist_spend(self, record: WorkRecord) -> None:
+        """Add this attempt's cost to the item's running total, once.
+
+        Accumulated across attempts because the ceiling bounds the *item*: a
+        total that reset on every re-claim would bound one attempt, and an
+        item that crashes in a loop would then never reach any ceiling at all.
+        """
+        if not (self._spend.priced or self._spend.unpriced):
+            return
+        spent, unpriced = self._spend.usd, self._spend.unpriced
+        self._spend = Spend()
+        with contextlib.suppress(Exception):
+            self.queue.add_spend(record.item_id, spent, unpriced, project_id=self.project_id)
+
     def _partial_for(self, record: WorkRecord) -> Outcome | None:
         partial = self._partial
         if partial is not None and partial.item_id == record.item_id:
@@ -1341,6 +1420,34 @@ class Executor:
         return outcomes
 
     # ------------------------------------------------------------ the loop
+
+    def _budget(self, record: WorkRecord) -> Budget:
+        if self._budget_cache is None:
+            self._budget_cache = budget_for(self.queue.get_project(self.project_id), record)
+        return self._budget_cache
+
+    def _budget_stop(self, record: WorkRecord) -> None:
+        """Refuse to go past a ceiling this item declared.
+
+        Called at the boundaries that already exist rather than from a timer.
+        A budget stop must never kill work in flight: stopping mid-stage
+        destroys the context and leaves a half-finished worktree, which is the
+        reasoning `work.py` already gives about pause semantics.
+        """
+        budget = self._budget(record)
+        if not budget.bounded:
+            return
+        started = record.first_started_at or self.now()
+        verdict = budget_check(budget, elapsed=self.now() - started, spend=self._spend)
+        for ceiling, why in verdict.unenforceable:
+            # Said once per stop, and said as a fact rather than a warning
+            # nobody reads: a ceiling that cannot be checked is not a ceiling
+            # that was met.
+            if ceiling not in self._unenforceable_said:
+                self._unenforceable_said.add(ceiling)
+                self._emit(record, "budget_unenforceable", detail=why)
+        if verdict.exceeded is not None:
+            raise verdict.exceeded
 
     def _keepalive(self, record: WorkRecord) -> None:
         """Extend the lease, and stop if it is no longer ours.
@@ -1364,6 +1471,10 @@ class Executor:
                 f"{record.item_id} is no longer owned by {self.owner}; "
                 "its lease expired and another worker re-claimed it"
             )
+        # The heartbeat proves the process is alive; it proves nothing about
+        # progress. This is the boundary where "alive" and "within budget"
+        # stop being the same question.
+        self._budget_stop(record)
 
     def _context_for(self, record: WorkRecord, planner: PlannerResult) -> ContextSelection:
         if self.context_provider is not None:
@@ -1891,10 +2002,16 @@ class Executor:
 
     def _call(self, record: WorkRecord, role: str, prompt: str) -> str:
         self._emit(record, "calling", detail=role)
+        self._budget_stop(record)
         try:
             response = self.client.call(role, [{"role": "user", "content": prompt}])
         except RequestRefused as exc:
             raise RuntimeError(f"{role} refused: {exc}") from exc
+        # Folded in as it happens, not reconstructed afterwards. An item that
+        # blows its ceiling on the implementer must not reach the reviewer,
+        # and a total assembled at the end could only ever say so too late.
+        with contextlib.suppress(Exception):
+            self._spend.add_call(self.client.usage_for(role, response.body))
         return _text_of(response.body, _reader_for(self.client, role))
 
     def _base_for(self, record: WorkRecord) -> tuple[str, str | None]:

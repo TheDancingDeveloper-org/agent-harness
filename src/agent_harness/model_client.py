@@ -822,6 +822,18 @@ class ModelClient:
             usage = protocols.GENERIC_PRESET.reader.usage(body)
         return price_fields(usage, route.pricing_key, self.prices)
 
+    def usage_for(self, role: str, body: Any) -> dict[str, Any]:
+        """The tokens and prices this reply reported, for a caller that needs
+        to add them up itself.
+
+        The same reading `_emit` does, exposed because the per-item budget in
+        `budgets.py` has to agree with the telemetry about what a call cost.
+        Two readings of one body would eventually disagree, and the one that
+        stops an item had better be the one that matches the bill.
+        """
+        chain = self.routes_for(role)
+        return dict(self._usage(chain[0], body))
+
     def _identity(self, route: Route) -> dict[str, Any]:
         """Which route, which protocol, which classifier — on every event.
 

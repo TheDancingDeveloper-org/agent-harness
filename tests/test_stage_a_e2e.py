@@ -691,7 +691,7 @@ def test_transport_covers_malformed_and_slow_success_without_network() -> None:
     malformed = transport(Route("malformed", "fixture://one"), [], {})
     slow = transport(Route("slow", "fixture://two"), [], {})
     assert malformed.body == "not-json"
-    assert json.loads(slow.body)["choices"][0]["message"]["content"] == "healthy"  # type: ignore[arg-type]
+    assert json.loads(slow.body)["choices"][0]["message"]["content"] == "healthy"
     assert called == ["slow"]
 
 

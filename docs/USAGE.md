@@ -432,6 +432,40 @@ Worth doing deliberately: a reviewer on the same vendor as the implementer
 means some share of reviews is a model grading its own work. Nothing enforces
 that; it is your call.
 
+### Which protocol a route speaks
+
+A route may name a **preset** — the wire protocol, the authentication header,
+the response reader and the failure classifier, as one name:
+
+```bash
+curl -sH "Authorization: Bearer $TOKEN" -X PUT localhost:8099/api/roles \
+  -H 'content-type: application/json' -d '{
+    "roles": {
+      "reviewer": {"model": "m", "endpoint": "https://api.example/v1",
+                   "preset": "claw-bay", "price_ref": "tier-2"}
+    }
+  }'
+```
+
+`GET /api/roles` shows it back. Omit it and the route uses the deployment
+default (`run --preset` / `serve --preset`, default `chat-completions`), which
+is printed at startup along with any per-role override.
+
+`agent-harness --help` will not list the presets you can name, because they are
+not a fixed set: `generic` is built in, this distribution publishes
+`chat-completions` and `claw-bay`, and any installed package or
+`HARNESS_ROUTE_PRESETS` entry adds more. Name one that does not resolve and the
+CLI refuses before anything claims work, listing the ones that do.
+
+The older `provider` field still works and still means what it always meant —
+the **classifier only**. `{"provider": "claw-bay"}` keeps the deployment's wire
+protocol and reads failures with that gateway's envelope, which is exactly what
+it did before presets existed. Writing a `preset` supersedes it.
+
+Adding a vendor of your own is a preset registered by name — no fork, no change
+to any harness module. See
+[`INTERNALS.md`](INTERNALS.md#route-presets-adding-a-vendor-without-touching-core).
+
 ---
 
 ## 4d. Serve the API *and* the workers
@@ -660,6 +694,8 @@ is the lever.
 | `HARNESS_DB` | all | SQLite path. Default `./harness.sqlite`. |
 | `HARNESS_API_KEY` | `run`, `serve` | Key for the model provider. In `serve` it is the reviewer's. |
 | `HARNESS_ENDPOINT` | `run`, `serve` | Model API base URL. |
+| `HARNESS_ROUTE_PRESET` | `run`, `serve` | Default route preset (`--preset`) for roles that name none: the wire protocol, the authentication header, the response reader and a failure classifier, as one name. Default `chat-completions`. |
+| `HARNESS_ROUTE_PRESETS` | all | Extra presets to make resolvable, as `name=module:attribute` pairs. For a preset that lives in your own code rather than in an installed distribution's entry points. |
 | `HARNESS_ROOT_PATH` | `serve` | Prefix when behind a proxy, e.g. `/api/harness`. |
 | `AIDEVENV_URL` | `run`, `serve` | Session host, enabling attachable agents. In `serve` it is what makes the deployment supervised rather than monitoring-only. |
 | `AIDEVENV_TOKEN` | `run`, `serve` | Session host token. |

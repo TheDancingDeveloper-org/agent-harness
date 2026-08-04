@@ -1093,9 +1093,17 @@ Your plan:
 
 Repository context:
 {context}
-
+{checks}
 Reply with a single unified diff (`diff --git` / `---` / `+++` / `@@`) that
 applies cleanly at the repository root. No commentary outside the diff.
+"""
+
+#: The gates, told to the writer as well as the marker. Empty when a project
+#: configured none, so a run without checks reads exactly as it did before.
+CHECKS_PROMPT = """
+These commands run on your diff before any reviewer sees it, and a non-zero
+exit refuses the change:
+{commands}
 """
 
 REVIEW_PROMPT = """\
@@ -1693,6 +1701,13 @@ class Executor:
                 brief=record.brief,
                 plan=planner.plan,
                 context=context.text,
+                # The reviewer is told what the checks said; the implementer
+                # was never told what they are. So a diff is refused by a
+                # formatter the model was not shown, which costs an attempt and
+                # a model call to discover something the harness knew before it
+                # asked. Naming the commands is not weakening the gate: the
+                # gate still runs, and still refuses.
+                checks=self._checks_prompt(),
             ),
         )
         outcome.stages.append("implement")
@@ -2082,6 +2097,13 @@ class Executor:
         if len(candidates) > 1:
             note = f"{candidates[0]}; NOT stacked on {', '.join(candidates[1:])}"
         return first.branch, note
+
+    def _checks_prompt(self) -> str:
+        """The project's checks, as the implementer's prompt renders them."""
+        commands = [" ".join(command) for command in self.checks.commands if command]
+        if not commands:
+            return ""
+        return CHECKS_PROMPT.format(commands="\n".join(f"  {command}" for command in commands))
 
     def _size_of(self, path: str) -> str:
         """How big a file the budget could not fit, for the message that says so.

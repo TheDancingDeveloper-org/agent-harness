@@ -1,21 +1,51 @@
 # Fit-for-purpose programme — status and handoff
 
-**Frozen:** 2026-08-04. **Updated 2026-08-04 after Stage F.**
+**Frozen:** 2026-08-04. **Rewritten 2026-08-04 after stages F, D, K, H, L, J and M.**
 **Read this before doing any work on the proposal.**
 
-> **Stage F has since landed and this document's §1, §4 and §6 are out of
-> date where they say nothing is merged.** All four stage branches are merged
-> into `fix/validator-rejects-valid-patches` at `a33fd84`; the merged tree
-> passes all four gates at **895 tests**. The merged-tree verification this
-> document called the next work has been done, and its report is
-> [`evidence/2026-08-04-stage-f-integration.md`](evidence/2026-08-04-stage-f-integration.md),
-> which supersedes §6 below and records one semantic divergence between
-> Stages B and G that a clean auto-merge hid. §4's per-branch test counts
-> remain correct as history and remain not additive; **895 is the number**.
-> Stage D is still not started and Stage 8 is still blocked. The sequencing
-> from here is
+> ## Where it actually got to
+>
+> Everything below §1 describes the state *before* the integration, and is kept
+> because the per-branch history in §3 and §4 is still the record of how each
+> stage was verified in isolation. **It is out of date wherever it says nothing
+> is merged.**
+>
+> The current state is:
+>
+> | | |
+> |---|---|
+> | Branch | `fix/validator-rejects-valid-patches` at `3dbb764` |
+> | Merged | all four stage branches, plus seven further stages |
+> | Gates | `pytest` **1063 passed**, ruff, format and full-project strict `mypy` all clean |
+> | Stage 8 | still blocked, and still not startable from this repository |
+> | Pushed | **nothing.** Twenty-nine commits, all local. |
+>
+> Delivered since the freeze: **F** (integration), **D** (first run — the
+> deferral was lifted by explicit go-ahead), **K** (outcome and check
+> taxonomy), **H** (resumable attempts), **L** (item budgets), **J** (durable
+> human hold) and **M** (telemetry export). Each has its own report in
+> [`evidence/`](evidence/), and
+> [`evidence/2026-08-04-programme-report.md`](evidence/2026-08-04-programme-report.md)
+> is the §11 report over all of them — **read that one first.**
+>
+> **D11 and D12 were resolved by decision** and are recorded in
 > [`PROPOSAL-2026-08-finish-then-extend.md`](PROPOSAL-2026-08-finish-then-extend.md)
-> §3.
+> §11.1. **D7, D8 and D9 remain open**, untouched.
+>
+> **The three things a later agent should not assume**, because they are the
+> ones this document's earlier text would leave you assuming:
+>
+> 1. **Nothing here is evidence about live behaviour.** Not one provider was
+>    contacted in any stage. Deterministic success is proven; live success is
+>    not, and Stage 8 is what would change that.
+> 2. **Session mode is behind.** Stages H and L are the direct-API executor
+>    only. A session-mode fleet has no resumable attempts and no per-item
+>    budgets.
+> 3. **The per-branch test counts in §4 are history.** The number is **1063**,
+>    derived on the merged tree.
+>
+> The suggested next actions in §6 are done. The current ones are §8 of the
+> programme report.
 
 This document is the pickup point for
 [`PROPOSAL-2026-08-fit-for-purpose.md`](PROPOSAL-2026-08-fit-for-purpose.md).
@@ -27,6 +57,9 @@ as reality changes. The reports in [`evidence/`](evidence/) may not — those ar
 append-only (see [`evidence/README.md`](evidence/README.md)).
 
 ## 1. The one-paragraph summary
+
+**As of the freeze**, before the integration above. Kept as the record of what
+the earlier session handed over.
 
 Stages 0, A and E2 were complete before this session. This session completed
 **E1, C, B and G** — each on its own branch, each with its own evidence report
@@ -333,7 +366,11 @@ each one caught a real defect in this session:
 - Commit style: lowercase, conventional-commit prefix, describing the
   behaviour in plain words. No `Co-Authored-By` trailers.
 
-## 6. Suggested next actions, in order
+## 6. Suggested next actions, in order — **all done**
+
+Kept as the record of what was suggested and in what order, because the
+integration was carried out in exactly this order and the Stage F report refers
+back to it. For what to do *now*, see §8 of the programme report.
 
 1. Merge the four stage branches into `fix/validator-rejects-valid-patches`,
    with `TMPDIR` on a fast volume. **Expect conflicts** — the overlaps are:

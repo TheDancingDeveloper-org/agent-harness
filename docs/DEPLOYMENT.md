@@ -26,6 +26,48 @@ only requires that the process has one.
 
 ---
 
+## The ceiling: one SQLite file, one host
+
+This runs on **one machine**, against **one SQLite file**, with **one writer**.
+That is the right choice for what it is and it is the wrong thing to discover
+under load, so it is stated here rather than left to be inferred.
+
+What that means concretely:
+
+- **You cannot run two `serve` processes against the same database over a
+  network filesystem.** SQLite's locking on NFS and most container volume
+  drivers is not reliable, and the failure is corruption rather than an error.
+  Two processes on the *same* host sharing the file work, because WAL mode and
+  the 30-second busy timeout handle that — but they are two writers contending
+  for one lock, not a cluster.
+- **Scaling is vertical.** More workers means `max_workers` on a project and a
+  bigger machine. There is no shard key, no leader election and no way to add a
+  second host.
+- **The queue and the audit store are separate files on purpose**, so history
+  does not share a fate with the working set, and you can put them on different
+  volumes. That is the extent of the separation available.
+- **Backup is a file copy after a WAL checkpoint** — `agent-harness graph
+  checkpoint` folds the WAL back in, and `docs/MIGRATION-graph.md` covers the
+  rest. Copying a WAL-mode database *without* checkpointing gives you a file
+  that may not open.
+- **A worktree per in-flight item** means peak disk is `max_workers` copies of
+  your repository plus its build output. Raising the worker count multiplies
+  that, and `min_free_disk_gb` is the floor that refuses a start rather than
+  filling the volume.
+
+Comparable systems separate stateless API servers from queue workers with
+PostgreSQL as the truth, or offer a choice of persistence backends. This does
+not, and **building for a scale nobody has asked for would be the wrong trade
+today.** The honest position is that the ceiling exists, it is roughly "one
+busy host", and nobody has measured where it actually is — no load test has
+been run, and the number of concurrent workers at which SQLite contention
+becomes the limit is **unknown**.
+
+If you reach it, the shape of the fix is a different store behind `work.py` and
+`store.py`, not a bigger file.
+
+---
+
 ## Monitoring-only
 
 ```bash

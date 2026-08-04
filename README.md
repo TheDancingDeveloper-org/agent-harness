@@ -25,6 +25,23 @@ follow-up run, so it is an observation, not proof that the harness works against
 fleet. Deterministic fixture success proves wiring, not model quality or unattended
 reliability.
 
+Three words are used precisely throughout this README, and they are not
+interchangeable:
+
+| | What it means | How to check it yourself |
+|---|---|---|
+| **tested** | A test in this repository fails if it stops being true. Deterministic, no network. | `uv run pytest` |
+| **observed** | Seen happen in a real run, without a preserved artefact that would let anyone reproduce it. | the reports in [`docs/evidence/`](docs/evidence/) |
+| **proven** | Measured against a stated criterion, with the denominator and the commands published. | nothing about live behaviour is in this column yet |
+
+Concretely: the first-run path, the queue, the dependency graph, the patch
+ladder, the checks gate and the reviewer gate are **tested**. Behaviour against
+real models and a real fleet is **observed**. Unattended reliability, cost per
+merged item and second-repository portability are **neither** — they are
+blocked on runs this repository cannot perform on its own.
+
+"No failures observed" is not the same as "the requirement was exercised".
+
 | Module | What it does |
 |---|---|
 | `plan` | Parses a markdown plan into work items, reporting what it could **not** read |
@@ -127,6 +144,40 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
 
 A five-minute tour. The full walkthrough, with real output, is in
 [`docs/USAGE.md`](docs/USAGE.md).
+
+### 0. See it work, before you configure anything
+
+```bash
+agent-harness init --demo --into ./demo
+```
+
+That builds a real git repository, a one-item plan, a queue and a route in
+`./demo`, and leaves the project **stopped**. It prints one command; run it and
+the harness takes the item from plan to implement to apply to checks to commit
+to review, and leaves a branch you can read.
+
+No credentials, no network, no provider account, no GitHub. Nothing is pushed
+and no repository is configured, so nothing here *can* reach GitHub.
+
+**It proves the wiring and nothing else.** The model calls are answered by a
+fixed script, so a green demo says the harness is plumbed together correctly.
+It says nothing about whether a model writes a good diff, because there is no
+model. Only the transport is replaced — the queue, the graph, the worktree, the
+patch validator, the checks and the reviewer gate are the same code a real run
+uses.
+
+Then ask what a real run would need:
+
+```bash
+agent-harness --db ./demo/queue.sqlite doctor
+```
+
+`doctor` reports route completeness, which wire protocol and failure classifier
+each route resolved to, whether the checkout and the check commands are
+actually runnable, reviewer independence, whether the spend is visible, and
+whether anything is permitted to mutate GitHub. It contacts nothing: asking a
+model whether it answers is `--probe-models` and is otherwise reported as *not
+asked*, which is not the same as passing.
 
 ### 1. Write a plan, get a backlog
 

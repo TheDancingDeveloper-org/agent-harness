@@ -21,6 +21,8 @@ import argparse
 import logging
 import os
 import secrets
+import shlex
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -111,6 +113,101 @@ def _plan(args: argparse.Namespace) -> int:
             + ", ".join(report.orphaned)
         )
     return 0
+
+
+def _init(args: argparse.Namespace) -> int:
+    """Build the deterministic demo, and say what it is and is not.
+
+    Refuses an existing directory. `init` is the command a stranger runs
+    first, on a machine whose layout it knows nothing about, and a first
+    command that can overwrite is a first command that can lose something.
+    """
+    from .demo import create_demo
+
+    target = args.into
+    if target.exists() and any(target.iterdir()):
+        print(f"{target} already exists and is not empty", file=sys.stderr)
+        print("Pass --into DIR with somewhere new, or remove that one.", file=sys.stderr)
+        return 2
+    if not shutil.which("git"):
+        print("git is not on PATH, and the demo needs a real repository", file=sys.stderr)
+        return 2
+
+    demo = create_demo(target)
+    print(f"built the demo in {demo.root}")
+    print(f"  repository   {demo.repo}   (a real git repo, one commit)")
+    print(f"  plan         {demo.plan}   (one item)")
+    print(f"  queue        {demo.db}   (project `demo`, stopped)")
+    print()
+    print("Nothing is running and nothing external has happened: no network call,")
+    print("no credential read, no GitHub anything. Run it with:")
+    print()
+    print("  " + shlex.join(demo.run_command()))
+    print()
+    print("That runs the real executor against fixed answers. It proves the wiring —")
+    print("plan to queue to worktree to patch to checks to reviewer to commit — and it")
+    print("proves nothing about model quality, because there is no model.")
+    print()
+    print(f"Afterwards: `git -C {demo.repo} log --oneline --all` for the branch it made,")
+    print(f"and {demo.events} for every step it took.")
+    return 0
+
+
+def _doctor(args: argparse.Namespace) -> int:
+    """Say what is configured and what is missing, without spending anything.
+
+    This exists because the expensive failure is not a broken configuration —
+    it is a broken configuration that looks fine until the fleet has claimed
+    work and paid for it. Preflight already refuses to *start* such a project;
+    doctor is the same set of questions asked before you get that far, plus
+    the ones preflight does not ask because they do not block a start.
+
+    **Nothing here contacts a model, a gateway or GitHub's write API by
+    default.** `--probe-models` opts into the one check that does. A diagnostic
+    that spends money to tell you whether you can afford to spend money is a
+    diagnostic nobody runs twice.
+    """
+    import json as _json
+
+    from .doctor import diagnose, render
+    from .work import WorkQueue
+
+    queue = WorkQueue(args.db)
+    projects = queue.projects()
+    if args.project:
+        projects = [p for p in projects if p.project_id == args.project]
+        if not projects:
+            print(f"no project {args.project!r} in {args.db}", file=sys.stderr)
+            return 2
+
+    ask = None
+    if args.probe_models:
+        api_key = os.environ.get("HARNESS_API_KEY", "")
+        if not api_key:
+            print("--probe-models needs HARNESS_API_KEY", file=sys.stderr)
+            return 2
+        if not args.endpoint:
+            print("--probe-models needs --endpoint (or $HARNESS_ENDPOINT)", file=sys.stderr)
+            return 2
+        from .model_client import ModelClient
+
+        # `answers`, not `call`: one brief request, no retry ladder, no
+        # parking and no telemetry. A diagnostic must not idle an endpoint
+        # for the fleet or appear in anybody's cost rollup.
+        probe_client = ModelClient(roles={}, transport=_http_transport(api_key))
+
+        def ask(route: Any) -> tuple[bool, str]:
+            return probe_client.answers(route, timeout=20.0)
+
+    report = diagnose(queue, projects, ask=ask)
+    if args.json:
+        print(_json.dumps(report.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(render(report))
+    # 0 when nothing blocks, 1 when something does. A diagnostic whose exit
+    # code never changes cannot be used in a script, and "would this run?" is
+    # exactly the question a script wants to ask.
+    return 0 if report.ok else 1
 
 
 def _graph(args: argparse.Namespace) -> int:
@@ -296,7 +393,6 @@ def _run(args: argparse.Namespace) -> int:
     """Execute work items. This is the command that spends money and writes
     code, so it says exactly what it will do before doing any of it."""
     import json as _json
-    import shlex
 
     from .executor import Checks, Executor
     from .github import GitHub
@@ -307,6 +403,33 @@ def _run(args: argparse.Namespace) -> int:
     # reviewer needs a model. Demanding three would be asking for two that are
     # never called.
     session_mode = bool(args.session_host)
+    demo_mode = bool(getattr(args, "demo", False))
+    if demo_mode and session_mode:
+        print("--demo and --session-host are different first runs; pick one", file=sys.stderr)
+        print(
+            "--demo replaces the transport with fixed answers and needs no "
+            "network. --session-host runs a real CLI agent in a real session.",
+            file=sys.stderr,
+        )
+        return 2
+    if demo_mode:
+        # The demo's route lives in the queue's role map, written by
+        # `init --demo`. Filling the flags here rather than requiring them
+        # keeps the documented command to one line, and keeps the route a
+        # *stored* one, so the demo exercises the same lookup a fleet does.
+        from .demo import ENDPOINT as DEMO_ENDPOINT
+        from .demo import MODEL as DEMO_MODEL
+
+        for role in ("planner", "implementer", "reviewer"):
+            if not getattr(args, role):
+                setattr(args, role, DEMO_MODEL)
+        if not args.endpoint:
+            args.endpoint = DEMO_ENDPOINT
+        if not args.no_push:
+            # Not a default, a refusal. The demo has no repository and must
+            # not acquire one by inheriting a flag.
+            print("--demo runs entirely locally; pass --no-push", file=sys.stderr)
+            return 2
     roles = {"planner": args.planner, "implementer": args.implementer, "reviewer": args.reviewer}
     if session_mode:
         roles = {"reviewer": args.reviewer}
@@ -333,9 +456,17 @@ def _run(args: argparse.Namespace) -> int:
         return 2
 
     api_key = os.environ.get("HARNESS_API_KEY", "")
-    if not api_key and not args.dry_run:
+    if not api_key and not args.dry_run and not demo_mode:
         print("HARNESS_API_KEY is not set", file=sys.stderr)
         return 2
+
+    # Absolute from here on. Worktrees are created beside the repository and
+    # git is invoked with `-C`, so a relative `--work` resolves against
+    # whatever directory each subprocess happens to be in — which worked from
+    # the repository's own parent and failed everywhere else, as
+    # "cannot change to 'x/y': No such file or directory" in the middle of an
+    # apply.
+    args.work = args.work.resolve()
 
     queue = WorkQueue(args.db)
     if args.plan:
@@ -344,16 +475,26 @@ def _run(args: argparse.Namespace) -> int:
         plan = parse_plan_file(args.plan)
         added = queue.add(
             [
-                WorkRecord(item_id=i.id, title=i.title, brief=i.brief(), depends_on=i.depends_on)
+                WorkRecord(
+                    item_id=i.id,
+                    title=i.title,
+                    brief=i.brief(),
+                    depends_on=i.depends_on,
+                    project_id=args.project,
+                )
                 for i in plan.deduplicated()
                 if not i.done
-            ]
+            ],
+            project_id=args.project,
         )
         print(f"loaded {added} new items from {args.plan}")
 
     checks = Checks(commands=[shlex.split(c) for c in args.check])
-    counts = queue.counts()
-    print(f"queue: {counts or 'empty'}")
+    # This project's counts, not the rollup. `--project` decides which queue
+    # this run works, so a cross-project total here would report items no
+    # worker in this process can claim.
+    counts = queue.counts(args.project)
+    print(f"queue: {counts or 'empty'}   project: {args.project}")
     print(f"repo: {args.work}   base: {args.base}   push: {not args.no_push}")
     if session_mode:
         print(f"agents: `{args.agent}` as sessions on {args.session_host}")
@@ -466,9 +607,17 @@ def _run(args: argparse.Namespace) -> int:
         )
         return 2
 
+    if demo_mode:
+        from .demo import demo_transport
+
+        transport = demo_transport(args.work)
+        print("demo: fixed answers, no network, no model. This proves wiring, not quality.")
+    else:
+        transport = _http_transport(api_key)
+
     client = ModelClient(
         roles=live_routes(),
-        transport=_http_transport(api_key),
+        transport=transport,
         on_event=emit,
         routes_provider=live_routes,
     )
@@ -504,6 +653,7 @@ def _run(args: argparse.Namespace) -> int:
             ui_base_url=args.session_host,
             on_event=emit,
             push=not args.no_push,
+            project_id=args.project,
         )
     else:
         executor = Executor(
@@ -516,6 +666,10 @@ def _run(args: argparse.Namespace) -> int:
             on_event=emit,
             push=not args.no_push,
             artifacts=artifacts,
+            # Without this, `run --project X` set X running and then claimed
+            # from `default` — which is nobody's project once more than one
+            # exists, and reports "nothing to do" over a full queue.
+            project_id=args.project,
         )
     # Typing `agent-harness run` IS the human deciding to start this project.
     # A project starts `stopped` so a restart never resumes on its own, but
@@ -790,6 +944,46 @@ def main(argv: list[str] | None = None) -> int:
         help="timeout for each item's `verify:` command; defaults to the project-check timeout",
     )
 
+    p_init = sub.add_parser("init", help="create a first-run environment that needs no credentials")
+    p_init.add_argument(
+        "--demo",
+        action="store_true",
+        required=True,
+        help="build the deterministic demo. Required, and the only mode there "
+        "is: `init` with nothing to initialise would be a command that guesses "
+        "what you wanted.",
+    )
+    p_init.add_argument(
+        "--into",
+        type=Path,
+        default=Path("demo"),
+        metavar="DIR",
+        help="where to build it (default: ./demo). Must not already exist.",
+    )
+
+    p_doctor = sub.add_parser(
+        "doctor", help="report what is configured and what is missing, spending nothing"
+    )
+    p_doctor.add_argument(
+        "--project",
+        default="",
+        metavar="ID",
+        help="limit to one project (default: every project)",
+    )
+    p_doctor.add_argument("--json", action="store_true", help="machine-readable report on stdout")
+    p_doctor.add_argument(
+        "--probe-models",
+        action="store_true",
+        help="also ask each routed model a one-token question. OFF by default: "
+        "it needs a network and a credential, and it spends, however little. "
+        "Everything else doctor reports is answered without leaving the machine.",
+    )
+    p_doctor.add_argument(
+        "--endpoint",
+        default=os.environ.get("HARNESS_ENDPOINT", ""),
+        help="model API base url for --probe-models (or $HARNESS_ENDPOINT)",
+    )
+
     p_run = sub.add_parser("run", help="execute claimed work items")
     p_run.add_argument(
         "--repo",
@@ -888,6 +1082,13 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument(
         "--dry-run", action="store_true", help="show what would run, call nothing, change nothing"
     )
+    p_run.add_argument(
+        "--demo",
+        action="store_true",
+        help="answer every model call from a fixed script instead of a network. "
+        "Needs no credentials, no endpoint and no model, and proves the wiring "
+        "only — the answers are written to succeed. Use with `init --demo`.",
+    )
 
     p_serve = sub.add_parser(
         "serve", help="serve the JSON API (headless — the GUI is the session host's)"
@@ -978,6 +1179,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         return _run(args)
+
+    if args.command == "init":
+        return _init(args)
+
+    if args.command == "doctor":
+        return _doctor(args)
 
     if args.command == "graph":
         return _graph(args)
@@ -1118,7 +1325,6 @@ def _fleet_for_serve(
         return (None, None, None, None)
 
     import json as _json
-    import shlex
 
     from .api import ROLE_MAP_KEY
     from .events import KINDS, MODEL_CALL, Event

@@ -251,3 +251,55 @@ def test_a_map_written_before_fallbacks_existed_still_reads() -> None:
 
 def test_a_role_with_no_endpoint_is_dropped_rather_than_half_built() -> None:
     assert chains_from_map({"reviewer": {"models": ["gpt-5.6"]}}) == {}
+
+
+# --------------------------------------------------- configuring it remotely
+
+
+def test_the_api_schema_can_express_a_chain() -> None:
+    """The gap this closes: chains shipped in the CLI and the stored map, and
+    `RoleRoute` — the only way to configure a deployed pod — could not say
+    them. A feature unconfigurable where it is used is not shipped."""
+    from agent_harness.schemas import RoleRoute
+
+    route = RoleRoute(models=["deepseek-v4-flash", "glm-5.2", "gpt-5.4"], endpoint=ENDPOINT)
+
+    assert route.model == "deepseek-v4-flash", "`model` is the preferred one"
+    assert [
+        r.model for r in chains_from_map({"implementer": route.model_dump()})["implementer"]
+    ] == [
+        "deepseek-v4-flash",
+        "glm-5.2",
+        "gpt-5.4",
+    ]
+
+
+def test_a_single_model_still_works_unchanged() -> None:
+    from agent_harness.schemas import RoleRoute
+
+    route = RoleRoute(model="gpt-5.6", endpoint=ENDPOINT)
+
+    assert route.models == ["gpt-5.6"]
+    assert [r.model for r in chains_from_map({"reviewer": route.model_dump()})["reviewer"]] == [
+        "gpt-5.6"
+    ]
+
+
+def test_a_route_whose_two_fields_disagree_is_refused() -> None:
+    """They are two views of one thing. A route where they contradict behaves
+    differently depending on which field a reader consults."""
+    from pydantic import ValidationError
+
+    from agent_harness.schemas import RoleRoute
+
+    with pytest.raises(ValidationError, match="preferred route"):
+        RoleRoute(model="gpt-5.6", models=["gpt-5.4", "gpt-5.6"], endpoint=ENDPOINT)
+
+
+def test_a_route_naming_no_model_at_all_is_refused() -> None:
+    from pydantic import ValidationError
+
+    from agent_harness.schemas import RoleRoute
+
+    with pytest.raises(ValidationError, match="a role needs a model"):
+        RoleRoute(endpoint=ENDPOINT)

@@ -14,7 +14,14 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 # --------------------------------------------------------------------- work
 
@@ -170,7 +177,19 @@ class SetFleetControl(BaseModel):
 
 
 class RoleRoute(BaseModel):
-    model: str = Field(description="Model identifier as the provider names it.")
+    model: str = Field(
+        "",
+        description="Model identifier as the provider names it. The PREFERRED "
+        "one when `models` names several; filled in from the first of them "
+        "when omitted.",
+    )
+    models: list[str] = Field(
+        default_factory=list,
+        description="Models to try for this role, in preference order. The "
+        "first that answers does the work; the rest are tried only when it "
+        "will not, and the whole list is tried before any backoff. Omit for a "
+        "single model — `model` alone still works and always has.",
+    )
     endpoint: str = Field(description="Base URL of the provider API.")
     provider: str = Field(
         "claw-bay",
@@ -178,6 +197,28 @@ class RoleRoute(BaseModel):
         "cannot tell a spend cap from a burst "
         "limit, because nothing in HTTP can.",
     )
+
+    @model_validator(mode="after")
+    def one_source_of_truth(self) -> RoleRoute:
+        """Keep `model` and `models` from disagreeing.
+
+        They are two views of one thing, and a route where they contradict
+        each other is a route whose behaviour depends on which field a reader
+        happens to consult -- exactly the ambiguity that made the old
+        single-field map unable to express a fallback at all.
+        """
+        if self.models and not self.model:
+            self.model = self.models[0]
+        elif self.model and not self.models:
+            self.models = [self.model]
+        elif not self.model and not self.models:
+            raise ValueError("a role needs a model: set `model`, or `models` in preference order")
+        elif self.models[0] != self.model:
+            raise ValueError(
+                f"`model` is {self.model!r} but `models` prefers {self.models[0]!r}; "
+                "`model` is the preferred route, so either match it or omit it"
+            )
+        return self
 
 
 class RoutedRole(RoleRoute):

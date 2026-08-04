@@ -1220,6 +1220,57 @@ is counted as *unpriced*, not as free. While any call is unpriced:
 `doctor` reports the ceilings before anything runs, and warns when there are
 none: unlimited is safe on upgrade and unsafe unattended.
 
+### 6e. When an item is waiting on you
+
+```bash
+curl -sH "Authorization: Bearer $TOKEN" 'localhost:8099/api/holds' | jq
+```
+
+```json
+{"open": [{"item_id": "T4",
+           "question": "the agent is waiting for input in its terminal session — attach at https://…/t/abc",
+           "age_seconds": 412.0,
+           "expires_at": 1754000000,
+           "session_url": "https://…/t/abc",
+           "who_may_answer": "anyone"}]}
+```
+
+That is the inbox, oldest first. It is a **state of the work item**, not a
+projection over recent events: it survives the worker dying, no other worker can
+claim a held item, and the answer can come from anywhere.
+
+**This is how a hang stops looking like a question** (issue #103). An item that
+is `claimed`, making no progress and holding no question is a hang. One that is
+`held` says what it is waiting for and how long it has waited.
+
+Answer from anywhere — a phone, a second terminal, a script:
+
+```bash
+curl -XPOST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"resume_token":"…","text":"use postgres","who":"me"}' \
+  'localhost:8099/api/work/T4/answer'
+```
+
+The item goes back to `claimed`, with a fresh lease for the worker that asked,
+and its worktree and context intact. If that worker really did die, the lease
+expires as it always did and another worker continues the attempt from its last
+durable stage.
+
+**Four things it deliberately does not do.**
+
+- **Nothing interprets your answer.** It is structured data or a message,
+  recorded verbatim. A model reading human feedback to decide what it meant is a
+  gate decided by a model, and `AGENTS.md` rejects that.
+- **Nothing is typed into the session.** The agent may be at a shell, where an
+  answer becomes a command. Delivery is through the protocol.
+- **Being held is not approval.** Answering returns the item to where it
+  stopped; it does not move it past anything.
+- **A hold that times out returns the item to `blocked`, never to `ready`**,
+  with the question preserved in the blocked reason. `max_hold_seconds`
+  (default six hours) is what stops one unanswered question tying up a worker
+  for ever — a hold keeps its claim, so unlike the budgets its default is
+  deliberately **not** unlimited.
+
 ---
 
 ## Configuration reference

@@ -234,6 +234,13 @@ class Stop:
         }
 
 
+#: Dispositions in which something was actually *decided* about the item.
+#: An attempt that ends in one of these is history; one that ends in
+#: `withheld`, or that never ends at all because its worker was killed, is a
+#: position to continue from.
+DECIDED = frozenset({COMPLETED, REFUSED, ESCALATED, CRASHED})
+
+
 #: Dispositions a human should be looking at rather than waiting through.
 #: `REFUSED` is absent on purpose: a rejected diff is the system working.
 NEEDS_A_PERSON = frozenset({ESCALATED})

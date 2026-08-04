@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import attempts as A
 from .graph import LOCAL_WORK
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
 from .outcomes import (
@@ -48,6 +49,7 @@ from .outcomes import (
     CLAIM_LOST,
     COMPLETED,
     CRASHED,
+    DECIDED,
     DEPENDENCY_INVALIDATED,
     ESCALATE,
     FAIL,
@@ -129,6 +131,46 @@ class Outcome:
     @property
     def reason_kind(self) -> str:
         return self.stop.reason_kind if self.stop is not None else ""
+
+
+def _planner_artefact(planner: PlannerResult) -> dict[str, Any]:
+    """The planner's answer, as something a later process can read back.
+
+    Every field, because a partial round trip would silently downgrade a
+    resumed attempt's context — and a resumed attempt that plans worse than a
+    fresh one is a resumption nobody should want.
+    """
+    return {
+        "plan": planner.plan,
+        "targets": [
+            {
+                "path": target.path,
+                "reason": target.reason,
+                "usable": target.usable,
+                "uncertainty": target.uncertainty,
+            }
+            for target in planner.targets
+        ],
+        "cannot_identify_target": planner.cannot_identify_target,
+        "uncertainties": list(planner.uncertainties),
+    }
+
+
+def _planner_from(artefact: Mapping[str, Any]) -> PlannerResult:
+    return PlannerResult(
+        plan=str(artefact.get("plan") or ""),
+        targets=tuple(
+            PlannerTarget(
+                path=str(entry.get("path") or ""),
+                reason=str(entry.get("reason") or ""),
+                usable=bool(entry.get("usable", True)),
+                uncertainty=entry.get("uncertainty"),
+            )
+            for entry in artefact.get("targets") or []
+        ),
+        cannot_identify_target=artefact.get("cannot_identify_target"),
+        uncertainties=tuple(artefact.get("uncertainties") or []),
+    )
 
 
 def run_git(repo: Path, *args: str, check: bool = True) -> str:
@@ -1099,8 +1141,14 @@ class Executor:
         context_policy: ContextPolicy | None = None,
         artifacts: Path | None = None,
         project_id: str = DEFAULT_PROJECT,
+        durability: str | None = None,
     ) -> None:
         self.queue = queue
+        #: How often this worker makes progress durable. None takes the
+        #: queue's own setting. A policy rather than a constant because the
+        #: deterministic demo wants the cheapest and a fleet wants the
+        #: strictest, and one number cannot be both.
+        self.durability = durability
         # Which project's queue this worker serves. Items are keyed by
         # (project_id, item_id), so a worker that does not say which project
         # it is for claims from `default` -- which is nobody's project once
@@ -1166,11 +1214,15 @@ class Executor:
             # new owner is working on it right now, and reporting anything
             # here would overwrite a live claim.
             self._emit(record, "claim_lost", detail=str(exc), error_class=CLAIM_LOST)
+            # Not ours to record either. Whatever `exit` mode buffered belongs
+            # to an attempt somebody else now owns.
+            self.queue.attempts_log.discard()
             return None
         except CapExhausted as exc:
             # Out of budget. Hand the item back untouched rather than
             # burning an attempt on something that was never tried.
             self._emit(record, "budget_exhausted", detail=str(exc))
+            self.queue.attempts_log.flush(self.durability)
             partial = self._partial_for(record)
             self.queue.release(
                 record.item_id,
@@ -1187,6 +1239,7 @@ class Executor:
             raise
         except RetryExhausted as exc:
             self._emit(record, "retry_exhausted", detail=str(exc), error_class=exc.kind)
+            self.queue.attempts_log.flush(self.durability)
             partial = self._partial_for(record)
             # A provider that would not answer is not this item's fault, so
             # the disposition says `withheld`. The attempt is still consumed,
@@ -1212,6 +1265,7 @@ class Executor:
             return Outcome(record.item_id, PENDING, reason=str(exc), stop=stop)
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
+            self.queue.attempts_log.flush(self.durability)
             partial = self._partial_for(record)
             # Crashed, not refused. Nothing was decided about the item; an
             # exception happened while deciding, and a human reading the
@@ -1234,6 +1288,21 @@ class Executor:
                 partial.stop = stop
                 return partial
             return Outcome(record.item_id, FAILED, reason=str(exc), stop=stop)
+        # Whatever `exit` mode buffered lands now, however the attempt ended.
+        # A failed attempt's record is as useful as a successful one's -- more
+        # so, since it is the one somebody will read.
+        self.queue.attempts_log.flush(self.durability)
+        # A decision was reached, so the attempt stops being resumable. Only a
+        # worker that was KILLED leaves a position to continue from; one that
+        # reached a verdict decided, and resuming into that decision would make
+        # an operator's retry replay the rejection it was retrying.
+        #
+        # `withheld` is the exception and the point: a spend cap, or a provider
+        # that would not answer, decided nothing about the item, so the next
+        # claim continues rather than restarts. That is where the cost saving
+        # under real-world failure actually lives.
+        if outcome.disposition in DECIDED:
+            self.queue.attempts_log.seal(self.project_id, record.item_id, record.attempts)
         # `consume_attempt` follows the disposition, so an item nobody
         # attempted and an item waiting on a person do not spend one. Every
         # disposition that consumed an attempt before still does.
@@ -1317,12 +1386,82 @@ class Executor:
             ref=self._base,
         )
 
+    def _resume_point(
+        self, record: WorkRecord, log: A.AttemptLog, attempt: int, mode: str
+    ) -> A.Resume:
+        """Where this attempt starts, and whether it may start there at all.
+
+        Two things happen here that are easy to conflate. The first is reading
+        the durable position. The second is **checking that the position is
+        still an answer to the question that was asked** — `WorkQueue.add`
+        rewrites `title`, `brief` and `depends_on` on live claimed rows, so a
+        worker can be briefed from one revision and judged against another.
+        An attempt whose brief moved has its position thrown away and starts
+        again from the planner, loudly.
+        """
+        resume = log.resume(self.project_id, record.item_id, attempt)
+        if resume.brief is None:
+            log.begin(
+                self.project_id,
+                record.item_id,
+                attempt,
+                title=record.title,
+                brief=record.brief,
+                depends_on=list(record.depends_on),
+                admitted_revision=record.admitted_revision,
+            )
+            return resume
+
+        pinned = resume.brief
+        moved = pinned.brief != record.brief or list(pinned.depends_on) != list(record.depends_on)
+        if moved and resume.resumable:
+            self._emit(
+                record,
+                "brief_moved",
+                detail=(
+                    f"{record.item_id} was briefed at graph revision "
+                    f"{pinned.admitted_revision} and the plan has changed since; the "
+                    f"durable position at {resume.at!r} is discarded and the attempt "
+                    "starts again from the planner against the current brief"
+                ),
+            )
+            log.abandon(self.project_id, record.item_id, attempt)
+            log.begin(
+                self.project_id,
+                record.item_id,
+                attempt,
+                title=record.title,
+                brief=record.brief,
+                depends_on=list(record.depends_on),
+                admitted_revision=record.admitted_revision,
+            )
+            return A.Resume(attempt=attempt)
+        if resume.open_intents:
+            # `sync` durability caught a crash mid-effect. Said out loud
+            # because the alternative -- a push that may or may not have
+            # landed, discovered later by someone reading git -- is the exact
+            # thing that mode is bought for.
+            self._emit(
+                record,
+                "effect_unconfirmed",
+                detail=(
+                    "began and did not confirm: " + ", ".join(resume.open_intents) + "; "
+                    "the effect may have half-happened and is re-attempted"
+                ),
+            )
+        return resume
+
     def _execute(self, record: WorkRecord) -> Outcome:
         outcome = Outcome(record.item_id, FAILED)
         # Retained so a reviewer-side exception can still return the durable
         # checkpoint's branch/PR to the queue and caller.
         self._partial = outcome
         self._emit(record, "started")
+
+        log = self.queue.attempts_log
+        attempt = record.attempts
+        mode = log.mode_for(self.durability)
+        resume = self._resume_point(record, log, attempt, mode)
 
         # Resolved first, and deliberately before the implementer is called:
         # the working tree still holds the previous item's branch, so a model
@@ -1333,8 +1472,21 @@ class Executor:
         self._base = base
 
         # 1. Plan. Cheap, once per item, and the highest-leverage call.
-        planner_reply = self._call(record, PLANNER, PLAN_PROMPT.format(brief=record.brief))
-        planner = parse_planner_result(planner_reply)
+        planner = _planner_from(resume.artefact(A.PLANNED)) if resume.skips(A.PLANNED) else None
+        if planner is not None:
+            self._emit(record, "resumed", detail=f"{A.PLANNED} (mode={mode})")
+        else:
+            planner_reply = self._call(record, PLANNER, PLAN_PROMPT.format(brief=record.brief))
+            planner = parse_planner_result(planner_reply)
+            log.record(
+                self.project_id,
+                record.item_id,
+                attempt,
+                A.PLANNED,
+                _planner_artefact(planner),
+                admitted_revision=record.admitted_revision,
+                mode=mode,
+            )
         self._emit(
             record,
             "planner_targets",
@@ -1352,7 +1504,16 @@ class Executor:
         outcome.stages.append("plan")
         self._keepalive(record)
 
-        # 2. Implement.
+        # 2. Implement. Skipped whole when a durable diff already exists: this
+        #    is the call the stage exists to stop re-paying for.
+        if resume.skips(A.IMPLEMENTED):
+            stored = str(resume.artefact(A.IMPLEMENTED).get("diff") or "")
+            outcome.stages.append("implement")
+            self._emit(record, "resumed", detail=f"{A.IMPLEMENTED} (mode={mode})")
+            return self._from_diff(
+                record, outcome, planner, stored, base, stacked_on, resume, log, attempt, mode
+            )
+
         context = self._context_for(record, planner)
         self._emit(
             record,
@@ -1396,7 +1557,40 @@ class Executor:
             outcome.reason = "the implementer returned no diff"
             outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
             return outcome
+        log.record(
+            self.project_id,
+            record.item_id,
+            attempt,
+            A.IMPLEMENTED,
+            {"diff": diff},
+            admitted_revision=record.admitted_revision,
+            mode=mode,
+        )
+        return self._from_diff(
+            record, outcome, planner, diff, base, stacked_on, resume, log, attempt, mode
+        )
 
+    def _from_diff(
+        self,
+        record: WorkRecord,
+        outcome: Outcome,
+        planner: PlannerResult,
+        diff: str,
+        base: str,
+        stacked_on: str | None,
+        resume: A.Resume,
+        log: A.AttemptLog,
+        attempt: int,
+        mode: str,
+    ) -> Outcome:
+        """Everything from a diff in hand to a verdict.
+
+        Split out because it is the whole of the resumable half: an attempt
+        that already has a durable diff enters here rather than at the planner,
+        and one that has just paid for a diff falls through into it. Two
+        entrances, one body — a second copy of the apply/check/review sequence
+        would be a second place for the gates to drift.
+        """
         # 3. Parse the patch BEFORE touching git. A reply that is not a
         #    well-formed diff is a model failure, and it is worth saying so:
         #    it looks identical to a patch written against the wrong base once
@@ -1424,9 +1618,24 @@ class Executor:
         # 4. Apply, on a branch of its own, based on whatever this item
         #    actually depends on.
         branch = f"{self.branch_prefix}{record.item_id.lower()}"
-        self._prepare_branch(branch, base)
         outcome.branch = branch
         outcome.base = base
+
+        if resume.skips(A.CHECKPOINTED):
+            # The commit already exists in git, which is the strongest durable
+            # artefact there is. Re-applying would either conflict with itself
+            # or produce an empty diff; checking the branch out is the resume.
+            checkpoint = resume.artefact(A.CHECKPOINTED)
+            outcome.pr_url = checkpoint.get("pr_url") or None
+            self._emit(record, "resumed", detail=f"{A.CHECKPOINTED} (mode={mode})")
+            run_git(self.repo, "checkout", "-q", branch)
+            applied_diff = run_git(self.repo, "diff", f"{base}...{branch}") or diff
+            outcome.stages.extend(("apply", "checks", "commit"))
+            return self._review_stage(
+                record, outcome, applied_diff, branch, base, resume, log, attempt, mode
+            )
+
+        self._prepare_branch(branch, base)
         if stacked_on:
             self._emit(record, "stacked", detail=f"based on {base} ({stacked_on})")
         applied, how = apply_diff(self.repo, diff, allow_fuzzy=self.allow_fuzzy_apply)
@@ -1449,6 +1658,15 @@ class Executor:
             self._abandon_branch(branch)
             return outcome
         self._emit(record, "applied", detail=how)
+        log.record(
+            self.project_id,
+            record.item_id,
+            attempt,
+            A.APPLIED,
+            {"branch": branch, "base": base, "how": how},
+            admitted_revision=record.admitted_revision,
+            mode=mode,
+        )
         # What landed, not what was proposed. The tolerance ladder exists to
         # rescue malformed patches, so the text a model produced and the change
         # it produced are routinely different -- a `@@ -0,0` hunk that git
@@ -1491,6 +1709,20 @@ class Executor:
             self._abandon_branch(branch)
             return outcome
         self._emit(record, "checks_passed")
+        # Recorded, though it makes resumption no cheaper: re-running a
+        # project's checks is idempotent and costs no model call, so a resumed
+        # attempt runs them again rather than trusting a result from a tree
+        # that may have been rebuilt. What this row buys is the report — how
+        # far an attempt got, for the cost accounting in the evidence.
+        log.record(
+            self.project_id,
+            record.item_id,
+            attempt,
+            A.CHECKED,
+            {},
+            admitted_revision=record.admitted_revision,
+            mode=mode,
+        )
         self._keepalive(record)
 
         # The graph is re-checked here, at the last cheap point before review
@@ -1511,6 +1743,12 @@ class Executor:
                 "discarded and the item goes back to pending"
             )
             self._emit(record, "dependency_invalidated", detail=outcome.reason)
+            # And the resumable position goes with it. The plan the attempt was
+            # briefed with is no longer the plan, so the diff it produced is an
+            # answer to a question nobody is asking; resuming into it would be
+            # exactly the silent judgement against a newer brief that §7.4
+            # forbids.
+            log.abandon(self.project_id, record.item_id, attempt)
             outcome.stop = Stop(WITHHELD, DEPENDENCY_INVALIDATED, detail=outcome.reason)
             outcome.state = PENDING
             self._abandon_branch(branch)
@@ -1523,31 +1761,112 @@ class Executor:
         self._commit(record, checkpoint=True)
         outcome.stages.append("commit")
         self._emit(record, "checkpointed", detail=branch)
+        # Recorded immediately, and BEFORE the external effects below. The
+        # commit is the durable artefact; a crash during the push must resume
+        # from the commit rather than from the diff.
+        log.record(
+            self.project_id,
+            record.item_id,
+            attempt,
+            A.CHECKPOINTED,
+            {
+                "branch": branch,
+                "base": base,
+                "sha": run_git(self.repo, "rev-parse", "HEAD").strip(),
+            },
+            admitted_revision=record.admitted_revision,
+            mode=mode,
+        )
+        # Neither of the two effects below is idempotent, so each is bracketed
+        # in `sync` mode: a row left in `attempt_intents` is a crash caught in
+        # the one window where the effect may have half-happened. In the other
+        # modes this is a no-op and the window is simply invisible, which is
+        # the honest description of what those modes buy.
         if self.push:
+            log.opening(self.project_id, record.item_id, attempt, "push", branch, mode=mode)
             run_git(self.repo, "push", "-u", "origin", branch)
+            log.closed(self.project_id, record.item_id, attempt, "push", mode=mode)
             outcome.stages.append("push")
             self._emit(record, "pushed", detail=branch)
         if self.github is not None and record.issue:
+            log.opening(self.project_id, record.item_id, attempt, "draft_pr", branch, mode=mode)
             outcome.pr_url = self._open_pr(record, branch, base, draft=True)
+            log.closed(self.project_id, record.item_id, attempt, "draft_pr", mode=mode)
             if outcome.pr_url:
                 outcome.stages.append("draft-pr")
                 self._emit(record, "draft_pr_opened", detail=outcome.pr_url)
+                log.record(
+                    self.project_id,
+                    record.item_id,
+                    attempt,
+                    A.CHECKPOINTED,
+                    {
+                        "branch": branch,
+                        "base": base,
+                        "sha": run_git(self.repo, "rev-parse", "HEAD").strip(),
+                        "pr_url": outcome.pr_url,
+                    },
+                    admitted_revision=record.admitted_revision,
+                    mode=mode,
+                )
 
+        return self._review_stage(
+            record, outcome, applied_diff, branch, base, resume, log, attempt, mode
+        )
+
+    def _review_stage(
+        self,
+        record: WorkRecord,
+        outcome: Outcome,
+        applied_diff: str,
+        branch: str,
+        base: str,
+        resume: A.Resume,
+        log: A.AttemptLog,
+        attempt: int,
+        mode: str,
+    ) -> Outcome:
+        """The expensive gate, and what approval buys.
+
+        Reached from two places: an attempt that just checkpointed, and one
+        resumed at a checkpoint a previous worker made. Both must run exactly
+        the same gate — a resumed attempt that reviewed more cheaply would be
+        this stage weakening the thing the whole pipeline exists to protect.
+        """
         # 7. Review, by a different role -- and ideally a different vendor,
         #    which `ModelClient.reviewer_independence()` now reports on rather
         #    than leaving to a comment nobody reads.
-        verdict_text = self._call(
-            record,
-            REVIEWER,
-            REVIEW_PROMPT.format(
-                brief=record.brief,
-                diff=applied_diff[:20000],
-                # Always "passed" by here: a non-passing check returned above.
-                checks="passed",
-            ),
-        )
+        if resume.skips(A.REVIEWED):
+            # A verdict already exists. Re-asking would spend the most
+            # expensive call in the pipeline to re-derive an answer we have,
+            # and -- since a model is not deterministic -- might get a
+            # different one, which would make a crash a way to shop for a
+            # verdict.
+            recorded = resume.artefact(A.REVIEWED)
+            verdict_text = str(recorded.get("text") or "")
+            self._emit(record, "resumed", detail=f"{A.REVIEWED} (mode={mode})")
+        else:
+            verdict_text = self._call(
+                record,
+                REVIEWER,
+                REVIEW_PROMPT.format(
+                    brief=record.brief,
+                    diff=applied_diff[:20000],
+                    # Always "passed" by here: a non-passing check returned above.
+                    checks="passed",
+                ),
+            )
         outcome.stages.append("review")
         verdict = APPROVED if verdict_text.strip().upper().startswith("APPROVED") else REJECTED
+        log.record(
+            self.project_id,
+            record.item_id,
+            attempt,
+            A.REVIEWED,
+            {"verdict": verdict, "text": verdict_text[:4000]},
+            admitted_revision=record.admitted_revision,
+            mode=mode,
+        )
         outcome.verdict = verdict
         self._emit(record, f"review_{verdict}", detail=verdict_text[:2000])
         if outcome.pr_url and self.github is not None:
@@ -1614,6 +1933,17 @@ class Executor:
         return first.branch, note
 
     def _prepare_branch(self, branch: str, base: str | None = None) -> None:
+        """A clean tree at `base`, on a branch of this item's own.
+
+        The discard is not belt-and-braces. `_abandon_branch` cleans up after
+        an attempt that *ended*; a worker that was killed mid-apply ended
+        nothing, and leaves its half-applied diff in the working tree. Without
+        this, the next attempt carries those changes across the checkout and
+        its own patch then fails to apply against a tree that already contains
+        it — which reads as "the model wrote a bad diff" and is not.
+        """
+        run_git(self.repo, "checkout", "--", ".", check=False)
+        run_git(self.repo, "clean", "-fd", check=False)
         run_git(self.repo, "checkout", base or self.base_branch)
         run_git(self.repo, "checkout", "-B", branch)
 

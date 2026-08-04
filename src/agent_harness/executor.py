@@ -206,7 +206,27 @@ def _ensure_trailing_newline(text: str) -> str:
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 #: Lines that legitimately sit between hunks: file headers and git metadata.
-_BETWEEN_HUNKS = ("diff --git ", "--- ", "+++ ", "index ", "old mode ", "new mode ")
+_BETWEEN_HUNKS = (
+    "diff --git ",
+    "--- ",
+    "+++ ",
+    "index ",
+    "old mode ",
+    "new mode ",
+    # Every one of these is emitted by `git diff` and none of them was
+    # recognised, so a patch that CREATED a file -- the ordinary way to add a
+    # module -- could be rejected as corrupt with `line inside a hunk starts
+    # with 'n'`. Found by running a real backlog: the first item that tried to
+    # add a file failed here.
+    "new file mode ",
+    "deleted file mode ",
+    "similarity index ",
+    "dissimilarity index ",
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+)
 
 
 @dataclass(frozen=True)
@@ -243,6 +263,15 @@ def validate_diff(diff: str) -> list[PatchProblem]:
     problems: list[PatchProblem] = []
     lines = diff.splitlines()
     if not any(_HUNK_HEADER.match(line) for line in lines):
+        # No hunks usually means the model answered in prose, which is the
+        # failure this check is for. But a rename, a delete or a mode change
+        # is a complete patch with nothing to hunk, so the presence of a real
+        # file header is what separates "no diff" from "no content".
+        if any(line.startswith("diff --git ") for line in lines) and any(
+            line.startswith(("rename from ", "deleted file mode ", "old mode ", "new file mode "))
+            for line in lines
+        ):
+            return []
         return [PatchProblem(1, "no hunk header (`@@ -a,b +c,d @@`) anywhere in the reply")]
 
     old_left = new_left = 0
@@ -252,11 +281,17 @@ def validate_diff(diff: str) -> list[PatchProblem]:
         header = _HUNK_HEADER.match(line)
         if header:
             if counting and (old_left or new_left):
+                # Another hunk follows, so nothing was cut off: the header
+                # simply over-declared. `recount_hunks` derives the right
+                # counts from the body, so this is reported and not refused --
+                # which is what this class of damage was always documented to
+                # be, and was not.
                 problems.append(
                     PatchProblem(
                         hunk_line,
                         f"hunk ends {old_left} source and {new_left} result line(s) "
                         "short of what its header declares",
+                        fatal=False,
                     )
                 )
             old_left = int(header.group(2) or 1)
@@ -280,12 +315,15 @@ def validate_diff(diff: str) -> list[PatchProblem]:
             new_left = max(0, new_left - 1)
         elif line.startswith(_BETWEEN_HUNKS):
             # The next file starts while this hunk is unfinished: the header
-            # claimed more lines than the hunk contains.
+            # claimed more lines than the hunk contains. A whole file follows,
+            # so the reply did not stop -- the counts are wrong and derivable,
+            # so this is recounted rather than refused.
             problems.append(
                 PatchProblem(
                     hunk_line,
                     f"hunk header declares {old_left} more source and {new_left} more "
                     "result line(s) than the hunk contains",
+                    fatal=False,
                 )
             )
             counting = False
@@ -377,6 +415,12 @@ def recount_hunks(diff: str) -> str:
             pending, old, new = len(out) - 1, 0, 0
             continue
         if pending is not None:
+            if line.startswith("\\"):
+                # "\ No newline at end of file" annotates the line above and
+                # counts towards neither side. Ending the hunk here would
+                # recount it short.
+                out.append(line)
+                continue
             if line.startswith("+"):
                 new += 1
             elif line.startswith("-"):

@@ -19,6 +19,7 @@ SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "agent_harness"
 #: The modules a work item passes through, from claim to pull request.
 EXECUTION_PATH = [
     "work.py",
+    "graph.py",
     "fleet.py",
     "session_executor.py",
     "executor.py",

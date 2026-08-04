@@ -80,6 +80,7 @@ from .work import (
     DEFAULT_PROJECT,
     DONE,
     FAILED,
+    HELD,
     PENDING,
     ClaimLost,
     LeaseHeartbeat,
@@ -132,6 +133,11 @@ class Outcome:
     #: different questions — `failed` covers both a reviewer's rejection and a
     #: crashed worker, and those want different responses from a human.
     stop: Stop | None = None
+    #: A question this item is waiting on, when it asked rather than guessed.
+    #: Carried rather than acted on immediately because a hold **keeps the
+    #: claim** (D12) — so it replaces the release at the end of an attempt
+    #: instead of following one, which would have found the item unclaimed.
+    ask: str = ""
 
     @property
     def ok(self) -> bool:
@@ -1364,6 +1370,7 @@ class Executor:
         context_provider: Callable[[WorkRecord], str] | None = None,
         context_policy: ContextPolicy | None = None,
         ledger: Any | None = None,
+        ask_when_uncertain: bool = False,
         artifacts: Path | None = None,
         project_id: str = DEFAULT_PROJECT,
         durability: str | None = None,
@@ -1397,6 +1404,11 @@ class Executor:
         #: Where this worker reports setbacks so a coordinator can read them.
         #: None is the ordinary case and changes nothing.
         self.ledger = ledger
+        #: Whether a worker that cannot proceed asks instead of failing.
+        #: Off by default: a hold keeps the claim, so an unwatched fleet is
+        #: better served by failing fast than by tying up a worker until the
+        #: hold expires.
+        self.ask_when_uncertain = ask_when_uncertain
         #: Which go at this item the worker is on. `attempts` cannot serve:
         #: `requeue` resets it to zero deliberately, so three consecutive
         #: failures of the same item all reported as attempt 0, deduplicated
@@ -1593,6 +1605,15 @@ class Executor:
         # `consume_attempt` follows the disposition, so an item nobody
         # attempted and an item waiting on a person do not spend one. Every
         # disposition that consumed an attempt before still does.
+        if outcome.ask:
+            # A held item is not released: the claim, the worktree and the
+            # context are exactly what an answer resumes into (D12). Failing
+            # to hold is not fatal — the item falls through to the ordinary
+            # release below and is retried, which is what happened before any
+            # of this existed.
+            with contextlib.suppress(Exception):
+                self._hold(record, outcome)
+                return outcome
         self.queue.release(
             record.item_id,
             outcome.state,
@@ -1606,6 +1627,49 @@ class Executor:
             project_id=self.project_id,
         )
         return outcome
+
+    def _hold(self, record: WorkRecord, outcome: Outcome) -> None:
+        """Ask, in the room and on the item, and keep the claim.
+
+        Two halves of one feature that had never been introduced:
+        `message_type: "question"` existed in the ledger and no worker sent
+        one, while `holds.py` independently implemented an item waiting on a
+        person. A question in the room survives everything; a hold survives
+        the worker dying. Neither alone is what a stuck agent needs.
+        """
+        hold = self.queue.hold(
+            record.item_id,
+            question=outcome.ask,
+            reason=outcome.reason or "the worker could not proceed without an answer",
+            owner=self.owner,
+            project_id=self.project_id,
+        )
+        self._emit(record, "held", detail=outcome.ask)
+        if self.ledger is None:
+            return
+        from .coordination import Submission
+
+        with contextlib.suppress(Exception):
+            self.ledger.append(
+                Submission(
+                    project_id=self.project_id,
+                    room_id=item_room(record.item_id),
+                    sender_id=self.owner,
+                    sender_role="worker",
+                    message_type="question",
+                    body=outcome.ask,
+                    item_id=record.item_id,
+                    attempt=record.attempts,
+                    idempotency_key=(
+                        f"ask:{self.owner}:{self.project_id}:{record.item_id}:{self._episode}"
+                    ),
+                    # The resume token is deliberately absent. Answering is an
+                    # action through the command service, which looks the token
+                    # up itself — a token in a room is a token anything that can
+                    # read the room may spend.
+                    payload={"stage": "held", "expires_at": hold.expires_at},
+                )
+            )
 
     def _persist_spend(self, record: WorkRecord) -> None:
         """Add this attempt's cost to the item's running total, once.
@@ -1850,6 +1914,25 @@ class Executor:
             return self._from_diff(
                 record, outcome, planner, stored, base, stacked_on, resume, log, attempt, mode
             )
+
+        if planner.cannot_identify_target and self.ask_when_uncertain:
+            # The planner has said, in as many words, that the task is
+            # ambiguous, contradicts the codebase, or depends on something
+            # absent. Today the harness records that and carries on to pay an
+            # implementer that has no target — which is guessing, and
+            # `AGENTS.md` is explicit that the ambiguous case must reach a
+            # person rather than be guessed at.
+            #
+            # Opt-in, because a hold keeps the claim: a fleet nobody is
+            # watching would rather fail an item in seconds than tie a worker
+            # up until the hold expires.
+            outcome.ask = (
+                f"The planner could not identify what to change: {planner.cannot_identify_target}"
+            )
+            outcome.reason = outcome.ask
+            outcome.stop = Stop(ESCALATED, NO_TARGET, detail=outcome.ask, consumes_attempt=False)
+            outcome.state = HELD
+            return outcome
 
         context = self._context_for(record, planner)
         self._emit(

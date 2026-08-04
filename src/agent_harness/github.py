@@ -61,6 +61,29 @@ class Issue:
 
 
 @dataclass
+class PullRequest:
+    """An existing pull request, as adoption needs to judge it.
+
+    `head` and `same_repository` are here because "a branch with a similar
+    name" and "a branch this repository produced" are different claims, and
+    only the second one is evidence of anything.
+    """
+
+    number: int
+    title: str
+    body: str
+    state: str
+    head: str = ""
+    url: str = ""
+    same_repository: bool = True
+
+    @property
+    def harness_id(self) -> str | None:
+        match = _MARKER_RE.search(self.body or "")
+        return match.group(1) if match else None
+
+
+@dataclass
 class SyncReport:
     created: list[str] = field(default_factory=list)
     updated: list[str] = field(default_factory=list)
@@ -144,6 +167,42 @@ class GitHub:
             )
         return issues
 
+    def list_prs(self, limit: int = 200) -> list[PullRequest]:
+        """Every pull request, open, closed and merged.
+
+        Read-only, and used by adoption: a merged pull request naming an item
+        is some of the strongest evidence that its work already exists, and a
+        pull request from a fork is evidence that this repository did not
+        produce it. Both need the same listing.
+        """
+        out = self._run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "-R",
+                self.repo,
+                "--state",
+                "all",
+                "--limit",
+                str(limit),
+                "--json",
+                "number,title,body,state,headRefName,url,isCrossRepository",
+            ]
+        )
+        return [
+            PullRequest(
+                number=raw["number"],
+                title=raw.get("title") or "",
+                body=raw.get("body") or "",
+                state=(raw.get("state") or "").lower(),
+                head=raw.get("headRefName") or "",
+                url=raw.get("url") or "",
+                same_repository=not raw.get("isCrossRepository", False),
+            )
+            for raw in json.loads(out or "[]")
+        ]
+
     def list_labels(self) -> set[str]:
         out = self._run(
             ["gh", "label", "list", "-R", self.repo, "--limit", "200", "--json", "name"]
@@ -210,6 +269,27 @@ class GitHub:
         if item.milestone:
             args += ["--milestone", item.milestone]
         self._run(args)
+
+    def update_issue_body(self, number: int, body: str) -> None:
+        """Change only an issue body, for adoption marker backfill.
+
+        This separate operation is what prevents adoption from overwriting a
+        human's title, labels, milestone, assignees or prose merely to append
+        an idempotency marker.
+        """
+        self._run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                str(number),
+                "-R",
+                self.repo,
+                "--body-file",
+                "-",
+            ],
+            stdin=body,
+        )
 
     def comment(self, number: int, text: str) -> None:
         self._run(

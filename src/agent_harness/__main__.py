@@ -1,6 +1,7 @@
 """CLI.
 
     agent-harness plan   PLAN.md --repo owner/name   # plan -> GitHub backlog
+    agent-harness adopt  PLAN.md --project existing  # inspect work already done
     agent-harness run    --repo owner/name --work .  # execute the backlog
     agent-harness ingest --events ./run/events.jsonl
     agent-harness serve  --port 8099
@@ -549,6 +550,105 @@ def _run(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _assessor(args: argparse.Namespace) -> Any:
+    """The optional `assessor` role, over the same transport `run` uses."""
+    from .adoption import ASSESSOR, ModelAssessor
+    from .executor import _text_of
+    from .model_client import ModelClient, Route
+
+    api_key = os.environ.get("HARNESS_API_KEY", "")
+    client = ModelClient(
+        roles={ASSESSOR: Route(args.assessor_model, args.endpoint, api_key=api_key)},
+        transport=_http_transport(api_key),
+    )
+
+    def ask(prompt: str) -> str:
+        reply = client.call(ASSESSOR, [{"role": "user", "content": prompt}])
+        return _text_of(reply.body)
+
+    return ModelAssessor(ask)
+
+
+def _adopt(args: argparse.Namespace) -> int:
+    """Inspect an existing project, then reconcile only with explicit approval.
+
+    The default is inspection: it reads the plan, the repository, the queue
+    and — with `--repo` — the issues and pull requests, and prints what it
+    would do. Nothing outside the harness changes until someone types
+    `--approve`, and no completed work is dropped unless they also name it.
+    """
+    import json as _json
+
+    from .adoption import DEFAULT_VERIFY_TIMEOUT, Adoption, GitHubAdoptionInspector
+    from .github import GitHub
+    from .plan import parse_plan_file
+    from .work import WorkQueue
+
+    decision = args.reject or args.revise
+    if args.reconcile and not args.approve:
+        print("--reconcile requires --approve", file=sys.stderr)
+        return 2
+    if args.approve_drop and not args.approve:
+        print("--approve-drop requires --approve", file=sys.stderr)
+        return 2
+    if args.approve and decision:
+        print("--approve and --reject/--revise are opposite decisions", file=sys.stderr)
+        return 2
+    if args.dry_run and (args.approve or decision):
+        print(
+            "--dry-run inspects and stores nothing, so there is no proposal to "
+            "approve, reject or revise. Run it without --dry-run first.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.assessor_model and not args.endpoint:
+        print("--assessor-model needs --endpoint (or $HARNESS_ENDPOINT)", file=sys.stderr)
+        return 2
+
+    external = GitHubAdoptionInspector(GitHub(args.repo)) if args.repo else None
+    adopter = Adoption(
+        WorkQueue(args.db),
+        args.work,
+        external=external,
+        assessor=_assessor(args) if args.assessor_model else None,
+        verify_timeout=(
+            DEFAULT_VERIFY_TIMEOUT if args.verify_timeout is None else args.verify_timeout
+        ),
+    )
+    report = adopter.inspect(
+        args.project,
+        parse_plan_file(args.path),
+        dry_run=args.dry_run,
+        persist=not args.dry_run,
+    )
+    if decision:
+        report = adopter.reject(args.project, reason=decision, revise=bool(args.revise))
+    elif args.approve:
+        report = adopter.approve(args.project, approved_drops=args.approve_drop)
+        if args.reconcile:
+            report = adopter.reconcile(args.project)
+
+    print(report.summary())
+    if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(_json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n")
+        print(f"report written to {args.report}")
+    if args.reconcile:
+        return 0
+    unapproved = sorted(set(report.proposed_drops()) - set(report.approved_drops))
+    print(
+        "inspection only: no queue rows, issue edits or other external changes were made."
+        + (
+            f"\n{len(unapproved)} item(s) proposed as already delivered and NOT dropped: "
+            + ", ".join(unapproved)
+            if unapproved
+            else ""
+        )
+        + "\nUse --approve --reconcile, and name every allowed drop with --approve-drop."
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agent-harness", description=__doc__)
     parser.add_argument(
@@ -622,6 +722,72 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         metavar="FILE",
         help="where `export` writes its JSON (default: stdout)",
+    )
+
+    p_adopt = sub.add_parser(
+        "adopt", help="inspect an existing project and propose a reconciliation"
+    )
+    p_adopt.add_argument("path", type=Path, help="the plan markdown file")
+    p_adopt.add_argument("--project", required=True, help="stable queue project id")
+    p_adopt.add_argument(
+        "--work", type=Path, default=Path("."), help="existing repository working tree"
+    )
+    p_adopt.add_argument(
+        "--repo",
+        default="",
+        metavar="OWNER/NAME",
+        help="optional GitHub repository to inspect read-only before approval",
+    )
+    p_adopt.add_argument(
+        "--approve", action="store_true", help="approve this exact reconciliation proposal"
+    )
+    p_adopt.add_argument(
+        "--approve-drop",
+        action="append",
+        default=[],
+        metavar="ITEM",
+        help="allow one proposed completed item to enter the queue as done; repeatable",
+    )
+    p_adopt.add_argument(
+        "--reconcile",
+        action="store_true",
+        help="write approved queue rows and marker backfills; otherwise inspection is read-only",
+    )
+    p_adopt.add_argument(
+        "--reject", default="", metavar="REASON", help="refuse this proposal, with a reason"
+    )
+    p_adopt.add_argument(
+        "--revise",
+        default="",
+        metavar="REASON",
+        help="send this proposal back to be inspected again, with a reason",
+    )
+    p_adopt.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="inspect and print, storing nothing at all — not even the proposal",
+    )
+    p_adopt.add_argument(
+        "--report", type=Path, default=None, metavar="FILE", help="also write the report as JSON"
+    )
+    p_adopt.add_argument(
+        "--assessor-model",
+        default="",
+        metavar="MODEL",
+        help="ask a model whether unverifiable items already exist. It can only "
+        "propose; a drop still needs --approve-drop.",
+    )
+    p_adopt.add_argument(
+        "--endpoint",
+        default=os.environ.get("HARNESS_ENDPOINT", ""),
+        help="model API endpoint for --assessor-model",
+    )
+    p_adopt.add_argument(
+        "--verify-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="timeout for each item's `verify:` command; defaults to the project-check timeout",
     )
 
     p_run = sub.add_parser("run", help="execute claimed work items")
@@ -815,6 +981,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "graph":
         return _graph(args)
+
+    if args.command == "adopt":
+        return _adopt(args)
 
     store = EventStore(args.db)
 

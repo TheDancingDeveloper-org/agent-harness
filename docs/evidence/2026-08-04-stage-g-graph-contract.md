@@ -8,7 +8,7 @@ tests asserted the behaviour this stage reverses and were rewritten — see
 
 ## Configuration under test
 
-- Implementation commit: `38673156a5b5db4367668c11d42aa329e01972c8`, branch
+- Implementation commit: `660718b771f5d93be3c7a15d716c8d3cf03b0c85`, branch
   `codex/fit-stage-g`.
 - Base commit: `afdc3bc998cfc5f6b0e763782023acf3b860de43` ("test: enforce
   full-project typing for Stage A").
@@ -39,11 +39,11 @@ uv run mypy
 
 Observed on 2026-08-04 at the commit above:
 
-- 715 tests passed in 53.75 s wall-clock (the base commit collected 676; the
+- 715 tests passed in 53.66 s wall-clock (the base commit collected 676; the
   Stage G modules add 33, and two existing tests were rewritten rather than
   added);
 - `tests/test_stage_g_graph.py` collected 24 cases, `tests/test_graph_migration.py`
-  collected 9; both modules passed in 3.97 s;
+  collected 9; both modules passed in 4.04 s;
 - `ruff check` reported no findings; `ruff format --check` reported 74 files
   already formatted;
 - `mypy` reported no issues in 70 source files under the project's strict
@@ -51,7 +51,7 @@ Observed on 2026-08-04 at the commit above:
 
 Timings are from a shared build machine running other work concurrently. An
 earlier run of the same suite on the same commit took 351 s under heavy load;
-the 53.75 s figure is the quiet-machine number, and the base commit measured
+the 53.66 s figure is the quiet-machine number, and the base commit measured
 47.16 s on the same machine for comparison. Neither number is a benchmark.
 
 ## How each §6.1 acceptance case is proven
@@ -289,7 +289,7 @@ untested rather than implied.
   simultaneously is not exercised.
 - **Performance is not characterised.** `claim` now evaluates cycles once per
   scan and readiness per candidate. At the test suite's scale this is not
-  measurable against the base commit (47.16 s versus 53.75 s for a suite that
+  measurable against the base commit (47.16 s versus 53.66 s for a suite that
   grew by 39 tests). Behaviour at thousands of items or hundreds of edges per
   item is unmeasured, and `CLAIM_SCAN_LIMIT` still bounds the scan at 200 rows.
 - **Cycle detection covers required local edges only.** A loop that passes

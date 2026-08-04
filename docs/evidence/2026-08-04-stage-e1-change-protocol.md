@@ -264,3 +264,16 @@ A later measurement against a real provider must append a new dated package
 with its route, raw artifacts, costs and a single run denominator, rather than
 editing this one. The frequency question this report could not answer is the
 one that would change the ranking.
+
+## Correction, 2026-08-04
+
+The link above to `../backlog.json` is dead. The file was renamed to
+`docs/backlog-seed-2026-08-02.json` during Stage F, because it read like a
+record of current state and is not one — it has no state field, and 44 issues
+existed on GitHub that it never held.
+
+**D10 is unchanged and is in that file**, same content, same position. The
+superseded reference is left in place above rather than edited, per
+[`README.md`](README.md); this note is the correction.
+
+Nothing else in this report is affected, and no measurement changed.

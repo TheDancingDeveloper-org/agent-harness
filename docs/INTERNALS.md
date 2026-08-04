@@ -595,24 +595,43 @@ looks at the repository.
 ## 8. What every stage writes down
 
 Each transition above emits an event, and each event lands in an append-only
-store that outlives the queue:
+store that outlives the queue. **This table is the shape, not the schema** —
+it names the outcomes worth knowing about rather than every string the code
+can emit, and `events.py` is the authority:
 
 | Stage | Outcome recorded |
 |---|---|
-| Claim | `started` |
-| Agent | `agent_started` · `waiting_for_input` · `agent_timeout` · `agent_failed` · `agent_finished` |
-| Lease lost | `claim_lost` |
-| Checks | `checks_passed` · `checks_failed` |
+| Claim | `started` · `resumed` · `done` |
+| Plan | `planner_targets` · `context_selected` · `no_diff` |
+| Patch | `patch_malformed` · `patch_suspect` · `applied` · `apply_failed` |
+| Agent | `agent_started` · `waiting_for_input` · `held` · `agent_timeout` · `agent_failed` · `agent_finished` |
+| Lease lost | `claim_lost` · `retry_exhausted` |
+| Checks | `checks_passed` · `checks_failed` · `fix_available` |
+| Graph | `dependency_invalidated` · `brief_moved` |
 | Review | `review_approved` · `review_rejected` |
-| Delivery | `committed` · `pushed` · `pr_opened` |
-| Budget | `budget_exhausted` |
+| Delivery | `checkpointed` · `committed` · `pushed` · `draft_pr_opened` · `pr_opened` |
+| Budget | `budget_exhausted` (the *provider* is out) · `budget_exceeded` (this *item* is) · `budget_unenforceable` |
 | Cleanup | `session_reaped` |
 | Outside | `pr_merged` · `pr_closed_unmerged` · `pr_reverted` |
+
+Two `budget_` outcomes, and they are not the same fact.
+`budget_exhausted` is a **provider** saying our account is out and belongs in
+the never-retry set; `budget_exceeded` is **this deployment** saying one item
+has had enough, and it never parks an endpoint. Conflating them would put a
+local policy decision into the never-retry set.
+
+Beyond the stream, the work row itself now carries **why** it is in the state
+it is in — a `disposition` (`completed`, `refused`, `crashed`, `withheld`,
+`escalated`) and a `reason_kind` token. `failed` alone cannot tell a reviewer's
+rejection from a crashed worker, and those want opposite responses from a
+human. Empty means nobody has finished with it yet, which is not a sixth
+disposition.
 
 Model calls additionally carry tokens and **the price that was applied to
 them** — not just tokens, because applying today's rates to last year's usage
 is a projection rather than history, and it silently rewrites the past every
-time a vendor reprices.
+time a vendor reprices. A call whose price is unknown is recorded as
+**unpriced**, never as free.
 
 See [`AUDIT-PLAN.md`](AUDIT-PLAN.md) for what is worth measuring on top of
 this, and the rules that keep the numbers defensible.

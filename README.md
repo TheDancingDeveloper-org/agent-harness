@@ -45,6 +45,14 @@ blocked on runs this repository cannot perform on its own.
 | Module | What it does |
 |---|---|
 | `plan` | Parses a markdown plan into work items, reporting what it could **not** read |
+| `inception` | Scopes a project from a paragraph, argues about it, and produces a `PLAN.md` — never queue rows |
+| `adoption` | Takes on a project already part-built: proposes what is *already done*, with evidence. **A proposal is never a decision** |
+| `graph` | The typed dependency graph. A required target it cannot resolve is a blocker, not an assumption |
+| `demo` / `doctor` | A first run with no credentials; and what a real run would need, reported without spending anything |
+| `outcomes` | What a gate answered and what stopped an item — five check outcomes, five dispositions, not one bit |
+| `attempts` | Where an attempt got to, durably, so a killed worker resumes instead of re-paying |
+| `budgets` | How long one item may take and what it may spend. **Not** a provider cost cap |
+| `holds` | An item waiting on a person: durable, survives worker death, answerable from anywhere |
 | `fleet` | One worker pool per project, so no project starves another |
 | `audit` | Append-only history in its **own** database, with no mutation surface |
 | `pricing` | Token usage and the price applied to it — unknown is never zero |
@@ -119,8 +127,10 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
   inside: backlog building, triage and claiming, model routing, the retry ladder,
   completion, review, and merge/revert reconciliation.
 - **[`docs/USAGE.md`](docs/USAGE.md) — start here.** A worked example end to end, with
-  real output: write a plan, sync it, execute it, resume it, drive it from the API, and
-  read the failures.
+  real output. Its **"Which way in?"** table routes you by where you are starting from:
+  a demo with no credentials, a new project from a paragraph, a plan you already wrote,
+  or a project already half-built that you want to take on. Then: sync it, execute it,
+  resume it, drive it from the API, and read the failures.
 - **[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — running it as a service.** The two
   `serve` modes, what a supervised deployment must provide, and a non-destructive smoke
   test that distinguishes "healthy" from "able to run anything".
@@ -137,6 +147,14 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
   that seeded the GitHub issues on that date, plus the decision records `D1`–`D10`. It is
   a historical artefact: it has no state field and is not kept in sync. GitHub is the
   tracker (D1); this file cannot tell you whether anything is open.
+- [`docs/COORDINATION-PLANE.md`](docs/COORDINATION-PLANE.md) — the typed work graph (§8,
+  built) and the message ledger, rooms and oversight actor (**proposed, not built**).
+- [`docs/MIGRATION-graph.md`](docs/MIGRATION-graph.md) — backing up, exporting, rebuilding
+  and rolling back the queue's schema.
+- [`docs/evidence/`](docs/evidence/) — append-only evidence packages, one per stage, each
+  with a blind-spots section saying which of its own claims are untested.
+  [`2026-08-04-programme-report.md`](docs/evidence/2026-08-04-programme-report.md) is the
+  summary over all of them.
 - [`AGENTS.md`](AGENTS.md) — binding rules of engagement for anyone, human or agent,
   working in this repository.
 

@@ -21,6 +21,35 @@ already there, already running, and already behind the Work tab.
 
 ---
 
+## Which way in?
+
+Four routes, and they are not alternatives to each other so much as different
+starting points. Find your row.
+
+| Where you are | Start at | What you get |
+|---|---|---|
+| **You want to see whether this thing works at all** | [§0a](#0a-the-first-run-no-credentials-no-network-no-model) — `init --demo` | A real git repo, a plan and a queue, and one item taken end to end. No credentials, no network, no model. |
+| **New project, and you have not written the plan yet** | [§0b](#0b-or-dont-write-a-plan--describe-it-and-argue) — inception, **over the API** | Describe it in a paragraph, argue with the proposed scope, get a `PLAN.md`. Nothing external exists until you approve. |
+| **New project, and you already have a plan** | [§1](#1-write-a-plan) — `plan` | Your markdown parsed into work items, then synced to issues. |
+| **Existing project, already part-built** | [§0c](#0c-or-adopt-a-project-that-is-already-half-built) — `adopt` | What is *already done* proposed rather than assumed, with the evidence for each claim. Nothing is dropped unless you name it. |
+
+They converge. **Every route ends at a `PLAN.md` and a project in the queue**,
+and from there [§3](#3-execute-it) is the same for all of them:
+
+```
+inception ──┐
+            ├──▶ PLAN.md ──▶ plan (sync) ──▶ project ──▶ run
+your plan ──┤                                  ▲
+   adopt ───┴──────────────────────────────────┘
+                (adopt also seeds what is already done)
+```
+
+Whichever you pick, run [`doctor`](#0a1-ask-what-a-real-run-would-need) before
+you start anything real. It tells you what a run would need and contacts
+nothing.
+
+---
+
 ## 0a. The first run: no credentials, no network, no model
 
 Before configuring anything, watch an item go all the way through.
@@ -121,7 +150,7 @@ you can believe about a run.
 
 ---
 
-## 0a.2 Running against a local model
+### 0a.2 Running against a local model
 
 Optional, and deliberately not part of the demo or of required CI: a local
 model is a *your machine* dependency, and the no-network path must not acquire
@@ -188,6 +217,18 @@ opt-in smoke test you run against a server you supplied.
 
 If you do not already have a plan, scope one. Nothing external exists during
 any of this: no repository, no issues, no branches, no queue rows.
+
+> **This one is API-only — there is no `agent-harness inception` subcommand.**
+> Start the service first and keep it running for the whole exchange:
+>
+> ```bash
+> HARNESS_TOKEN=dev uv run agent-harness --db harness.sqlite serve --port 8099
+> export TOKEN=dev
+> ```
+>
+> It needs a model routed for the `scoper` role, because proposing a scope is a
+> model call. `agent-harness --db harness.sqlite doctor` will tell you whether
+> one is.
 
 ```bash
 # A paragraph, not a plan.
@@ -273,6 +314,13 @@ fork the pipeline into a generated path and a hand-written path that diverge
 forever. A plan document goes through the machinery below unchanged — including
 the parser that reports what it could **not** read, so a proposal the harness
 cannot consume is caught before it creates a single issue.
+
+---
+
+**What you have now is a `PLAN.md`, and nothing else.** No repository, no
+issues, no queue rows — deliberately, so another round of questions costs a
+conversation rather than a cleanup. Continue at [§1](#1-write-a-plan) to parse
+and sync it, exactly as though you had written it by hand.
 
 ---
 
@@ -367,6 +415,25 @@ the second inspection sees the marker it wrote the first time.
 An item the queue has already failed keeps its attempts, its error and its
 event history; the report quotes the prior failure so you can decide what to
 do about it, and rewrites none of it.
+
+### After adopting: you have a queue, not a running project
+
+`--reconcile` writes the queue rows. It does **not** register a project's
+configuration, and it does not start anything — a project starts `stopped`, and
+registering one must never begin spending.
+
+So the next two steps are the ordinary ones:
+
+1. **Register the project** with its checkout, base branch and checks —
+   [§4a](#4a-projects--running-more-than-one-thing-at-once). Set
+   `max_item_seconds` and `max_item_spend_usd` here too if this is going to run
+   unattended ([§6d](#6d-bounding-what-one-item-may-cost-you)).
+2. **Check it could actually run**, then start it —
+   [`doctor`](#0a1-ask-what-a-real-run-would-need) and
+   [§3](#3-execute-it).
+
+Re-running `adopt` later is safe and is the intended way to pick up work done
+outside the harness since. It never resets an item the fleet has finished.
 
 ---
 

@@ -87,6 +87,12 @@ ADAPTER_RESOLVERS = {
     "github-issue": "agent_harness.adapters.github_issue",
 }
 
+#: Provenance for an edge declared by a work row's `depends_on`. Named once
+#: because the queue writes it and a rebuild re-derives it, and a rebuild that
+#: recorded a different provenance would look like a change and move the
+#: revision for nothing.
+WORK_DECLARATION = "work.depends_on"
+
 _ADVISORY_SUFFIX = "(advisory)"
 
 
@@ -1042,6 +1048,11 @@ class DependencyGraph:
         The supported recovery, and the reason the edge table is allowed to
         be derived at all. It invents nothing: an edge exists here only
         because a work row declares it.
+
+        Rebuilding an intact graph is a no-op and does not move the revision.
+        The revision moves exactly where the derived edges differed from the
+        stored ones -- which is the only place anyone would want to be told
+        something happened.
         """
         connection, owned = self._with_conn(conn)
         try:
@@ -1068,8 +1079,12 @@ class DependencyGraph:
             for row in rows:
                 project = row["project_id"]
                 declared.setdefault(project, set()).add(row["item_id"])
+                # The same provenance `add` writes, because it names where the
+                # edge was DECLARED, not which code path last wrote the row.
+                # Recording "rebuild" would make an intact graph's rebuild
+                # look like a change and move the revision for nothing.
                 specs = parse_dependencies(
-                    json.loads(row["depends_on"] or "[]"), provenance="rebuild"
+                    json.loads(row["depends_on"] or "[]"), provenance=WORK_DECLARATION
                 )
                 revisions[project] = self.set_edges(project, row["item_id"], specs, conn=connection)
             # Edges whose source no longer exists as work are not rebuildable

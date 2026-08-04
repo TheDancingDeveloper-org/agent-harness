@@ -172,7 +172,7 @@ def _run(args: argparse.Namespace) -> int:
 
     from .executor import Checks, Executor
     from .github import GitHub
-    from .model_client import ModelClient, Route, routes_from_map
+    from .model_client import Chain, ModelClient, chains_from_map
     from .work import RUNNING, WorkQueue, WorkRecord
 
     # With a session host the CLI agent does the implementing, so only the
@@ -263,8 +263,21 @@ def _run(args: argparse.Namespace) -> int:
 
     # Seed the shared map from the command line, then read it back per call so
     # `PUT /api/roles` takes effect without a restart.
+    # A role may name several models, comma-separated and in preference
+    # order. The first that answers does the work; the rest exist because on
+    # this endpoint 34 of 42 advertised models were unavailable at once, and a
+    # fleet with one name per role simply stops when that name is down.
     from_cli = {
-        name: {"model": model, "endpoint": args.endpoint, "provider": "claw-bay"}
+        name: {
+            # Both, on purpose: `models` is the chain, `model` is the
+            # preferred one, so a reader that predates fallbacks -- including
+            # the `RoleRoute` wire schema -- still sees a route rather than a
+            # role it thinks is unconfigured.
+            "models": (names := [m.strip() for m in model.split(",") if m.strip()]),
+            "model": names[0] if names else "",
+            "endpoint": args.endpoint,
+            "provider": "claw-bay",
+        }
         for name, model in roles.items()
     }
     stored_map = queue.get_setting(ROLE_MAP_KEY) or {}
@@ -291,8 +304,8 @@ def _run(args: argparse.Namespace) -> int:
     if stored_map and filled:
         print(f"note: the stored role map had no route for {', '.join(filled)}; used the flags.")
 
-    def live_routes() -> dict[str, Route]:
-        return routes_from_map(queue.get_setting(ROLE_MAP_KEY) or {}, api_key=api_key)
+    def live_routes() -> dict[str, Chain]:
+        return chains_from_map(queue.get_setting(ROLE_MAP_KEY) or {}, api_key=api_key)
 
     # Nothing claims work until every role this run needs can be routed. The
     # alternative is finding out on the first model call -- after the project
@@ -751,7 +764,7 @@ def _fleet_for_serve(
     from .events import KINDS, MODEL_CALL, Event
     from .fleet import Fleet
     from .github import GitHub
-    from .model_client import ModelClient, Route, effective_routes, routes_from_map
+    from .model_client import Chain, ModelClient, chains_from_map, effective_routes
     from .runtime import ExecutorRoles, session_executor_factory
     from .session_executor import AgentSpec
     from .session_host import HttpSessionHost
@@ -774,10 +787,10 @@ def _fleet_for_serve(
         }
         queue.set_setting(ROLE_MAP_KEY, stored)
 
-    def live_routes() -> dict[str, Route]:
-        return routes_from_map(queue.get_setting(ROLE_MAP_KEY) or {}, api_key=api_key)
+    def live_routes() -> dict[str, Chain]:
+        return chains_from_map(queue.get_setting(ROLE_MAP_KEY) or {}, api_key=api_key)
 
-    def routes_for(project_id: str) -> dict[str, Route]:
+    def routes_for(project_id: str) -> dict[str, Chain]:
         """One project's effective map, read live on every call.
 
         The project row is read here rather than closed over so that a role
@@ -787,7 +800,7 @@ def _fleet_for_serve(
         project = queue.get_project(project_id)
         return effective_routes(
             live_routes(),
-            routes_from_map(getattr(project, "roles", None) or {}, api_key=api_key),
+            chains_from_map(getattr(project, "roles", None) or {}, api_key=api_key),
         )
 
     routes = live_routes()

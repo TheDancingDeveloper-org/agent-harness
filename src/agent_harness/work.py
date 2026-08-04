@@ -26,9 +26,18 @@ import socket
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+from .graph import (
+    WORK_DECLARATION,
+    DependencyGraph,
+    DependencySpec,
+    Readiness,
+    Resolver,
+    parse_dependencies,
+)
 
 # Lease length. Long enough that an agent thinking hard about a hard problem
 # is not evicted; short enough that a crashed worker's item is picked up in
@@ -124,6 +133,10 @@ CREATE TABLE IF NOT EXISTS work (
     last_error  TEXT,
     branch      TEXT,
     pr_url      TEXT,
+    -- The graph revision this claim was admitted at. Admission and the check
+    -- before the expensive gate have to be talking about the same graph; this
+    -- is how the second one can tell that the first one saw a different one.
+    admitted_revision INTEGER NOT NULL DEFAULT 0,
     updated_at  REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, item_id)
 );
@@ -331,6 +344,9 @@ class WorkRecord:
     pr_url: str | None = None
     updated_at: float = 0.0
     project_id: str = DEFAULT_PROJECT
+    #: Graph revision at the moment this item was claimed. 0 for anything
+    #: never claimed under a Stage G build.
+    admitted_revision: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> WorkRecord:
@@ -338,19 +354,40 @@ class WorkRecord:
         data["depends_on"] = json.loads(data.get("depends_on") or "[]")
         return cls(**data)
 
+    def dependency_specs(self, provenance: str = WORK_DECLARATION) -> list[DependencySpec]:
+        """This item's declared edges, typed.
+
+        `depends_on` stays a list of strings on the wire and in the row --
+        that is what a plan writes and what every existing client sends --
+        but each string is a token with a grammar, so `T1`,
+        `external:tracker:TICKET-9` and `decision:D9` are three different
+        kinds of edge rather than three strings that look alike.
+        """
+        return parse_dependencies(self.depends_on, provenance=provenance)
+
 
 class WorkQueue:
     """Claimable work, backed by the same SQLite file as the event store."""
 
     def __init__(
-        self, path: str, lease_seconds: float = DEFAULT_LEASE_SECONDS, now: Any = time.time
+        self,
+        path: str,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+        now: Any = time.time,
+        *,
+        resolvers: Mapping[str, Resolver] | None = None,
     ) -> None:
         self.path = path
         self.lease_seconds = lease_seconds
         self.now = now
+        #: The typed dependency graph over the same file. Constructed with
+        #: this queue's connection factory so admission can evaluate the graph
+        #: inside the very transaction that hands out the work.
+        self.graph = DependencyGraph(self._connect, now=now, resolvers=resolvers)
         self._migrate()
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self.graph.create_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
@@ -417,6 +454,12 @@ class WorkQueue:
         "projects": {
             "max_attempts": "INTEGER NOT NULL DEFAULT 5",
             "min_free_disk_gb": "REAL NOT NULL DEFAULT 0",
+        },
+        # Stage G. Additive, so a rollback to an older build still reads every
+        # column it knows and simply ignores this one. The migration plan is
+        # docs/MIGRATION-graph.md.
+        "work": {
+            "admitted_revision": "INTEGER NOT NULL DEFAULT 0",
         },
     }
 
@@ -577,7 +620,13 @@ class WorkQueue:
 
     # ------------------------------------------------------------ loading
 
-    def add(self, records: Iterable[WorkRecord], project_id: str = DEFAULT_PROJECT) -> int:
+    def add(
+        self,
+        records: Iterable[WorkRecord],
+        project_id: str = DEFAULT_PROJECT,
+        *,
+        provenance: str = WORK_DECLARATION,
+    ) -> int:
         """Add work to a project, leaving anything already present untouched.
 
         Re-adding is how a re-synced plan reaches the queue, so it must not
@@ -586,6 +635,11 @@ class WorkQueue:
 
         The project is scoped explicitly rather than taken from the record so
         that loading a plan cannot silently scatter items across projects.
+
+        Each record's `depends_on` is also written into the dependency graph.
+        That write is idempotent: re-ingesting an unchanged plan leaves the
+        graph revision exactly where it was, so a routine re-sync cannot
+        invalidate the claims that are running.
         """
         conn = self._connect()
         added = 0
@@ -633,6 +687,12 @@ class WorkQueue:
                         record.item_id,
                     ),
                 )
+            self.graph.set_edges(
+                project_id,
+                record.item_id,
+                record.dependency_specs(provenance),
+                conn=conn,
+            )
         conn.close()
         return added
 
@@ -759,9 +819,15 @@ class WorkQueue:
         """Take the next available item, or None.
 
         Available means: pending (or a lease that has expired), and every
-        dependency done. The whole selection and claim happens inside one
-        IMMEDIATE transaction, so two workers racing cannot both win — the
-        loser sees the row already claimed and picks something else.
+        **required** dependency edge explicitly satisfied. The whole selection
+        and claim happens inside one IMMEDIATE transaction, so two workers
+        racing cannot both win — the loser sees the row already claimed and
+        picks something else.
+
+        The graph revision the decision was made at is written onto the row.
+        Admission and the check before the expensive gate must be able to say
+        they looked at the same graph; without a recorded revision the second
+        check can only ever answer "not now", never "and the graph moved".
         """
         owner = owner or worker_identity()
         # Checked before anything is taken, so a pause stops the fleet at the
@@ -773,6 +839,10 @@ class WorkQueue:
         try:
             limit = self.max_attempts_for(conn, project_id)
             conn.execute("BEGIN IMMEDIATE")
+            # Computed once for the whole scan rather than per candidate: a
+            # cycle is a property of the project's graph, not of one row.
+            cycles = self.graph.cycles(project_id, conn=conn)
+            revision = self.graph.revision(project_id, conn=conn)
             row = conn.execute(
                 "SELECT * FROM work WHERE project_id = ? "
                 "AND (state = ? OR (state = ? AND lease_until < ?)) "
@@ -801,16 +871,20 @@ class WorkQueue:
                         ),
                     )
                     continue
-                if not self._dependencies_met(conn, record):
+                admission = self.graph.readiness(
+                    project_id, record.item_id, conn=conn, cycles=cycles
+                )
+                if not admission.ready:
                     continue
                 conn.execute(
                     "UPDATE work SET state = ?, owner = ?, lease_until = ?, "
-                    "attempts = attempts + 1, updated_at = ? "
+                    "attempts = attempts + 1, admitted_revision = ?, updated_at = ? "
                     "WHERE project_id = ? AND item_id = ?",
                     (
                         CLAIMED,
                         owner,
                         now + self.lease_seconds,
+                        revision,
                         now,
                         project_id,
                         record.item_id,
@@ -821,6 +895,7 @@ class WorkQueue:
                 record.owner = owner
                 record.lease_until = now + self.lease_seconds
                 record.attempts += 1
+                record.admitted_revision = revision
                 return record
             conn.execute("COMMIT")
             return None
@@ -839,48 +914,36 @@ class WorkQueue:
         ).fetchone()
         return int(row["max_attempts"]) if row else DEFAULT_MAX_ATTEMPTS
 
-    def _dependencies_met(self, conn: sqlite3.Connection, record: WorkRecord) -> bool:
-        for dependency in record.depends_on:
-            # Scoped to the item's own project: an id means one thing here and
-            # something else there, and resolving across the boundary would
-            # let a project unblock on another project's work.
-            row = conn.execute(
-                "SELECT state FROM work WHERE project_id = ? AND item_id = ?",
-                (record.project_id, dependency),
-            ).fetchone()
-            # A dependency on something not in the queue is not a blocker:
-            # plans routinely reference work tracked elsewhere, and refusing
-            # to start would strand the item forever.
-            if row is not None and row["state"] != DONE:
-                return False
-        return True
+    def readiness(self, item_id: str, *, project_id: str = DEFAULT_PROJECT) -> Readiness:
+        """Whether an item may be admitted, and — when it may not — why.
+
+        The **same** call `claim` uses. Two implementations of "is it ready"
+        is two answers, and the one that disagreed would be the one that let
+        ineligible work reach a durable gate.
+        """
+        return self.graph.readiness(project_id, item_id)
 
     def unmet_dependencies(self, item_id: str, *, project_id: str = DEFAULT_PROJECT) -> list[str]:
-        """Dependencies of an item that are not done, right now.
+        """Required targets of an item that are not satisfied, right now.
 
         `claim` checks this once, at the moment of claiming. The graph can be
         corrected while an item is in flight -- that is what correcting a plan
         looks like -- and an item that is no longer eligible must not go on to
         pass a durable gate on the strength of a check made minutes earlier.
+
+        A thin projection of `readiness` kept for callers that only want the
+        identities. Anything reporting to a human should use `readiness`
+        instead: a list of ids cannot say whether a target is missing, merely
+        unfinished, or part of a cycle, and those need different actions.
         """
-        record = self.get(item_id, project_id=project_id)
-        if record is None:
+        state = self.readiness(item_id, project_id=project_id)
+        if state.ready:
             return []
-        conn = self._connect()
-        try:
-            unmet = []
-            for dependency in record.depends_on:
-                row = conn.execute(
-                    "SELECT state FROM work WHERE project_id = ? AND item_id = ?",
-                    (project_id, dependency),
-                ).fetchone()
-                # Absent means tracked elsewhere, which is not a blocker --
-                # the same rule `claim` uses, for the same reason.
-                if row is not None and row["state"] != DONE:
-                    unmet.append(dependency)
-            return unmet
-        finally:
-            conn.close()
+        return [
+            reason.target_id or reason.evidence or reason.kind
+            for reason in state.reasons
+            if reason.required
+        ]
 
     def heartbeat(self, item_id: str, owner: str, project_id: str = DEFAULT_PROJECT) -> bool:
         """Extend the lease. Returns False if the claim was lost — which is

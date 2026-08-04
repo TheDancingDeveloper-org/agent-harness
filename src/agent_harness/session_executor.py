@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from .executor import APPROVED, REJECTED, Checks, Outcome, is_disk_exhaustion, run_git
+from .graph import LOCAL_WORK
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
 from .reaper import DEFAULT_MAX_AGE_SECONDS, ReapReport, reap_abandoned_sessions
 from .session_host import Session, SessionHost
@@ -525,6 +526,30 @@ class SessionExecutor:
             self._emit(record, "checks_passed", session_id=session.id)
             self._keepalive(record)
 
+            # The same graph check the direct executor makes, at the same
+            # point and through the same call. Session mode reached its
+            # checkpoint without re-reading the graph at all, so a plan
+            # corrected while an agent was working produced a durable,
+            # externally visible candidate for work that was no longer
+            # eligible -- the one place the two executors disagreed about a
+            # gate. The live agent is not killed: it has already reached a
+            # safe boundary, and the item goes back to pending.
+            admission = self.queue.readiness(record.item_id, project_id=self.project_id)
+            if not admission.ready:
+                outcome.reason = (
+                    f"{record.item_id} was admitted at graph revision "
+                    f"{record.admitted_revision} and {admission.explain()}; the candidate is "
+                    "discarded and the item goes back to pending"
+                )
+                self._emit(
+                    record,
+                    "dependency_invalidated",
+                    detail=outcome.reason,
+                    session_id=session.id,
+                )
+                outcome.state = PENDING
+                return outcome
+
             # Checkpoint BEFORE the expensive gate.
             #
             # Review is the slowest and most failure-prone step, and it used
@@ -633,9 +658,10 @@ class SessionExecutor:
 
     def _base_for(self, record: WorkRecord) -> tuple[str, str | None]:
         candidates = [
-            dependency
-            for dependency in record.depends_on
-            if (found := self.queue.get(dependency, project_id=self.project_id))
+            spec.target_id
+            for spec in record.dependency_specs()
+            if spec.target_kind == LOCAL_WORK
+            and (found := self.queue.get(spec.target_id, project_id=self.project_id))
             and found.branch
             and found.state == DONE
         ]

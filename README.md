@@ -130,7 +130,14 @@ A five-minute tour. The full walkthrough, with real output, is in
 
 Keep writing plans the way you already do. Items are recognised as `### T1: Title`
 headings, `- [ ] T1 Title` checkboxes, or table rows with an id column; `labels:`,
-`milestone:` and `depends on:` lines in the prose become metadata.
+`milestone:` and `depends on:` lines in the prose become metadata. A whole
+dependency graph can also be drawn in one ```dependencies block as `W1 -> W2`.
+
+A dependency names what **kind** of thing it waits for — work here, work in
+another project, a human decision, or something outside the harness entirely
+(`external:RESOLVER:IDENTITY`). A required target the graph cannot resolve
+blocks the item and says why, rather than being assumed to be tracked
+somewhere else.
 
 ```bash
 agent-harness plan PLAN.md --repo owner/name --dry-run   # see what it would do

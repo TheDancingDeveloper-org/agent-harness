@@ -56,6 +56,10 @@ from .schemas import (
     BaselineList,
     BlockRequest,
     BlockResult,
+    DependencyEdgeModel,
+    DependencyGraphReport,
+    DependencyOverrideRequest,
+    DependencyOverrideResult,
     Event,
     EventPage,
     ExecutionReadiness,
@@ -64,6 +68,7 @@ from .schemas import (
     InceptionDraft,
     InceptionPlan,
     InceptionStart,
+    ItemReadiness,
     LatestEvent,
     MaintenanceResult,
     NewBaseline,
@@ -81,6 +86,7 @@ from .schemas import (
     ProposalModel,
     RateLimits,
     ReadinessProbe,
+    ReadinessReasonModel,
     ReconcileResult,
     ResolveQuestion,
     RetryResult,
@@ -426,6 +432,117 @@ def create_api(
         reason = request.reason if request.who is None else f"{request.reason} (— {request.who})"
         queue.release(item_id, BLOCKED, error=reason, project_id=project_id)
         return BlockResult(ok=True, item_id=item_id, state="blocked", reason=reason)
+
+    # ------------------------------------------------------ dependency graph
+
+    @app.get(
+        "/api/work/{item_id}/readiness",
+        tags=["work"],
+        summary="Why an item is or is not ready",
+        response_model=ItemReadiness,
+        responses={404: {"description": "No such item"}},
+    )
+    def item_readiness(
+        item_id: str = PathParam(description="Plan id, e.g. `T4`."),
+        project_id: str = Query("default", description="Which project the item is in."),
+        _: None = Depends(require_token),
+    ) -> ItemReadiness:
+        """The dependency graph's answer for one item, with its reasons.
+
+        This is the **same** evaluation `claim` makes and the executor
+        repeats before the expensive gate. An item that will not start is the
+        single most common thing an operator has to explain, and until now
+        the only answer available was "it is pending".
+        """
+        queue = need_queue()
+        record = queue.get(item_id, project_id=project_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
+        return _readiness_model(queue.readiness(item_id, project_id=project_id), record)
+
+    @app.get(
+        "/api/graph",
+        tags=["work"],
+        summary="The dependency graph for one project",
+        response_model=DependencyGraphReport,
+    )
+    def dependency_graph(
+        project_id: str = Query("default", description="Which project's graph to report."),
+        _: None = Depends(require_token),
+    ) -> DependencyGraphReport:
+        """Every edge, every cycle, and who is ready — in one call.
+
+        Asked item by item, "which work can start and why not" is a report
+        nobody assembles. A cycle in particular is invisible one item at a
+        time: each member looks like it is merely waiting.
+        """
+        queue = need_queue()
+        report = queue.graph.report(project_id)
+        records = {r.item_id: r for r in queue.items(project_id=project_id)}
+        return DependencyGraphReport(
+            project_id=report.project_id,
+            revision=report.revision,
+            edges=[
+                DependencyEdgeModel(
+                    source_item=edge.source_item,
+                    target_kind=edge.target_kind,
+                    target_id=edge.target_id,
+                    required=edge.required,
+                    resolver=edge.resolver,
+                    state=edge.state,
+                    evidence=edge.evidence,
+                    provenance=edge.provenance,
+                    revision=edge.revision,
+                )
+                for edge in report.edges
+            ],
+            cycles=[list(cycle) for cycle in report.cycles],
+            ready=list(report.ready),
+            not_ready=[
+                _readiness_model(state, records.get(state.item_id)) for state in report.not_ready
+            ],
+        )
+
+    @app.post(
+        "/api/work/{item_id}/dependency-override",
+        tags=["work"],
+        summary="Admit blocked work deliberately",
+        response_model=DependencyOverrideResult,
+        responses={404: {"description": "No such item"}},
+    )
+    def dependency_override(
+        request: DependencyOverrideRequest,
+        item_id: str = PathParam(description="Plan id, e.g. `T4`."),
+        project_id: str = Query("default", description="Which project the item is in."),
+        _: None = Depends(require_token),
+    ) -> DependencyOverrideResult:
+        """Record an operator decision to admit an item the graph blocks.
+
+        The gate is not removed and nothing is marked satisfied: the edges
+        keep their real state, and the override is recorded next to them with
+        a reason. It applies to **the graph revision it was granted at**, so
+        a later correction re-blocks the item rather than inheriting a
+        judgement nobody made about it.
+
+        This is the escape hatch §8.2 of the coordination plane requires so
+        that a dependency discovered after a claim can be resolved *or*
+        explicitly overridden, rather than leaving the work stuck with no
+        supported way forward.
+        """
+        queue = need_queue()
+        record = queue.get(item_id, project_id=project_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
+        revision = queue.graph.record_override(
+            project_id, item_id, reason=request.reason, who=request.who
+        )
+        return DependencyOverrideResult(
+            ok=True,
+            project_id=project_id,
+            item_id=item_id,
+            revision=revision,
+            readiness=_readiness_model(queue.readiness(item_id, project_id=project_id), record),
+        )
 
     # ------------------------------------------------------------- control
 
@@ -1330,6 +1447,7 @@ def create_api(
         if not target.is_file():
             raise HTTPException(status_code=404, detail=f"no plan at {path!r}")
         parsed = parse_plan_file(target)
+        report = parsed.dependency_report()
         return PlanParseResult(
             items=[
                 PlanItem(
@@ -1346,7 +1464,13 @@ def create_api(
             ],
             skipped=[f"line {n}: {title}" for n, title in parsed.skipped],
             duplicate_ids=parsed.duplicate_ids(),
-            unresolved_dependencies=parsed.unresolved_dependencies(),
+            unresolved_dependencies=report.unresolved,
+            external_dependencies=report.external,
+            decision_dependencies=report.decisions,
+            cross_project_dependencies=report.cross_project,
+            malformed_dependencies=report.malformed,
+            dependency_cycles=[list(cycle) for cycle in report.cycles],
+            unattached_arrows=[f"line {n}: {text}" for n, text in report.unattached_arrows],
         )
 
     @app.post(
@@ -1744,6 +1868,34 @@ def _worker_health(fleet: Any | None, project_id: str) -> dict[str, Any]:
         "worker_failures": len(failures),
         "last_worker_error": failures[-1].error if failures else None,
     }
+
+
+def _reason_model(reason: Any) -> ReadinessReasonModel:
+    return ReadinessReasonModel(
+        kind=reason.kind,
+        explanation=reason.explanation,
+        target_kind=reason.target_kind,
+        target_id=reason.target_id,
+        required=reason.required,
+        resolver=reason.resolver,
+        state=reason.state,
+        evidence=reason.evidence,
+    )
+
+
+def _readiness_model(state: Any, record: WorkRecord | None) -> ItemReadiness:
+    return ItemReadiness(
+        project_id=state.project_id,
+        item_id=state.item_id,
+        ready=state.ready,
+        graph_revision=state.revision,
+        admitted_revision=record.admitted_revision if record is not None else None,
+        reasons=[_reason_model(reason) for reason in state.reasons],
+        advisory=[_reason_model(reason) for reason in state.advisory],
+        overridden=state.overridden,
+        override_reason=state.override_reason,
+        explanation=state.explain(),
+    )
 
 
 def _item_model(record: WorkRecord, event: dict[str, Any] | None) -> WorkItem:

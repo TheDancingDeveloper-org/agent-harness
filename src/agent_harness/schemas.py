@@ -116,7 +116,8 @@ class WorkItem(BaseModel):
         "can branch on it: `checks_failed`, `check_escalated`, `check_transient`, "
         "`review_rejected`, `patch_rejected`, `no_target`, `worker_error`, "
         "`provider_exhausted`, `budget_exhausted`, `dependency_invalidated`, "
-        "`agent_timeout`, `claim_lost`.",
+        "`agent_timeout`, `claim_lost`, `item_wall_clock`, `item_spend`, "
+        "`hold_expired`, `context_unavailable`.",
     )
     branch: str | None = None
     pr_url: str | None = None

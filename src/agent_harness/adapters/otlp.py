@@ -99,6 +99,7 @@ ITEM_OUTCOMES = {
     "no_changes": "error",
     "agent_timeout": "error",
     "agent_failed": "error",
+    "context_unavailable": "error",
 }
 
 

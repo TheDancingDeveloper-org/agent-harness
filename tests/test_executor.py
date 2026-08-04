@@ -1272,6 +1272,56 @@ def test_context_selection_and_planner_targets_are_observable_events(
     assert context["fallback_relevance"] is False
 
 
+def test_a_target_that_cannot_be_shown_stops_the_item_before_the_implementer(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A file larger than the whole budget is a stop, not a smaller prompt.
+
+    Found importing a second repository whose one relevant source file is
+    600 KB. The planner named it, the budget could not hold it, and the
+    implementer was called anyway — with unrelated files in the space the
+    target should have had. It answered, because a model asked to patch a file
+    it has not seen writes a plausible diff rather than refusing.
+    """
+    events: list[dict[str, Any]] = []
+    executor, queue, transport = build(
+        repo,
+        tmp_path,
+        {
+            "planner": json.dumps(
+                {
+                    "plan": "Edit the large file.",
+                    "targets": [{"path": "large.txt", "reason": "is the thing to change"}],
+                    "cannot_identify_target": None,
+                }
+            ),
+            "implementer": DIFF,
+            "reviewer": "APPROVED\nfine",
+        },
+        events=events,
+    )
+    executor.context_policy = ContextPolicy(budget=100)
+    (repo / "large.txt").write_text("target line\n" * 200)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "a file larger than the budget")
+    add_item(queue)
+
+    executor.run_once()
+
+    assert "implementer" not in transport.roles, "the implementer was paid for an impossible task"
+    stopped = next(event for event in events if event["outcome"] == "context_unavailable")
+    assert "large.txt" in stopped["detail"]
+    assert "2400 bytes" in stopped["detail"], "the size that did not fit is part of the answer"
+    assert "--context-budget" in stopped["detail"], "and so is what to do about it"
+
+    item = queue.get("T1")
+    assert item is not None
+    assert item.state == "blocked", "retrying cannot make the file smaller"
+    assert item.disposition == "escalated"
+    assert item.reason_kind == "context_unavailable"
+    assert item.attempts == 0, "a ceiling this deployment set is not the item failing"
+
+
 def test_the_implementer_is_shown_the_repository(repo: Path, tmp_path: Path) -> None:
     """The regression for #135.
 

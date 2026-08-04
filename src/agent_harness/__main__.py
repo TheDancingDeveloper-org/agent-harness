@@ -394,7 +394,7 @@ def _run(args: argparse.Namespace) -> int:
     code, so it says exactly what it will do before doing any of it."""
     import json as _json
 
-    from .executor import Checks, Executor
+    from .executor import Checks, ContextPolicy, Executor
     from .github import GitHub
     from .model_client import Chain, ModelClient, chains_from_map
     from .work import RUNNING, WorkQueue, WorkRecord
@@ -686,6 +686,7 @@ def _run(args: argparse.Namespace) -> int:
             client,
             args.work,
             checks=checks,
+            context_policy=ContextPolicy(budget=args.context_budget),
             durability=durability,
             github=GitHub(args.repo) if args.repo else None,
             base_branch=args.base,
@@ -830,6 +831,11 @@ def _adopt(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Imported here, as every other executor name in this module is: the CLI
+    # starts for `--help` on a machine with no queue and no credentials, and
+    # only the default value is needed to print it.
+    from .executor import DEFAULT_CONTEXT_BUDGET
+
     parser = argparse.ArgumentParser(prog="agent-harness", description=__doc__)
     parser.add_argument(
         "--db",
@@ -1128,6 +1134,17 @@ def main(argv: list[str] | None = None) -> int:
         "external effect before it happens. Empty takes the project's setting, "
         "then the default. The pre-review git checkpoint is unaffected by all "
         "three (or $HARNESS_DURABILITY).",
+    )
+    p_run.add_argument(
+        "--context-budget",
+        type=int,
+        default=int(os.environ.get("HARNESS_CONTEXT_BUDGET", "") or DEFAULT_CONTEXT_BUDGET),
+        help="how many characters of repository the implementer is shown "
+        f"(default {DEFAULT_CONTEXT_BUDGET}, or $HARNESS_CONTEXT_BUDGET). A file "
+        "larger than this cannot be supplied at all, and an item whose target "
+        "does not fit is stopped before the implementer is paid rather than "
+        "asked to change a file it cannot see. Raise it for a repository with "
+        "large files; the ceiling that matters is the model's context window.",
     )
     p_run.add_argument(
         "--demo",

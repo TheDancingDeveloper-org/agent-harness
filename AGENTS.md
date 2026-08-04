@@ -71,6 +71,7 @@ trade and it is rejected.
 | Where an attempt got to, durably | `src/agent_harness/attempts.py` — a fixed stage list, **not** a workflow engine |
 | How long one item may take, and what it may spend | `src/agent_harness/budgets.py` — **not** a provider cost cap, and never parks an endpoint |
 | An item waiting on a person | `src/agent_harness/holds.py` — a state of the item, **not** a projection over events, and **not** the coordination plane |
+| Telemetry export | `src/agent_harness/adapters/otlp.py` — opt-in, lazily loaded, **export only**; the event store stays the source of truth |
 | Queue schema migration | `docs/MIGRATION-graph.md` — backup, export, rebuild, rollback |
 | Log readers | `src/agent_harness/ingest.py` |
 | JSON API (no GUI) | `src/agent_harness/api.py` |

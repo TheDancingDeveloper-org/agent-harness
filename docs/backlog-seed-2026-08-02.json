@@ -403,5 +403,12 @@
     "milestone": "P4",
     "labels": ["type:task", "area:github", "blocked"],
     "body": "Run the harness against a repository other than oxidex, using only the repo's own required checks plus whatever domain gates it declares.\n\nThis is the test of whether P4 actually generalised anything.\n\n**Acceptance:** a full attempt completes end to end with **no oxidex-specific code on the path** — verified by grep, not by assertion."
+  },
+  {
+    "id": "T43",
+    "title": "T43: A/B whether the reviewer seeing the plan changes its verdict",
+    "milestone": "P1",
+    "labels": ["type:spike", "area:dispatch"],
+    "body": "Follow-up from D9, which ruled *withhold in P1, settle by measurement not argument*.\n\nThe reviewer currently sees the brief, the diff and the check results \u2014 not the planner's rationale. Supplying it risks anchoring: the reviewer approves by construction, having already read the justification for what it is judging. Withholding it risks the reviewer lacking the context to judge intent. Both are plausible, which is why D9 deferred it.\n\nRun the same backlog twice, identical in every other respect, with the rationale withheld and supplied. Compare approval rate, revert rate, closed-unmerged rate and cost per *merged* item \u2014 not per approved, because approving more cheaply is not better.\n\n**Acceptance:** a ruling recorded against measured numbers, with the sample size and the window stated. If the difference is inside noise, say so and keep the cheaper configuration. Do not settle by argument \u2014 that is what D9 already declined to do.\n\n**Backfilled into this seed on 2026-08-04.** The issue (#84) was created after the seeding run; the seed is the record of what was created, so an item missing from it is a hole in that record."
   }
 ]

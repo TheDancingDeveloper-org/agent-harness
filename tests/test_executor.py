@@ -1395,6 +1395,30 @@ def test_the_reviewer_is_told_the_diff_is_complete_and_which_checks_ran(
     assert "  true" in shown, "and which commands they were"
 
 
+def test_the_reviewer_is_told_scope_belongs_to_the_task(repo: Path, tmp_path: Path) -> None:
+    """Measured on rdpapp. An item declared two constants and said in as many
+    words that adopting them at the call sites was out of scope. The reviewer
+    verified every requirement, quoted the exclusion back, and rejected anyway
+    because "the repository still has the inconsistency the task described" —
+    overruling the plan author on scope, which is not its call."""
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+    )
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    shown = capturing.prompts["reviewer"]
+    assert "The task's scope is narrower than the problem." in shown
+    assert "a rejection is not" in shown
+
+
 def test_a_reviewer_with_no_checks_behind_it_is_told_so(repo: Path, tmp_path: Path) -> None:
     """Silence would let it assume there were some."""
     executor, queue, _ = build(

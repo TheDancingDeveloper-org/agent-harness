@@ -36,10 +36,27 @@ Both notations produce the same tokens, and the token grammar
 (`agent_harness.graph.parse_dependency`) is what says whether a target is
 local work, an external reference, a human decision or another project's
 work. A target the plan does not define is reported, never assumed.
+
+One of those keys is executable, and its syntax is deliberately narrow:
+
+    verify: ["python", "-m", "pytest", "-q", "tests/test_serials.py"]
+
+`verify:` is a **JSON array of argv strings**, never shell text. Adoption runs
+it to decide whether an item's work already exists, under the same rules as a
+project check — fixed argv, no shell, a timeout. A plan is a document people
+edit and paste into; letting it carry `&&`, redirection or globbing would make
+reading a plan equivalent to granting it a shell, and `verify: rm -rf build`
+would look no different from anything else on the page. A value that is not a
+non-empty JSON array of non-empty strings is refused rather than reinterpreted.
+
+It is also *per item*, and is not the project's check command: the project's
+checks say the tree is healthy, and `verify:` says one specific item is
+already delivered.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -73,7 +90,8 @@ _PLAIN_HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _CHECKBOX = re.compile(rf"^\s*[-*]\s+\[( |x|X)\]\s+(?:({ID}){_SEP}\s*)?(.+?)\s*$")
 _TABLE_ROW = re.compile(rf"^\|\s*({ID})\s*\|(.+)$")
 _META = re.compile(
-    r"^\s*(labels?|milestone|phase|depends[ _-]?on|size|risk)\s*:\s*(.+?)\s*$", re.IGNORECASE
+    r"^\s*(labels?|milestone|phase|depends[ _-]?on|size|risk|verify)\s*:\s*(.+?)\s*$",
+    re.IGNORECASE,
 )
 _TABLE_SEP = re.compile(r"^\|[\s:|-]+\|$")
 
@@ -98,6 +116,10 @@ class WorkItem:
     milestone: str | None = None
     depends_on: list[str] = field(default_factory=list)
     done: bool = False
+    #: Optional item-specific verification, from `verify:`. JSON argv, never
+    #: shell text, so adoption can run evidence without silently treating it
+    #: as a project check or granting a plan arbitrary shell syntax.
+    verification: list[str] | None = None
     #: Line number in the source plan, so a reader can find it again.
     line: int = 0
 
@@ -217,11 +239,13 @@ class ParsedPlan:
                     item.labels = sorted(set(item.labels) | set(current.labels))
                     item.milestone = item.milestone or current.milestone
                     item.depends_on = sorted(set(item.depends_on) | set(current.depends_on))
+                    item.verification = item.verification or current.verification
                 best[item.id] = item
             else:
                 current.labels = sorted(set(current.labels) | set(item.labels))
                 current.milestone = current.milestone or item.milestone
                 current.depends_on = sorted(set(current.depends_on) | set(item.depends_on))
+                current.verification = current.verification or item.verification
         return [best[i] for i in dict.fromkeys(item.id for item in self.items)]
 
     def unresolved_dependencies(self) -> dict[str, list[str]]:
@@ -441,6 +465,18 @@ def _apply_metadata(item: WorkItem) -> None:
             item.depends_on.extend(_split(value))
         elif key in ("size", "risk"):
             item.labels.append(f"{key}:{value.lower()}")
+        elif key == "verify":
+            try:
+                argv = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"item {item.id} verification must be a JSON argv array") from exc
+            if (
+                not isinstance(argv, list)
+                or not argv
+                or not all(isinstance(part, str) and part for part in argv)
+            ):
+                raise ValueError(f"item {item.id} verification must be a non-empty JSON argv array")
+            item.verification = argv
     item.body = "\n".join(kept).strip()
 
 

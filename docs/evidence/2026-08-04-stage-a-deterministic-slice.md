@@ -30,7 +30,7 @@ uv run pytest tests/test_stage_a_e2e.py tests/test_executor.py -q
 uv run pytest -q
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy src
+uv run mypy
 ```
 
 Observed after integration on 2026-08-04:
@@ -39,7 +39,7 @@ Observed after integration on 2026-08-04:
   scenarios and their failure/protocol matrices;
 - the combined Stage A and executor-context tests passed;
 - all 676 repository tests passed in 49.418 seconds wall-clock time;
-- lint, formatting and strict source typing passed.
+- lint, formatting and strict project typing passed.
 
 No sleeps wait for provider time in the fixture. The one slow-worker scenario
 uses short real thread scheduling intervals to exercise the lease heartbeat;

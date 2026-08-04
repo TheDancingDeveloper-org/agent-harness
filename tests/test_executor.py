@@ -1178,3 +1178,79 @@ def test_recounting_does_not_move_anything(repo: Path) -> None:
     assert [line for line in recounted.splitlines() if line.startswith(("+", "-", " "))] == [
         line for line in OVERCOUNTED_DIFF.splitlines() if line.startswith(("+", "-", " "))
     ]
+
+
+#: A patch that CREATES a file — the ordinary way to add a module. `new file
+#: mode` is emitted by git and was not recognised, so the validator called it
+#: corrupt body content and refused a perfectly good patch.
+NEW_FILE_DIFF = """\
+diff --git a/hello.txt b/hello.txt
+--- a/hello.txt
++++ b/hello.txt
+@@ -1 +1 @@
+-hello world
++hello harness
+diff --git a/added.py b/added.py
+new file mode 100644
+index 0000000..3e75765
+--- /dev/null
++++ b/added.py
+@@ -0,0 +1,2 @@
++def multiply(a, b):
++    return a * b
+"""
+
+
+def test_a_patch_that_creates_a_file_is_not_called_corrupt(repo: Path) -> None:
+    """The regression, found by running a real backlog: the first item that
+    tried to add a file failed with `line inside a hunk starts with 'n'`."""
+    problems = validate_diff(NEW_FILE_DIFF)
+
+    assert [p for p in problems if p.fatal] == [], [p.detail for p in problems]
+
+
+def test_that_patch_actually_applies(repo: Path) -> None:
+    """Guards the test above: a validator that accepts a patch git rejects is
+    no better than one that rejects a patch git accepts."""
+    applied, how = apply_diff(repo, NEW_FILE_DIFF)
+
+    assert applied, how
+    assert (repo / "added.py").read_text().startswith("def multiply")
+    assert (repo / "hello.txt").read_text() == "hello harness\n"
+
+
+def test_a_patch_that_deletes_a_file_is_not_called_corrupt() -> None:
+    deletion = """\
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+index 3e75765..0000000
+--- a/gone.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-gone
+"""
+    assert [p for p in validate_diff(deletion) if p.fatal] == []
+
+
+def test_a_rename_is_not_called_corrupt() -> None:
+    rename = """\
+diff --git a/old.txt b/new.txt
+similarity index 100%
+rename from old.txt
+rename to new.txt
+"""
+    assert [p for p in validate_diff(rename) if p.fatal] == []
+
+
+def test_a_no_newline_marker_does_not_shorten_a_recount() -> None:
+    """It annotates the line above and counts towards neither side."""
+    marked = """\
+diff --git a/hello.txt b/hello.txt
+--- a/hello.txt
++++ b/hello.txt
+@@ -1,1 +1,1 @@
+-hello world
++hello harness
+\\ No newline at end of file
+"""
+    assert recount_hunks(marked) == marked

@@ -912,6 +912,7 @@ class WorkQueue:
         branch: str | None = None,
         pr_url: str | None = None,
         owner: str | None = None,
+        consume_attempt: bool = True,
         project_id: str = DEFAULT_PROJECT,
     ) -> bool:
         """Finish with an item. `state` is done, failed, blocked or pending
@@ -926,6 +927,12 @@ class WorkQueue:
         and leaves the new owner running with nothing left to release. The
         guard makes the late report a no-op, which is what it is.
 
+        ``consume_attempt=False`` returns work that could not be attempted at
+        all, notably when every route is out of spend budget. A cap is an
+        endpoint condition, not a failed item attempt; counting it would
+        retire sound work merely because it was repeatedly claimed while no
+        provider could serve it.
+
         `heartbeat` has always guarded on owner. Without the same guard here,
         the lease only held against the half of the race that asked politely.
 
@@ -938,12 +945,14 @@ class WorkQueue:
         try:
             sql = (
                 "UPDATE work SET state = ?, owner = NULL, lease_until = 0, "
+                "attempts = CASE WHEN ? THEN attempts ELSE MAX(0, attempts - 1) END, "
                 "last_error = ?, branch = COALESCE(?, branch), "
                 "pr_url = COALESCE(?, pr_url), updated_at = ? "
                 "WHERE project_id = ? AND item_id = ?"
             )
             params: list[Any] = [
                 state,
+                consume_attempt,
                 error,
                 branch,
                 pr_url,

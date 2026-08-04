@@ -377,9 +377,11 @@ def test_a_full_pass_commits_on_a_branch(repo: Path, tmp_path: Path) -> None:
     assert "hello harness" in git(repo, "show", "harness/t1:hello.txt")
 
 
-def test_the_commit_records_the_item_and_the_verdict(repo: Path, tmp_path: Path) -> None:
-    """So a commit can be traced back to the work that asked for it and the
-    review that let it through, without the dashboard."""
+def test_the_checkpoint_commit_records_the_item_without_claiming_a_verdict(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The commit is durable before review, so it records provenance while
+    being explicit that no verdict existed at checkpoint time."""
     executor, queue, _ = build(
         repo,
         tmp_path,
@@ -392,7 +394,8 @@ def test_the_commit_records_the_item_and_the_verdict(repo: Path, tmp_path: Path)
     executor.run_once()
     message = git(repo, "log", "-1", "--format=%B", "harness/t1")
     assert "harness-item: T1" in message
-    assert "Looks right" in message
+    assert "Reviewed: not yet" in message
+    assert "Looks right" not in message
 
 
 def test_cheap_checks_run_before_the_expensive_review(repo: Path, tmp_path: Path) -> None:
@@ -431,7 +434,7 @@ def test_a_failing_check_reports_the_output_not_just_failure(repo: Path, tmp_pat
     assert "the-actual-error" in outcome.reason
 
 
-def test_a_rejected_review_does_not_commit(repo: Path, tmp_path: Path) -> None:
+def test_a_rejected_review_keeps_an_unreviewed_checkpoint(repo: Path, tmp_path: Path) -> None:
     executor, queue, _ = build(
         repo,
         tmp_path,
@@ -445,7 +448,10 @@ def test_a_rejected_review_does_not_commit(repo: Path, tmp_path: Path) -> None:
     assert outcome is not None
     assert outcome.state == FAILED
     assert "wrong string" in outcome.reason
-    assert git(repo, "branch", "--list", "harness/t1").strip() == ""
+    assert git(repo, "branch", "--list", "harness/t1").strip()
+    message = git(repo, "log", "-1", "--format=%B", "harness/t1")
+    assert "Reviewed: not yet" in message
+    assert "APPROVED" not in message
 
 
 def test_a_failed_attempt_leaves_the_tree_clean(repo: Path, tmp_path: Path) -> None:
@@ -461,8 +467,8 @@ def test_a_failed_attempt_leaves_the_tree_clean(repo: Path, tmp_path: Path) -> N
     add_item(queue)
     executor.run_once()
     assert git(repo, "status", "--porcelain").strip() == ""
-    assert (repo / "hello.txt").read_text() == "hello world\n"
-    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+    assert (repo / "hello.txt").read_text() == "hello harness\n"
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip() == "harness/t1"
 
 
 def test_an_implementer_that_returns_no_diff_fails_the_item_cheaply(
@@ -610,11 +616,19 @@ def test_a_broken_event_sink_does_not_fail_the_item(repo: Path, tmp_path: Path) 
 def test_a_pr_is_opened_and_linked_to_the_issue(repo: Path, tmp_path: Path) -> None:
     class FakeGitHub:
         def __init__(self) -> None:
-            self.calls: list[dict[str, str]] = []
+            self.calls: list[dict[str, Any]] = []
+            self.comments: list[str] = []
+            self.ready: list[str] = []
 
-        def create_pr(self, **kw: str) -> str:
+        def create_pr(self, **kw: Any) -> str:
             self.calls.append(kw)
             return "https://github.com/o/r/pull/9"
+
+        def comment_pr(self, pr: str, body: str) -> None:
+            self.comments.append(body)
+
+        def mark_pr_ready(self, pr: str) -> None:
+            self.ready.append(pr)
 
     github = FakeGitHub()
     executor, queue, _ = build(
@@ -631,7 +645,9 @@ def test_a_pr_is_opened_and_linked_to_the_issue(repo: Path, tmp_path: Path) -> N
     assert outcome is not None
     assert outcome.pr_url == "https://github.com/o/r/pull/9"
     assert "Closes #7" in github.calls[0]["body"]
-    assert "fine" in github.calls[0]["body"]  # the verdict travels with it
+    assert github.calls[0]["draft"] is True
+    assert "fine" in github.comments[0]  # the verdict travels with it
+    assert github.ready == ["https://github.com/o/r/pull/9"]
 
 
 def test_a_pr_failure_does_not_lose_the_committed_work(repo: Path, tmp_path: Path) -> None:

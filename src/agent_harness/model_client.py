@@ -594,7 +594,31 @@ class ModelClient:
                     self.sleep(parked)
 
                 started = self.now()
-                response = self.transport(route, messages, merged)
+                try:
+                    response = self.transport(route, messages, merged)
+                except (ConnectionError, TimeoutError) as exc:
+                    # Wire failures have no HTTP response for a provider to
+                    # classify. They are nevertheless transient in the one
+                    # useful, vendor-neutral sense: the same request may
+                    # succeed when the connection is available again. Keep
+                    # them inside the ordinary per-worker retry ladder so a
+                    # timeout cannot escape as an item failure or create any
+                    # fleet-wide state.
+                    latency = self.now() - started
+                    last = Classification(
+                        P.TRANSIENT,
+                        f"{type(exc).__name__}: {str(exc)[:300]}",
+                    )
+                    kinds.append(last.kind)
+                    self._emit(
+                        role,
+                        route,
+                        "error",
+                        last,
+                        attempt=attempt,
+                        latency=latency,
+                    )
+                    continue
                 latency = self.now() - started
 
                 if 200 <= response.status < 300:

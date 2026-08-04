@@ -134,6 +134,7 @@ graph LR
 
     subgraph model["Talking to models"]
         mc["model_client.py<br/>role → model routing<br/>per-worker jittered retry"]
+        proto["protocols.py<br/>route presets:<br/>wire · auth · reader · classifier<br/><i>resolved by name</i>"]
         prov["providers.py<br/>classify a failure:<br/>burst · window · cap · refused"]
         price["pricing.py<br/>tokens + the price applied"]
     end
@@ -149,7 +150,7 @@ graph LR
 
     plan --> gh --> work
     work --> fleet --> sx & ex
-    sx & ex --> mc --> prov & price
+    sx & ex --> mc --> proto --> prov & price
     sx & ex --> store & audit
     maint --> audit
     recon --> audit
@@ -165,6 +166,7 @@ graph LR
 | `session_executor` | Runs an item as a CLI agent in an attachable terminal |
 | `executor` | The same loop for direct API calls, plus the diff-apply tolerance ladder |
 | `model_client` | Routes **roles** to models; per-worker jittered retry; per-endpoint parking |
+| `protocols` | What a route is made of — wire protocol, auth, response reader, classifier — and the registry that resolves a preset by name without importing an adapter |
 | `providers` | Classifies a failure — burst limit vs spent window vs spent cap vs refused |
 | `pricing` | Token usage, and the price that was applied to it |
 | `audit` | Append-only history, its own database, no mutation surface |
@@ -216,7 +218,7 @@ mid-item releases its work by doing nothing.
 flowchart TD
     req["model call"] --> code{"HTTP status"}
     code -->|2xx| ok["record usage + cost"]
-    code -->|429 / 5xx| classify["providers.classify<br/>read the vendor envelope"]
+    code -->|429 / 5xx| classify["route.classifier.classify<br/>from the route's preset"]
 
     classify --> rpm["rpm<br/><i>going too fast</i>"]
     classify --> window["window_cap<br/><i>5-hour budget gone</i>"]
@@ -242,6 +244,16 @@ together, which is precisely the shape a rate limiter exists to reject.
 
 So: classify first, never retry a cap, keep every reaction **per worker and
 per endpoint**, and jitter the backoff.
+
+**Which classifier reads it is a property of the route, not of this diagram.**
+A route names a preset, and the preset supplies the wire protocol, the
+authentication strategy, the response reader and the classifier together — so a
+gateway that states its reasons in a body brings the reader for them along with
+the shape it speaks. The core preset is generic and can only see HTTP, which
+means it calls a spend cap `rpm`; that is a documented limit rather than a bug,
+and `tests/test_route_conformance.py` asserts it as one. Adding a vendor is a
+preset registered by name, with no core module changed and none importing it —
+see [`INTERNALS.md`](INTERNALS.md#route-presets-adding-a-vendor-without-touching-core).
 
 ---
 

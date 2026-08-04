@@ -1201,8 +1201,7 @@ class Executor:
             detail=json.dumps(
                 {
                     "targets": [
-                        {"path": target.path, "reason": target.reason}
-                        for target in planner.targets
+                        {"path": target.path, "reason": target.reason} for target in planner.targets
                     ],
                     "cannot_identify_target": planner.cannot_identify_target,
                     "uncertainties": list(planner.uncertainties),

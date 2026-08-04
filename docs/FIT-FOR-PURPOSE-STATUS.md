@@ -1,6 +1,21 @@
 # Fit-for-purpose programme — status and handoff
 
-**Frozen:** 2026-08-04. **Read this before doing any work on the proposal.**
+**Frozen:** 2026-08-04. **Updated 2026-08-04 after Stage F.**
+**Read this before doing any work on the proposal.**
+
+> **Stage F has since landed and this document's §1, §4 and §6 are out of
+> date where they say nothing is merged.** All four stage branches are merged
+> into `fix/validator-rejects-valid-patches` at `a33fd84`; the merged tree
+> passes all four gates at **895 tests**. The merged-tree verification this
+> document called the next work has been done, and its report is
+> [`evidence/2026-08-04-stage-f-integration.md`](evidence/2026-08-04-stage-f-integration.md),
+> which supersedes §6 below and records one semantic divergence between
+> Stages B and G that a clean auto-merge hid. §4's per-branch test counts
+> remain correct as history and remain not additive; **895 is the number**.
+> Stage D is still not started and Stage 8 is still blocked. The sequencing
+> from here is
+> [`PROPOSAL-2026-08-finish-then-extend.md`](PROPOSAL-2026-08-finish-then-extend.md)
+> §3.
 
 This document is the pickup point for
 [`PROPOSAL-2026-08-fit-for-purpose.md`](PROPOSAL-2026-08-fit-for-purpose.md).

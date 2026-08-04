@@ -1,6 +1,16 @@
 # Agent coordination and oversight
 
-Status: proposed, not implemented. Written 2026-08-03.
+Status: written 2026-08-03. **Partly implemented — updated 2026-08-04.**
+
+| Section | State |
+|---|---|
+| **§8 Typed work graph** | **Built** (Stage G). `src/agent_harness/graph.py`, with a schema migration in [`MIGRATION-graph.md`](MIGRATION-graph.md) and five divergences from this text listed in `evidence/2026-08-04-stage-g-graph-contract.md`. |
+| §5's `talk ask --wait`, as an *item-level hold* | **Partly built** (Stage J). `src/agent_harness/holds.py` gives a durable, transferable hold with a maximum duration. It is **not** the protocol in §5: there is no room, no ledger entry and no agent-to-agent message. |
+| §4 message ledger, §5 rooms and protocol, §6 oversight actor, §7 command service, §9 publication boundary | **Proposed, not implemented.** |
+
+§8's own rule — *a required target the graph cannot resolve is a blocker* — is
+live and enforced in both executors. Everything else below should still be read
+as a proposal.
 
 This document proposes a first-class coordination plane through which agents
 can speak to one another, an oversight agent can direct traffic, and the

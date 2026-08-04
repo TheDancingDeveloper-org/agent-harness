@@ -121,15 +121,25 @@ instead, and reaped later if nobody comes back to it.
 ```mermaid
 graph LR
     subgraph ingest["Getting work in"]
+        inc["inception.py<br/>paragraph → PLAN.md<br/><i>never queue rows</i>"]
         plan["plan.py<br/>markdown → items<br/><i>reports what it could NOT read</i>"]
+        adopt["adoption.py<br/>what is already done<br/><i>proposes, never decides</i>"]
         gh["github.py<br/>items → issues<br/><i>idempotent, marker-matched</i>"]
     end
 
     subgraph core["Doing the work"]
         work["work.py<br/>queue, leases, projects<br/>control per project"]
+        graph["graph.py<br/>typed dependencies<br/><i>unresolved = blocked</i>"]
         fleet["fleet.py<br/>worker pool per project"]
         sx["session_executor.py<br/>agent in a terminal"]
         ex["executor.py<br/>direct API calls"]
+    end
+
+    subgraph govern["Deciding and bounding"]
+        out["outcomes.py<br/>what a gate answered<br/>what stopped an item"]
+        att["attempts.py<br/>where an attempt got to<br/><i>resume, do not re-pay</i>"]
+        bud["budgets.py<br/>wall clock · spend<br/><i>per item</i>"]
+        hold["holds.py<br/>waiting on a person"]
     end
 
     subgraph model["Talking to models"]
@@ -148,27 +158,51 @@ graph LR
 
     api["api.py<br/>documented HTTP + OpenAPI"]
 
+    inc --> plan
+    adopt --> work
     plan --> gh --> work
+    work --> graph
     work --> fleet --> sx & ex
     sx & ex --> mc --> proto --> prov & price
+    sx & ex --> out & att & bud & hold
     sx & ex --> store & audit
     maint --> audit
     recon --> audit
-    api --- work & audit & fleet
+    api --- work & audit & fleet & hold
 ```
+
+**`doctor.py`** sits outside all of it and reads: route completeness, resolved
+protocol and classifier, checkout, whether a check command can even start,
+reviewer independence, cost visibility, budgets, and whether anything here can
+mutate GitHub. It contacts nothing. **`demo.py`** builds a whole one of these
+in a temporary directory with a scripted transport, which is how the first-run
+path needs no credentials.
+
+**`adapters/otlp.py`** projects the event stream to OpenTelemetry spans, opt-in
+and export-only. It is deliberately not in any subgraph above: nothing reads
+back from it.
 
 | Module | Job |
 |---|---|
+| `inception` | A paragraph → a proposed scope you argue with → a `PLAN.md`. Blocking questions refuse approval; nothing external exists until you approve |
 | `plan` | Markdown → work items, reporting what it could **not** read |
+| `adoption` | A project already part-built → a proposal about what is already done, ranked by evidence. **Nothing is dropped unless a human names it** |
 | `github` | Items → issues, idempotently; re-running an edited plan updates rather than duplicates |
 | `work` | The queue. Claims are **leases**; projects, control state, `max_attempts` |
+| `graph` | Typed dependencies. A required target it cannot resolve **blocks** rather than being assumed satisfied |
 | `fleet` | One worker pool per project, so no project starves another |
 | `session_executor` | Runs an item as a CLI agent in an attachable terminal |
 | `executor` | The same loop for direct API calls, plus the diff-apply tolerance ladder |
 | `model_client` | Routes **roles** to models; per-worker jittered retry; per-endpoint parking |
 | `protocols` | What a route is made of — wire protocol, auth, response reader, classifier — and the registry that resolves a preset by name without importing an adapter |
 | `providers` | Classifies a failure — burst limit vs spent window vs spent cap vs refused |
-| `pricing` | Token usage, and the price that was applied to it |
+| `pricing` | Token usage, and the price that was applied to it. **Unknown is never zero** |
+| `outcomes` | What a gate answered (five check outcomes) and what stopped an item (five dispositions). Not `providers` — that is what a *provider* answered |
+| `attempts` | One durable row per stage an attempt reached, so a killed worker resumes rather than re-paying for the planner and implementer |
+| `budgets` | Per-item wall-clock and spend ceilings. **Not** a provider cost cap, and never parks an endpoint |
+| `holds` | An item waiting on a person: durable, survives worker death, answerable from any process |
+| `preflight` | Whether a project could finish an item at all — refuses a start rather than failing every item |
+| `doctor` | The same questions, asked earlier and for the whole deployment, spending nothing |
 | `audit` | Append-only history, its own database, no mutation surface |
 | `maintenance` | Rolls up complete days, then thins what is covered |
 | `reconcile` | Merged / closed / reverted, fetched from GitHub |
@@ -342,11 +376,23 @@ what makes the reviewer cynical, and how merges and reverts are reconciled.
 
 ## 9. What is not built yet
 
+Corrected 2026-08-04. Project inception used to be listed here as designed and
+not built; it **is** built (`inception.py`, and `docs/USAGE.md` §0b), though it
+is reachable only over the API and has no CLI subcommand.
+
 - **The Work tab renders 2 of ~20 endpoints.** Board, item detail, live event
   feed, fleet controls, role editor and the rate-limit dashboard are designed
   (`MULTI-PROJECT-PLAN.md` §5) and not built.
-- **Project inception** — describe a project in a paragraph, argue with the
-  proposal, then have it create the repo and backlog — is designed
-  (§6) and not built.
+- **The coordination plane is one section of nine.** The typed work graph
+  (`COORDINATION-PLANE.md` §8) is built. The message ledger, rooms, the
+  oversight actor and `talk ask --wait` are **proposed and not built** — the
+  durable hold in `holds.py` is the item-level piece only.
+- **Session mode has no resumable attempts and no per-item budgets.** Both are
+  the direct-API executor only.
+- **Telemetry has never reached a collector.** The projection to spans is
+  tested; the OTLP wire has never executed, and nothing flushes the tracer on
+  exit.
 - **The harness has never driven a real agent against a real provider.** Every
-  path is tested; none is proven.
+  path is tested; none is proven. That is the whole of Stage 8 and it is
+  blocked on credentials, network, a real second repository and decisions this
+  repository will not make by assertion.

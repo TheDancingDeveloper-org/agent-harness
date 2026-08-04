@@ -1,6 +1,18 @@
 # Multi-project harness and a real Work GUI
 
-Status: proposed, not started. Written 2026-08-02.
+Status: written 2026-08-02. **Partly implemented — updated 2026-08-04.**
+
+| Phase | State |
+|---|---|
+| §2 Phase 0 — correctness, unattended running | **Largely built.** Leases, per-project control, preflight, the reaper and the audit layer are live. Unattended running itself is **unproven** — no long run has happened. |
+| §3 Phase 1 — project as a scope | **Built.** Projects are first-class, with their own checkout, checks, roles, budgets and control state. |
+| §4 Phase 2 — separate streams, explicitly resumed | **Built.** One worker pool per project; a project starts `stopped` and only a human starts it. |
+| §5 Phase 3 — the GUI worth having | **Not built**, and not built *here* — the GUI belongs to the session host, per `AGENTS.md`. |
+| §6 Phase 4 — project inception | **Built**, over the API only: `src/agent_harness/inception.py`, worked example in [`USAGE.md`](USAGE.md) §0b. There is no `agent-harness inception` subcommand. |
+| §7 Phase 5 — operational depth | **Partly built.** Per-item budgets, resumable attempts, a typed outcome taxonomy and durable holds landed in 2026-08; telemetry export is opt-in and has never reached a collector. |
+
+Taking on a project that is **already part-built** is not a phase in this
+document and was added later: `agent-harness adopt`, [`USAGE.md`](USAGE.md) §0c.
 
 This supersedes nothing. It adds the concept the harness has never had — a
 **project** — and builds the GUI that concept makes possible.

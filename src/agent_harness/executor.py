@@ -1140,18 +1140,28 @@ Checks: {checks}
 
 First line exactly APPROVED or REJECTED. Then, in order:
 
-1. **What I verified** — the specific things in the diff you actually checked
-   against the task. If you cannot name any, that is a REJECTED.
-2. **What I could not verify** — anything the diff claims that the diff alone
-   does not show. Say it, do not assume it.
+1. **What I verified** — the specific things you actually checked against the
+   task. If you cannot name any, that is a REJECTED.
+2. **What I could not verify** — anything the change claims that *what you were
+   given* does not show. Say it, do not assume it.
+
+   **Read the files above before writing this section.** They are the touched
+   files in full, at their post-change state, so questions like "is this the
+   only caller", "is there another path that bypasses it" and "does this
+   signature fit its callers" are answerable — answer them. Only a file listed
+   as not included is genuinely unavailable to you, and "the diff does not
+   show it" is not a reason when the file does.
 3. **Why** — one paragraph.
 
 ## Reject if
 
 - It does not do what the task asked, or does more than the task asked.
-- It claims an effect the diff does not demonstrate.
+- It claims an effect the change does not demonstrate.
 - It changes something unrelated, however small.
-- The task cannot be judged from what you were given.
+- The task cannot be judged from what you were given — but only after you have
+  looked at what you were given. Wanting evidence that was in front of you is
+  not grounds to reject, and neither is wanting evidence the task did not ask
+  for.
 
 Approving work that does not do what was asked is the expensive failure here:
 it reaches a pull request, a human reads it as reviewed, and the cost lands

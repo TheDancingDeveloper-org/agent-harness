@@ -81,13 +81,15 @@ def _plan(args: argparse.Namespace) -> int:
         return 2
 
     items = plan.deduplicated()
-    unresolved = plan.unresolved_dependencies()
-    if unresolved:
-        # Not fatal: a dependency on work tracked elsewhere is legitimate.
-        # Silence is not, because a typo would block an item forever.
-        print("warning: dependencies naming unknown items:", file=sys.stderr)
-        for item_id, missing in sorted(unresolved.items()):
-            print(f"  {item_id} -> {', '.join(missing)}", file=sys.stderr)
+    dependencies = plan.dependency_report()
+    if dependencies.lines():
+        # Not fatal at sync time -- this command writes GitHub issues, and the
+        # queue is where admission is decided. But every line here is
+        # something that WILL hold work back, and saying so before the issues
+        # exist is cheaper than explaining a stalled queue afterwards.
+        print("dependencies:", file=sys.stderr)
+        for line in dependencies.lines():
+            print(f"  {line}", file=sys.stderr)
 
     print(f"{len(items)} work items, {len(plan.skipped)} headings skipped as narrative")
     try:
@@ -108,6 +110,63 @@ def _plan(args: argparse.Namespace) -> int:
             + ", ".join(report.orphaned)
         )
     return 0
+
+
+def _graph(args: argparse.Namespace) -> int:
+    """Inspect, back up or rebuild the dependency graph.
+
+    The rebuild/export half of this command is the operational half of
+    `docs/MIGRATION-graph.md`. "The queue is disposable" is a statement about
+    what the queue means, not a licence to assume an in-place upgrade is
+    safe, so there has to be a supported way to take a copy that outlives the
+    schema and a supported way to re-derive the graph from it.
+    """
+    import json as _json
+
+    from .work import WorkQueue
+
+    queue = WorkQueue(args.db)
+
+    if args.action == "checkpoint":
+        queue.checkpoint()
+        print(f"{args.db}: WAL folded back into the database file")
+        return 0
+
+    if args.action == "export":
+        payload = _json.dumps(queue.graph.export(), indent=2, sort_keys=True)
+        if args.out:
+            args.out.write_text(payload + "\n")
+            print(f"wrote {args.out}")
+        else:
+            print(payload)
+        return 0
+
+    if args.action == "rebuild":
+        revisions = queue.graph.rebuild(args.project)
+        if not revisions:
+            print("nothing to rebuild: no work rows")
+            return 0
+        for project, revision in sorted(revisions.items()):
+            print(f"{project}: graph rebuilt, now at revision {revision}")
+        return 0
+
+    projects = [args.project] if args.project else [p.project_id for p in queue.projects()]
+    if not projects:
+        print("no projects")
+        return 0
+    blocked = 0
+    for project in projects:
+        report = queue.graph.report(project)
+        print(f"{project}: revision {report.revision}, {len(report.edges)} edges")
+        print(f"  ready: {', '.join(report.ready) or '(none)'}")
+        for cycle in report.cycles:
+            print("  cycle: " + " -> ".join([*cycle, cycle[0]]))
+        for state in report.not_ready:
+            blocked += 1
+            print(f"  {state.item_id}: {state.explain()}")
+    # A non-zero exit only when something is actually held back, so this is
+    # usable as a gate in a script without parsing the text.
+    return 0 if blocked == 0 else 4
 
 
 def _describe(event: dict[str, Any]) -> str:
@@ -469,6 +528,29 @@ def main(argv: list[str] | None = None) -> int:
         help="sync anyway when the plan states an id twice (the richest description wins)",
     )
 
+    p_graph = sub.add_parser(
+        "graph",
+        help="inspect, export, rebuild or checkpoint the dependency graph",
+    )
+    p_graph.add_argument(
+        "action",
+        choices=("report", "export", "rebuild", "checkpoint"),
+        help="report: why each item is or is not ready. export: a JSON backup that "
+        "outlives this schema. rebuild: re-derive every edge from work.depends_on. "
+        "checkpoint: fold the WAL back into the database file before a backup.",
+    )
+    p_graph.add_argument(
+        "--project",
+        metavar="ID",
+        help="limit to one project (default: every project)",
+    )
+    p_graph.add_argument(
+        "--out",
+        type=Path,
+        metavar="FILE",
+        help="where `export` writes its JSON (default: stdout)",
+    )
+
     p_run = sub.add_parser("run", help="execute claimed work items")
     p_run.add_argument(
         "--repo",
@@ -641,6 +723,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         return _run(args)
+
+    if args.command == "graph":
+        return _graph(args)
 
     store = EventStore(args.db)
 

@@ -1,9 +1,9 @@
 # Evidence package: first sustained NGMS workload, 2026-08-03/04 (v1)
 
-**Evidence package ID:** `ngms-first-sustained-2026-08-03-04-v1`  
-**Report version:** 1  
-**Report date:** 2026-08-04  
-**Observation window:** 2026-08-03 through 2026-08-04 UTC  
+**Evidence package ID:** `ngms-first-sustained-2026-08-03-04-v1`
+**Report version:** 1
+**Report date:** 2026-08-04
+**Observation window:** 2026-08-03 through 2026-08-04 UTC
 **Status:** historical reconstruction; raw run artifacts are not retained here
 
 ## Decision

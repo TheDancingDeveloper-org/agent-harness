@@ -537,3 +537,64 @@ def test_an_upgraded_database_reports_no_disposition_rather_than_a_wrong_one(
     assert record.attempts == 3, "the upgrade did not lose what was there"
     assert record.disposition == ""
     assert record.reason_kind == ""
+
+
+# ------------------------------------------- a fix declared on the project
+
+
+def test_a_project_can_declare_a_fix_and_it_survives_a_round_trip(tmp_path: Path) -> None:
+    """The shape `docs/USAGE.md` §6b documents, through the API that serves it."""
+    import tempfile
+
+    from fastapi.testclient import TestClient
+
+    from agent_harness.api import create_api
+    from agent_harness.store import EventStore
+
+    queue = make_queue(str(tmp_path / "w.sqlite"))
+    store = EventStore(Path(tempfile.mkdtemp()) / "e.sqlite")
+    spec = {
+        "project_id": "widgets",
+        "name": "Widgets",
+        "checks": ["ruff format --check ."],
+        "fixes": {"ruff format --check .": ["ruff", "format", "."]},
+    }
+    with TestClient(create_api(store, queue=queue, token="t")) as client:  # noqa: S106
+        auth = {"Authorization": "Bearer t"}
+        created = client.post("/api/projects", json=spec, headers=auth)
+        assert created.status_code in (200, 201), created.text
+        read = client.get("/api/projects/widgets", headers=auth)
+        assert read.status_code == 200, read.text
+        assert read.json()["project"]["fixes"] == spec["fixes"]
+
+    from agent_harness.runtime import _checks_for
+
+    project = queue.get_project("widgets")
+    assert project is not None
+    checks = _checks_for(project)
+    assert checks.fixes == {"ruff format --check .": ["ruff", "format", "."]}
+
+
+def test_a_fix_for_a_command_that_is_not_a_check_is_refused() -> None:
+    """Dead configuration, almost always a typo, and a fix that silently never
+    applies is worse than no fix because somebody believes it is there."""
+    import pydantic
+
+    from agent_harness.schemas import ProjectSpec
+
+    with pytest.raises(pydantic.ValidationError, match="not checks"):
+        ProjectSpec(
+            project_id="p",
+            name="P",
+            checks=["pytest -q"],
+            fixes={"ruff format --check .": ["ruff", "format", "."]},
+        )
+
+
+def test_an_empty_fix_is_refused() -> None:
+    import pydantic
+
+    from agent_harness.schemas import ProjectSpec
+
+    with pytest.raises(pydantic.ValidationError, match="non-empty argv"):
+        ProjectSpec(project_id="p", name="P", checks=["pytest -q"], fixes={"pytest -q": []})

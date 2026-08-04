@@ -512,6 +512,39 @@ They follow D1–D10's numbering.
 |---|---|---|
 | **D11** | Does a resumed attempt consume a new attempt, or continue the existing one? | Stage H. It decides whether `max_attempts` bounds crashes or bounds genuine failures, and whether cost is attributed to one attempt or several. |
 | **D12** | Does a human hold suspend the lease or release the claim? | Stage J. Suspending keeps the worktree and context; releasing frees the worker. They cannot both be true. |
+
+### 11.1 Rulings, 2026-08-04
+
+Recorded here because this document is not append-only and these were answered
+by decision, not by argument. Each stage's evidence report restates the ruling
+it was built under.
+
+**D11 — resolved: a resumed attempt continues the existing one.** A crash is
+not a failure of the work, so `max_attempts` bounds genuine failures, which is
+what it reads like it means, and the whole cost of one item's attempt stays
+attributed to one attempt. **The consequence is named rather than hidden:** an
+item that crashes in a loop is then bounded by Stage L's budgets and by nothing
+else. Stage L stops being a nice-to-have and becomes the thing that closes this
+hole; until it lands, a crash loop is bounded only by the operator noticing.
+
+**D12 — resolved: a hold suspends the lease and keeps the claim.** The worktree
+and the context survive, so answering resumes where the item stopped — the
+reasoning `work.py` already gives about pause semantics, that stopping mid-item
+destroys context and leaves a half-finished worktree, applies unchanged to a
+hold. The item is not eligible for another worker while held. **The cost is
+named:** a worker slot is tied up for the whole hold, so the configured maximum
+hold duration in §9.2 is not optional decoration — it is what stops one
+unanswered question from consuming a worker indefinitely.
+
+**Stage D — go-ahead given, 2026-08-04.** The deferral in
+`FIT-FOR-PURPOSE-STATUS.md` §3 is lifted. Specification unchanged: §8 of the
+original proposal, acceptance §8.4.
+
+D13 and D14 are not asked as questions because this document already answers
+them and the answers are the safe ones: telemetry is export-only (§10.2), and
+budget ceilings default to unlimited so an existing database upgrades with no
+behaviour change (§8.2). They are recorded as open only so that they are not
+decided by accident later.
 | **D13** | Is telemetry export-only, or may an exporter ever be the sole record of an event? | Stage M. The safe answer is export-only; asking it explicitly stops it being decided by accident. |
 | **D14** | Which budget ceilings, if any, are enforced by default on a new project? | Stage L. Unlimited is safe on upgrade and unsafe on a 7-day unattended run. |
 

@@ -4,7 +4,9 @@
 
 ## Configuration under test
 
-- Commit: working tree based on `6a909a7962a8b9afb2750c61c81f9b1f6c5db4f0`.
+- Implementation commit: `9e73aaa` plus the follow-up safety/format commits
+  `28cb0d4` and `e76ba43`, based on
+  `6a909a7962a8b9afb2750c61c81f9b1f6c5db4f0`.
 - Executor: direct API `Executor` with a local scripted transport.
 - Context policy: 600-character fixture budget; structured planner target
   `SECURITY.md`; no network, provider route, GitHub mutation or push.

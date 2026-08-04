@@ -7,6 +7,15 @@ work, and everything skipped is reported so you can see what was left out.
 
 More narrative. Not work.
 
+## Dependencies
+
+The graph can be stated in one place instead of repeated per item. The arrow
+follows the work: `W1 -> W3` means W3 waits for W1.
+
+```dependencies
+W1 -> W3
+```
+
 ### W1: Add a serial-number column
 
 Add a `serial` column to the widgets table, unique and non-null, with a
@@ -27,5 +36,15 @@ labels: area:api
 
 Add the serial to the widget list response and its test.
 
-depends on: W1
+Its dependency on W1 is declared by the arrow block above rather than here.
+
 labels: area:api
+
+### W4: Announce the change
+
+Update the changelog once the tracking issue is closed. An external target has
+to name its kind and its resolver: nothing here can see the other system, so
+`unresolved` is a blocker rather than an assumption.
+
+depends on: W3, external:github-issue:owner/name#42
+labels: area:docs

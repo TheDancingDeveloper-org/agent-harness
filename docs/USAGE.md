@@ -1057,6 +1057,75 @@ refuses to imply a per-class delta that does not exist.
 per-minute ceiling allows. Retry tuning will not fix that; fleet concurrency
 is the lever.
 
+### 6a. Why an item is in the state it is in
+
+The classes above are what a **provider** answered. They say nothing about what
+a **gate** answered, and those are different questions — a gateway's opinion
+about your budget and a test suite's opinion about a diff are not the same kind
+of fact.
+
+`failed` covers a reviewer's rejection and a crashed worker alike. One is the
+system working and the other is the system broken, and they want opposite
+responses. So every item also carries a `disposition` and a `reason_kind`:
+
+```bash
+curl -sH "Authorization: Bearer $TOKEN" 'localhost:8099/api/work/T4' \
+  | jq '{state, disposition, reason_kind, attempts, last_error}'
+```
+
+```json
+{
+  "state": "failed",
+  "disposition": "refused",
+  "reason_kind": "review_rejected",
+  "attempts": 1,
+  "last_error": "review rejected: …"
+}
+```
+
+| Disposition | Means | What you should look at |
+|---|---|---|
+| `completed` | It is done | Nothing |
+| `refused` | A gate said no about **this item's work** | The diff, or the brief |
+| `crashed` | The worker or harness broke; nothing judged the work | The harness |
+| `withheld` | Never attempted, or discarded through no fault of the item | The provider, the budget, or the plan |
+| `escalated` | A person has to resolve something | The machine |
+| *(empty)* | Nobody has finished with it yet | Nothing. **Not a sixth disposition.** |
+
+`reason_kind` is the specific one, as a token rather than English so a client
+can branch on it: `checks_failed`, `check_escalated`, `check_transient`,
+`review_rejected`, `patch_rejected`, `no_target`, `worker_error`,
+`provider_exhausted`, `budget_exhausted`, `dependency_invalidated`,
+`agent_timeout`, `claim_lost`.
+
+### 6b. A check has five answers, not two
+
+`Checks` classifies **how the subprocess ended**, never what your project's
+output said — guessing at another ecosystem's messages is how a generic harness
+stops being one.
+
+| Outcome | When | What happens |
+|---|---|---|
+| `pass` | exit 0 | On to the reviewer |
+| `fail` | exit non-zero | The item is refused. Costs an attempt. |
+| `fix_available` | exit non-zero, **and** you declared a fix for that command | The item is refused, and the fix is **recorded in the event stream and never run** |
+| `retry` | the command did not finish in time | The item goes back to pending. **Costs no attempt** — the question was not answered, which is not the answer being no |
+| `escalate` | the program is not installed, or the disk is full | The item is **blocked**. No diff fixes that and no retry clears it |
+
+Declaring a fix, per project:
+
+```json
+{"checks": ["ruff format --check ."], "fixes": {"ruff format --check .": ["ruff", "format", "."]}}
+```
+
+It is recorded, not applied. A gate that silently repaired what it was meant to
+catch could not be trusted to have caught anything; applying it is a decision
+with its own consequences.
+
+`escalate` is an **additional** outcome and never a softer `fail`. A check
+cannot reach for it to avoid failing an item, and an escalating check still
+stops the item before the reviewer is paid.
+
 ---
 
 ## Configuration reference

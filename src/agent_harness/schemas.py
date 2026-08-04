@@ -328,6 +328,17 @@ class ProjectSpec(BaseModel):
             "(shlex-split, no shell); shell operators such as &&, ||, |, ; and > are rejected."
         ),
     )
+    fixes: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "`check command -> argv believed to clear it`. When a check with a declared "
+            "fix fails, the item's outcome is `fix_available` rather than plain `fail` "
+            "and the fix is recorded in the event stream. **It is never run.** A gate "
+            "that silently repaired what it was meant to catch could not be trusted to "
+            "have caught anything; applying it is a separate decision. The key must be "
+            "one of `checks`, verbatim."
+        ),
+    )
     plan_path: str | None = None
     roles: dict[str, RoleRoute] | None = Field(
         None, description="Role overrides for this project. Null uses the global map."
@@ -359,6 +370,25 @@ class ProjectSpec(BaseModel):
         for command in commands:
             validate_check_command(command)
         return commands
+
+    @model_validator(mode="after")
+    def fixes_name_a_declared_check(self) -> ProjectSpec:
+        """A fix keyed to a command that is not a check is dead configuration.
+
+        Rejected rather than ignored: it is almost always a typo, and a fix
+        that silently never applies is worse than no fix, because someone
+        believes it is there.
+        """
+        unknown = sorted(set(self.fixes) - set(self.checks))
+        if unknown:
+            raise ValueError(
+                f"fixes name commands that are not checks: {', '.join(unknown)}. "
+                "The key must match a `checks` entry verbatim."
+            )
+        for command, fix in self.fixes.items():
+            if not fix or not all(part for part in fix):
+                raise ValueError(f"the fix for {command!r} must be a non-empty argv list")
+        return self
 
 
 class ProjectSummary(BaseModel):

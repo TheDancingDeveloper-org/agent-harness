@@ -735,6 +735,40 @@ fallback that has not been needed is not what you configured.
   default) so it can be read instead of paid for again. Pass `--artifacts ''`
   to keep nothing.
 
+### What each role is shown
+
+Worth knowing, because it is what the models are actually judged on, and
+because each of these was once absent and cost real attempts to discover.
+
+| Role | Sees |
+|---|---|
+| planner | the brief, and the repository's file listing |
+| implementer | the brief, its own plan, a bounded slice of the repository **target file first**, the check commands that will run on its diff, and why the previous attempt was refused if there was one |
+| reviewer | the brief, the diff, **the files that diff touched as they now stand**, and whether the checks passed |
+
+Three of those are recent and are worth stating plainly:
+
+- **The implementer is told the checks.** It is graded by them; keeping them
+  secret from it costs an attempt and two model calls to discover a formatter.
+  It does not weaken the gate — the command still runs and still refuses.
+- **The reviewer is given the touched files.** Asked whether a change is wired
+  in where it should be, and holding only the change, it must answer "the diff
+  does not show" — and "the task cannot be judged from what you were given" is
+  grounds to reject. A file too large for the budget is **named as absent**,
+  because a reviewer that thinks a partial view is complete is worse than one
+  that knows it is partial.
+- **A retry is told why the last attempt was refused.** It is *not* a
+  resumption: the item is re-planned against the current brief exactly as
+  before, no prior diff is fed back, and nothing is treated as progress. It
+  simply does not repeat the last mistake blind.
+
+**A brief that does not bound its own scope will be rejected.** The reviewer is
+told to assume the work is wrong, and a sufficiently sceptical model can always
+name one more path it has not been shown. An item that says what "done" is —
+finitely, and including what is *not* in scope — is judged; one that does not
+collects rejections that are each individually reasonable. That cost lands as
+retries, and it is the plan's to fix, not the reviewer's.
+
 ---
 
 ## 4. Resume after anything

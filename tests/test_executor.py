@@ -21,11 +21,16 @@ from agent_harness import providers as P
 from agent_harness.executor import (
     APPROVED,
     Checks,
+    ContextPolicy,
     Executor,
+    PlannerResult,
+    PlannerTarget,
     apply_diff,
     extract_diff,
+    parse_planner_result,
     recount_hunks,
     repo_context,
+    select_repo_context,
     unplaceable_hunks,
     validate_diff,
 )
@@ -1047,6 +1052,207 @@ def test_a_reviewer_can_tell_where_a_rescued_hunk_landed(repo: Path, tmp_path: P
 
 
 # --------------------------------------------- what the implementer is shown
+
+
+def test_the_planner_result_names_ordered_targets_with_reasons() -> None:
+    result = parse_planner_result(
+        json.dumps(
+            {
+                "plan": "Change the greeting and test it.",
+                "targets": [
+                    {"path": "hello.txt", "reason": "contains the greeting"},
+                    {"path": "tests/test_hello.py", "reason": "verifies it"},
+                ],
+                "cannot_identify_target": None,
+            }
+        )
+    )
+
+    assert result.plan == "Change the greeting and test it."
+    assert [target.path for target in result.targets] == ["hello.txt", "tests/test_hello.py"]
+    assert not result.uncertainties
+
+
+def test_an_ambiguous_planner_result_says_so_without_inventing_a_target() -> None:
+    result = parse_planner_result(
+        json.dumps(
+            {
+                "plan": "Inspect the missing integration requirements.",
+                "targets": [],
+                "cannot_identify_target": "The task does not name the integration.",
+            }
+        )
+    )
+
+    assert result.targets == ()
+    assert result.cannot_identify_target == "The task does not name the integration."
+
+
+def test_malformed_planner_output_is_uncertainty_not_file_authority() -> None:
+    result = parse_planner_result("I think ../../secrets may be relevant")
+
+    assert result.targets == ()
+    assert result.cannot_identify_target
+    assert result.uncertainties
+
+
+def test_planner_targets_are_confined_and_checked(repo: Path, tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n")
+    (repo / "link.txt").symlink_to(outside)
+    git(repo, "add", "link.txt")
+    git(repo, "commit", "-q", "-m", "link")
+    planner = PlannerResult(
+        plan="inspect",
+        targets=(
+            PlannerTarget("../../outside.txt", "escape"),
+            PlannerTarget("missing.txt", "not present"),
+            PlannerTarget("link.txt", "escapes through a symlink"),
+            PlannerTarget("hello.txt", "the real target"),
+        ),
+    )
+
+    selected = select_repo_context(repo, planner=planner)
+
+    assert selected.files[0] == "hello.txt"
+    assert "secret" not in selected.text
+    invalid = {target.path: target.uncertainty for target in selected.targets if not target.usable}
+    assert "escapes" in (invalid["../../outside.txt"] or "")
+    assert "missing" in (invalid["missing.txt"] or "")
+    assert "escapes" in (invalid["link.txt"] or "")
+
+
+def test_named_targets_precede_context_and_empty_or_generated_files_cost_nothing(
+    repo: Path,
+) -> None:
+    (repo / "empty.stub").write_text("")
+    generated = repo / "output"
+    generated.mkdir()
+    (generated / "result.json").write_text("generated payload\n")
+    (repo / "nearby.txt").write_text("greeting conventions live here\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "context candidates")
+    selected = select_repo_context(
+        repo,
+        WorkRecord(item_id="T", title="Change greeting", brief="Update greeting behaviour"),
+        planner=PlannerResult(
+            plan="Change and verify the greeting.",
+            targets=(PlannerTarget("hello.txt", "contains the greeting"),),
+        ),
+        policy=ContextPolicy(budget=1000, generated_paths=("output",)),
+    )
+
+    assert selected.files[0] == "hello.txt"
+    assert "--- empty.stub ---" not in selected.text
+    assert "--- output/result.json ---" not in selected.text
+    assert ("empty.stub", "empty file") in selected.omitted
+    assert ("output/result.json", "configured generated artefact") in selected.omitted
+
+
+def test_a_target_that_does_not_fit_is_reported_not_silently_omitted(repo: Path) -> None:
+    (repo / "large.txt").write_text("target line\n" * 200)
+    git(repo, "add", "large.txt")
+    git(repo, "commit", "-q", "-m", "large target")
+
+    selected = select_repo_context(
+        repo,
+        planner=PlannerResult(
+            plan="change it",
+            targets=(PlannerTarget("large.txt", "the requested implementation"),),
+        ),
+        policy=ContextPolicy(budget=100),
+    )
+
+    assert "large.txt" not in selected.files
+    assert selected.truncated
+    assert ("large.txt", "named target exceeds remaining content budget") in selected.omitted
+
+
+def test_ngms_shaped_context_supplies_the_planner_target_not_empty_stubs(
+    repo: Path,
+) -> None:
+    """Regression for #146, including an observable header at the target top."""
+    (repo / "SECURITY.md").write_text("<!-- GPL header stays first -->\n\nSecurity policy.\n")
+    stubs = repo / "docker" / "services"
+    stubs.mkdir(parents=True)
+    for index in range(80):
+        (stubs / f"stub-{index:03}.txt").write_text("")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "NGMS-shaped context")
+
+    # The historical smallest-first policy uses its whole allowance on the
+    # empty service stubs and omits the file the task is about.
+    tracked = git(repo, "ls-files").splitlines()
+    old_parts: list[str] = []
+    old_spent = 0
+    for path in sorted(tracked, key=lambda name: (repo / name).stat().st_size):
+        block = f"--- {path} ---\n{(repo / path).read_text()}\n"
+        if old_spent + len(block) > 600:
+            continue
+        old_parts.append(block)
+        old_spent += len(block)
+    old_context = "".join(old_parts)
+    assert "--- SECURITY.md ---" not in old_context, "fixture no longer reproduces #146"
+
+    selected = select_repo_context(
+        repo,
+        WorkRecord(item_id="T27", title="Apply headers", brief="Apply the licence header."),
+        planner=PlannerResult(
+            plan="Update SECURITY.md without moving its existing header.",
+            targets=(PlannerTarget("SECURITY.md", "contains the policy text to update"),),
+        ),
+        policy=ContextPolicy(budget=600),
+    )
+
+    assert selected.files[0] == "SECURITY.md"
+    assert "<!-- GPL header stays first -->" in selected.text
+    assert not any(path.startswith("docker/services") for path in selected.files)
+
+    wrong_location = """\
+diff --git a/SECURITY.md b/SECURITY.md
+--- a/SECURITY.md
++++ b/SECURITY.md
+@@ -0,0 +1 @@
++GPL-3.0-only
+"""
+    applied, reason = apply_diff(repo, wrong_location)
+    assert not applied, "the fixture accepted a hunk with no observable placement"
+    assert "SECURITY.md" in reason and "-0,0" in reason
+    assert (repo / "SECURITY.md").read_text().startswith("<!-- GPL header stays first -->")
+
+
+def test_context_selection_and_planner_targets_are_observable_events(
+    repo: Path, tmp_path: Path
+) -> None:
+    events: list[dict[str, Any]] = []
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {
+            "planner": json.dumps(
+                {
+                    "plan": "Edit and verify hello.txt.",
+                    "targets": [{"path": "hello.txt", "reason": "contains greeting"}],
+                    "cannot_identify_target": None,
+                }
+            ),
+            "implementer": DIFF,
+            "reviewer": "APPROVED\nfine",
+        },
+        events=events,
+    )
+    add_item(queue)
+
+    executor.run_once()
+
+    planner_event = next(event for event in events if event["outcome"] == "planner_targets")
+    context_event = next(event for event in events if event["outcome"] == "context_selected")
+    assert json.loads(planner_event["detail"])["targets"][0]["path"] == "hello.txt"
+    context = json.loads(context_event["detail"])
+    assert context["files"][0] == "hello.txt"
+    assert context["character_budget"] == 60_000
+    assert context["truncated"] is False
+    assert context["fallback_relevance"] is False
 
 
 def test_the_implementer_is_shown_the_repository(repo: Path, tmp_path: Path) -> None:

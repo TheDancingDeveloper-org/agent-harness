@@ -39,9 +39,12 @@ uv run mypy
 
 Observed on 2026-08-04 at the commit above:
 
-- 715 tests passed in 53.66 s wall-clock (the base commit collected 676; the
-  Stage G modules add 33, and two existing tests were rewritten rather than
-  added);
+- 715 tests passed in 53.66 s wall-clock, against 676 at the base commit. The
+  39 accounted for: `tests/test_stage_g_graph.py` +24, `tests/test_graph_migration.py`
+  +9, `tests/test_work.py` 25 → 28, `tests/test_api.py` 90 → 93 (the
+  route-coverage test is parametrised over `app.routes`, so the three new
+  routes are covered by construction). `tests/test_queue_lifecycle.py` stays at
+  7: one test was rewritten, not added;
 - `tests/test_stage_g_graph.py` collected 24 cases, `tests/test_graph_migration.py`
   collected 9; both modules passed in 4.04 s;
 - `ruff check` reported no findings; `ruff format --check` reported 74 files

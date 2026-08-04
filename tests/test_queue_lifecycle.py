@@ -149,11 +149,18 @@ def test_unmet_dependencies_are_reported_for_work_in_flight(tmp_path: Path) -> N
     assert queue.unmet_dependencies("B", project_id="p") == []
 
 
-def test_a_dependency_tracked_elsewhere_is_not_unmet(tmp_path: Path) -> None:
-    """Plans routinely reference work this queue does not hold; treating that
-    as a blocker would strand the item forever. Same rule `claim` uses."""
+def test_a_dependency_the_graph_cannot_find_is_unmet(tmp_path: Path) -> None:
+    """The same rule `claim` uses, and it is now the Stage G rule.
+
+    A target this queue does not hold used to be reported as met, which made
+    a typo indistinguishable from a legitimate external reference. It is now
+    unmet, and `readiness` says which of the two it looks like.
+    """
     queue = WorkQueue(str(tmp_path / "w.sqlite"))
     queue.add_project(Project(project_id="p", name="P"))
     queue.add([rec("B", depends_on=["SOMEWHERE-ELSE"])], project_id="p")
 
-    assert queue.unmet_dependencies("B", project_id="p") == []
+    assert queue.unmet_dependencies("B", project_id="p") == ["SOMEWHERE-ELSE"]
+    reason = queue.readiness("B", project_id="p").reasons[0]
+    assert reason.target_kind == "local_work"
+    assert "not an assumed external dependency" in reason.explanation

@@ -1120,7 +1120,7 @@ The diff:
 ```diff
 {diff}
 ```
-
+{context}
 Checks: {checks}
 
 ## Answer
@@ -1143,6 +1143,17 @@ First line exactly APPROVED or REJECTED. Then, in order:
 Approving work that does not do what was asked is the expensive failure here:
 it reaches a pull request, a human reads it as reviewed, and the cost lands
 much later. An unnecessary rejection costs one retry.
+"""
+
+#: The files the diff touched, as they now stand. Without this the reviewer is
+#: asked whether a change is wired in correctly while holding only the change,
+#: and "the task cannot be judged from what you were given" — which the prompt
+#: lists as grounds to reject — becomes true by construction rather than by
+#: fault. What is missing is named, because a reviewer that does not know its
+#: view is partial will treat it as complete.
+REVIEW_CONTEXT_PROMPT = """
+The files it touched, as they now stand:
+{files}{omitted}
 """
 
 
@@ -2012,6 +2023,7 @@ class Executor:
                 REVIEW_PROMPT.format(
                     brief=record.brief,
                     diff=applied_diff[:20000],
+                    context=self._review_context(applied_diff),
                     # Always "passed" by here: a non-passing check returned above.
                     checks="passed",
                 ),
@@ -2097,6 +2109,49 @@ class Executor:
         if len(candidates) > 1:
             note = f"{candidates[0]}; NOT stacked on {', '.join(candidates[1:])}"
         return first.branch, note
+
+    def _review_context(self, diff: str) -> str:
+        """The touched files as they now stand, for the reviewer.
+
+        The reviewer is asked whether a change is wired in where it should be
+        and whether anything unrelated moved, and was given only the change.
+        Measured on rdpapp: two of the three reasons in a rejection were "the
+        diff does not show whether …", which no diff ever can. That is a gate
+        rejecting for the shape of its own prompt.
+
+        The same budget bounds it, and a file too large to include is **named
+        as absent** rather than quietly left out — a reviewer that believes a
+        partial view is complete is worse than one that knows it is partial.
+        """
+        paths: list[str] = []
+        for line in diff.splitlines():
+            if line.startswith("+++ ") and not line.startswith("+++ /dev/null"):
+                path = line[4:].strip()
+                path = path[2:] if path.startswith("b/") else path
+                if path and path not in paths:
+                    paths.append(path)
+        if not paths:
+            return ""
+
+        blocks: list[str] = []
+        missing: list[str] = []
+        spent = 0
+        for path in paths:
+            try:
+                body = (self.repo / path).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                missing.append(f"  {path} — could not be read")
+                continue
+            block = f"--- {path} ---\n{body}\n"
+            if spent + len(block) > self.context_policy.budget:
+                missing.append(f"  {path} — {len(body)} characters, too large to include")
+                continue
+            blocks.append(block)
+            spent += len(block)
+        omitted = (
+            "\nNot included, so you have not seen them:\n" + "\n".join(missing) if missing else ""
+        )
+        return REVIEW_CONTEXT_PROMPT.format(files="\n".join(blocks), omitted=omitted)
 
     def _checks_prompt(self) -> str:
         """The project's checks, as the implementer's prompt renders them."""

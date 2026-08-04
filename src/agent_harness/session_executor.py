@@ -627,9 +627,9 @@ class SessionExecutor:
             response = self.reviewer.call("reviewer", [{"role": "user", "content": prompt}])
         except RequestRefused as exc:
             return f"REJECTED\nThe reviewer refused to answer: {exc}"
-        from .executor import _text_of
+        from .executor import _reader_for, _text_of
 
-        return _text_of(response.body)
+        return _text_of(response.body, _reader_for(self.reviewer, "reviewer"))
 
     def _base_for(self, record: WorkRecord) -> tuple[str, str | None]:
         candidates = [

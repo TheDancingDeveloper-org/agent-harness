@@ -193,9 +193,28 @@ class RoleRoute(BaseModel):
     endpoint: str = Field(description="Base URL of the provider API.")
     provider: str = Field(
         "claw-bay",
-        description="Failure classifier to use: `generic` "
+        description="Failure classifier to use, by preset name: `generic` "
         "cannot tell a spend cap from a burst "
-        "limit, because nothing in HTTP can.",
+        "limit, because nothing in HTTP can. This field selects ONLY the "
+        "classifier; the wire protocol comes from `preset`, or from the "
+        "deployment's default when this route names none.",
+    )
+    preset: str = Field(
+        "",
+        description="Route preset: the wire protocol, the authentication "
+        "strategy, the response/usage reader and a failure classifier, as one "
+        "registered name. Overrides `provider` when both are given. Empty means "
+        "the deployment's default preset. The names a deployment can use are "
+        "whatever is registered in its process, named in $HARNESS_ROUTE_PRESETS "
+        "or published by an installed distribution — adding a vendor needs no "
+        "change to this service.",
+    )
+    price_ref: str = Field(
+        "",
+        description="What to look this model up as in the price table, when "
+        "that is not its model id. Empty uses the model id. A model the table "
+        "does not price keeps its token counts and gets no cost at all: an "
+        "unknown price is reported as unknown, never as zero.",
     )
 
     @model_validator(mode="after")

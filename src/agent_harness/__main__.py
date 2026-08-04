@@ -130,6 +130,12 @@ def _http_transport(api_key: str) -> Any:
     Imported lazily and constructed here rather than in model_client,
     because the client's whole design is that it does not own the HTTP —
     a caller with its own client should be able to keep it.
+
+    It performs requests; it does not shape them. The URL, the payload and the
+    credential header come from the route's preset, so a second wire protocol
+    is a preset somebody registers rather than another branch in here. This
+    used to hardcode one gateway's path and one authentication header, which
+    meant "add a provider" was an edit to this function.
     """
     import httpx
 
@@ -139,21 +145,25 @@ def _http_transport(api_key: str) -> Any:
 
     def transport(route: Any, messages: Any, options: Any) -> Any:
         asked = float(options.get("timeout") or 0.0)
-        payload = {"model": route.model, "messages": list(messages)}
-        # `timeout` instructs the transport; it is not a completion parameter,
-        # and sending it as one would have the provider reject the request.
-        # Preflight's reachability probe sets it, because a probe that
-        # inherited the work timeout would take ten minutes to establish that
-        # a model is not answering.
-        payload.update({k: v for k, v in options.items() if k not in ("role", "timeout")})
+        preset = route.resolve()
+        # `timeout` and `role` instruct the transport; they are not completion
+        # parameters, and sending them as ones would have the provider reject
+        # the request. Preflight's reachability probe sets `timeout`, because a
+        # probe that inherited the work timeout would take ten minutes to
+        # establish that a model is not answering. The preset decides which
+        # keys those are.
+        request = preset.request.render(route, messages, options)
+        headers = {
+            "content-type": "application/json",
+            **preset.auth.headers(route, api_key),
+            **request.headers,
+        }
         try:
-            response = client.post(
-                f"{route.endpoint.rstrip('/')}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {route.api_key or api_key}",
-                    "content-type": "application/json",
-                },
-                json=payload,
+            response = client.request(
+                request.method,
+                request.url,
+                headers=headers,
+                json=dict(request.payload),
                 timeout=(
                     httpx.Timeout(asked, connect=min(30.0, asked))
                     if asked
@@ -170,6 +180,56 @@ def _http_transport(api_key: str) -> Any:
         return Response(response.status_code, dict(response.headers), response.text)
 
     return transport
+
+
+#: What a route means when it names no preset. A deployment picks one; the
+#: library default stays generic, because a default wire shape that guesses is
+#: a request sent to a URL nobody chose.
+DEFAULT_PRESET = "chat-completions"
+
+
+def _resolved_preset(name: str) -> Any:
+    """The deployment's default preset, or a refusal that names the choices.
+
+    Checked before anything claims work. The alternative is discovering that a
+    preset is not installed on the first model call — after the item is claimed
+    and the attempt is spent.
+    """
+    from . import protocols
+
+    try:
+        return protocols.resolve(name)
+    except protocols.UnknownPreset as exc:
+        print(str(exc), file=sys.stderr)
+        return None
+
+
+def _report_routes(merged: dict[str, dict[str, Any]], preset: Any) -> None:
+    """Say which protocol each role will be spoken to with, and any suggestion.
+
+    A suggestion is printed and acted on by nobody. Choosing a protocol from a
+    hostname would mean a fleet talking to a URL nobody configured, and the
+    only symptom would be failures the classifier cannot explain.
+    """
+    from . import protocols
+
+    print(f"protocol: {preset.describe()} (default for routes naming no preset)")
+    for role, spec in sorted(merged.items()):
+        named = str(spec.get("preset") or "").strip()
+        if named and named != preset.name:
+            found = protocols.find(named)
+            print(
+                f"  {role}: preset {named}" + (f" — {found.describe()}" if found else " — UNKNOWN")
+            )
+    seen: set[str] = set()
+    for spec in merged.values():
+        endpoint = str(spec.get("endpoint") or "")
+        if not endpoint or endpoint in seen or str(spec.get("preset") or "").strip():
+            continue
+        seen.add(endpoint)
+        hint = protocols.suggest(endpoint)
+        if hint is not None and hint.preset != preset.name:
+            print(f"note: {hint.why}")
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -284,6 +344,12 @@ def _run(args: argparse.Namespace) -> int:
             "models": (names := [m.strip() for m in model.split(",") if m.strip()]),
             "model": names[0] if names else "",
             "endpoint": args.endpoint,
+            # The *classifier*, and only the classifier — this field always
+            # meant that, and the wire shape comes from `--preset`. Kept as the
+            # seeded default because it is the one this deployment has live
+            # evidence for: it can tell a burst limit from a weekly spend cap,
+            # where the generic HTTP classifier cannot. Change it per role with
+            # PUT /api/roles, which also accepts a whole `preset`.
             "provider": "claw-bay",
         }
         for name, model in roles.items()
@@ -312,8 +378,15 @@ def _run(args: argparse.Namespace) -> int:
     if stored_map and filled:
         print(f"note: the stored role map had no route for {', '.join(filled)}; used the flags.")
 
+    preset = _resolved_preset(args.preset)
+    if preset is None:
+        return 2
+    _report_routes(merged, preset)
+
     def live_routes() -> dict[str, Chain]:
-        return chains_from_map(queue.get_setting(ROLE_MAP_KEY) or {}, api_key=api_key)
+        return chains_from_map(
+            queue.get_setting(ROLE_MAP_KEY) or {}, api_key=api_key, default_preset=preset.name
+        )
 
     # Nothing claims work until every role this run needs can be routed. The
     # alternative is finding out on the first model call -- after the project
@@ -546,6 +619,16 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("HARNESS_ENDPOINT", ""),
         help="model API base url (or $HARNESS_ENDPOINT)",
     )
+    p_run.add_argument(
+        "--preset",
+        default=os.environ.get("HARNESS_ROUTE_PRESET", DEFAULT_PRESET),
+        metavar="NAME",
+        help="route preset for roles that name none: the wire protocol, the "
+        "authentication header, the response reader and a failure classifier, "
+        "as one name (or $HARNESS_ROUTE_PRESET). A role's stored `preset` "
+        "overrides this; its older `provider` field selects only the classifier. "
+        "Register your own — nothing here needs editing to add a vendor.",
+    )
     p_run.add_argument("--planner", default="", help="model for the planner role")
     p_run.add_argument("--implementer", default="", help="model for the implementer role")
     p_run.add_argument(
@@ -591,6 +674,12 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("HARNESS_ENDPOINT", ""),
         help="model API base URL for the reviewer. Only the reviewer needs a model "
         "in this mode: the CLI agent does the implementing.",
+    )
+    p_serve.add_argument(
+        "--preset",
+        default=os.environ.get("HARNESS_ROUTE_PRESET", DEFAULT_PRESET),
+        metavar="NAME",
+        help="route preset for roles that name none. Same meaning as `run --preset`.",
     )
     p_serve.add_argument(
         "--reviewer",
@@ -665,6 +754,12 @@ def main(argv: list[str] | None = None) -> int:
         token = secrets.token_urlsafe(24)
         print(f"HARNESS_TOKEN not set; generated one for this run:\n  {token}", file=sys.stderr)
 
+    # Before anything is served. Readiness probes routes with it, so a preset
+    # this build cannot resolve should be a refusal at startup rather than a
+    # probe quietly asking the wrong URL.
+    if _resolved_preset(args.preset) is None:
+        return 2
+
     import uvicorn
 
     from .api import create_api
@@ -735,6 +830,9 @@ def main(argv: list[str] | None = None) -> int:
                 # than the URL keeps the token out of the API layer.
                 session_host=host,
                 executor_roles=executor_roles,
+                # The same default the workers route with, so a readiness
+                # probe asks the URL the work will actually use.
+                default_preset=args.preset,
             ),
             host=args.host,
             port=args.port,
@@ -790,13 +888,23 @@ def _fleet_for_serve(
             "reviewer": {
                 "model": args.reviewer,
                 "endpoint": args.endpoint,
+                # The classifier only; the wire shape is `--preset`. See `run`.
                 "provider": "claw-bay",
             },
         }
         queue.set_setting(ROLE_MAP_KEY, stored)
 
+    preset = _resolved_preset(getattr(args, "preset", "") or DEFAULT_PRESET)
+    if preset is None:
+        # Refused here rather than on the first review, which would be after an
+        # item had been claimed, implemented and checked.
+        raise SystemExit(2)
+    _report_routes(dict(stored), preset)
+
     def live_routes() -> dict[str, Chain]:
-        return chains_from_map(queue.get_setting(ROLE_MAP_KEY) or {}, api_key=api_key)
+        return chains_from_map(
+            queue.get_setting(ROLE_MAP_KEY) or {}, api_key=api_key, default_preset=preset.name
+        )
 
     def routes_for(project_id: str) -> dict[str, Chain]:
         """One project's effective map, read live on every call.
@@ -808,7 +916,11 @@ def _fleet_for_serve(
         project = queue.get_project(project_id)
         return effective_routes(
             live_routes(),
-            chains_from_map(getattr(project, "roles", None) or {}, api_key=api_key),
+            chains_from_map(
+                getattr(project, "roles", None) or {},
+                api_key=api_key,
+                default_preset=preset.name,
+            ),
         )
 
     routes = live_routes()

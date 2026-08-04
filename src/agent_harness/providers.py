@@ -15,9 +15,19 @@ up with tens of thousands of undifferentiated rate-limit errors and no way
 to say what any of them meant.
 
 So classification is a provider's own concern, expressed as a `Provider`.
-Two are shipped: `GENERIC`, which assumes nothing beyond HTTP, and
-`CLAW_BAY`, a worked example of reading a vendor envelope. Add your own; the
-rest of the harness only sees a `Classification`.
+
+**Classifying a failure is not the same job as speaking to an endpoint**, and
+this module does only the first. What a request looks like on the wire, how the
+credential is attached and where the token counts live belong to a route
+preset — see `protocols.py`. A route names both, and either can change without
+the other.
+
+Two classifiers are shipped, and neither names a vendor. `GENERIC` assumes
+nothing beyond HTTP. `VendorEnvelopeProvider` reads a reason out of a JSON
+envelope whose field names it is *told*, because the shape is common even
+though the names are not. A particular gateway's names are an adapter that
+constructs one — `adapters/claw_bay.py` is the worked example — and the rest of
+the harness only ever sees a `Classification`.
 """
 
 from __future__ import annotations
@@ -163,7 +173,11 @@ class VendorEnvelopeProvider:
     though the field names are not: a nested object carrying a machine code,
     a category, a retryable flag and sometimes a retry delay.
 
-    The defaults describe The Claw Bay's envelope, verified live 2026-08-02:
+    Nothing here names a gateway. `vendor_field` is empty by default, which
+    means "read the top level"; an adapter that has seen a particular
+    envelope constructs one of these with that envelope's names. The worked
+    example is `adapters/claw_bay.py`, built from a response captured live on
+    2026-08-02:
 
         {"error": "invalid request", "code": "upstream_rejected",
          "theclawbayError": {"category": "internal", "code": "upstream_rejected",
@@ -182,7 +196,9 @@ class VendorEnvelopeProvider:
     """
 
     name: str = "vendor-envelope"
-    vendor_field: str = "theclawbayError"
+    #: The key holding the nested envelope. Empty means there is none and the
+    #: fields are read from the top level of the body.
+    vendor_field: str = ""
     quota_categories: tuple[str, ...] = ("quota",)
     auth_categories: tuple[str, ...] = ("auth",)
     #: Substrings that mark a code as a spend cap.
@@ -262,6 +278,10 @@ def _positive_number(value: Any) -> float | None:
 
 
 GENERIC = GenericProvider()
-CLAW_BAY = VendorEnvelopeProvider(name="claw-bay")
 
-PROVIDERS = {p.name: p for p in (GENERIC, CLAW_BAY)}
+#: The classifiers this module defines, by name. Not the list of classifiers a
+#: deployment can use: a route names a *preset*, and a preset supplies a
+#: classifier along with the wire shape it belongs to. `protocols.names()` is
+#: the answer to "what can I configure"; this is the answer to "what does core
+#: know how to do without loading anything".
+PROVIDERS: dict[str, Provider] = {GENERIC.name: GENERIC}

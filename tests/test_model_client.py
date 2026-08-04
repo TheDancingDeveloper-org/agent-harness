@@ -25,6 +25,12 @@ from agent_harness.model_client import (
 
 MESSAGES = [{"role": "user", "content": "x"}]
 
+#: A classifier that reads a nested envelope, configured here rather than
+#: imported from an adapter. These are core tests and must pass with nothing
+#: but the generic route installed; what they exercise is the retry ladder's
+#: reaction to a classification, not any gateway's field names.
+ENVELOPE = P.VendorEnvelopeProvider(vendor_field="vendorError")
+
 
 def ok(body: str = '{"ok": true}') -> Response:
     return Response(200, {}, body)
@@ -73,7 +79,7 @@ def build(
         clock[0] += seconds
 
     return ModelClient(
-        roles=roles or {"implementer": Route("m", "https://a", P.CLAW_BAY)},
+        roles=roles or {"implementer": Route("m", "https://a", ENVELOPE)},
         transport=transport,
         policy=policy or RetryPolicy(max_attempts=4),
         on_event=(events.append if events is not None else None),
@@ -127,7 +133,7 @@ def test_a_spend_cap_is_never_retried() -> None:
             429,
             {
                 "code": "weekly_cost_limit_reached",
-                "theclawbayError": {
+                "vendorError": {
                     "category": "quota",
                     "code": "weekly_cost_limit_reached",
                     "retryable": False,
@@ -148,7 +154,7 @@ def test_a_cap_parks_only_that_endpoint() -> None:
         fail(
             429,
             {
-                "theclawbayError": {
+                "vendorError": {
                     "category": "quota",
                     "code": "weekly_cost_limit_reached",
                     "retryable": False,
@@ -159,7 +165,7 @@ def test_a_cap_parks_only_that_endpoint() -> None:
     client = build(
         transport,
         parks=parks,
-        roles={"implementer": Route("m", "https://capped", P.CLAW_BAY)},
+        roles={"implementer": Route("m", "https://capped", ENVELOPE)},
         policy=RetryPolicy(terminal_cap_park_seconds=1800),
     )
     with pytest.raises(CapExhausted):
@@ -174,7 +180,7 @@ def test_a_short_window_cap_parks_for_less_than_a_long_one() -> None:
         fail(
             429,
             {
-                "theclawbayError": {
+                "vendorError": {
                     "category": "quota",
                     "code": "5h_cost_limit_reached",
                     "retryable": False,
@@ -213,7 +219,7 @@ def test_a_refused_request_does_not_park_the_endpoint() -> None:
         fail(
             429,
             {
-                "theclawbayError": {
+                "vendorError": {
                     "category": "internal",
                     "code": "upstream_rejected",
                     "retryable": False,
@@ -299,7 +305,7 @@ def test_two_clients_do_not_share_park_state() -> None:
     processes mean separate dicts; nothing is shared, persisted or locked."""
     a_parks, b_parks = EndpointParks(), EndpointParks()
     body = {
-        "theclawbayError": {
+        "vendorError": {
             "category": "quota",
             "code": "weekly_cost_limit_reached",
             "retryable": False,
@@ -334,7 +340,7 @@ def test_every_attempt_is_emitted_with_role_model_endpoint_and_class() -> None:
     assert error["role"] == "implementer"
     assert error["model"] == "m"
     assert error["endpoint"] == "https://a"
-    assert error["provider"] == "claw-bay"
+    assert error["provider"] == "vendor-envelope"
 
 
 def test_a_cap_is_emitted_before_it_raises() -> None:
@@ -345,7 +351,7 @@ def test_a_cap_is_emitted_before_it_raises() -> None:
         fail(
             429,
             {
-                "theclawbayError": {
+                "vendorError": {
                     "category": "quota",
                     "code": "weekly_cost_limit_reached",
                     "retryable": False,
@@ -447,7 +453,7 @@ def test_an_exhausted_implementer_does_not_silence_the_reviewer() -> None:
                 {},
                 json.dumps(
                     {
-                        "theclawbayError": {
+                        "vendorError": {
                             "category": "quota",
                             "code": "weekly_cost_limit_reached",
                             "retryable": False,
@@ -459,8 +465,8 @@ def test_an_exhausted_implementer_does_not_silence_the_reviewer() -> None:
 
     client = ModelClient(
         roles={
-            "implementer": Route("impl", "https://api", P.CLAW_BAY),
-            "reviewer": Route("rev", "https://api", P.CLAW_BAY),
+            "implementer": Route("impl", "https://api", ENVELOPE),
+            "reviewer": Route("rev", "https://api", ENVELOPE),
         },
         transport=transport,
         parks=parks,

@@ -3,6 +3,12 @@
 This is the highest-risk logic in the project: it decides whether a fleet
 waits half a second or a week. It is also trivially testable — a status, a
 header map and a body.
+
+Nothing here loads an adapter. Core ships two classifiers and neither names a
+vendor: `GENERIC`, which has only HTTP to go on, and `VendorEnvelopeProvider`,
+which reads an envelope whose field names it is *told*. A particular gateway's
+names live in `adapters/`, and their tests with them —
+`tests/test_adapter_claw_bay.py`.
 """
 
 from __future__ import annotations
@@ -13,142 +19,94 @@ import json
 
 from agent_harness import providers as P
 
-# The real envelope, captured from a live gateway on 2026-08-02. Two things
-# in it contradict a reasonable first guess, and both were bugs before this
-# response was actually looked at.
-LIVE_NON_QUOTA = {
-    "error": "invalid request",
-    "code": "upstream_rejected",
-    "theclawbayError": {
-        "requestId": "7b75cd73-6e1c-4265-98db-1f40bf75ca70",
-        "category": "internal",
-        "code": "upstream_rejected",
-        "userMessage": "The upstream model provider rejected this request.",
-        "retryable": False,
-        "retryAfterSeconds": None,
-        "nextAction": "Review the request and retry.",
-    },
-}
-
 WEEKLY_CAP = {
     "error": "weekly cost limit reached for this account",
     "code": "weekly_cost_limit_reached",
-    "theclawbayError": {
-        "category": "quota",
-        "code": "weekly_cost_limit_reached",
-        "userMessage": "Your weekly usage limit has been reached.",
-        "retryable": False,
-    },
-}
-
-SHORT_CAP = {
-    "code": "5h_cost_limit_reached",
-    "theclawbayError": {
-        "category": "quota",
-        "code": "5h_cost_limit_reached",
-        "retryable": False,
-    },
+    "category": "quota",
+    "retryable": False,
 }
 
 
 def classify(
-    body: object, status: int = 429, headers: dict[str, str] | None = None
+    body: object,
+    status: int = 429,
+    headers: dict[str, str] | None = None,
+    provider: P.Provider | None = None,
 ) -> P.Classification:
     payload = json.dumps(body) if body is not None else None
-    return P.CLAW_BAY.classify(status, headers or {}, payload)
+    return (provider or P.VendorEnvelopeProvider()).classify(status, headers or {}, payload)
 
 
-# ------------------------------------------------------- the two live findings
+# --------------------------------------------------- the configurable envelope
+
+
+def test_an_unconfigured_envelope_reads_the_top_level() -> None:
+    """The default names no nesting key, because naming one would be naming a
+    vendor. A body that states its reason plainly is still read."""
+    assert classify(WEEKLY_CAP).kind == P.TERMINAL_CAP
+
+
+def test_the_nesting_key_is_configuration_not_a_branch() -> None:
+    """Same classifier, a different gateway's envelope name. Adding a vendor
+    is a construction, never an edit to this module."""
+    nested = P.VendorEnvelopeProvider(name="somewhere", vendor_field="somewhereError")
+    body = {"somewhereError": {"category": "quota", "code": "5h_cost_limit_reached"}}
+    assert classify(body, provider=nested).kind == P.WINDOW_CAP
+    # ...and the same body means nothing to a classifier told a different name.
+    assert classify(body).kind == P.RPM
 
 
 def test_not_retryable_is_not_the_same_as_out_of_budget() -> None:
     """Providers use the flag for ordinary upstream failures. Calling this a
     cap would park a healthy endpoint for an hour over one hiccup."""
-    verdict = classify(LIVE_NON_QUOTA)
+    verdict = classify(
+        {"error": "upstream said no", "code": "upstream_rejected", "retryable": False}
+    )
     assert verdict.kind == P.NON_RETRYABLE
     assert verdict.kind not in P.CAPS
-    assert "upstream_rejected" in (verdict.message or "")
 
 
 def test_retry_after_is_read_from_the_body_not_only_the_header() -> None:
-    """The gateway states the wait in the body. Parsing only headers
-    silently discards the server's own instruction."""
-    body = {
-        "theclawbayError": {
-            "category": "rate",
-            "code": "rate_limited",
-            "retryable": True,
-            "retryAfterSeconds": 42,
-        }
-    }
-    verdict = classify(body)
+    """A gateway may state the wait in the body. Parsing only headers silently
+    discards the server's own instruction."""
+    verdict = classify({"retryable": True, "retryAfterSeconds": 42})
     assert verdict.kind == P.RPM
     assert verdict.retry_after == 42.0
 
 
 def test_the_longer_of_header_and_body_retry_after_wins() -> None:
     # Undershooting earns another rejection; overshooting costs idle time.
-    body = {"theclawbayError": {"retryable": True, "retryAfterSeconds": 10}}
-    assert classify(body, headers={"Retry-After": "90"}).retry_after == 90.0
-    body_big = {"theclawbayError": {"retryable": True, "retryAfterSeconds": 90}}
-    assert classify(body_big, headers={"Retry-After": "10"}).retry_after == 90.0
+    assert classify({"retryAfterSeconds": 10}, headers={"Retry-After": "90"}).retry_after == 90.0
+    assert classify({"retryAfterSeconds": 90}, headers={"Retry-After": "10"}).retry_after == 90.0
 
 
 def test_a_null_retry_after_is_absent_not_zero() -> None:
     """'Wait zero seconds' and 'no instruction given' are different claims;
     collapsing them would erase the backoff on every such response."""
-    assert classify(LIVE_NON_QUOTA).retry_after is None
-
-
-# ------------------------------------------------------------------- caps
-
-
-def test_a_long_window_cap_is_terminal() -> None:
-    verdict = classify(WEEKLY_CAP)
-    assert verdict.kind == P.TERMINAL_CAP
-    assert "weekly" in (verdict.message or "").lower()
+    assert classify({"code": "upstream_rejected", "retryAfterSeconds": None}).retry_after is None
 
 
 def test_a_short_window_cap_is_distinguished_from_a_long_one() -> None:
     # They differ only in how long to wait, but that is the whole decision.
-    assert classify(SHORT_CAP).kind == P.WINDOW_CAP
+    assert classify({"category": "quota", "code": "5h_cost_limit_reached"}).kind == P.WINDOW_CAP
+    assert classify(WEEKLY_CAP).kind == P.TERMINAL_CAP
 
 
 def test_a_rejected_credential_is_terminal() -> None:
-    body = {
-        "code": "invalid_api_key",
-        "theclawbayError": {"code": "invalid_api_key", "retryable": False},
-    }
-    assert classify(body).kind == P.TERMINAL_CAP
+    assert classify({"code": "invalid_api_key", "retryable": False}).kind == P.TERMINAL_CAP
 
 
 def test_a_401_is_terminal_whatever_the_body_says() -> None:
     assert classify(None, status=401).kind == P.TERMINAL_CAP
 
 
-# -------------------------------------------------------------------- rpm
-
-
-def test_a_plain_burst_limit_is_rpm() -> None:
-    body = {"error": {"message": "Rate limit reached", "type": "rate_limit_error"}}
-    assert classify(body).kind == P.RPM
-
-
 def test_an_unparseable_body_is_rpm() -> None:
     """Asymmetric on purpose: wrongly retrying a permanent condition costs
     one backoff; wrongly giving up on a transient one costs the work."""
-    assert P.CLAW_BAY.classify(429, {}, b"<html>nope</html>").kind == P.RPM
-
-
-def test_a_non_dict_body_is_rpm() -> None:
-    assert P.CLAW_BAY.classify(429, {}, b"[1,2,3]").kind == P.RPM
-
-
-def test_a_missing_body_is_rpm() -> None:
-    assert P.CLAW_BAY.classify(429, {}, None).kind == P.RPM
-
-
-# ------------------------------------------------------------ other statuses
+    envelope = P.VendorEnvelopeProvider()
+    assert envelope.classify(429, {}, b"<html>nope</html>").kind == P.RPM
+    assert envelope.classify(429, {}, b"[1,2,3]").kind == P.RPM
+    assert envelope.classify(429, {}, None).kind == P.RPM
 
 
 def test_5xx_is_transient() -> None:
@@ -202,6 +160,12 @@ def test_the_generic_provider_still_honours_retry_after() -> None:
 
 def test_the_generic_provider_treats_auth_failures_as_terminal() -> None:
     assert P.GENERIC.classify(403, {}, None).kind == P.TERMINAL_CAP
+
+
+def test_core_knows_exactly_one_classifier_by_name() -> None:
+    """A name that resolves without loading anything. Everything else is a
+    preset, and a preset is discovered rather than built in."""
+    assert set(P.PROVIDERS) == {"generic"}
 
 
 def test_every_kind_has_a_human_meaning() -> None:

@@ -167,6 +167,7 @@ def create_api(
     session_host: Any | None = None,
     probes: Mapping[str, Any] | None = None,
     executor_roles: Any | None = None,
+    default_preset: str = "",
 ) -> FastAPI:
     """Build the API.
 
@@ -186,6 +187,11 @@ def create_api(
     advertises every configured route as live, which in session mode was
     wrong for two of three stages: the agent process plans and implements,
     and no `planner` or `implementer` route is ever called.
+
+    `default_preset` is the route preset this deployment's workers use for
+    roles that name none. It matters here because readiness *probes* routes:
+    a report built with a different wire protocol from the one the work uses
+    would be asking a different URL, and would answer a question nobody asked.
     """
     app = FastAPI(
         title="agent-harness",
@@ -209,6 +215,7 @@ def create_api(
     # routed per project, which roles it believed its executor could reach.
     app.state.probes = dict(probes or {})
     app.state.executor_roles = executor_roles
+    app.state.default_preset = default_preset
     app.state.ask_model = _model_asker(model_client)
     app.state.base_checks = BaseChecks()
     app.state.token = token
@@ -1132,12 +1139,14 @@ def create_api(
         # be reviewed while every project routed a reviewer of its own.
         from .model_client import reviewer_independence
 
-        global_routes = _role_routes(queue)
+        preset = app.state.default_preset
+        global_routes = _role_routes(queue, default_preset=preset)
         global_route = global_routes.get("reviewer")
         overriding = sorted(
             p.project_id
             for p in projects
-            if (p.roles or {}).get("reviewer") and _role_routes(queue, p).get("reviewer")
+            if (p.roles or {}).get("reviewer")
+            and _role_routes(queue, p, default_preset=preset).get("reviewer")
         )
         # Not "some project can review": a reviewer nothing has is a reviewer
         # the projects without one still fail closed on.
@@ -1552,7 +1561,9 @@ def _audit_event_fields(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _role_routes(queue: WorkQueue, project: Project | None = None) -> dict[str, Any]:
+def _role_routes(
+    queue: WorkQueue, project: Project | None = None, *, default_preset: str = ""
+) -> dict[str, Any]:
     """The routes a project will actually use.
 
     The global map, with that project's own overrides applied **per role**.
@@ -1564,12 +1575,18 @@ def _role_routes(queue: WorkQueue, project: Project | None = None) -> dict[str, 
 
     No API key is attached: these routes are for reading and reporting, and
     the transport supplies the credential when a call is actually made.
+
+    `default_preset` must be this deployment's, because readiness *probes* these
+    routes. A report built with a different wire protocol from the one the
+    workers use would ask a different URL and answer a different question.
     """
     from .model_client import effective_routes, routes_from_map
 
     return effective_routes(
-        routes_from_map(queue.get_setting(ROLE_MAP_KEY) or {}),
-        routes_from_map(project.roles or {}) if project is not None else {},
+        routes_from_map(queue.get_setting(ROLE_MAP_KEY) or {}, default_preset=default_preset),
+        routes_from_map(project.roles or {}, default_preset=default_preset)
+        if project is not None
+        else {},
     )
 
 
@@ -1606,7 +1623,8 @@ def _role_map_view(state: Any, queue: WorkQueue) -> RoleMapView:
     stored = queue.get_setting(ROLE_MAP_KEY) or {}
     executor = _executor_roles(state)
     independent, why = reviewer_independence(
-        _role_routes(queue), implemented_by=executor.implemented_by
+        _role_routes(queue, default_preset=getattr(state, "default_preset", "")),
+        implemented_by=executor.implemented_by,
     )
     return RoleMapView(
         reviewer_independent=independent,
@@ -1643,7 +1661,7 @@ def _preflight(
         session_host_probe,
     )
 
-    routes = _role_routes(queue, project)
+    routes = _role_routes(queue, project, default_preset=getattr(state, "default_preset", ""))
     executor = _executor_roles(state)
     ask = getattr(state, "ask_model", None)
     host = getattr(state, "session_host", None)

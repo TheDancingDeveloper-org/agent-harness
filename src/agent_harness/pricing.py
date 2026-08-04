@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -107,7 +108,23 @@ def load_price_table(source: str | None = None) -> PriceTable:
         return PriceTable()
 
 
-def extract_usage(body: bytes | str | None) -> dict[str, int] | None:
+#: The key names in common use, as defaults rather than as the only ones a
+#: build can read. A preset's response reader supplies its own when a provider
+#: reports usage under different names — that is configuration, not a branch
+#: here on which vendor sent the body.
+INPUT_TOKEN_KEYS = ("input_tokens", "prompt_tokens", "tokens_in")
+OUTPUT_TOKEN_KEYS = ("output_tokens", "completion_tokens", "tokens_out")
+CACHED_TOKEN_KEYS = ("cache_read_input_tokens", "cached_tokens", "tokens_cached")
+
+
+def extract_usage(
+    body: bytes | str | None,
+    *,
+    usage_key: str = "usage",
+    tokens_in_keys: tuple[str, ...] = INPUT_TOKEN_KEYS,
+    tokens_out_keys: tuple[str, ...] = OUTPUT_TOKEN_KEYS,
+    cached_token_keys: tuple[str, ...] = CACHED_TOKEN_KEYS,
+) -> dict[str, int] | None:
     """Token usage from a response body, or None if it does not report any.
 
     Handles the shapes in common use — `prompt_tokens`/`completion_tokens`,
@@ -115,6 +132,9 @@ def extract_usage(body: bytes | str | None) -> dict[str, int] | None:
     top level. Deliberately conservative: an unrecognised body returns None,
     because inventing zeros here would understate every total downstream and
     nothing would ever flag it.
+
+    The key names are arguments so that a provider reporting under other names
+    is a preset's configuration rather than another `if` in this function.
     """
     if body is None:
         return None
@@ -126,20 +146,21 @@ def extract_usage(body: bytes | str | None) -> dict[str, int] | None:
     if not isinstance(parsed, dict):
         return None
 
-    usage = parsed.get("usage")
+    usage = parsed.get(usage_key)
     if not isinstance(usage, dict):
         usage = parsed
 
-    def first_int(*keys: str) -> int | None:
+    def first_int(keys: tuple[str, ...]) -> int | None:
         for key in keys:
             value = usage.get(key)
-            if isinstance(value, int):
+            # `bool` is an `int`; a flag is not a token count.
+            if isinstance(value, int) and not isinstance(value, bool):
                 return value
         return None
 
-    tokens_in = first_int("input_tokens", "prompt_tokens", "tokens_in")
-    tokens_out = first_int("output_tokens", "completion_tokens", "tokens_out")
-    cached = first_int("cache_read_input_tokens", "cached_tokens", "tokens_cached")
+    tokens_in = first_int(tokens_in_keys)
+    tokens_out = first_int(tokens_out_keys)
+    cached = first_int(cached_token_keys)
 
     if tokens_in is None and tokens_out is None:
         return None
@@ -154,13 +175,17 @@ def extract_usage(body: bytes | str | None) -> dict[str, int] | None:
     return out
 
 
-def usage_fields(body: bytes | str | None, model: str | None, table: PriceTable) -> dict[str, Any]:
-    """Everything a `model_call` event should carry about what it consumed.
+def price_fields(
+    usage: Mapping[str, int] | None, model: str | None, table: PriceTable
+) -> dict[str, Any]:
+    """Counted tokens, and the rate applied to them if one is known.
 
-    Returns an empty dict when the response reported no usage — an event with
-    no usage keys is honestly silent, where one carrying zeros is a claim.
+    Separate from reading the body because who reads the usage is a route's
+    business — a preset's reader knows its own field names — while what a token
+    costs is the price table's. An unpriced model keeps its token counts and
+    gets no price keys at all, so the API can count it as `unpriced` instead of
+    adding zero to a total.
     """
-    usage = extract_usage(body)
     if usage is None:
         return {}
     fields: dict[str, Any] = dict(usage)
@@ -170,3 +195,15 @@ def usage_fields(body: bytes | str | None, model: str | None, table: PriceTable)
         fields["price_out_per_mtok"] = price.out_per_mtok
         fields["price_table"] = table.version
     return fields
+
+
+def usage_fields(body: bytes | str | None, model: str | None, table: PriceTable) -> dict[str, Any]:
+    """Everything a `model_call` event should carry about what it consumed.
+
+    Returns an empty dict when the response reported no usage — an event with
+    no usage keys is honestly silent, where one carrying zeros is a claim.
+
+    The generic reading, for a caller that has a body and no route. A client
+    holding a route asks that route's reader and then `price_fields`.
+    """
+    return price_fields(extract_usage(body), model, table)

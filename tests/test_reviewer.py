@@ -12,11 +12,16 @@ from typing import Any
 from agent_harness import providers
 from agent_harness.model_client import ModelClient, Response, Route
 
+#: A configured classifier standing in for "some vendor that states its
+#: reasons". No adapter is loaded: what matters here is that two routes share
+#: one classifier name, not whose envelope it reads.
+ENVELOPE = providers.VendorEnvelopeProvider()
 
-def client_with(implementer: str, reviewer: str, provider: Any = providers.CLAW_BAY) -> ModelClient:
+
+def client_with(implementer: str, reviewer: str, provider: Any = ENVELOPE) -> ModelClient:
     return ModelClient(
         roles={
-            "implementer": Route(implementer, "https://api.example", providers.CLAW_BAY),
+            "implementer": Route(implementer, "https://api.example", ENVELOPE),
             "reviewer": Route(reviewer, "https://api.example", provider),
         },
         transport=lambda r, m, o: Response(200, {}, "{}"),
@@ -58,7 +63,7 @@ def test_it_is_reported_not_refused() -> None:
 
 def test_an_incomplete_role_map_is_not_a_false_alarm() -> None:
     client = ModelClient(
-        roles={"implementer": Route("m", "https://api.example", providers.CLAW_BAY)},
+        roles={"implementer": Route("m", "https://api.example", ENVELOPE)},
         transport=lambda r, m, o: Response(200, {}, "{}"),
     )
     independent, _ = client.reviewer_independence()

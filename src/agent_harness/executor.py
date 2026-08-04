@@ -1093,7 +1093,7 @@ Your plan:
 
 Repository context:
 {context}
-{checks}
+{checks}{prior}
 Reply with a single unified diff (`diff --git` / `---` / `+++` / `@@`) that
 applies cleanly at the repository root. No commentary outside the diff.
 """
@@ -1104,6 +1104,19 @@ CHECKS_PROMPT = """
 These commands run on your diff before any reviewer sees it, and a non-zero
 exit refuses the change:
 {commands}
+"""
+
+#: Why the previous attempt was refused. **This is a new attempt informed by
+#: the last refusal, not a resumption of it** — the item is re-planned against
+#: the current brief exactly as before (D11), and nothing here is treated as
+#: progress. Without it a retry repeats the same mistake blind: measured on
+#: rdpapp, three of four attempts at one item were refused by the same
+#: formatter, each one unaware the last had been.
+PRIOR_FAILURE_PROMPT = """
+A previous attempt at this task was refused. You are starting again from the
+current brief, not continuing that attempt — but do not reproduce the fault:
+
+{error}
 """
 
 REVIEW_PROMPT = """\
@@ -1719,6 +1732,7 @@ class Executor:
                 # asked. Naming the commands is not weakening the gate: the
                 # gate still runs, and still refuses.
                 checks=self._checks_prompt(),
+                prior=self._prior_failure_prompt(record),
             ),
         )
         outcome.stages.append("implement")
@@ -2152,6 +2166,17 @@ class Executor:
             "\nNot included, so you have not seen them:\n" + "\n".join(missing) if missing else ""
         )
         return REVIEW_CONTEXT_PROMPT.format(files="\n".join(blocks), omitted=omitted)
+
+    def _prior_failure_prompt(self, record: WorkRecord) -> str:
+        """Why the last attempt was refused, for the attempt replacing it.
+
+        Bounded, because a check's output can be a whole build log and the
+        useful part is at the top, where the tool says what it objected to.
+        """
+        error = (record.last_error or "").strip()
+        if not error:
+            return ""
+        return PRIOR_FAILURE_PROMPT.format(error=error[:4000])
 
     def _checks_prompt(self) -> str:
         """The project's checks, as the implementer's prompt renders them."""

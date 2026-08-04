@@ -1367,6 +1367,46 @@ def test_a_touched_file_too_large_to_show_the_reviewer_is_named(repo: Path, tmp_
     assert "--- hello.txt ---" not in shown
 
 
+def test_a_retry_is_told_why_the_last_attempt_was_refused(repo: Path, tmp_path: Path) -> None:
+    """Measured on rdpapp: three of four attempts at one item were refused by
+    the same formatter, each unaware the last had been."""
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+    )
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+    queue.release("T1", FAILED, error="`cargo fmt --all -- --check` failed: line 12 too long")
+    queue.requeue("T1")
+
+    executor.run_once()
+
+    shown = capturing.prompts["implementer"]
+    assert "line 12 too long" in shown
+    assert "not continuing that attempt" in shown, "a new attempt, not a resumption"
+
+
+def test_a_first_attempt_is_told_about_no_prior_failure(repo: Path, tmp_path: Path) -> None:
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+    )
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    assert "previous attempt" not in capturing.prompts["implementer"]
+
+
 def test_the_implementer_is_told_which_checks_will_judge_it(repo: Path, tmp_path: Path) -> None:
     """The reviewer was told what the checks said; the writer was told nothing.
 

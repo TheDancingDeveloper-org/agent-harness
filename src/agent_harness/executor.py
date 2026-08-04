@@ -1148,12 +1148,13 @@ more than they did — not because they are obviously broken.
 The task:
 {brief}
 
-The diff:
+The diff, which is the change **in full** — it was produced from the
+repository, so any file not appearing in it is unchanged:
 ```diff
 {diff}
 ```
 {context}
-Checks: {checks}
+{checks}
 
 ## Answer
 
@@ -1185,6 +1186,27 @@ First line exactly APPROVED or REJECTED. Then, in order:
 Approving work that does not do what was asked is the expensive failure here:
 it reaches a pull request, a human reads it as reviewed, and the cost lands
 much later. An unnecessary rejection costs one retry.
+"""
+
+#: What the checks were and who ran them. The reviewer used to be handed the
+#: bare word `passed`, which reads as the author's claim about their own work
+#: — and a reviewer told to assume the work is wrong will discount it, as one
+#: did: "I cannot verify that the file still type-checks, because no build
+#: output was provided beyond the claim 'Checks: passed'." The harness ran
+#: them, on this exact tree, before the reviewer was called. Saying so is a
+#: fact, not a reassurance.
+REVIEW_CHECKS_PROMPT = """
+These commands were run by the harness on this exact tree, after the change
+was applied and before you were called. All of them exited zero:
+{commands}
+"""
+
+#: When a project has configured none. Said plainly, because "no checks" is
+#: information a reviewer should weigh, and silence would let it assume there
+#: were some.
+REVIEW_NO_CHECKS_PROMPT = """
+This project has no checks configured, so nothing has been run against this
+change. You are the only gate it has.
 """
 
 #: The files the diff touched, as they now stand. Without this the reviewer is
@@ -2075,8 +2097,11 @@ class Executor:
                     brief=record.brief,
                     diff=applied_diff[:20000],
                     context=self._review_context(applied_diff),
-                    # Always "passed" by here: a non-passing check returned above.
-                    checks="passed",
+                    # Always passing by here: a non-passing check returned
+                    # above. What the reviewer needs is *which* commands
+                    # passed, and that the harness rather than the author ran
+                    # them.
+                    checks=self._review_checks_prompt(),
                 ),
             )
         outcome.stages.append("review")
@@ -2203,6 +2228,15 @@ class Executor:
             "\nNot included, so you have not seen them:\n" + "\n".join(missing) if missing else ""
         )
         return REVIEW_CONTEXT_PROMPT.format(files="\n".join(blocks), omitted=omitted)
+
+    def _review_checks_prompt(self) -> str:
+        """Which commands passed, and that the harness ran them."""
+        commands = [" ".join(command) for command in self.checks.commands if command]
+        if not commands:
+            return REVIEW_NO_CHECKS_PROMPT
+        return REVIEW_CHECKS_PROMPT.format(
+            commands="\n".join(f"  {command}" for command in commands)
+        )
 
     def _starved_prompt(self, starved: Sequence[str]) -> str:
         """Supporting targets that did not fit, named so they are not guessed at."""

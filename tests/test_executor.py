@@ -1367,6 +1367,52 @@ def test_a_touched_file_too_large_to_show_the_reviewer_is_named(repo: Path, tmp_
     assert "--- hello.txt ---" not in shown
 
 
+def test_the_reviewer_is_told_the_diff_is_complete_and_which_checks_ran(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Measured on rdpapp. The reviewer verified a change was correct and in
+    scope, then rejected it: it could not confirm "no other file has changed",
+    and treated `Checks: passed` as the author's claim — "no build output was
+    provided beyond the claim". The harness knows both for certain."""
+    checks = Checks(commands=[["true"]])
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+        checks=checks,
+    )
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    shown = capturing.prompts["reviewer"]
+    assert "any file not appearing in it is unchanged" in shown
+    assert "run by the harness on this exact tree" in shown
+    assert "  true" in shown, "and which commands they were"
+
+
+def test_a_reviewer_with_no_checks_behind_it_is_told_so(repo: Path, tmp_path: Path) -> None:
+    """Silence would let it assume there were some."""
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+    )
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    assert "You are the only gate it has." in capturing.prompts["reviewer"]
+
+
 def test_a_supporting_target_that_does_not_fit_is_named_not_fatal(
     repo: Path, tmp_path: Path
 ) -> None:

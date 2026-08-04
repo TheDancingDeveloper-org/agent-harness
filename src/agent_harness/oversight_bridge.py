@@ -223,3 +223,43 @@ def build_coordinator(
         work=QueueWorkView(queue),
         model=model,
     )
+
+
+class RoomSweep:
+    """Run a coordinator over every room in a project, keeping a cursor each.
+
+    One room per item means a coordinator can no longer poll a single place.
+    It also means it no longer has to read one item's traffic to reach
+    another's, which is the reason the rooms exist.
+
+    Cursors are held per room and in memory. That is deliberate for now: a
+    restarted sweep re-reads a room from the beginning, and the ledger's
+    idempotency makes acting on the same evidence twice the same command
+    rather than a second one. A durable cursor is worth having and is not
+    worth having *first*.
+    """
+
+    def __init__(self, actor: Any, ledger: Any, *, general: bool = True) -> None:
+        self._actor = actor
+        self._ledger = ledger
+        self._general = general
+        self._cursors: dict[str, int] = {}
+
+    def run_once(self) -> list[Any]:
+        """One pass over every room. Returns each room's report."""
+        from .coordination import GENERAL_ROOM
+
+        rooms = list(self._ledger.rooms(self._actor.project_id))
+        if self._general and GENERAL_ROOM not in rooms:
+            rooms.append(GENERAL_ROOM)
+        reports = []
+        for room in sorted(rooms):
+            report = self._actor.run_once(room, after=self._cursors.get(room, 0))
+            if not report.authoritative:
+                # Another process holds the lease. Stop the sweep rather than
+                # walking every remaining room to be told the same thing.
+                reports.append(report)
+                break
+            self._cursors[room] = report.cursor
+            reports.append(report)
+        return reports

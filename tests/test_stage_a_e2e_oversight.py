@@ -601,7 +601,7 @@ def test_20_a_real_failing_item_reaches_a_coordinator_and_is_stopped(tmp_path: P
 
     from agent_harness import providers as P
     from agent_harness.coordination import MessageLedger
-    from agent_harness.executor import Checks, Executor
+    from agent_harness.executor import Checks, Executor, item_room
     from agent_harness.model_client import ModelClient, Response, RetryPolicy, Route
     from agent_harness.oversight_bridge import build_coordinator
     from agent_harness.work import WorkRecord
@@ -664,7 +664,7 @@ def test_20_a_real_failing_item_reaches_a_coordinator_and_is_stopped(tmp_path: P
     worker.run_once()
 
     # 1. The worker said something, without any help from this test.
-    said = ledger.read("default", GENERAL_ROOM, after=0, audience="oversight")
+    said = ledger.read("default", item_room("R2"), after=0, audience="oversight")
     assert said, "the worker reported nothing into the room"
     assert said[0].sender_role == "worker"
     assert said[0].item_id == "R2"
@@ -687,7 +687,7 @@ def test_20_a_real_failing_item_reaches_a_coordinator_and_is_stopped(tmp_path: P
         )
     )
     coordinator = build_coordinator(queue, "default", db_path=db, model=model, ledger=ledger)
-    report = coordinator.run_once()
+    report = coordinator.run_once(item_room("R2"))
 
     # 3. The queue really moved, through the command service.
     assert report.proposed == 1, f"the proposal was not accepted: {report}"
@@ -771,7 +771,7 @@ def test_21_a_real_model_coordinating_a_real_failing_item(tmp_path: Path) -> Non
 
     from agent_harness import providers as P
     from agent_harness.coordination import MessageLedger
-    from agent_harness.executor import Checks, Executor
+    from agent_harness.executor import Checks, Executor, item_room
     from agent_harness.model_client import ModelClient, Response, RetryPolicy, Route
     from agent_harness.oversight_bridge import build_coordinator
     from agent_harness.protocols import resolve
@@ -841,7 +841,7 @@ def test_21_a_real_model_coordinating_a_real_failing_item(tmp_path: Path) -> Non
         worker.run_once()
         queue.requeue("R2")
 
-    said = ledger.read("default", GENERAL_ROOM, after=0, audience="oversight")
+    said = ledger.read("default", item_room("R2"), after=0, audience="oversight")
     assert len(said) >= 1, "the workers reported nothing for a coordinator to read"
 
     preset = os.environ.get("HARNESS_ROUTE_PRESET", "claw-bay")
@@ -897,7 +897,7 @@ def test_22_three_goes_at_one_item_are_three_observations_not_one(tmp_path: Path
 
     from agent_harness import providers as P
     from agent_harness.coordination import MessageLedger
-    from agent_harness.executor import Checks, Executor
+    from agent_harness.executor import Checks, Executor, item_room
     from agent_harness.model_client import ModelClient, Response, RetryPolicy, Route
     from agent_harness.work import WorkRecord
     from conftest import make_queue
@@ -951,7 +951,7 @@ def test_22_three_goes_at_one_item_are_three_observations_not_one(tmp_path: Path
 
     failures = [
         m
-        for m in ledger.read("default", GENERAL_ROOM, after=0)
+        for m in ledger.read("default", item_room("R2"), after=0)
         if m.sender_role == "worker" and "checks_failed" in m.body
     ]
     assert len(failures) == 3, (
@@ -959,3 +959,212 @@ def test_22_three_goes_at_one_item_are_three_observations_not_one(tmp_path: Path
         "a coordinator cannot see a pattern in one message"
     )
     assert [m.payload["episode"] for m in failures] == [1, 2, 3]
+
+
+# =================== 23. the evidence a coordinator can actually act on
+
+
+def _failing_fleet(tmp_path: Path, check: list[str]) -> Any:
+    """A real worker, a real repository, and a check that really fails."""
+    import subprocess
+
+    from agent_harness import providers as P
+    from agent_harness.coordination import MessageLedger
+    from agent_harness.executor import Checks, Executor
+    from agent_harness.model_client import ModelClient, Response, RetryPolicy, Route
+    from agent_harness.work import WorkRecord
+    from conftest import make_queue
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for argv in (
+        ["init", "-q", "-b", "main"],
+        ["config", "user.email", "t@t"],
+        ["config", "user.name", "t"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *argv], check=True, capture_output=True)
+    (repo / "hello.txt").write_text("hello world\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "initial"], check=True, capture_output=True
+    )
+    diff = (
+        "diff --git a/hello.txt b/hello.txt\n"
+        "--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-hello world\n+hello harness\n"
+    )
+
+    def scripted(route: Route, messages: Any, options: Any) -> Response:
+        role = route.options.get("role", route.model)
+        reply = {"planner": "plan", "implementer": diff, "reviewer": "APPROVED\nfine"}[str(role)]
+        return Response(200, {}, json.dumps({"choices": [{"message": {"content": reply}}]}))
+
+    queue = make_queue(str(tmp_path / "queue.sqlite"))
+    queue.add([WorkRecord(item_id="R2", title="t", brief="b")])
+    ledger = MessageLedger(tmp_path / "coordination.sqlite")
+    worker = Executor(
+        queue,
+        ModelClient(
+            roles={
+                r: Route(f"m-{r}", "https://api.example", P.GENERIC, options={"role": r})
+                for r in ("planner", "implementer", "reviewer")
+            },
+            transport=scripted,
+            policy=RetryPolicy(max_attempts=1, backoff_seconds=0.001),
+            sleep=lambda _s: None,
+        ),
+        repo,
+        checks=Checks(commands=[check]),
+        push=False,
+        ledger=ledger,
+    )
+    return queue, ledger, worker
+
+
+def test_23_a_failed_check_carries_the_command_and_its_output(tmp_path: Path) -> None:
+    """The measured complaint, fixed.
+
+    Given only "checks_failed", a real coordinator replied "I was not given
+    the diff, file paths, or any evidence of what needs changing" and escalated
+    rather than routing around the problem. It was right to. The harness had
+    all of it and was sending none of it.
+    """
+    from agent_harness.executor import item_room
+
+    queue, ledger, worker = _failing_fleet(
+        tmp_path, ["python", "-c", "import sys; print('E123: undefined name'); sys.exit(1)"]
+    )
+
+    worker.run_once()
+
+    said = ledger.read("default", item_room("R2"), after=0)
+    failure = next(m for m in said if m.payload.get("stage") == "checks_failed")
+    assert "python" in failure.payload["check"], "which command refused it"
+    assert "E123: undefined name" in failure.payload["output"], "and what it said"
+    assert failure.payload["outcome"] == "fail"
+
+
+def test_23b_a_patch_that_would_not_apply_attaches_the_patch(tmp_path: Path) -> None:
+    """`--artifacts` already keeps the diff so it can be read instead of paid
+    for again. Nothing pointed a coordinator at it."""
+    import subprocess
+
+    from agent_harness import providers as P
+    from agent_harness.coordination import MessageLedger
+    from agent_harness.executor import Executor, item_room
+    from agent_harness.model_client import ModelClient, Response, RetryPolicy, Route
+    from agent_harness.work import WorkRecord
+    from conftest import make_queue
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for argv in (
+        ["init", "-q", "-b", "main"],
+        ["config", "user.email", "t@t"],
+        ["config", "user.name", "t"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *argv], check=True, capture_output=True)
+    (repo / "hello.txt").write_text("hello world\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "initial"], check=True, capture_output=True
+    )
+
+    # A diff whose context does not exist — the rdpapp failure exactly.
+    wrong = (
+        "diff --git a/hello.txt b/hello.txt\n"
+        "--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n"
+        "-this line is not in the file\n+hello harness\n"
+    )
+
+    def scripted(route: Route, messages: Any, options: Any) -> Response:
+        role = route.options.get("role", route.model)
+        reply = {"planner": "plan", "implementer": wrong, "reviewer": "APPROVED\nfine"}[str(role)]
+        return Response(200, {}, json.dumps({"choices": [{"message": {"content": reply}}]}))
+
+    queue = make_queue(str(tmp_path / "queue.sqlite"))
+    queue.add([WorkRecord(item_id="R2", title="t", brief="b")])
+    ledger = MessageLedger(tmp_path / "coordination.sqlite")
+    worker = Executor(
+        queue,
+        ModelClient(
+            roles={
+                r: Route(f"m-{r}", "https://api.example", P.GENERIC, options={"role": r})
+                for r in ("planner", "implementer", "reviewer")
+            },
+            transport=scripted,
+            policy=RetryPolicy(max_attempts=1, backoff_seconds=0.001),
+            sleep=lambda _s: None,
+        ),
+        repo,
+        push=False,
+        ledger=ledger,
+        artifacts=tmp_path / "artifacts",
+    )
+
+    worker.run_once()
+
+    said = ledger.read("default", item_room("R2"), after=0)
+    failed = next(m for m in said if m.payload.get("stage") == "apply_failed")
+    assert failed.attachments, "the kept patch was not attached"
+    attachment = failed.attachments[0]
+    assert attachment.digest.startswith("sha256:"), "content-addressed, not inlined"
+    assert attachment.media_type == "text/x-diff"
+    assert Path(attachment.location).read_text() == wrong, "and it really is the patch"
+    assert "rungs" in failed.payload, "which tolerance rungs were tried"
+
+
+def test_23c_a_missing_artefact_is_left_out_rather_than_referenced(tmp_path: Path) -> None:
+    """A broken reference is worse than no reference: a coordinator that
+    cannot open an attachment is no worse off than one never told about it."""
+    from agent_harness.executor import _attachments
+
+    assert _attachments(["/nonexistent/patch.patch"]) == ()
+
+
+def test_23d_each_item_gets_its_own_room(tmp_path: Path) -> None:
+    """Everything used to land in the general room, so a coordinator polling
+    one project read every item's traffic interleaved."""
+    from agent_harness.executor import item_room
+    from agent_harness.work import WorkRecord
+
+    queue, ledger, worker = _failing_fleet(tmp_path, ["false"])
+    queue.add([WorkRecord(item_id="R3", title="t", brief="b")])
+
+    worker.run_once()
+    worker.run_once()
+
+    rooms = set(ledger.rooms("default"))
+    assert item_room("R2") in rooms
+    assert item_room("R3") in rooms
+    assert GENERAL_ROOM not in rooms, "item traffic must not land in the project room"
+    for item_id in ("R2", "R3"):
+        said = ledger.read("default", item_room(item_id), after=0)
+        assert said and all(m.item_id == item_id for m in said), "rooms must not bleed"
+
+
+def test_23e_a_sweep_reads_every_room_and_keeps_a_cursor_each(tmp_path: Path) -> None:
+    """One room per item means a coordinator can no longer poll one place."""
+    from agent_harness.oversight_bridge import RoomSweep, build_coordinator
+    from agent_harness.work import WorkRecord
+
+    queue, ledger, worker = _failing_fleet(tmp_path, ["false"])
+    queue.add([WorkRecord(item_id="R3", title="t", brief="b")])
+    worker.run_once()
+    worker.run_once()
+
+    coordinator = build_coordinator(
+        queue,
+        "default",
+        db_path=str(tmp_path / "queue.sqlite"),
+        model=ScriptedOversightModel(),  # every decision is `wait`
+        ledger=ledger,
+    )
+    sweep = RoomSweep(coordinator, ledger)
+
+    first = sweep.run_once()
+    assert sum(r.triggers for r in first) == 2, "both items' rooms were read"
+
+    # A second sweep must not re-read what it already saw, or a coordinator
+    # pays for the same conclusion on every cycle forever.
+    second = sweep.run_once()
+    assert sum(r.triggers for r in second) == 0

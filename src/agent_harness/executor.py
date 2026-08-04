@@ -218,6 +218,49 @@ BUDGET_SPENT = "content budget exhausted"
 #: in `COORDINATION-PLANE.md` §6 as an oversight trigger. Successes are
 #: absent on purpose: a coordinator reading `checks_passed` pays a model to
 #: conclude that nothing is wrong.
+#: One room per work item, per COORDINATION-PLANE.md §5. Everything used to
+#: land in the general room, so a coordinator polling one project read every
+#: item's traffic interleaved — unreadable past two concurrent items, and
+#: impossible to reason about per item.
+ITEM_ROOM_PREFIX = "work:"
+
+
+def item_room(item_id: str) -> str:
+    """The room one item's traffic belongs in."""
+    return f"{ITEM_ROOM_PREFIX}{item_id}"
+
+
+def _attachments(paths: Sequence[str]) -> tuple[Any, ...]:
+    """Real files, referenced rather than inlined.
+
+    An attachment is content-addressed on purpose: bodies are kept forever and
+    blobs are not, so the message keeps enough to find and verify one and
+    nothing else. A file that has since gone is simply not attached — a
+    coordinator that cannot open it is no worse off than one that was never
+    told, and a broken reference is worse than both.
+    """
+    import hashlib
+
+    from .coordination import Attachment
+
+    found = []
+    for raw in paths:
+        path = Path(str(raw))
+        try:
+            body = path.read_bytes()
+        except OSError:
+            continue
+        found.append(
+            Attachment(
+                digest=f"sha256:{hashlib.sha256(body).hexdigest()}",
+                size=len(body),
+                media_type="text/x-diff" if path.suffix == ".patch" else "text/plain",
+                location=str(path),
+            )
+        )
+    return tuple(found)
+
+
 LEDGER_TRIGGERS = frozenset(
     {
         "checks_failed",
@@ -1931,6 +1974,14 @@ class Executor:
                 record,
                 "apply_failed",
                 detail=how + (f"\npatch kept at {kept}" if kept else ""),
+                evidence={
+                    "base": base,
+                    # Which rungs of the tolerance ladder were tried, and what
+                    # each said. "corrupt patch at line 22" and "patch does not
+                    # apply" are different diagnoses and lead different places.
+                    "rungs": how,
+                    "files": [str(kept)] if kept else [],
+                },
             )
             outcome.reason = f"the diff did not apply to {base}: {how}" + (
                 f" (patch kept at {kept})" if kept else ""
@@ -1970,6 +2021,14 @@ class Executor:
                 record,
                 "checks_failed",
                 detail=failure[:2000],
+                evidence={
+                    "check": " ".join(checked.command) if checked.command else "",
+                    "outcome": checked.outcome,
+                    # The tail is where a build tool prints what it objected
+                    # to, which is the part a person reads first.
+                    "output": failure[-4000:],
+                    "fix_declared": " ".join(checked.fix) if checked.fix else "",
+                },
                 # The gate's own word for what happened, so a client branches
                 # on a token rather than on English. `disk_exhausted` is kept
                 # exactly as it was: it is a narrower, older fact and the
@@ -2153,7 +2212,17 @@ class Executor:
             mode=mode,
         )
         outcome.verdict = verdict
-        self._emit(record, f"review_{verdict}", detail=verdict_text[:2000])
+        self._emit(
+            record,
+            f"review_{verdict}",
+            detail=verdict_text[:2000],
+            # The verdict in full, not the 500 characters the queue keeps. A
+            # reviewer's reasoning is the single most useful thing a
+            # coordinator can read about a refused item, and truncating it
+            # mid-sentence — which is what `last_error` does — throws away the
+            # part that says what to do differently.
+            evidence={"verdict": verdict, "review": verdict_text[:8000]},
+        )
         if outcome.pr_url and self.github is not None:
             self._record_verdict(record, outcome.pr_url, verdict, verdict_text)
         if verdict != APPROVED:
@@ -2464,6 +2533,7 @@ class Executor:
         stage: str,
         detail: str | None = None,
         error_class: str | None = None,
+        evidence: Mapping[str, Any] | None = None,
     ) -> None:
         if self.on_event is not None:
             # Telemetry is never load-bearing: a broken sink must not fail an
@@ -2482,9 +2552,15 @@ class Executor:
                         "project_id": self.project_id,
                     }
                 )
-        self._say(record, stage, detail)
+        self._say(record, stage, detail, evidence or {})
 
-    def _say(self, record: WorkRecord, stage: str, detail: str | None) -> None:
+    def _say(
+        self,
+        record: WorkRecord,
+        stage: str,
+        detail: str | None,
+        evidence: Mapping[str, Any],
+    ) -> None:
         """Report a setback into the coordination room, if there is one.
 
         A coordinator can only act on what it was told, and until now no
@@ -2502,7 +2578,7 @@ class Executor:
             self._episode += 1
         if self.ledger is None or stage not in LEDGER_TRIGGERS:
             return
-        from .coordination import GENERAL_ROOM, Submission
+        from .coordination import Submission
 
         # Never load-bearing, for the same reason telemetry is not: the
         # coordination plane is designed to be safe when absent, so a broken
@@ -2511,7 +2587,7 @@ class Executor:
             self.ledger.append(
                 Submission(
                     project_id=self.project_id,
-                    room_id=GENERAL_ROOM,
+                    room_id=item_room(record.item_id),
                     sender_id=self.owner,
                     sender_role="worker",
                     message_type="observation",
@@ -2531,7 +2607,15 @@ class Executor:
                         "stage": stage,
                         "attempts": record.attempts,
                         "episode": self._episode,
+                        # The evidence a person would open. A coordinator told
+                        # only "checks_failed" can conclude nothing and says so:
+                        # asked to act on three identical failures it replied
+                        # "I was not given the diff, file paths, or any evidence
+                        # of what needs changing", and escalated instead of
+                        # routing around the problem. It was right to.
+                        **{k: v for k, v in evidence.items() if k != "files"},
                     },
+                    attachments=_attachments(evidence.get("files") or ()),
                 )
             )
 

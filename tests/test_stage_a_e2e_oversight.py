@@ -1270,3 +1270,113 @@ def observe_raw(ledger: Any, body: str, item_id: str, room: str, key: str) -> No
             idempotency_key=key,
         )
     )
+
+
+# ================= 25. the return path: the loop actually closes
+
+
+def test_25_a_coordinators_answer_reaches_the_next_attempt(tmp_path: Path) -> None:
+    """§3.3, and the first step in this design that closes a loop.
+
+    Everything before it made observation better. Until now a coordinator's
+    conclusion went into a room nothing read — so a correct, specific and
+    actionable diagnosis reached nobody who could act on it.
+    """
+    from agent_harness.executor import item_room
+    from agent_harness.oversight_bridge import build_coordinator
+
+    queue, ledger, worker = _failing_fleet(tmp_path, ["false"])
+    worker.run_once()
+
+    coordinator = build_coordinator(
+        queue,
+        "default",
+        db_path=str(tmp_path / "queue.sqlite"),
+        model=ScriptedOversightModel(
+            json.dumps(
+                {
+                    "kind": "answer",
+                    "reason": "the compiler named the fix",
+                    "body": "E0277: `?` on a Result<_, String> needs the error boxed first.",
+                }
+            )
+        ),
+        ledger=ledger,
+    )
+    coordinator.run_once(item_room("R2"))
+
+    capturing = PromptCapturingOversight()
+    worker.client.transport = capturing
+    queue.requeue("R2")
+    worker.run_once()
+
+    assert "E0277" in capturing.prompts["implementer"], "the guidance did not reach the work"
+    assert "the brief wins" in capturing.prompts["implementer"], (
+        "and it must arrive as advice, not as an instruction that outranks the task"
+    )
+
+
+def test_25b_an_escalation_to_a_human_is_not_shown_to_the_worker(tmp_path: Path) -> None:
+    """Telling the implementer that a human has been asked to decide invites
+    it to guess the answer, which is the opposite of what escalating is for."""
+    from agent_harness.executor import item_room
+    from agent_harness.oversight_bridge import build_coordinator
+
+    queue, ledger, worker = _failing_fleet(tmp_path, ["false"])
+    worker.run_once()
+
+    coordinator = build_coordinator(
+        queue,
+        "default",
+        db_path=str(tmp_path / "queue.sqlite"),
+        model=ScriptedOversightModel(
+            json.dumps(
+                {
+                    "kind": "escalate",
+                    "reason": "needs a person",
+                    "body": "SECRET-FOR-HUMANS: decide whether to split this file",
+                }
+            )
+        ),
+        ledger=ledger,
+    )
+    report = coordinator.run_once(item_room("R2"))
+    assert report.escalated == 1
+
+    capturing = PromptCapturingOversight()
+    worker.client.transport = capturing
+    queue.requeue("R2")
+    worker.run_once()
+
+    assert "SECRET-FOR-HUMANS" not in capturing.prompts["implementer"]
+
+
+def test_25c_no_coordinator_means_no_guidance_section_at_all(tmp_path: Path) -> None:
+    """Absence stays safe, and stays invisible: a run with no coordinator must
+    read exactly as it did before this existed."""
+    queue, ledger, worker = _failing_fleet(tmp_path, ["false"])
+
+    capturing = PromptCapturingOversight()
+    worker.client.transport = capturing
+    worker.run_once()
+
+    assert "project coordinator" not in capturing.prompts["implementer"]
+
+
+class PromptCapturingOversight:
+    """Records each role's prompt while still driving the loop."""
+
+    def __init__(self) -> None:
+        self.prompts: dict[str, str] = {}
+        self.diff = (
+            "diff --git a/hello.txt b/hello.txt\n"
+            "--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-hello world\n+hello harness\n"
+        )
+
+    def __call__(self, route: Any, messages: Any, options: Any) -> Any:
+        from agent_harness.model_client import Response
+
+        role = str(route.options.get("role", route.model))
+        self.prompts[role] = messages[-1]["content"]
+        reply = {"planner": "plan", "implementer": self.diff, "reviewer": "APPROVED\nfine"}[role]
+        return Response(200, {}, json.dumps({"choices": [{"message": {"content": reply}}]}))

@@ -213,6 +213,33 @@ DEFAULT_CONTEXT_BUDGET = 60_000
 TARGET_OVER_BUDGET = "named target exceeds remaining content budget"
 BUDGET_SPENT = "content budget exhausted"
 
+#: What a coordinator says that a worker should act on. `decision` is absent
+#: because that is what an **escalation** is recorded as, addressed to an
+#: operator: telling the implementer that a human has been asked to decide
+#: invites it to guess the answer, which is the opposite of what escalating is
+#: for. A test asserts the escalation body never reaches a prompt.
+GUIDANCE_TYPES = frozenset({"answer", "correction"})
+
+#: Who a message has to be for. Unaddressed traffic is the room talking to
+#: everyone; anything with an explicit recipient list is for those recipients,
+#: and a worker reading someone else's mail is how an escalation to a human
+#: becomes a hint to a model.
+GUIDANCE_AUDIENCE = frozenset({"worker", "agent", "all"})
+
+#: How much of the room reaches the prompt. A conversation is unbounded and a
+#: prompt is not; the most recent few are the ones that still describe the
+#: item as it now stands.
+GUIDANCE_MESSAGES = 3
+GUIDANCE_CHARS = 4000
+
+GUIDANCE_PROMPT = """
+The project coordinator has looked at this item and said the following. It is
+advice from something that can see the whole project, not an instruction that
+overrides the task or the checks — and it may be wrong. Where it conflicts
+with the brief, the brief wins.
+{messages}
+"""
+
 #: The stages a worker reports into the coordination room. Every one is a
 #: setback a person watching the run would react to, and every one is named
 #: in `COORDINATION-PLANE.md` §6 as an oversight trigger. Successes are
@@ -1189,7 +1216,7 @@ Your plan:
 
 Repository context:
 {context}
-{unavailable}{checks}{prior}
+{unavailable}{checks}{guidance}{prior}
 Reply with a single unified diff (`diff --git` / `---` / `+++` / `@@`) that
 applies cleanly at the repository root. No commentary outside the diff.
 """
@@ -1896,6 +1923,7 @@ class Executor:
                 # asked. Naming the commands is not weakening the gate: the
                 # gate still runs, and still refuses.
                 checks=self._checks_prompt(),
+                guidance=self._guidance(record),
                 prior=self._prior_failure_prompt(record),
                 unavailable=self._starved_prompt(starved),
             ),
@@ -2579,6 +2607,45 @@ class Executor:
                     }
                 )
         self._say(record, stage, detail, evidence or {})
+
+    def _guidance(self, record: WorkRecord) -> str:
+        """What the coordinator has said about this item, for the next go.
+
+        The return path, and the first thing in this design that closes a
+        loop rather than improving observation. Until now a coordinator's
+        conclusion went into a room that nothing read, so a correct and
+        specific diagnosis — measured: "the `?` operator is being used on a
+        `Result<_, String>` in a function whose error type expects
+        `StdError`" — reached nobody who could act on it.
+
+        **This is not resumption.** No prior diff is fed back, the item is
+        re-planned against the current brief exactly as before, and a guided
+        attempt that fails consumes an attempt exactly as an unguided one
+        does (proposal Q1). Guidance is information, not absolution: if a
+        guided attempt were free, a coordinator could grant an item unlimited
+        attempts by advising it.
+        """
+        if self.ledger is None:
+            return ""
+        with contextlib.suppress(Exception):
+            said = self.ledger.read(
+                self.project_id,
+                item_room(record.item_id),
+                after=0,
+                audience="worker",
+            )
+            recent = [
+                m
+                for m in said
+                if m.sender_role == "oversight"
+                and m.message_type in GUIDANCE_TYPES
+                and (not m.recipients or GUIDANCE_AUDIENCE & set(m.recipients))
+            ][-GUIDANCE_MESSAGES:]
+            if not recent:
+                return ""
+            body = "\n".join(f"  - {m.body.strip()[:GUIDANCE_CHARS]}" for m in recent)
+            return GUIDANCE_PROMPT.format(messages=body)
+        return ""
 
     def _say(
         self,

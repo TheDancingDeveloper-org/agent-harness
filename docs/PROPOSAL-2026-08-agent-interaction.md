@@ -146,9 +146,28 @@ is the interesting part.
 
 **Q1 — does guidance from a coordinator make an attempt *its* attempt?**
 If a coordinator's advice reaches the implementer and the work then fails,
-whose failure is it, and does it consume an attempt? I do not think this can
-be answered before §3.3 exists to be measured, but it must be answered before
-it is switched on by default.
+whose failure is it, and does it consume an attempt?
+
+**Answered, 2026-08-04: it consumes an attempt, exactly as an unguided one
+does.** Guidance is information, not absolution. Three reasons, in order of
+how much they matter:
+
+- **Anything else is gameable.** If a guided attempt were free, a coordinator
+  could grant an item unlimited attempts by advising it, and `max_attempts`
+  would stop bounding anything. The one thing that must not depend on a
+  model's judgement is the ceiling on a model's spending.
+- **It keeps D11 intact.** `max_attempts` bounds genuine failures rather than
+  crashes. A guided attempt that fails is a genuine failure — the work was
+  tried and was wrong — and is indistinguishable from an unguided one in every
+  respect that the counter is about.
+- **The alternative hides the case worth seeing.** An item that keeps failing
+  *with* guidance is a more interesting signal than one failing without it,
+  and making those attempts invisible to the counter is precisely how it would
+  stop being visible at all.
+
+The corollary, which is not a caveat: a coordinator that wants an item to have
+more attempts must say so, as a proposal, and have it accepted. That path
+already exists and is auditable. Quietly not counting would not be.
 
 **Q2 — what stops a room becoming a bill?** Every message a coordinator reads
 is tokens. §3.1 makes messages bigger and §3.2 makes them more numerous. There

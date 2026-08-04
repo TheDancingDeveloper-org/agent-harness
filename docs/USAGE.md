@@ -1126,6 +1126,59 @@ with its own consequences.
 cannot reach for it to avoid failing an item, and an escalating check still
 stops the item before the reviewer is paid.
 
+### 6c. What a killed worker costs
+
+An attempt used to be all-or-nothing: kill a worker after the checks passed and
+the next claim started again at the planner, re-paying for the plan, the
+context selection and the implementer. It now resumes.
+
+Six stages are recorded as an attempt reaches them — `planned`, `implemented`,
+`applied`, `checked`, `checkpointed`, `reviewed` — each with the artefact that
+makes it resumable. A re-claim reads the last one and continues.
+
+**Recording a stage is not the same as being able to resume at it**, and the
+difference is stated rather than implied:
+
+| Reached | Resumes at | Because |
+|---|---|---|
+| `planned` | `planned` | the plan is durable; the planner is not re-asked |
+| `implemented` | `implemented` | the diff is durable; the implementer is not re-asked |
+| `applied` | `implemented` | an uncommitted working tree does not survive a crash, so the stored diff is re-applied to a fresh branch |
+| `checked` | `implemented` | same, and re-running checks is cheap and idempotent |
+| `checkpointed` | `checkpointed` | the commit is in git, which is as durable as it gets |
+| `reviewed` | `reviewed` | the verdict is reused, not re-asked — a model is not deterministic, and re-asking would make a crash a way to shop for a different answer |
+
+**A resumed attempt is the same attempt.** `max_attempts` bounds genuine
+failures, not crashes (decision D11). The consequence is worth knowing: an item
+that crashes in a loop is bounded by a budget rather than by the attempt count,
+and per-item budgets are a later stage.
+
+**A decision ends resumability.** A worker that reached a verdict decided; only
+a worker that was *killed* leaves a position to continue from. So retrying a
+rejected item re-plans it against the current brief rather than resuming into
+its own rejection, and `POST /api/work/{id}/retry` forgets every attempt at it.
+
+**A brief that moves discards the position, loudly.** Re-syncing a plan rewrites
+`title`, `brief` and `depends_on` on live claimed rows. An attempt briefed
+before that change is not resumed into work that answers a superseded question —
+it emits `brief_moved` and starts again.
+
+#### Durability is a policy
+
+```json
+{"durability": "boundary"}
+```
+
+| Mode | Writes | Use it for |
+|---|---|---|
+| `exit` | nothing until the attempt ends | the deterministic demo, and anywhere a crash costing a re-plan is cheaper than the writes |
+| `boundary` | one row per stage boundary — **the default** | a fleet |
+| `sync` | every boundary, plus the *intent* to perform each external effect before it happens | anywhere a push that may have half-happened must be a fact rather than a gap |
+
+The **pre-review git checkpoint is unaffected by all three.** The mode governs
+the attempt *record*; the commit before the expensive gate happens regardless,
+and no mode can remove it.
+
 ---
 
 ## Configuration reference

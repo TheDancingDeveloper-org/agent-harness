@@ -768,3 +768,43 @@ def test_a_provider_that_would_not_answer_leaves_the_position_intact(
     )
     resume = queue.attempts_log.resume("default", "T1", 1)
     assert resume.skips(A.CHECKPOINTED), "the checkpoint is still there to resume from"
+
+
+# ------------------------------------------- durability, as configuration
+
+
+def test_a_project_can_declare_its_durability_and_the_flag_beats_it(tmp_path: Path) -> None:
+    """The shape `docs/USAGE.md` §6c documents, through the API that serves it."""
+    import tempfile
+
+    from fastapi.testclient import TestClient
+
+    from agent_harness.api import create_api
+    from agent_harness.store import EventStore
+
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    store = EventStore(Path(tempfile.mkdtemp()) / "e.sqlite")
+    with TestClient(create_api(store, queue=queue, token="t")) as client:  # noqa: S106
+        auth = {"Authorization": "Bearer t"}
+        created = client.post(
+            "/api/projects",
+            json={"project_id": "widgets", "name": "Widgets", "durability": "sync"},
+            headers=auth,
+        )
+        assert created.status_code in (200, 201), created.text
+        assert (
+            client.get("/api/projects/widgets", headers=auth).json()["project"]["durability"]
+            == "sync"
+        )
+
+    project = queue.get_project("widgets")
+    assert project is not None and project.durability == "sync"
+
+
+def test_an_unknown_durability_is_refused_at_the_api_too() -> None:
+    import pydantic
+
+    from agent_harness.schemas import ProjectSpec
+
+    with pytest.raises(pydantic.ValidationError, match="unknown durability mode"):
+        ProjectSpec(project_id="p", name="P", durability="probably-fine")

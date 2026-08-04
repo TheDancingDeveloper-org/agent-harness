@@ -339,6 +339,18 @@ class ProjectSpec(BaseModel):
             "one of `checks`, verbatim."
         ),
     )
+    durability: str = Field(
+        "",
+        description=(
+            "How often an attempt is made durable, so a killed worker resumes rather than "
+            "re-paying for the planner and the implementer. `exit` writes nothing until the "
+            "attempt ends; `boundary` (the default) writes one row per stage; `sync` also "
+            "records the intent to perform each external effect before it happens, so a push "
+            "that may have half-happened is a fact rather than a gap. Empty takes the "
+            "deployment's default. **The pre-review git checkpoint is unaffected by all "
+            "three** — this governs the attempt record, not the commit."
+        ),
+    )
     plan_path: str | None = None
     roles: dict[str, RoleRoute] | None = Field(
         None, description="Role overrides for this project. Null uses the global map."
@@ -370,6 +382,15 @@ class ProjectSpec(BaseModel):
         for command in commands:
             validate_check_command(command)
         return commands
+
+    @field_validator("durability")
+    @classmethod
+    def durability_is_a_known_mode(cls, mode: str) -> str:
+        from .attempts import MODES
+
+        if mode and mode not in MODES:
+            raise ValueError(f"unknown durability mode {mode!r}; expected one of {MODES}")
+        return mode
 
     @model_validator(mode="after")
     def fixes_name_a_declared_check(self) -> ProjectSpec:

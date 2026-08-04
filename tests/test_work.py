@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_harness.graph import ResolverOutcome
 from agent_harness.work import (
     CLAIMED,
     DONE,
@@ -96,11 +97,75 @@ def test_dependencies_gate_claiming(queue: WorkQueue) -> None:
     assert second is not None and second.item_id == "T2"
 
 
-def test_a_dependency_outside_the_queue_does_not_block(queue: WorkQueue) -> None:
-    """Plans routinely reference work tracked elsewhere. Refusing to start
-    would strand the item forever."""
+def test_a_dependency_the_graph_cannot_find_blocks_and_says_so(queue: WorkQueue) -> None:
+    """This replaces the old rule, and the replacement is the point of Stage G.
+
+    A dependency absent from the queue used to be treated as satisfied, on
+    the grounds that plans reference work tracked elsewhere. That is true,
+    and it made a typo, an omitted item and a genuine external reference
+    indistinguishable -- all three ran immediately. An unresolvable required
+    target is now a blocker that explains itself.
+    """
     queue.add([rec("T1", depends_on=["EXTERNAL-9"])])
-    assert queue.claim("a") is not None
+
+    assert queue.claim("a") is None
+    state = queue.readiness("T1")
+    assert state.ready is False
+    assert [r.target_id for r in state.reasons] == ["EXTERNAL-9"]
+    assert state.reasons[0].state == "unresolved"
+    assert "no item 'EXTERNAL-9'" in state.reasons[0].explanation
+
+
+def test_a_declared_external_target_is_claimable_once_a_resolver_answers(
+    queue: WorkQueue,
+) -> None:
+    """The legitimate case still works -- it just has to say what it is.
+
+    An external reference declares its kind and its resolver, and becomes
+    satisfied when that resolver reports an outcome. Nothing is assumed on
+    its behalf in the meantime.
+    """
+    queue.add([rec("T1", depends_on=["external:tracker:TICKET-9"])])
+
+    assert queue.claim("a") is None, "an external target with no outcome is not satisfied"
+    reason = queue.readiness("T1").reasons[0]
+    assert reason.target_kind == "external_reference"
+    assert reason.resolver == "tracker"
+    assert "has not reported an outcome" in reason.explanation
+
+    queue.graph.record_resolver_outcome(
+        "default",
+        "T1",
+        "TICKET-9",
+        ResolverOutcome("satisfied", "TICKET-9 was closed on 2026-08-01"),
+    )
+    claimed = queue.claim("a")
+    assert claimed is not None and claimed.item_id == "T1"
+
+
+def test_an_advisory_dependency_is_reported_but_never_blocks(queue: WorkQueue) -> None:
+    """`?T9` says "related", not "wait for". Reported, because an advisory
+    edge that vanished silently would be indistinguishable from one that was
+    never declared."""
+    queue.add([rec("T1", depends_on=["?T9"])])
+
+    claimed = queue.claim("a")
+    assert claimed is not None
+    state = queue.readiness("T1")
+    assert state.ready is True
+    assert [r.target_id for r in state.advisory] == ["T9"]
+
+
+def test_a_cycle_blocks_every_member_and_names_the_loop(queue: WorkQueue) -> None:
+    """Two items that each wait for the other used to be reported as
+    "waiting", forever, with nothing saying the wait could never end."""
+    queue.add([rec("T1", depends_on=["T2"]), rec("T2", depends_on=["T1"])])
+
+    assert queue.claim("a") is None
+    state = queue.readiness("T1")
+    cycle = [r for r in state.reasons if r.kind == "cycle"]
+    assert cycle, state.reasons
+    assert cycle[0].evidence == "T1 -> T2 -> T1"
 
 
 def test_re_adding_a_synced_plan_does_not_reset_progress(queue: WorkQueue) -> None:

@@ -1435,7 +1435,7 @@ class Executor:
             response = self.client.call(role, [{"role": "user", "content": prompt}])
         except RequestRefused as exc:
             raise RuntimeError(f"{role} refused: {exc}") from exc
-        return _text_of(response.body)
+        return _text_of(response.body, _reader_for(self.client, role))
 
     def _base_for(self, record: WorkRecord) -> tuple[str, str | None]:
         """Which branch this item's work should sit on top of.
@@ -1600,14 +1600,37 @@ class Executor:
             )
 
 
-def _text_of(body: Any) -> str:
+def _reader_for(client: Any, role: str) -> Any:
+    """The response reader belonging to the route a role is served by.
+
+    Defensive because this is a *convenience*: a route with an unresolvable
+    preset, or a client that predates presets, still gets an answer out of the
+    fallback below rather than failing a call that already succeeded.
+    """
+    try:
+        return client.route_for(role).resolve().reader
+    except Exception:  # noqa: BLE001 - any failure means "no configured reader"
+        return None
+
+
+def _text_of(body: Any, reader: Any = None) -> str:
     """Best-effort extraction of assistant text from a provider response.
 
-    Handles the OpenAI and Anthropic shapes, and falls back to the raw body
-    — a reply this build cannot parse is still evidence, and discarding it
+    The route's own reader is asked first, so a gateway that puts its reply
+    somewhere unusual is a preset's configuration rather than another branch
+    here. Failing that, the two shapes in common use, and failing those the raw
+    body — a reply this build cannot parse is still evidence, and discarding it
     would turn a parsing gap into a silent empty answer.
     """
     import json as _json
+
+    if reader is not None:
+        try:
+            found = reader.text(body)
+        except Exception:  # noqa: BLE001 - a reader is never load-bearing
+            found = None
+        if found:
+            return str(found)
 
     if isinstance(body, bytes):
         body = body.decode(errors="replace")

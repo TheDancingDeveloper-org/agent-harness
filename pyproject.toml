@@ -30,6 +30,14 @@ dev = [
 [project.scripts]
 agent-harness = "agent_harness.__main__:main"
 
+# Route presets, resolved by name at runtime. Declared as metadata rather than
+# imported, so core never depends on an adapter and a build that names none
+# loads none. Any distribution may add to this group; that is how a vendor is
+# added without editing `model_client.py`.
+[project.entry-points."agent_harness.route_presets"]
+chat-completions = "agent_harness.adapters.chat_completions:PRESET"
+claw-bay = "agent_harness.adapters.claw_bay:PRESET"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

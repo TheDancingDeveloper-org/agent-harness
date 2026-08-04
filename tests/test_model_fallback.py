@@ -30,9 +30,13 @@ from agent_harness.model_client import (
 
 ENDPOINT = "https://api.example/v1"
 
+#: Configured here, not imported from an adapter: these are core tests, and the
+#: subject is chain order, not any gateway's envelope.
+ENVELOPE = P.VendorEnvelopeProvider()
+
 
 def chain(*models: str) -> tuple[Route, ...]:
-    return tuple(Route(m, ENDPOINT, P.CLAW_BAY, options={"role": "implementer"}) for m in models)
+    return tuple(Route(m, ENDPOINT, ENVELOPE, options={"role": "implementer"}) for m in models)
 
 
 class Scripted:
@@ -162,8 +166,8 @@ def test_a_parked_route_is_skipped_when_another_endpoint_can_serve() -> None:
     client = ModelClient(
         roles={
             "implementer": (
-                Route("a", ENDPOINT, P.CLAW_BAY, options={"role": "implementer"}),
-                Route("b", elsewhere, P.CLAW_BAY, options={"role": "implementer"}),
+                Route("a", ENDPOINT, ENVELOPE, options={"role": "implementer"}),
+                Route("b", elsewhere, ENVELOPE, options={"role": "implementer"}),
             )
         },
         transport=transport,

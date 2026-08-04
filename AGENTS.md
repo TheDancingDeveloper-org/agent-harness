@@ -69,6 +69,7 @@ trade and it is rejected.
 | Typed dependency graph | `src/agent_harness/graph.py` — contract in `docs/COORDINATION-PLANE.md` §8 |
 | What a gate answered, and what stopped an item | `src/agent_harness/outcomes.py` — **not** `providers.py`, which is what a *provider* answered |
 | Where an attempt got to, durably | `src/agent_harness/attempts.py` — a fixed stage list, **not** a workflow engine |
+| How long one item may take, and what it may spend | `src/agent_harness/budgets.py` — **not** a provider cost cap, and never parks an endpoint |
 | Queue schema migration | `docs/MIGRATION-graph.md` — backup, export, rebuild, rollback |
 | Log readers | `src/agent_harness/ingest.py` |
 | JSON API (no GUI) | `src/agent_harness/api.py` |

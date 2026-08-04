@@ -1322,6 +1322,51 @@ def test_a_target_that_cannot_be_shown_stops_the_item_before_the_implementer(
     assert item.attempts == 0, "a ceiling this deployment set is not the item failing"
 
 
+def test_the_reviewer_sees_the_files_the_diff_touched(repo: Path, tmp_path: Path) -> None:
+    """Measured on rdpapp: two of three rejection reasons were "the diff does
+    not show whether …", which no diff ever can. The prompt lists "the task
+    cannot be judged from what you were given" as grounds to reject, so a
+    diff-only reviewer rejects for the shape of its own prompt."""
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+    )
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    shown = capturing.prompts["reviewer"]
+    assert "--- hello.txt ---" in shown
+    assert "hello harness" in shown, "the file as it now stands, not as it was"
+
+
+def test_a_touched_file_too_large_to_show_the_reviewer_is_named(repo: Path, tmp_path: Path) -> None:
+    """A reviewer that does not know its view is partial treats it as whole."""
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"},
+    )
+    executor.context_policy = ContextPolicy(budget=10)
+    capturing = PromptCapturingModel(
+        {"planner": "plan", "implementer": DIFF, "reviewer": "APPROVED\nfine"}
+    )
+    executor.client.transport = capturing
+    add_item(queue)
+
+    executor.run_once()
+
+    shown = capturing.prompts["reviewer"]
+    assert "Not included, so you have not seen them:" in shown
+    assert "hello.txt — 14 characters, too large to include" in shown
+    assert "--- hello.txt ---" not in shown
+
+
 def test_the_implementer_is_told_which_checks_will_judge_it(repo: Path, tmp_path: Path) -> None:
     """The reviewer was told what the checks said; the writer was told nothing.
 

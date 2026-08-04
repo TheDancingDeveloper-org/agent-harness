@@ -276,6 +276,8 @@ class CycleReport:
     escalated: int = 0
     waited: int = 0
     rejected: int = 0
+    #: Triggers that were the same failure again, and cost no model call.
+    repeats: int = 0
     errors: list[str] = field(default_factory=list)
     cursor: int = 0
 
@@ -327,6 +329,7 @@ class OversightActor:
         now: Callable[[], float] = time.time,
         lease_seconds: float = DEFAULT_LEASE_SECONDS,
         proposal_ttl_seconds: float = 300.0,
+        repeat_threshold: int = 3,
     ) -> None:
         self.project_id = project_id
         self.ledger = ledger
@@ -339,7 +342,17 @@ class OversightActor:
         self.now = now
         self.lease_seconds = lease_seconds
         self.proposal_ttl_seconds = proposal_ttl_seconds
+        #: How many times one failure must recur before it is worth a fresh
+        #: opinion. Measured: shown three identical observations a real model
+        #: answered three times, in near-identical words, having no notion it
+        #: had seen any of them before. Repetition is the signal §6 is written
+        #: for; paying for it three times is not how to notice it.
+        self.repeat_threshold = max(1, repeat_threshold)
         self._held: Authority | None = None
+        #: signature -> how many times seen. In memory, like the sweep's
+        #: cursors: a restarted coordinator re-reads and re-decides, which is
+        #: wasteful and safe, and a durable version of both belongs together.
+        self._seen: dict[str, int] = {}
 
     # ------------------------------------------------------------ the cycle
 
@@ -369,8 +382,20 @@ class OversightActor:
                 # with itself, at model prices.
                 continue
             report.triggers += 1
+            repeat = self._repeat_count(message)
+            if 1 < repeat < self.repeat_threshold:
+                # The same failure *again*, and not yet often enough to be a
+                # pattern worth a fresh opinion. Counted, not paid for.
+                #
+                # `1 <` is load-bearing and was wrong first: a first sighting
+                # also "has a count", and skipping it made the coordinator
+                # blind to every new failure — strictly worse than having no
+                # deduplication at all. A test caught it; the ordering of the
+                # comparison is the whole feature.
+                report.repeats += 1
+                continue
             try:
-                self._handle(message, room_id, held, report)
+                self._handle(message, room_id, held, report, repeat=repeat)
             except OversightUnavailable as exc:
                 # The model is down or the route is wrong. Stop this cycle and
                 # leave everything exactly as it was: unresolved work stays
@@ -391,8 +416,30 @@ class OversightActor:
 
     # ----------------------------------------------------------- one message
 
-    def _handle(self, message: Message, room_id: str, held: Authority, report: CycleReport) -> None:
-        decision = self._decide(message)
+    def _repeat_count(self, message: Message) -> int:
+        """How many times this exact failure has now been seen, or 0.
+
+        Zero means "no signature, or the first sighting" — both of which are
+        handled normally. A worker that reports no signature is never
+        deduplicated, because an unknown failure must not be mistaken for a
+        familiar one.
+        """
+        signature = str(message.payload.get("signature") or "")
+        if not signature:
+            return 0
+        self._seen[signature] = self._seen.get(signature, 0) + 1
+        return self._seen[signature]
+
+    def _handle(
+        self,
+        message: Message,
+        room_id: str,
+        held: Authority,
+        report: CycleReport,
+        *,
+        repeat: int = 0,
+    ) -> None:
+        decision = self._decide(message, repeat=repeat)
         if decision.kind == WAIT:
             report.waited += 1
             return
@@ -482,7 +529,7 @@ class OversightActor:
 
     # ------------------------------------------------------------- the model
 
-    def _decide(self, message: Message) -> Decision:
+    def _decide(self, message: Message, *, repeat: int = 0) -> Decision:
         if self.model is None:
             # No route configured. Escalating beats guessing and beats
             # silence: the finding reaches a person, and no gate moved.
@@ -501,6 +548,11 @@ class OversightActor:
                     "payload": dict(message.payload),
                 },
                 "work": [i.as_dict() for i in self.work.items(self.project_id)][:50],
+                # Stated rather than left to be inferred from the room. "This
+                # is the third identical failure" is a different question from
+                # "this failed", and the answer to it is the whole reason a
+                # coordinator is cheaper than a person.
+                **({"identical_occurrences": repeat} if repeat > 1 else {}),
             },
             default=str,
         )

@@ -137,3 +137,16 @@ def test_the_shipped_presets_are_declared_rather_than_imported() -> None:
     declared = manifest["project"]["entry-points"]["agent_harness.route_presets"]
     assert set(declared) == {"chat-completions", "claw-bay"}
     assert all(value.startswith("agent_harness.adapters.") for value in declared.values())
+
+
+def test_the_shipped_dependency_resolvers_are_declared_the_same_way() -> None:
+    """Stage G's resolver lookup and Stage B's preset lookup were written apart
+    and reached the same place: a name in core, a module in metadata. Merging
+    them made the difference visible, so they now use one door rather than two
+    conventions that happen to agree today."""
+    import tomllib
+
+    manifest = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text())
+    declared = manifest["project"]["entry-points"]["agent_harness.dependency_resolvers"]
+    assert set(declared) == {"github-issue"}
+    assert all(value.startswith("agent_harness.adapters.") for value in declared.values())

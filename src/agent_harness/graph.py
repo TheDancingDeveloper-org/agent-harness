@@ -41,11 +41,14 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import sqlite3
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+log = logging.getLogger(__name__)
 
 # ------------------------------------------------------------- target kinds
 
@@ -83,12 +86,12 @@ REASON_CYCLE = "cycle"
 #: database whose graph has not been rebuilt yet.
 REASON_STALE = "stale_graph"
 
-#: Resolver names the core will load on demand, and the module that provides
-#: each. Only the *name* lives here; nothing in this module imports an adapter
-#: at module scope, and the core never learns an external system's format.
-ADAPTER_RESOLVERS = {
-    "github-issue": "agent_harness.adapters.github_issue",
-}
+#: The entry-point group a distribution declares to publish dependency
+#: resolvers. The same door `protocols.py` opens for route presets, for the
+#: same reason: a name written into core as a dotted module path is an import
+#: wearing a string's clothes. Core reads the *metadata* and loads only the
+#: one name a token asked for.
+RESOLVER_ENTRY_POINT_GROUP = "agent_harness.dependency_resolvers"
 
 #: Provenance for an edge declared by a work row's `depends_on`. Named once
 #: because the queue writes it and a rebuild re-derives it, and a rebuild that
@@ -133,25 +136,75 @@ class Resolver(Protocol):
     def __call__(self, target: ExternalTarget, /) -> ResolverOutcome: ...
 
 
+#: Resolvers already loaded by name in this process, so a claim scan does not
+#: re-import once per edge. A cache, not a registration door: `extra` is how a
+#: deployment supplies a resolver of its own.
+_LOADED_RESOLVERS: dict[str, Resolver] = {}
+
+
+def _declared_resolver_targets() -> dict[str, str]:
+    """`name -> module:attribute`, from installed distributions.
+
+    Reads entry-point *metadata*; no declaring module is imported here, which
+    is what makes an adapter cost nothing until a token names it.
+    """
+    from importlib.metadata import entry_points
+
+    try:
+        return {point.name: point.value for point in entry_points(group=RESOLVER_ENTRY_POINT_GROUP)}
+    except Exception:  # noqa: BLE001 - broken metadata must not stop a claim scan
+        log.warning(
+            "graph: could not read %s entry points", RESOLVER_ENTRY_POINT_GROUP, exc_info=True
+        )
+        return {}
+
+
+def _load_resolver_target(target: str) -> Resolver | None:
+    """Import one declared target and get a resolver out of it.
+
+    The attribute may be a resolver or a zero-argument factory that builds
+    one, so an adapter that has to read something first can still be declared.
+    """
+    module_name, _, attribute = target.partition(":")
+    module = importlib.import_module(module_name)
+    found: Any = getattr(module, attribute or "resolver", None)
+    if found is None:  # pragma: no cover - a broken adapter, not a state
+        return None
+    if callable(found):
+        try:
+            built = found()
+        except TypeError:
+            # It wanted a target: it *is* the resolver, not a factory for one.
+            return found  # type: ignore[no-any-return]
+        if callable(built):
+            return built  # type: ignore[no-any-return]
+    return None
+
+
 def load_resolver(name: str, extra: Mapping[str, Resolver] | None = None) -> Resolver | None:
     """Find the resolver for a target kind, importing its adapter lazily.
 
     `extra` is how a deployment (or a test) supplies its own without editing
-    this module. Returning None rather than raising is intentional: an
-    unknown resolver leaves the edge `unresolved`, which is a blocker with an
-    explanation, and that is strictly better than an exception in the middle
-    of a claim scan.
+    this module or touching process-wide state. Returning None rather than
+    raising is intentional: an unknown resolver leaves the edge `unresolved`,
+    which is a blocker with an explanation, and that is strictly better than
+    an exception in the middle of a claim scan.
     """
     if extra and name in extra:
         return extra[name]
-    module_name = ADAPTER_RESOLVERS.get(name)
-    if module_name is None:
+    if name in _LOADED_RESOLVERS:
+        return _LOADED_RESOLVERS[name]
+    target = _declared_resolver_targets().get(name)
+    if target is None:
         return None
-    module = importlib.import_module(module_name)
-    factory = getattr(module, "resolver", None)
-    if factory is None:  # pragma: no cover - a broken adapter, not a state
+    try:
+        resolver = _load_resolver_target(target)
+    except Exception:  # noqa: BLE001 - a broken plugin is a named failure
+        log.warning("graph: could not load resolver %r from %r", name, target, exc_info=True)
         return None
-    resolver: Resolver = factory()
+    if resolver is None:
+        return None
+    _LOADED_RESOLVERS[name] = resolver
     return resolver
 
 

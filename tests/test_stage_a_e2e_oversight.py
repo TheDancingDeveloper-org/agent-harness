@@ -1380,3 +1380,185 @@ class PromptCapturingOversight:
         self.prompts[role] = messages[-1]["content"]
         reply = {"planner": "plan", "implementer": self.diff, "reviewer": "APPROVED\nfine"}[role]
         return Response(200, {}, json.dumps({"choices": [{"message": {"content": reply}}]}))
+
+
+# ============== 26. a worker asks rather than guesses, and is answered
+
+
+def _uncertain_fleet(tmp_path: Path) -> Any:
+    """A worker whose planner says, in as many words, that it cannot tell what
+    to change — which today is recorded and then ignored."""
+    import subprocess
+
+    from agent_harness import providers as P
+    from agent_harness.coordination import MessageLedger
+    from agent_harness.executor import Executor
+    from agent_harness.model_client import ModelClient, Response, RetryPolicy, Route
+    from agent_harness.work import WorkRecord
+    from conftest import make_queue
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for argv in (
+        ["init", "-q", "-b", "main"],
+        ["config", "user.email", "t@t"],
+        ["config", "user.name", "t"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *argv], check=True, capture_output=True)
+    (repo / "hello.txt").write_text("hello world\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-q", "-m", "initial"], check=True, capture_output=True
+    )
+
+    stuck = json.dumps(
+        {
+            "plan": "cannot proceed",
+            "targets": [],
+            "cannot_identify_target": "the brief names a `settings` module that does not exist",
+        }
+    )
+
+    def scripted(route: Route, messages: Any, options: Any) -> Response:
+        role = str(route.options.get("role", route.model))
+        reply = {"planner": stuck, "implementer": "no diff", "reviewer": "APPROVED"}[role]
+        return Response(200, {}, json.dumps({"choices": [{"message": {"content": reply}}]}))
+
+    queue = make_queue(str(tmp_path / "queue.sqlite"))
+    queue.add([WorkRecord(item_id="R2", title="t", brief="b")])
+    ledger = MessageLedger(tmp_path / "coordination.sqlite")
+    worker = Executor(
+        queue,
+        ModelClient(
+            roles={
+                r: Route(f"m-{r}", "https://api.example", P.GENERIC, options={"role": r})
+                for r in ("planner", "implementer", "reviewer")
+            },
+            transport=scripted,
+            policy=RetryPolicy(max_attempts=1, backoff_seconds=0.001),
+            sleep=lambda _s: None,
+        ),
+        repo,
+        push=False,
+        ledger=ledger,
+        ask_when_uncertain=True,
+    )
+    return queue, ledger, worker
+
+
+def test_26_an_ambiguous_item_asks_instead_of_guessing(tmp_path: Path) -> None:
+    """`AGENTS.md` is explicit that the ambiguous case must reach a person
+    rather than be guessed at. The planner already says when it cannot tell
+    what to change — and the harness recorded that and carried on to pay an
+    implementer with no target, which is guessing."""
+    from agent_harness.executor import item_room
+
+    queue, ledger, worker = _uncertain_fleet(tmp_path)
+
+    worker.run_once()
+
+    held = queue.get("R2")
+    assert held is not None
+    assert held.state == "held", "the item is waiting on an answer, not failed"
+    # The attempt is still in flight, not spent: a hold suspends the lease and
+    # keeps the claim (D12), so answering resumes *this* attempt rather than
+    # starting a new one. It was never released, which is the point.
+    assert held.attempts == 1
+    assert held.owner == worker.owner, "and it is still the asking worker's"
+
+    asked = [
+        m for m in ledger.read("default", item_room("R2"), after=0) if m.message_type == "question"
+    ]
+    assert asked, "the question never reached the room"
+    assert "settings" in asked[0].body, "and it says what it could not resolve"
+    assert "resume_token" not in json.dumps(dict(asked[0].payload)), (
+        "a token in a room is a token anything that can read the room may spend"
+    )
+
+
+def test_26b_a_coordinator_answers_through_the_same_gate_as_everything_else(
+    tmp_path: Path,
+) -> None:
+    """The coordinator never sees the resume token. It proposes an answer; the
+    bridge looks the token up and spends it."""
+    from agent_harness.executor import item_room
+    from agent_harness.oversight_bridge import build_coordinator
+
+    queue, ledger, worker = _uncertain_fleet(tmp_path)
+    worker.run_once()
+
+    coordinator = build_coordinator(
+        queue,
+        "default",
+        db_path=str(tmp_path / "queue.sqlite"),
+        model=ScriptedOversightModel(
+            json.dumps(
+                {
+                    "kind": "propose",
+                    "action_type": "answer_question",
+                    "target": "R2",
+                    "reason": "the module was renamed; the brief is stale",
+                    "risk": "low",
+                    "approval_required": False,
+                    "payload": {"answer": "`settings` is now `config`. Use that."},
+                }
+            )
+        ),
+        ledger=ledger,
+    )
+
+    report = coordinator.run_once(item_room("R2"))
+
+    assert report.proposed == 1, f"the answer was not accepted: {report}"
+    resumed = queue.get("R2")
+    assert resumed is not None
+    assert resumed.state == "claimed", "the item returned to the worker that asked"
+    assert resumed.owner == worker.owner, "with its worktree and context intact"
+
+
+def test_26c_an_empty_answer_resolves_nothing(tmp_path: Path) -> None:
+    from agent_harness.command_service import ActionProposal, ExpectedTargetState
+    from agent_harness.oversight_bridge import QueueMutations
+
+    queue, ledger, worker = _uncertain_fleet(tmp_path)
+    worker.run_once()
+
+    empty = ActionProposal(
+        proposal_id="p1",
+        project_id="default",
+        room_id=GENERAL_ROOM,
+        proposer_id="coordinator-a",
+        proposer_role="oversight",
+        action_type="answer_question",
+        target="R2",
+        expected=ExpectedTargetState(
+            graph_revision=0, item_state="held", owner=worker.owner, attempt=1
+        ),
+        reason="...",
+        evidence_message_ids=("m1",),
+        idempotency_key="k1",
+        risk=Risk.LOW,
+        approval_required=False,
+        expires_at=9e9,
+        payload={"answer": "   "},
+    )
+
+    outcome = QueueMutations(queue).apply(empty, None)
+
+    assert outcome.status is CommandStatus.REJECTED
+    assert outcome.code == "empty_answer"
+    still = queue.get("R2")
+    assert still is not None and still.state == "held"
+
+
+def test_26d_asking_is_off_unless_a_deployment_turns_it_on(tmp_path: Path) -> None:
+    """A hold keeps the claim, so an unwatched fleet is better served by
+    failing fast than by tying up a worker until the hold expires."""
+    queue, ledger, worker = _uncertain_fleet(tmp_path)
+    worker.ask_when_uncertain = False
+
+    worker.run_once()
+
+    after = queue.get("R2")
+    assert after is not None
+    assert after.state != "held", "asking must not happen by default"

@@ -40,7 +40,11 @@ log = logging.getLogger(__name__)
 #: can undo is not one to hand to a model.
 BLOCK_WORK = "block_work"
 RETRY_WORK = "retry_work"
-SUPPORTED_ACTIONS = frozenset({BLOCK_WORK, RETRY_WORK})
+#: Answer a question a worker asked and is held on. Reversible in the sense
+#: that matters: it returns the item to its own worker, with its worktree and
+#: context intact, and decides nothing about the work itself.
+ANSWER_QUESTION = "answer_question"
+SUPPORTED_ACTIONS = frozenset({BLOCK_WORK, RETRY_WORK, ANSWER_QUESTION})
 
 
 class QueueWorkView:
@@ -86,6 +90,41 @@ class QueueMutations:
         self._queue = queue
         self._now = now
 
+    def _answer(self, proposal: ActionProposal, record: Any) -> MutationOutcome:
+        """Answer the question this item is held on.
+
+        **The resume token never leaves this module.** It is looked up here,
+        from the open hold, rather than travelling to the coordinator and back
+        — a token in a room is a token anything that can read the room may
+        spend, and it exists precisely so that a reply arriving after a
+        timeout cannot land on whatever the item is doing an hour later.
+
+        Nothing interprets the answer. It is recorded verbatim and the item
+        returns to its own worker: a model reading human feedback to decide
+        what it meant would be a gate decided by a model, which `AGENTS.md`
+        rejects.
+        """
+        from .holds import Answer
+
+        text = _answer_of(proposal)
+        if not text:
+            return MutationOutcome.rejected(
+                "empty_answer", "an answer with no content resolves nothing"
+            )
+        hold = self._queue.holds.current(proposal.project_id, record.item_id)
+        if hold is None:
+            return MutationOutcome.rejected(
+                "no_question", f"{record.item_id} is not waiting on an answer"
+            )
+        self._queue.answer_hold(
+            record.item_id,
+            hold.resume_token,
+            Answer(text=text, who=proposal.proposer_id),
+            project_id=proposal.project_id,
+        )
+        log.info("oversight answered %s/%s", proposal.project_id, record.item_id)
+        return MutationOutcome.accepted("answered", f"{record.item_id} may continue")
+
     def apply(self, proposal: ActionProposal, _authority: Any) -> MutationOutcome:
         if proposal.action_type not in SUPPORTED_ACTIONS:
             # Reachable only if a deployment's policy names an action this
@@ -108,6 +147,9 @@ class QueueMutations:
             # most likely to cause and least likely to notice.
             return MutationOutcome.rejected("stale_proposal", stale)
 
+        if proposal.action_type == ANSWER_QUESTION:
+            return self._answer(proposal, record)
+
         if proposal.action_type == BLOCK_WORK:
             reason = proposal.reason or "blocked by oversight"
             self._queue.release(
@@ -119,6 +161,11 @@ class QueueMutations:
         self._queue.requeue(record.item_id, project_id=proposal.project_id)
         log.info("oversight requeued %s/%s", proposal.project_id, record.item_id)
         return MutationOutcome.accepted("requeued", f"{record.item_id} is pending again")
+
+
+def _answer_of(proposal: ActionProposal) -> str:
+    payload = dict(proposal.payload)
+    return str(payload.get("answer") or payload.get("body") or "").strip()
 
 
 def _stale(proposal: ActionProposal, record: Any) -> str:
@@ -206,6 +253,9 @@ def build_coordinator(
         {
             BLOCK_WORK: ActionRule(risk=Risk.LOW, allowed_roles=frozenset({"human", "oversight"})),
             RETRY_WORK: ActionRule(risk=Risk.LOW, allowed_roles=frozenset({"human", "oversight"})),
+            ANSWER_QUESTION: ActionRule(
+                risk=Risk.LOW, allowed_roles=frozenset({"human", "oversight"})
+            ),
         }
     )
     commands = CommandService(

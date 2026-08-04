@@ -254,6 +254,27 @@ agent-harness run --repo owner/name --work ./target-repo \
     --endpoint https://api.your-gateway.example --check 'pytest -q'
 ```
 
+**A role may name several models, in preference order.** The first that
+answers does the work; the others are tried only when it will not:
+
+```bash
+    --implementer deepseek-v4-flash,glm-5.2,gpt-5.4 --reviewer gpt-5.6
+```
+
+This is not load spreading, it is availability. Measured on one gateway, 34 of
+42 advertised models were unavailable simultaneously — a role with a single
+name is a fleet that stops when that name is down. The whole chain is tried
+before any backoff, because a model that is down answers immediately and
+sleeping on it first would waste the alternatives entirely; the event stream
+records which model actually answered, so a fleet quietly running on its third
+choice says so.
+
+Two bounds worth knowing. A chain protects against a *model* being
+unavailable, not against running out of budget: a spend cap belongs to the
+account, so it parks every model behind that endpoint. And `/api/roles`,
+readiness and the independence warning all report the *preferred* route — a
+fallback that has not been needed is not what you configured.
+
 ### What it guarantees either way
 
 - **Cheap checks run before the reviewer.** Paying a model to tell you the

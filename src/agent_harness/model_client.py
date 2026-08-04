@@ -195,6 +195,33 @@ class Route:
     options: Mapping[str, Any] = field(default_factory=dict)
 
 
+#: One role's routes, in the order they are tried. A single `Route` is the
+#: one-element case, which is why almost nothing outside this module had to
+#: change: `route_for` still answers with the preferred one.
+Chain = tuple[Route, ...]
+
+
+def _as_chain(value: Route | Sequence[Route]) -> Chain:
+    return (value,) if isinstance(value, Route) else tuple(value)
+
+
+def _chain_names(chain: Chain) -> str:
+    """The chain as an operator reads it: which models, in which order."""
+    return ", ".join(f"{route.model} via {route.endpoint}" for route in chain)
+
+
+def _fell_back(chain: Chain, used: Route) -> str | None:
+    """Said out loud when a call was served by anything but the first choice.
+
+    A fleet quietly running on its third-choice model for a week is a fleet
+    whose costs and results nobody can explain, so the event stream records
+    which one answered rather than only that something did.
+    """
+    if used is chain[0]:
+        return None
+    return f"fell back to {used.model} (preferred {chain[0].model})"
+
+
 @dataclass
 class Response:
     status: int
@@ -218,21 +245,61 @@ def routes_from_map(
     """
     routes: dict[str, Route] = {}
     for name, spec in (stored or {}).items():
-        model, endpoint = spec.get("model"), spec.get("endpoint")
-        if not model or not endpoint:
-            continue
-        routes[name] = Route(
-            str(model),
-            str(endpoint),
-            P.PROVIDERS.get(str(spec.get("provider", "")), default_provider),
-            api_key=api_key,
-        )
+        chain = _chain_from_spec(spec, api_key=api_key, default_provider=default_provider)
+        if chain:
+            routes[name] = chain[0]
     return routes
 
 
-def effective_routes(
-    global_routes: Mapping[str, Route], project_routes: Mapping[str, Route] | None
-) -> dict[str, Route]:
+def chains_from_map(
+    stored: Mapping[str, Mapping[str, Any]] | None,
+    *,
+    api_key: str | None = None,
+    default_provider: Provider = P.CLAW_BAY,
+) -> dict[str, Chain]:
+    """The persisted role map, as fallback chains.
+
+    Same source as `routes_from_map`, which answers with each role's preferred
+    route for everything that *reports* on configuration. This one is what the
+    client calls with, because the second and third choices only matter at the
+    moment the first will not answer.
+    """
+    chains: dict[str, Chain] = {}
+    for name, spec in (stored or {}).items():
+        chain = _chain_from_spec(spec, api_key=api_key, default_provider=default_provider)
+        if chain:
+            chains[name] = chain
+    return chains
+
+
+def _chain_from_spec(
+    spec: Mapping[str, Any], *, api_key: str | None, default_provider: Provider
+) -> Chain:
+    """One role's stored spec as an ordered chain.
+
+    Accepts `model` as a single name or as a list, so a map written before
+    fallbacks existed still reads correctly and a role that names one model is
+    not forced into list syntax. A role missing a model or an endpoint is
+    dropped rather than half-built: it is not a route, and preflight's job is
+    to name it as missing rather than to fail on the first call that uses it.
+    """
+    endpoint = spec.get("endpoint")
+    models = spec.get("models") or spec.get("model")
+    if not endpoint or not models:
+        return ()
+    if isinstance(models, str):
+        models = [models]
+    provider = P.PROVIDERS.get(str(spec.get("provider", "")), default_provider)
+    return tuple(
+        Route(str(model), str(endpoint), provider, api_key=api_key)
+        for model in models
+        if str(model).strip()
+    )
+
+
+def effective_routes[R](
+    global_routes: Mapping[str, R], project_routes: Mapping[str, R] | None
+) -> dict[str, R]:
     """The global role map with one project's overrides applied.
 
     Per role, not wholesale. Choosing one map or the other was the defect:
@@ -314,7 +381,7 @@ class ModelClient:
 
     def __init__(
         self,
-        roles: Mapping[str, Route],
+        roles: Mapping[str, Route | Sequence[Route]],
         transport: Transport,
         policy: RetryPolicy | None = None,
         on_event: Callable[[dict[str, Any]], None] | None = None,
@@ -324,9 +391,14 @@ class ModelClient:
         jitter: Callable[[], float] = random.random,
         parks: EndpointParks | None = None,
         run_id: str | None = None,
-        routes_provider: Callable[[], Mapping[str, Route]] | None = None,
+        routes_provider: Callable[[], Mapping[str, Route | Sequence[Route]]] | None = None,
     ) -> None:
-        self.roles = dict(roles)
+        # Either form, on purpose: this is a public attribute that callers and
+        # tests assign to, and a bare `Route` put there by hand is the
+        # one-element chain it looks like. Normalised on read.
+        self.roles: dict[str, Route | Chain] = {
+            name: _as_chain(value) for name, value in roles.items()
+        }
         # Consulted per call when set, so the role -> model map can be changed
         # while the fleet is running. The call site names a ROLE and never a
         # model, which is the whole reason that is possible; a provider lets
@@ -359,9 +431,17 @@ class ModelClient:
         effective map -- which this client's own map may not be -- gets the
         same answer from the same code.
         """
-        return reviewer_independence(self.roles, implemented_by=implemented_by)
+        # The preferred route per role: a fallback that has not been needed
+        # is not what the operator configured, and is not what they should be
+        # told about their reviewer.
+        preferred = {
+            name: _as_chain(value)[0] for name, value in self.roles.items() if _as_chain(value)
+        }
+        return reviewer_independence(preferred, implemented_by=implemented_by)
 
-    def routed_by(self, routes_provider: Callable[[], Mapping[str, Route]]) -> ModelClient:
+    def routed_by(
+        self, routes_provider: Callable[[], Mapping[str, Route | Sequence[Route]]]
+    ) -> ModelClient:
         """A sibling client that resolves routes differently.
 
         Transport, retry policy, prices, telemetry and — deliberately — the
@@ -420,17 +500,38 @@ class ModelClient:
             + (f": {verdict.message[:160]}" if verdict.message else ""),
         )
 
-    def route_for(self, role: str) -> Route:
+    def routes_for(self, role: str) -> Chain:
+        """Every route for a role, preferred first.
+
+        More than one is a fallback chain, not a pool: the first that answers
+        does the work, and the rest exist because a provider being down is a
+        normal Tuesday. Measured on the endpoint this runs against, 34 of 42
+        advertised models were unavailable at once -- an ordering that names a
+        second and third choice is the difference between a fleet that pauses
+        and one that carries on.
+        """
         if self.routes_provider is not None:
             live = self.routes_provider()
             if live:
-                self.roles = dict(live)
+                self.roles = {name: _as_chain(value) for name, value in live.items()}
         try:
-            return self.roles[role]
+            # Normalised on read as well as on write: `roles` is a plain
+            # attribute callers assign to, and a bare `Route` put there by
+            # hand is the one-element chain it looks like.
+            return _as_chain(self.roles[role])
         except KeyError:
             raise KeyError(
                 f"no route for role {role!r}; known roles: {sorted(self.roles)}"
             ) from None
+
+    def route_for(self, role: str) -> Route:
+        """The preferred route for a role: what this deployment means to use.
+
+        Everything that *reports* on routing -- readiness, the role map,
+        reviewer independence -- asks this, because a fallback that has not
+        been needed is not what the operator configured.
+        """
+        return self.routes_for(role)[0]
 
     def call(self, role: str, messages: Sequence[Mapping[str, Any]], **options: Any) -> Response:
         """Call `role`'s model. Returns the successful response.
@@ -439,9 +540,9 @@ class ModelClient:
         if the provider refused and retrying cannot help, or `RetryExhausted`
         once the retryable attempt ladder is spent.
         """
-        route = self.route_for(role)
-        merged = {**route.options, **options}
+        chain = self.routes_for(role)
         last: Classification | None = None
+        last_route = chain[0]
 
         for attempt in range(self.policy.max_attempts):
             if attempt > 0:
@@ -449,72 +550,117 @@ class ModelClient:
                     attempt, last.retry_after if last else None, self.jitter()
                 )
                 self._emit(
-                    role, route, "retry_wait", last, attempt=attempt, detail=f"waiting {delay:.1f}s"
+                    role,
+                    last_route,
+                    "retry_wait",
+                    last,
+                    attempt=attempt,
+                    detail=f"waiting {delay:.1f}s",
                 )
                 self.sleep(delay)
 
-            # This process's own park on this endpoint, from an earlier cap.
-            parked = self.parks.remaining(route.endpoint, self.now(), role)
-            if parked > 0:
-                self._emit(
-                    role, route, "parked", None, attempt=attempt, detail=f"{parked:.0f}s remaining"
-                )
-                self.sleep(parked)
+            # One pass down the chain before any backoff. A model that is
+            # down answers immediately, so trying the alternatives first costs
+            # nothing and gets the work moving; backing off against a dead
+            # provider for minutes before even looking at the second choice
+            # would waste the fallback entirely.
+            kinds: list[str | None] = []
+            for route in chain:
+                merged = {**route.options, **options}
+                last_route = route
 
-            started = self.now()
-            response = self.transport(route, messages, merged)
-            latency = self.now() - started
+                parked = self.parks.remaining(route.endpoint, self.now(), role)
+                if parked > 0 and len(chain) > 1:
+                    # Somewhere else to go, so skip rather than sleep.
+                    self._emit(
+                        role,
+                        route,
+                        "skipped",
+                        None,
+                        attempt=attempt,
+                        detail=f"parked {parked:.0f}s",
+                    )
+                    kinds.append(P.WINDOW_CAP)
+                    continue
+                if parked > 0:
+                    self._emit(
+                        role,
+                        route,
+                        "parked",
+                        None,
+                        attempt=attempt,
+                        detail=f"{parked:.0f}s remaining",
+                    )
+                    self.sleep(parked)
 
-            if 200 <= response.status < 300:
-                self._emit(
-                    role,
-                    route,
-                    "ok",
-                    None,
-                    attempt=attempt,
-                    latency=latency,
-                    usage=usage_fields(response.body, route.model, self.prices),
-                )
-                return response
+                started = self.now()
+                response = self.transport(route, messages, merged)
+                latency = self.now() - started
 
-            verdict = route.provider.classify(response.status, response.headers, response.body)
-            last = verdict
-            self._emit(role, route, "error", verdict, attempt=attempt, latency=latency)
+                if 200 <= response.status < 300:
+                    self._emit(
+                        role,
+                        route,
+                        "ok",
+                        None,
+                        attempt=attempt,
+                        latency=latency,
+                        usage=usage_fields(response.body, route.model, self.prices),
+                        detail=_fell_back(chain, route),
+                    )
+                    return response
 
-            if verdict.kind in P.CAPS:
-                # Out of budget. Retrying cannot help, so park this endpoint
-                # in this process and stop. Other workers and other endpoints
-                # are untouched; the fleet still resumes unattended when the
-                # window rolls over.
-                park = (
-                    self.policy.window_cap_park_seconds
-                    if verdict.kind == P.WINDOW_CAP
-                    else self.policy.terminal_cap_park_seconds
-                )
-                self.parks.park(route.endpoint, park, self.now(), role)
-                raise CapExhausted(
-                    f"{route.model} via {route.endpoint}: {verdict.message or verdict.kind}",
-                    kind=verdict.kind,
-                    endpoint=route.endpoint,
-                )
-            if verdict.kind in (P.NON_RETRYABLE, P.FATAL):
-                # Refused, but nothing is exhausted — so do NOT park. Parking
-                # here would idle a healthy endpoint over one bad request.
+                verdict = route.provider.classify(response.status, response.headers, response.body)
+                last = verdict
+                kinds.append(verdict.kind)
+                self._emit(role, route, "error", verdict, attempt=attempt, latency=latency)
+
+                if verdict.kind in P.CAPS:
+                    # Out of budget on this endpoint. Park it -- retrying it
+                    # cannot help -- and try the next model rather than
+                    # stopping, which is the whole point of naming one.
+                    self.parks.park(
+                        route.endpoint,
+                        self.policy.window_cap_park_seconds
+                        if verdict.kind == P.WINDOW_CAP
+                        else self.policy.terminal_cap_park_seconds,
+                        self.now(),
+                        role,
+                    )
+                # A refusal is NOT parked: it says something about this
+                # request, not about the model's health, and idling a healthy
+                # endpoint over one bad prompt would be a self-inflicted
+                # outage. The next route is still tried, because a refusal
+                # from one vendor is routinely an answer from another.
+
+            if not any(kind == P.TRANSIENT or kind == P.RPM for kind in kinds):
+                # Nothing another cycle could fix: every route was refused or
+                # is out of budget. Say which, in the terms the executor acts
+                # on -- a cap hands the item back untouched, a refusal is the
+                # model's answer.
+                if all(kind in P.CAPS for kind in kinds):
+                    raise CapExhausted(
+                        f"{role}: every route is out of budget "
+                        f"({_chain_names(chain)}): {last.message if last else ''}",
+                        kind=last.kind if last else P.WINDOW_CAP,
+                        endpoint=last_route.endpoint,
+                    )
                 raise RequestRefused(
-                    f"{route.model} via {route.endpoint}: {verdict.message or verdict.kind}",
-                    kind=verdict.kind,
+                    f"{role}: every route refused ({_chain_names(chain)})"
+                    f": {last.message if last else ''}",
+                    kind=last.kind if last else P.NON_RETRYABLE,
                 )
 
         message = (
             f"{role}: {self.policy.max_attempts} attempts exhausted against "
-            f"{route.model} via {route.endpoint}" + (f"; last was {last.kind}" if last else "")
+            f"{_chain_names(chain)}" + (f"; last was {last.kind}" if last else "")
         )
         raise RetryExhausted(
             message,
             role=role,
             kind=last.kind if last else None,
-            endpoint=route.endpoint,
-            model=route.model,
+            endpoint=last_route.endpoint,
+            model=last_route.model,
             last=last,
         )
 

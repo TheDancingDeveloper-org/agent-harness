@@ -20,7 +20,7 @@ one.
 from __future__ import annotations
 
 import shlex
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -110,7 +110,7 @@ def session_executor_factory(
     host: Any,
     agent: AgentSpec | None = None,
     reviewer: Any | None = None,
-    routes_for: Callable[[str], Mapping[str, Route]] | None = None,
+    routes_for: Callable[[str], Mapping[str, Route | Sequence[Route]]] | None = None,
     github_for: Callable[[str], Any] | None = None,
     ui_base_url: str = "",
     on_event: Callable[[dict[str, Any]], None] | None = None,

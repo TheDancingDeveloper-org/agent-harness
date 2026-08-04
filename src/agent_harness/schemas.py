@@ -63,6 +63,25 @@ class WorkItem(BaseModel):
         "A block is a decision someone made, not a failure the harness had -- reading "
         "it out of `last_error` would make the two indistinguishable.",
     )
+    disposition: str = Field(
+        "",
+        description="WHY the item is in `state`, from the Stage K taxonomy: "
+        "`completed`, `refused` (a gate said no about this item's work), `crashed` "
+        "(the worker or harness broke, and nothing judged the work), `withheld` "
+        "(never attempted, or discarded through no fault of the item) or `escalated` "
+        "(a person has to resolve something). `state` alone cannot tell a reviewer's "
+        "rejection from a crashed worker — both are `failed` — and those want "
+        "different responses. Empty means nobody has finished with it yet, which is "
+        "not a sixth disposition.",
+    )
+    reason_kind: str = Field(
+        "",
+        description="The specific reason, as a token rather than English, so a client "
+        "can branch on it: `checks_failed`, `check_escalated`, `check_transient`, "
+        "`review_rejected`, `patch_rejected`, `no_target`, `worker_error`, "
+        "`provider_exhausted`, `budget_exhausted`, `dependency_invalidated`, "
+        "`agent_timeout`, `claim_lost`.",
+    )
     branch: str | None = None
     pr_url: str | None = None
     updated_at: float = 0.0

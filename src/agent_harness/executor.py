@@ -36,13 +36,35 @@ import json
 import re
 import subprocess
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .graph import LOCAL_WORK
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
+from .outcomes import (
+    BUDGET_EXHAUSTED,
+    CLAIM_LOST,
+    COMPLETED,
+    CRASHED,
+    DEPENDENCY_INVALIDATED,
+    ESCALATE,
+    FAIL,
+    FIX_AVAILABLE,
+    NO_TARGET,
+    PASSED,
+    PATCH_REJECTED,
+    PROVIDER_EXHAUSTED,
+    REFUSED,
+    RETRY,
+    REVIEW_REJECTED,
+    WITHHELD,
+    WORKER_ERROR,
+    CheckResult,
+    Stop,
+    stop_for,
+)
 from .work import (
     DEFAULT_PROJECT,
     DONE,
@@ -90,10 +112,23 @@ class Outcome:
     pr_url: str | None = None
     verdict: str | None = None
     stages: list[str] = field(default_factory=list)
+    #: What stopped it, in the taxonomy `outcomes.py` defines. `state` is the
+    #: queue's word for where the item ended up; this is why. They are
+    #: different questions — `failed` covers both a reviewer's rejection and a
+    #: crashed worker, and those want different responses from a human.
+    stop: Stop | None = None
 
     @property
     def ok(self) -> bool:
         return self.state == DONE
+
+    @property
+    def disposition(self) -> str:
+        return self.stop.disposition if self.stop is not None else ""
+
+    @property
+    def reason_kind(self) -> str:
+        return self.stop.reason_kind if self.stop is not None else ""
 
 
 def run_git(repo: Path, *args: str, check: bool = True) -> str:
@@ -888,24 +923,77 @@ class Checks:
 
     Commands are the caller's — the harness has no idea what your project
     builds with, and guessing would tie it to one ecosystem.
+
+    `run` returns a typed `CheckResult`. It still unpacks as `(ok, detail)`,
+    so a caller that only wants the bit keeps working; a caller that wants to
+    know *which kind* of not-ok this is can now ask.
+
+    **The classification is structural, never semantic.** The harness reads
+    how the subprocess ended — timed out, could not be started, ran out of
+    disk, exited non-zero — and never reads a project's output to guess what
+    its failure meant. Guessing at another ecosystem's messages is precisely
+    how a generic harness stops being one, and a misread failure here would
+    turn a real defect into a retry.
     """
 
     commands: Sequence[Sequence[str]] = ()
     timeout: float = 900.0
+    #: `command index or program name -> argv that is believed to clear it`.
+    #: Declared by the caller, because only the caller knows that
+    #: `ruff format` fixes what `ruff format --check` reports. Recorded when
+    #: the check fails; **never run** — see `outcomes.CheckResult.fix`.
+    fixes: Mapping[str, Sequence[str]] = field(default_factory=dict)
 
-    def run(self, repo: Path) -> tuple[bool, str]:
+    def _fix_for(self, command: Sequence[str]) -> tuple[str, ...]:
+        for key in (" ".join(command), command[0] if command else ""):
+            found = self.fixes.get(key)
+            if found:
+                return tuple(found)
+        return ()
+
+    def run(self, repo: Path) -> CheckResult:
         for command in self.commands:
-            result = subprocess.run(  # noqa: S603 - caller-supplied argv, no shell
-                list(command),
-                cwd=repo,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
+            argv = list(command)
+            label = " ".join(argv)
+            try:
+                result = subprocess.run(  # noqa: S603 - caller-supplied argv, no shell
+                    argv,
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                )
+            except subprocess.TimeoutExpired:
+                # The question was not answered. That is not the same as the
+                # answer being no, and holding it against the item would fail
+                # sound work because a machine was busy.
+                return CheckResult(
+                    RETRY,
+                    f"`{label}` did not finish within {self.timeout:g}s",
+                    command=tuple(argv),
+                )
+            except OSError as exc:
+                # The program is missing or not executable. No diff fixes
+                # that and no retry clears it; it is a deployment fault
+                # wearing a check's clothes.
+                return CheckResult(
+                    ESCALATE,
+                    f"`{label}` could not be started: {exc}",
+                    command=tuple(argv),
+                )
             if result.returncode != 0:
                 tail = (result.stdout + result.stderr).strip().splitlines()[-40:]
-                return False, f"`{' '.join(command)}` failed:\n" + "\n".join(tail)
-        return True, ""
+                detail = f"`{label}` failed:\n" + "\n".join(tail)
+                if is_disk_exhaustion(detail):
+                    # The machine is out of room. Every subsequent item fails
+                    # the same way, and each one pays a planner and an
+                    # implementer first.
+                    return CheckResult(ESCALATE, detail, command=tuple(argv))
+                fix = self._fix_for(argv)
+                if fix:
+                    return CheckResult(FIX_AVAILABLE, detail, command=tuple(argv), fix=fix)
+                return CheckResult(FAIL, detail, command=tuple(argv))
+        return PASSED
 
 
 def is_disk_exhaustion(detail: str) -> bool:
@@ -1077,7 +1165,7 @@ class Executor:
             # Deliberately no release: the item is not ours to finish. The
             # new owner is working on it right now, and reporting anything
             # here would overwrite a live claim.
-            self._emit(record, "claim_lost", detail=str(exc))
+            self._emit(record, "claim_lost", detail=str(exc), error_class=CLAIM_LOST)
             return None
         except CapExhausted as exc:
             # Out of budget. Hand the item back untouched rather than
@@ -1092,12 +1180,19 @@ class Executor:
                 pr_url=partial.pr_url if partial else None,
                 owner=self.owner,
                 consume_attempt=False,
+                disposition=WITHHELD,
+                reason_kind=BUDGET_EXHAUSTED,
                 project_id=self.project_id,
             )
             raise
         except RetryExhausted as exc:
             self._emit(record, "retry_exhausted", detail=str(exc), error_class=exc.kind)
             partial = self._partial_for(record)
+            # A provider that would not answer is not this item's fault, so
+            # the disposition says `withheld`. The attempt is still consumed,
+            # exactly as before: whether it should be is D11, and Stage K
+            # names distinctions rather than re-deciding accounting.
+            stop = Stop(WITHHELD, PROVIDER_EXHAUSTED, detail=str(exc))
             self.queue.release(
                 record.item_id,
                 PENDING,
@@ -1105,16 +1200,23 @@ class Executor:
                 branch=partial.branch if partial else None,
                 pr_url=partial.pr_url if partial else None,
                 owner=self.owner,
+                disposition=stop.disposition,
+                reason_kind=stop.reason_kind,
                 project_id=self.project_id,
             )
             if partial is not None:
                 partial.state = PENDING
                 partial.reason = str(exc)
+                partial.stop = stop
                 return partial
-            return Outcome(record.item_id, PENDING, reason=str(exc))
+            return Outcome(record.item_id, PENDING, reason=str(exc), stop=stop)
         except Exception as exc:  # noqa: BLE001 - one item must not kill the loop
             self._emit(record, "error", detail=str(exc))
             partial = self._partial_for(record)
+            # Crashed, not refused. Nothing was decided about the item; an
+            # exception happened while deciding, and a human reading the
+            # queue should be looking at the harness rather than the diff.
+            stop = Stop(CRASHED, WORKER_ERROR, detail=str(exc))
             self.queue.release(
                 record.item_id,
                 FAILED,
@@ -1122,13 +1224,19 @@ class Executor:
                 branch=partial.branch if partial else None,
                 pr_url=partial.pr_url if partial else None,
                 owner=self.owner,
+                disposition=stop.disposition,
+                reason_kind=stop.reason_kind,
                 project_id=self.project_id,
             )
             if partial is not None:
                 partial.state = FAILED
                 partial.reason = str(exc)
+                partial.stop = stop
                 return partial
-            return Outcome(record.item_id, FAILED, reason=str(exc))
+            return Outcome(record.item_id, FAILED, reason=str(exc), stop=stop)
+        # `consume_attempt` follows the disposition, so an item nobody
+        # attempted and an item waiting on a person do not spend one. Every
+        # disposition that consumed an attempt before still does.
         self.queue.release(
             record.item_id,
             outcome.state,
@@ -1136,6 +1244,9 @@ class Executor:
             branch=outcome.branch,
             pr_url=outcome.pr_url,
             owner=self.owner,
+            consume_attempt=outcome.stop.consumes_attempt if outcome.stop else True,
+            disposition=outcome.disposition,
+            reason_kind=outcome.reason_kind,
             project_id=self.project_id,
         )
         return outcome
@@ -1283,6 +1394,7 @@ class Executor:
         if not diff:
             self._emit(record, "no_diff")
             outcome.reason = "the implementer returned no diff"
+            outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
             return outcome
 
         # 3. Parse the patch BEFORE touching git. A reply that is not a
@@ -1306,6 +1418,7 @@ class Executor:
                 + "; ".join(str(p) for p in fatal[:3])
                 + (f" (patch kept at {kept})" if kept else "")
             )
+            outcome.stop = Stop(REFUSED, PATCH_REJECTED, detail=outcome.reason)
             return outcome
 
         # 4. Apply, on a branch of its own, based on whatever this item
@@ -1332,6 +1445,7 @@ class Executor:
             outcome.reason = f"the diff did not apply to {base}: {how}" + (
                 f" (patch kept at {kept})" if kept else ""
             )
+            outcome.stop = Stop(REFUSED, PATCH_REJECTED, detail=outcome.reason)
             self._abandon_branch(branch)
             return outcome
         self._emit(record, "applied", detail=how)
@@ -1348,16 +1462,32 @@ class Executor:
         # 5. Cheap checks BEFORE the expensive reviewer call. Paying a model
         #    to tell us the build is broken is paying the dearest gate to
         #    catch what the cheapest one already did.
-        passed, failure = self.checks.run(self.repo)
+        checked = self.checks.run(self.repo)
+        failure = checked.detail
         outcome.stages.append("checks")
-        if not passed:
+        if not checked.ok:
+            stop = stop_for(checked)
             self._emit(
                 record,
                 "checks_failed",
                 detail=failure[:2000],
-                error_class="disk_exhausted" if is_disk_exhaustion(failure) else None,
+                # The gate's own word for what happened, so a client branches
+                # on a token rather than on English. `disk_exhausted` is kept
+                # exactly as it was: it is a narrower, older fact and the
+                # audit layer already counts it.
+                error_class=("disk_exhausted" if is_disk_exhaustion(failure) else stop.reason_kind),
             )
+            if checked.fix:
+                # Recorded, and not run. The item still fails; somebody now
+                # knows what would clear it.
+                self._emit(
+                    record,
+                    "fix_available",
+                    detail="`" + " ".join(checked.fix) + "` is declared to clear this",
+                )
             outcome.reason = failure
+            outcome.stop = stop
+            outcome.state = stop.state
             self._abandon_branch(branch)
             return outcome
         self._emit(record, "checks_passed")
@@ -1381,6 +1511,7 @@ class Executor:
                 "discarded and the item goes back to pending"
             )
             self._emit(record, "dependency_invalidated", detail=outcome.reason)
+            outcome.stop = Stop(WITHHELD, DEPENDENCY_INVALIDATED, detail=outcome.reason)
             outcome.state = PENDING
             self._abandon_branch(branch)
             return outcome
@@ -1411,7 +1542,8 @@ class Executor:
             REVIEW_PROMPT.format(
                 brief=record.brief,
                 diff=applied_diff[:20000],
-                checks="passed" if passed else failure,
+                # Always "passed" by here: a non-passing check returned above.
+                checks="passed",
             ),
         )
         outcome.stages.append("review")
@@ -1422,6 +1554,7 @@ class Executor:
             self._record_verdict(record, outcome.pr_url, verdict, verdict_text)
         if verdict != APPROVED:
             outcome.reason = f"review rejected: {verdict_text.strip()[:500]}"
+            outcome.stop = Stop(REFUSED, REVIEW_REJECTED, detail=outcome.reason)
             return outcome
 
         # 8. Approval takes the durable draft out of draft. Never land: a
@@ -1431,6 +1564,7 @@ class Executor:
             outcome.stages.append("pr")
 
         outcome.state = DONE
+        outcome.stop = Stop(COMPLETED)
         self._emit(record, "done", detail=outcome.pr_url or branch)
         return outcome
 

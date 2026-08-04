@@ -59,7 +59,8 @@ trade and it is rejected.
 | How to deploy it | `docs/DEPLOYMENT.md` — the two serve modes, and a non-destructive smoke test |
 | Sample plan | `examples/PLAN.md` |
 | The original plan | `docs/HARNESS-PLAN.md` (superseded in part) |
-| Backlog manifest (seeds GitHub issues) | `docs/backlog.json` |
+| Issue tracker | GitHub, per D1. The only place an issue's *state* lives. |
+| The manifest that seeded those issues | `docs/backlog-seed-2026-08-02.json` — historical, carries no state, not kept in sync |
 | What a route is made of, and how a vendor is added | `src/agent_harness/protocols.py` |
 | Event schema | `src/agent_harness/events.py` |
 | Event store (append-only) | `src/agent_harness/store.py` |

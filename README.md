@@ -116,8 +116,10 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
   that scoping makes possible, and project inception. Phases 0-2 are built.
 - [`docs/AUDIT-PLAN.md`](docs/AUDIT-PLAN.md) — the durable audit layer: what is worth
   measuring and the rules that keep the numbers defensible.
-- [`docs/backlog.json`](docs/backlog.json) — the machine-readable backlog that seeds the
-  GitHub issues.
+- [`docs/backlog-seed-2026-08-02.json`](docs/backlog-seed-2026-08-02.json) — the manifest
+  that seeded the GitHub issues on that date, plus the decision records `D1`–`D10`. It is
+  a historical artefact: it has no state field and is not kept in sync. GitHub is the
+  tracker (D1); this file cannot tell you whether anything is open.
 - [`AGENTS.md`](AGENTS.md) — binding rules of engagement for anyone, human or agent,
   working in this repository.
 

@@ -231,6 +231,7 @@ class SessionExecutor:
                 branch=partial.branch if partial else None,
                 pr_url=partial.pr_url if partial else None,
                 owner=self.owner,
+                consume_attempt=False,
                 project_id=self.project_id,
             )
             raise
@@ -537,6 +538,7 @@ class SessionExecutor:
             # itself as reviewed. Marking it ready is what approval buys.
             self._commit(tree, record, checkpoint=True)
             outcome.stages.append("commit")
+            self._emit(record, "checkpointed", detail=branch, session_id=session.id)
             if self.push:
                 run_git(tree, "push", "-u", "origin", branch)
                 outcome.stages.append("push")

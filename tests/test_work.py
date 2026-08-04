@@ -143,6 +143,17 @@ def test_attempts_are_counted_so_a_poisonous_item_is_visible(
     assert queue.get("T1").attempts == 3  # type: ignore[union-attr]
 
 
+def test_release_can_return_unattempted_work_without_consuming_an_attempt(
+    queue: WorkQueue,
+) -> None:
+    queue.add([rec("T1")])
+    queue.claim("a")
+
+    queue.release("T1", PENDING, owner="a", consume_attempt=False)
+
+    assert queue.get("T1").attempts == 0  # type: ignore[union-attr]
+
+
 def test_the_least_attempted_item_is_claimed_first(queue: WorkQueue) -> None:
     """Otherwise one failing item is retried forever while untouched work
     waits behind it."""

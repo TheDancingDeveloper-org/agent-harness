@@ -95,12 +95,16 @@ uv run agent-harness --db harness.sqlite graph rebuild
 uv run agent-harness --db harness.sqlite graph report
 ```
 
-`rebuild` discards every derived edge and re-derives it from the authoritative
-declarations (`work.depends_on`), bumping the project revision once. It does
-**not** invent edges, and it does not clear stored resolver outcomes for
-external targets that are still declared — an outcome is evidence, and
-discarding evidence to make a rebuild tidier would turn a resolved external
-reference back into an unresolved one for no reason.
+`rebuild` re-derives every edge from the authoritative declarations
+(`work.depends_on`). It does **not** invent edges, and it does not clear stored
+resolver outcomes for external targets that are still declared — an outcome is
+evidence, and discarding evidence to make a rebuild tidier would turn a
+resolved external reference back into an unresolved one for no reason.
+
+Rebuilding an intact graph is a **no-op**: the revision does not move, and no
+live claim is invalidated. The revision moves exactly where the derived edges
+differed from the stored ones. That is what makes `rebuild` safe to run
+whenever anyone is unsure, which is the only time anyone runs it.
 
 `report` then prints, per project: the revision, the ready set, every
 unresolved and blocked edge with its evidence, every external target with its

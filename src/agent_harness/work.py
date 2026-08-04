@@ -30,7 +30,14 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from .graph import DependencyGraph, DependencySpec, Readiness, Resolver, parse_dependencies
+from .graph import (
+    WORK_DECLARATION,
+    DependencyGraph,
+    DependencySpec,
+    Readiness,
+    Resolver,
+    parse_dependencies,
+)
 
 # Lease length. Long enough that an agent thinking hard about a hard problem
 # is not evicted; short enough that a crashed worker's item is picked up in
@@ -347,7 +354,7 @@ class WorkRecord:
         data["depends_on"] = json.loads(data.get("depends_on") or "[]")
         return cls(**data)
 
-    def dependency_specs(self, provenance: str = "work.depends_on") -> list[DependencySpec]:
+    def dependency_specs(self, provenance: str = WORK_DECLARATION) -> list[DependencySpec]:
         """This item's declared edges, typed.
 
         `depends_on` stays a list of strings on the wire and in the row --
@@ -618,7 +625,7 @@ class WorkQueue:
         records: Iterable[WorkRecord],
         project_id: str = DEFAULT_PROJECT,
         *,
-        provenance: str = "work.depends_on",
+        provenance: str = WORK_DECLARATION,
     ) -> int:
         """Add work to a project, leaving anything already present untouched.
 

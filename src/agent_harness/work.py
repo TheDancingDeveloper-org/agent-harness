@@ -40,6 +40,22 @@ from .graph import (
     Resolver,
     parse_dependencies,
 )
+from .holds import DEFAULT_MAX_HOLD_SECONDS, Answer, Hold, HoldError, Holds
+
+# Re-exported deliberately, in the `X as X` form mypy reads as explicit. The
+# queue's states are defined in `outcomes.py` because both of that module's
+# vocabularies refer to them and this module refers to those vocabularies --
+# but `from .work import DONE` is what every caller and every test has always
+# written, and there is no reason to make a hundred of them say otherwise.
+from .outcomes import BLOCKED as BLOCKED
+from .outcomes import CLAIMED as CLAIMED
+from .outcomes import DONE as DONE
+from .outcomes import ESCALATED as ESCALATED_DISPOSITION
+from .outcomes import EXHAUSTED as EXHAUSTED
+from .outcomes import FAILED as FAILED
+from .outcomes import HELD as HELD
+from .outcomes import HOLD_EXPIRED as HOLD_EXPIRED
+from .outcomes import PENDING as PENDING
 
 # Lease length. Long enough that an agent thinking hard about a hard problem
 # is not evicted; short enough that a crashed worker's item is picked up in
@@ -47,19 +63,6 @@ from .graph import (
 log = logging.getLogger(__name__)
 
 DEFAULT_LEASE_SECONDS = 900.0
-
-PENDING = "pending"
-CLAIMED = "claimed"
-DONE = "done"
-FAILED = "failed"
-BLOCKED = "blocked"
-#: Tried too many times and given up on. Distinct from `failed`, which is one
-#: attempt that did not work: `exhausted` says the harness will not try again
-#: without a human. Without it, an item that reliably kills its worker is
-#: re-claimed forever -- it sinks to the back of the queue on `attempts` and
-#: returns every cycle, spending real money each time, looking identical to
-#: an item that is merely busy.
-EXHAUSTED = "exhausted"
 
 #: Attempts before an item is given up on. Generous: a lease expiring because
 #: a pod restarted is not the item's fault, and giving up on the first crash
@@ -119,6 +122,11 @@ CREATE TABLE IF NOT EXISTS projects (
     -- is the right default for an unattended run is D14, and it is open.
     max_item_seconds   REAL NOT NULL DEFAULT 0,
     max_item_spend_usd REAL NOT NULL DEFAULT 0,
+    -- Stage J. How long a question may go unanswered before the item is
+    -- returned to the queue with the question preserved. Not decoration: D12
+    -- keeps the claim during a hold, so this is what stops one unanswered
+    -- question from consuming a worker indefinitely.
+    max_hold_seconds REAL NOT NULL DEFAULT 21600,
     plan_path   TEXT,
     roles       TEXT,
     max_workers INTEGER NOT NULL DEFAULT 1,
@@ -171,6 +179,10 @@ CREATE TABLE IF NOT EXISTS work (
     -- the wall-clock ceiling bounds the ITEM, and an item that crashes in a
     -- loop would otherwise reset its own clock on every re-claim.
     first_started_at REAL NOT NULL DEFAULT 0,
+    -- Stage J. When a hold on this item gives up and returns it. Zero when
+    -- the item is not held. Denormalised from `holds` so the reaper's sweep
+    -- and the queue's own view of an item cannot disagree.
+    held_until  REAL NOT NULL DEFAULT 0,
     updated_at  REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, item_id)
 );
@@ -359,6 +371,11 @@ class Project:
     #: whether that should stay true for an unattended run; it is open.
     max_item_seconds: float = 0.0
     max_item_spend_usd: float = 0.0
+    #: How long a question on this project's items may go unanswered. Not
+    #: unlimited by default, unlike the budgets: a hold keeps the claim, so an
+    #: unbounded default would let one unanswered question tie up a worker for
+    #: ever, and "unlimited" is not a safe reading of "nobody said".
+    max_hold_seconds: float = DEFAULT_MAX_HOLD_SECONDS
     plan_path: str | None = None
     roles: dict[str, Any] | None = None
     max_workers: int = 1
@@ -411,6 +428,8 @@ class WorkRecord:
     unpriced_calls: int = 0
     #: When work on this item first began, across attempts.
     first_started_at: float = 0.0
+    #: When this hold gives up and returns the item. Zero when not held.
+    held_until: float = 0.0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> WorkRecord:
@@ -453,11 +472,16 @@ class WorkQueue:
         #: resumable position that can disappear independently of the item it
         #: belongs to will one day point at work the queue has forgotten.
         self.attempts_log = AttemptLog(self._connect, mode=durability, now=now)
+        #: Items waiting on a person. Same file for the same reason: a
+        #: question that can vanish independently of the item it is about is a
+        #: question somebody answers into nothing.
+        self.holds = Holds(self._connect, now=now)
         self._migrate()
         with self._connect() as conn:
             conn.executescript(SCHEMA)
             self.graph.create_schema(conn)
             self.attempts_log.migrate(conn)
+            self.holds.migrate(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
@@ -531,6 +555,7 @@ class WorkQueue:
             "durability": "TEXT NOT NULL DEFAULT ''",
             "max_item_seconds": "REAL NOT NULL DEFAULT 0",
             "max_item_spend_usd": "REAL NOT NULL DEFAULT 0",
+            "max_hold_seconds": "REAL NOT NULL DEFAULT 21600",
         },
         # Stage G. Additive, so a rollback to an older build still reads every
         # column it knows and simply ignores this one. The migration plan is
@@ -551,6 +576,8 @@ class WorkQueue:
             "spend_usd": "REAL NOT NULL DEFAULT 0",
             "unpriced_calls": "INTEGER NOT NULL DEFAULT 0",
             "first_started_at": "REAL NOT NULL DEFAULT 0",
+            # Stage J, additive: an existing row reads as "not held".
+            "held_until": "REAL NOT NULL DEFAULT 0",
         },
     }
 
@@ -656,15 +683,16 @@ class WorkQueue:
             conn.execute(
                 "INSERT INTO projects (project_id, name, repo, work_dir, base_branch, "
                 "checks, fixes, durability, max_item_seconds, max_item_spend_usd, "
-                "plan_path, roles, max_workers, max_attempts, "
+                "max_hold_seconds, plan_path, roles, max_workers, max_attempts, "
                 "min_free_disk_gb, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET "
                 "name=excluded.name, repo=excluded.repo, work_dir=excluded.work_dir, "
                 "base_branch=excluded.base_branch, checks=excluded.checks, "
                 "fixes=excluded.fixes, durability=excluded.durability, "
                 "max_item_seconds=excluded.max_item_seconds, "
                 "max_item_spend_usd=excluded.max_item_spend_usd, "
+                "max_hold_seconds=excluded.max_hold_seconds, "
                 "plan_path=excluded.plan_path, roles=excluded.roles, "
                 "max_workers=excluded.max_workers, max_attempts=excluded.max_attempts, "
                 "min_free_disk_gb=excluded.min_free_disk_gb, "
@@ -680,6 +708,7 @@ class WorkQueue:
                     project.durability,
                     project.max_item_seconds,
                     project.max_item_spend_usd,
+                    project.max_hold_seconds,
                     project.plan_path,
                     json.dumps(project.roles) if project.roles else None,
                     project.max_workers,
@@ -933,6 +962,13 @@ class WorkQueue:
         # next item boundary rather than part-way through one.
         if self.control(project_id)[0] != RUNNING:
             return None
+        # Questions nobody answered in time are returned before anything else
+        # is considered. Done here, before the transaction opens, because it
+        # needs its own connection and because a claim scan is the moment the
+        # queue's view of what is available has to be true. Nothing schedules
+        # this separately: a sweep that only ran under a cron would leave a
+        # held item stuck for as long as the cron was broken.
+        self.expire_holds()
         now = self.now()
         conn = self._connect()
         try:
@@ -1175,6 +1211,149 @@ class WorkQueue:
             return applied
         finally:
             conn.close()
+
+    def hold(
+        self,
+        item_id: str,
+        *,
+        question: str,
+        owner: str | None = None,
+        reason: str = "",
+        who_may_answer: str = "anyone",
+        session_id: str | None = None,
+        session_url: str | None = None,
+        max_seconds: float | None = None,
+        project_id: str = DEFAULT_PROJECT,
+    ) -> Hold:
+        """Suspend this item on a question, keeping its claim.
+
+        **D12: the claim is kept and the lease is suspended.** The owner stays
+        on the row so answering hands the item back to the worker that asked,
+        with its worktree and its context; `lease_until` goes to zero because
+        a lease exists to distinguish slow from dead and a held item is
+        neither. `claim` never selects a `held` row, so nothing can take the
+        item while a person is thinking about it.
+
+        Refused for an item nobody is working on. A hold is a *suspended
+        attempt*; holding an unclaimed item would be an operator parking it,
+        which is what `blocked` already is.
+        """
+        record = self.get(item_id, project_id=project_id)
+        if record is None:
+            raise HoldError(f"no item {item_id!r} in project {project_id!r}")
+        # Checked first, so an item that is already held says so specifically
+        # rather than reporting the state that being held put it in.
+        if self.holds.current(project_id, item_id) is not None:
+            raise HoldError(f"{item_id} already has an unanswered question")
+        if record.state != CLAIMED:
+            raise HoldError(
+                f"{item_id} is {record.state!r}, not claimed; a hold suspends an attempt, "
+                "and an item nobody is working on is parked with `block` instead"
+            )
+        if owner is not None and record.owner != owner:
+            raise HoldError(f"{item_id} is not owned by {owner!r}, so that worker cannot hold it")
+
+        project = self.get_project(project_id)
+        limit = (
+            max_seconds
+            if max_seconds is not None
+            else float(getattr(project, "max_hold_seconds", DEFAULT_MAX_HOLD_SECONDS) or 0.0)
+        )
+        hold = self.holds.open(
+            project_id,
+            item_id,
+            question=question,
+            attempt=record.attempts,
+            reason=reason,
+            who_may_answer=who_may_answer,
+            owner=record.owner,
+            session_id=session_id,
+            session_url=session_url,
+            max_seconds=limit,
+        )
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE work SET state = ?, lease_until = 0, held_until = ?, updated_at = ? "
+                "WHERE project_id = ? AND item_id = ?",
+                (HELD, hold.expires_at, self.now(), project_id, item_id),
+            )
+        finally:
+            conn.close()
+        return hold
+
+    def answer_hold(
+        self,
+        item_id: str,
+        token: str,
+        answer: Answer,
+        *,
+        project_id: str = DEFAULT_PROJECT,
+    ) -> Hold:
+        """Answer the open question and hand the item back to its worker.
+
+        Returns to `claimed`, with a fresh lease for the owner that asked, so
+        the worktree and context the hold preserved are the ones that continue.
+        If that worker is dead the lease expires exactly as it always did and
+        another worker re-claims — and, since Stage H, continues the attempt
+        rather than restarting it.
+
+        Nothing is injected into a session. The answer is recorded and the
+        worker reads it; `COORDINATION-PLANE.md` §5.1 rules on why, and the
+        reason is that the process may be at a shell and an answer becomes a
+        command.
+        """
+        hold = self.holds.answer(project_id, item_id, token, answer)
+        now = self.now()
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE work SET state = ?, lease_until = ?, held_until = 0, updated_at = ? "
+                "WHERE project_id = ? AND item_id = ? AND state = ?",
+                (CLAIMED, now + self.lease_seconds, now, project_id, item_id, HELD),
+            )
+        finally:
+            conn.close()
+        return hold
+
+    def expire_holds(self) -> list[Hold]:
+        """Return every item whose question has gone unanswered too long.
+
+        **To `blocked`, never to `ready`.** A hold that times out has not been
+        approved and must not be treated as though it had; the item goes to a
+        state a person has to act on, with the question preserved in the
+        blocked reason so it is not lost with the hold.
+
+        Returns the holds it closed, so a caller can say what happened rather
+        than reporting a count.
+        """
+        expired: list[Hold] = []
+        for hold in self.holds.due():
+            self.holds.close(hold.project_id, hold.item_id, "expired")
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "UPDATE work SET state = ?, owner = NULL, lease_until = 0, held_until = 0, "
+                    "last_error = ?, disposition = ?, reason_kind = ?, updated_at = ? "
+                    "WHERE project_id = ? AND item_id = ? AND state = ?",
+                    (
+                        BLOCKED,
+                        (
+                            f"nobody answered within the hold window: {hold.question}"
+                            + (f" ({hold.reason})" if hold.reason else "")
+                        ),
+                        ESCALATED_DISPOSITION,
+                        HOLD_EXPIRED,
+                        self.now(),
+                        hold.project_id,
+                        hold.item_id,
+                        HELD,
+                    ),
+                )
+            finally:
+                conn.close()
+            expired.append(hold)
+        return expired
 
     def add_spend(
         self,

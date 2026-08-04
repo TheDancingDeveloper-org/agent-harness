@@ -44,6 +44,8 @@ from .reconcile import GitHubReconciler, items_by_pr
 from .schemas import (
     AddItemsRequest,
     AddItemsResult,
+    AnswerRequest,
+    AnswerResult,
     AuditCost,
     AuditCostRow,
     AuditDelivery,
@@ -65,6 +67,8 @@ from .schemas import (
     ExecutionReadiness,
     FleetControl,
     Health,
+    HoldList,
+    HoldView,
     InceptionDraft,
     InceptionPlan,
     InceptionStart,
@@ -109,6 +113,7 @@ from .work import (
     DONE,
     DRAINING,
     FAILED,
+    HELD,
     PENDING,
     STOPPED,
     Project,
@@ -292,7 +297,17 @@ def create_api(
             counts=queue.counts(project_id=project_id),
             stale=[r.item_id for r in queue.stale(project_id=project_id)],
             items=[
-                _item_model(r, latest.get(r.item_id)) for r in queue.items(project_id=project_id)
+                _item_model(
+                    r,
+                    latest.get(r.item_id),
+                    # Only for the held ones. A query per row would be a query
+                    # per row, and the overwhelming majority are not held.
+                    queue.holds.current(project_id or "default", r.item_id)
+                    if r.state == HELD
+                    else None,
+                    queue.now(),
+                )
+                for r in queue.items(project_id=project_id)
             ],
         )
 
@@ -308,10 +323,16 @@ def create_api(
         project_id: str = Query("default", description="Which project the item is in."),
         _: None = Depends(require_token),
     ) -> WorkItem:
-        record = need_queue().get(item_id, project_id=project_id)
+        queue = need_queue()
+        record = queue.get(item_id, project_id=project_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
-        return _item_model(record, _latest_by_item(store, app.state.audit, project_id).get(item_id))
+        return _item_model(
+            record,
+            _latest_by_item(store, app.state.audit, project_id).get(item_id),
+            queue.holds.current(project_id, item_id) if record.state == HELD else None,
+            queue.now(),
+        )
 
     @app.post(
         "/api/work",
@@ -378,6 +399,90 @@ def create_api(
             )
         queue.release(item_id, PENDING, error=None, project_id=project_id)
         return RetryResult(ok=True, item_id=item_id, state="pending")
+
+    @app.get(
+        "/api/holds",
+        tags=["work"],
+        summary="Every question waiting on a person",
+        response_model=HoldList,
+    )
+    def list_holds(
+        project_id: str = Query("", description="Limit to one project. Empty is all of them."),
+        _: None = Depends(require_token),
+    ) -> HoldList:
+        """The inbox. Oldest first, which is the order to work through.
+
+        This is the answer to issue #103. A silent-but-active session and a
+        hung one used to look identical; a held item says what it is waiting
+        for and how long it has waited, and anything not in this list that is
+        making no progress is a hang rather than a question.
+        """
+        queue = need_queue()
+        # Swept before reading, so the inbox never shows a question that has
+        # already timed out. An operator reading a stale list would answer
+        # into nothing.
+        queue.expire_holds()
+        # The queue's clock, not the wall clock. They are the same in
+        # production and are deliberately not in a test, and an age computed
+        # against a different clock from the one that stamped the question is
+        # not an age.
+        now = queue.now()
+        return HoldList(
+            open=[
+                HoldView(**hold.as_dict(now)) for hold in queue.holds.open_holds(project_id or None)
+            ]
+        )
+
+    @app.post(
+        "/api/work/{item_id}/answer",
+        tags=["work"],
+        summary="Answer a held item's question",
+        response_model=AnswerResult,
+        responses={
+            404: {"description": "No such item, or it has no open question"},
+            409: {"description": "The resume token does not answer this question"},
+        },
+    )
+    def answer_hold(
+        request: AnswerRequest,
+        item_id: str = PathParam(description="Plan id, e.g. `T4`."),
+        project_id: str = Query("default", description="Which project the item is in."),
+        _: None = Depends(require_token),
+    ) -> AnswerResult:
+        """Answer from anywhere, and hand the item back to the worker that asked.
+
+        **From anywhere** is the point. The answer arrives from a phone, not
+        from the terminal that asked, and the worker that asked may have died
+        in the meantime — the hold survived it, and the item goes back to
+        `claimed` with a fresh lease. If that worker really is gone, the lease
+        expires as it always did and another worker continues the attempt.
+
+        Nothing is written into a live session. `COORDINATION-PLANE.md` §5.1
+        rules on why and the reason is exact: the process may be at a shell,
+        and an answer becomes a command.
+        """
+        from .holds import Answer as HoldAnswer
+        from .holds import HoldError
+
+        queue = need_queue()
+        try:
+            hold = queue.answer_hold(
+                item_id,
+                request.resume_token,
+                HoldAnswer(text=request.text, data=dict(request.data), who=request.who),
+                project_id=project_id,
+            )
+        except HoldError as exc:
+            # 404 for "there is nothing to answer", 409 for "you may not
+            # answer this one". A person who typed an answer is told which.
+            status = 404 if "no open question" in str(exc) else 409
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        return AnswerResult(
+            ok=True,
+            item_id=item_id,
+            state="claimed",
+            hold=HoldView(**hold.as_dict(queue.now())),
+        )
 
     @app.post(
         "/api/work/{item_id}/block",
@@ -1906,8 +2011,15 @@ def _readiness_model(state: Any, record: WorkRecord | None) -> ItemReadiness:
     )
 
 
-def _item_model(record: WorkRecord, event: dict[str, Any] | None) -> WorkItem:
+def _item_model(
+    record: WorkRecord,
+    event: dict[str, Any] | None,
+    hold: Any | None = None,
+    now: float | None = None,
+) -> WorkItem:
+    now = time.time() if now is None else now
     return WorkItem(
+        hold=HoldView(**hold.as_dict(now)) if hold is not None else None,
         item_id=record.item_id,
         title=record.title,
         brief=record.brief,
@@ -1926,6 +2038,7 @@ def _item_model(record: WorkRecord, event: dict[str, Any] | None) -> WorkItem:
         spend_usd=record.spend_usd,
         unpriced_calls=record.unpriced_calls,
         first_started_at=record.first_started_at,
+        held_until=record.held_until,
         disposition=record.disposition,
         reason_kind=record.reason_kind,
         branch=record.branch,

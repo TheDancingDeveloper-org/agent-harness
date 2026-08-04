@@ -113,6 +113,100 @@ cannot consume is caught before it creates a single issue.
 
 ---
 
+## 0c. Or adopt a project that is already half-built
+
+The common case is not a blank repository. It is a plan, a repository, some
+issues, some branches and some work that is *already done* — and nobody
+remembers exactly which. `adopt` is the command for that, and its first
+principle is that **it does not guess**.
+
+```bash
+agent-harness adopt PLAN.md --project widgets --work ./widgets --repo owner/name
+```
+
+That reads the plan, the working tree's branches, the queue and — with
+`--repo` — the repository's issues and pull requests, and prints a proposal.
+It writes no queue rows, opens no branches, edits no issue and closes nothing.
+`--dry-run` goes further and does not even store the proposal; `--report FILE`
+also writes it as JSON.
+
+Real output, from a three-item plan in a checkout with a `harness/W3` branch
+and no `--repo` (line-wrapped here to fit the page):
+
+```
+project widgets: proposed
+repository /home/you/widgets
+3 plan item(s); 2 proposed as already delivered; 0 needing a human decision
+  W1 -> done  [proposed done]
+      explicit/done: the plan item is checked
+      would create queue row item W1 in project widgets: insert as done if this
+        drop is approved, otherwise pending
+  W2 -> done  [proposed done]
+      runnable/passed: `python -m unittest -q tests.test_serials` succeeded
+      would create queue row item W2 in project widgets: insert as done if this
+        drop is approved, otherwise pending
+  W3 -> pending
+      candidate branch harness/W3 (present, medium): a local branch is named for
+        this item; a branch name is not proof that the harness created it, and
+        carries no evidence that the work is finished
+      would create queue row item W3 in project widgets: insert as pending
+inspection only: no queue rows, issue edits or other external changes were made.
+2 item(s) proposed as already delivered and NOT dropped: W1, W2
+Use --approve --reconcile, and name every allowed drop with --approve-drop.
+```
+
+With `--repo owner/name` each item also lists its issue and pull-request
+candidates, with the state (`open`, `closed`, `merged`), the confidence, and
+the reason the match was made — and the exact issue edit that approving it
+would cause.
+
+### How it decides an item is already done
+
+Three rungs, in this order, and every rung that ran stays in the report:
+
+| Rung | What it is | What it can do |
+|---|---|---|
+| **explicit** | The plan item is checked, or a closed issue / merged PR names the item id exactly. | Propose a drop. |
+| **runnable** | The item's own `verify:` command exits 0. | Propose a drop. |
+| **judged** | The `assessor` role says `done`, `partial` or `not_started`, with citations. | Propose a drop, and only with citations. |
+
+**A proposal is not a decision.** Nothing enters the queue as `done` unless a
+human names it:
+
+```bash
+agent-harness adopt PLAN.md --project widgets --work ./widgets --repo owner/name \
+    --approve --approve-drop W1 --approve-drop W2 --reconcile
+```
+
+Anything proposed and not named stays `pending` — it gets done again, which is
+wasteful, rather than lost, which is not recoverable. Rejecting works the same
+way and needs a reason: `--reject "W2 is not finished"` or `--revise "..."`.
+
+Uncertainty always resolves downwards. Two equally-good candidates for one
+item, an assessor that says `done` and cites nothing, an assessor whose route
+is down, or a `verify:` command that ran and *failed* while the assessor said
+`done` — all of them come back as work to do, flagged for a human.
+
+### What it will and will not touch outside the harness
+
+| | |
+|---|---|
+| Backfilling an id marker | Appends `<!-- harness:id=W1 -->` to an issue body and changes nothing else — not the title, labels, milestone, assignees or a single word of the prose. Only for a drop you approved. |
+| Adopting an existing pull request | Only when the PR carries that item's harness marker *and* its head branch is in this repository. A branch called `harness/w1` that nobody can prove the harness opened is reported as a medium-confidence candidate and never recorded as the item's PR. |
+| An existing local branch | Listed as a lead and nothing more. A branch has no body, so its name is the only evidence there is — which is never enough to say the work is finished, or that the harness cut it. |
+| A fork's pull request | Reported, never adopted: this repository did not produce it. |
+| Closing or deleting anything | Never. Adoption has no path that closes an issue, deletes a branch or removes a queue row. |
+
+Re-running is safe. Adoption never creates a second issue, never resets an
+item the fleet has already finished, and never repeats a marker backfill —
+the second inspection sees the marker it wrote the first time.
+
+An item the queue has already failed keeps its attempts, its error and its
+event history; the report quotes the prior failure so you can decide what to
+do about it, and rewrites none of it.
+
+---
+
 ## 1. Write a plan
 
 Keep writing plans the way you already do. Three shapes are recognised, all of
@@ -137,9 +231,35 @@ depends on: W1
 labels: area:api
 ```
 
-`labels:`, `milestone:`, `depends on:`, `size:` and `risk:` are recognised and
-removed from the brief — an agent should read the specification, not the
-bookkeeping.
+`labels:`, `milestone:`, `depends on:`, `size:`, `risk:` and `verify:` are
+recognised and removed from the brief — an agent should read the
+specification, not the bookkeeping.
+
+### `verify:` — how an item proves it is already done
+
+One metadata key is executable, and its syntax is deliberately narrow:
+
+```markdown
+### W2: Reject duplicate serials at the API
+
+verify: ["python", "-m", "pytest", "-q", "tests/test_serials.py::test_duplicate"]
+```
+
+A **JSON array of argv strings**, never shell text. `adopt` runs it in the
+repository under exactly the same rules as a project check — fixed argv, no
+shell, a timeout (`--verify-timeout`, defaulting to the project-check
+timeout) — and an exit code of 0 is evidence that this item's work already
+exists.
+
+| | |
+|---|---|
+| `verify: ["pytest", "-q", "tests/test_serials.py"]` | Fine. |
+| `verify: pytest -q && ./deploy.sh` | **Refused.** A plan is a document people edit and paste into; reading one must not be equivalent to granting it a shell. |
+| `verify: []` or `verify: "pytest -q"` | **Refused.** Not a non-empty array of non-empty strings. |
+
+It is per item, and it is not the project's check command. The project's
+checks say the tree is healthy; `verify:` says one specific item is delivered.
+`run` does not execute it — only `adopt` does.
 
 ### Dependencies say what kind of thing they are waiting for
 

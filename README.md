@@ -151,6 +151,24 @@ an item does not fork it into two.
 It refuses a plan that states an id twice, because each id becomes one issue. It never
 closes or reopens anything: the plan says what work *is*, the issue says where it *got to*.
 
+### 1b. Or adopt a project that is already half-built
+
+Most real projects are not blank. `adopt` reads the plan, the repository, the queue and
+the repository's issues and pull requests, and proposes what is already delivered —
+without writing a queue row, editing an issue or touching a branch.
+
+```bash
+agent-harness adopt PLAN.md --project widgets --work ./widgets --repo owner/name
+agent-harness adopt PLAN.md --project widgets --work ./widgets --repo owner/name \
+    --approve --approve-drop W1 --reconcile
+```
+
+Evidence is ranked and every rung is kept in the report: a checked plan item or a closed
+issue naming the item, then the item's own `verify:` command, then an `assessor` model
+with citations. **A proposal is never a decision** — nothing is dropped unless a human
+names it, and uncertainty always resolves to "still to do". Ambiguous matches, competing
+candidates and prior failed attempts are reported rather than resolved.
+
 ### 2. Execute it
 
 ```bash

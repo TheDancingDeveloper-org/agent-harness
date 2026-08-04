@@ -137,6 +137,14 @@ CREATE TABLE IF NOT EXISTS work (
     -- before the expensive gate have to be talking about the same graph; this
     -- is how the second one can tell that the first one saw a different one.
     admitted_revision INTEGER NOT NULL DEFAULT 0,
+    -- WHY the item is in the state it is in. `state` says where it ended up;
+    -- these say what put it there. `failed` covers a reviewer's rejection and
+    -- a crashed worker alike, and those want different responses from a
+    -- human, so the difference is stored rather than left in a log line.
+    -- Empty on any row written before this column existed, and on any row
+    -- nothing has finished with yet.
+    disposition TEXT NOT NULL DEFAULT '',
+    reason_kind TEXT NOT NULL DEFAULT '',
     updated_at  REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, item_id)
 );
@@ -347,6 +355,11 @@ class WorkRecord:
     #: Graph revision at the moment this item was claimed. 0 for anything
     #: never claimed under a Stage G build.
     admitted_revision: int = 0
+    #: Why the item is in `state`, per `outcomes.py`. Empty means nobody has
+    #: finished with it yet — which is a different thing from any of the five
+    #: dispositions, and is why the empty string is not one of them.
+    disposition: str = ""
+    reason_kind: str = ""
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> WorkRecord:
@@ -460,6 +473,13 @@ class WorkQueue:
         # docs/MIGRATION-graph.md.
         "work": {
             "admitted_revision": "INTEGER NOT NULL DEFAULT 0",
+            # Stage K. Additive for the same reason: an older build reads
+            # every column it knows and ignores these two, and an upgraded
+            # database with no disposition recorded yet reports an empty
+            # string -- which is "nobody has finished with this", not a
+            # sixth disposition.
+            "disposition": "TEXT NOT NULL DEFAULT ''",
+            "reason_kind": "TEXT NOT NULL DEFAULT ''",
         },
     }
 
@@ -976,10 +996,18 @@ class WorkQueue:
         pr_url: str | None = None,
         owner: str | None = None,
         consume_attempt: bool = True,
+        disposition: str = "",
+        reason_kind: str = "",
         project_id: str = DEFAULT_PROJECT,
     ) -> bool:
         """Finish with an item. `state` is done, failed, blocked or pending
         (pending puts it back for another attempt).
+
+        `disposition` and `reason_kind` are the Stage K taxonomy from
+        `outcomes.py`: `state` is where the item ended up, these are why. Both
+        default to empty and empty is written through, so a caller that does
+        not know the taxonomy clears a stale reason rather than leaving the
+        previous attempt's explanation attached to this one's result.
 
         Returns True if the item was actually updated.
 
@@ -1010,7 +1038,8 @@ class WorkQueue:
                 "UPDATE work SET state = ?, owner = NULL, lease_until = 0, "
                 "attempts = CASE WHEN ? THEN attempts ELSE MAX(0, attempts - 1) END, "
                 "last_error = ?, branch = COALESCE(?, branch), "
-                "pr_url = COALESCE(?, pr_url), updated_at = ? "
+                "pr_url = COALESCE(?, pr_url), disposition = ?, reason_kind = ?, "
+                "updated_at = ? "
                 "WHERE project_id = ? AND item_id = ?"
             )
             params: list[Any] = [
@@ -1019,6 +1048,8 @@ class WorkQueue:
                 error,
                 branch,
                 pr_url,
+                disposition,
+                reason_kind,
                 self.now(),
                 project_id,
                 item_id,

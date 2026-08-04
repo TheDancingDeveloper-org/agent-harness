@@ -41,6 +41,7 @@ from agent_harness.model_client import (
     RetryPolicy,
     Route,
 )
+from agent_harness.outcomes import PASSED, CheckResult
 from agent_harness.work import DONE, FAILED, PENDING, WorkQueue, WorkRecord
 from conftest import make_queue
 
@@ -494,9 +495,9 @@ def test_a_diff_that_does_not_apply_fails_before_any_check_runs(repo: Path, tmp_
     ran: list[str] = []
 
     class Recording(Checks):
-        def run(self, repo: Path) -> tuple[bool, str]:
+        def run(self, repo: Path) -> CheckResult:
             ran.append("checked")
-            return True, ""
+            return PASSED
 
     executor, queue, _ = build(
         repo,

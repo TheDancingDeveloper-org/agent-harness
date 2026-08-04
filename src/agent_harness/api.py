@@ -1913,6 +1913,8 @@ def _item_model(record: WorkRecord, event: dict[str, Any] | None) -> WorkItem:
         # The queue stores one "why" per item. Which of the two it is depends
         # entirely on the state, and a client should not have to know that.
         blocked_reason=record.last_error if record.state == BLOCKED else None,
+        disposition=record.disposition,
+        reason_kind=record.reason_kind,
         branch=record.branch,
         pr_url=record.pr_url,
         updated_at=record.updated_at,

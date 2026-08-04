@@ -42,6 +42,7 @@ from typing import Any, Protocol
 
 from .executor import Checks
 from .github import MARKER, GitHub
+from .outcomes import ESCALATE, RETRY
 from .plan import ParsedPlan, WorkItem
 from .work import CLAIMED, DONE, PENDING, Project, WorkQueue, WorkRecord
 
@@ -745,21 +746,28 @@ class Adoption:
         """
         checks = Checks(commands=[list(argv)], timeout=self.verify_timeout)
         rendered = " ".join(argv)
-        try:
-            passed, failure = checks.run(self.repository)
-        except subprocess.TimeoutExpired:
+        result = checks.run(self.repository)
+        if result.ok:
+            return Evidence(kind=RUNNABLE, outcome="passed", detail=f"`{rendered}` succeeded")
+        # The four not-ok outcomes, mapped to the three adoption already
+        # distinguishes. `Checks` classifies these itself now, so a timeout
+        # and a missing interpreter no longer arrive here as exceptions this
+        # module has to re-derive -- and, more to the point, no longer arrive
+        # as the same thing as "the verification says this item is not done".
+        #
+        # An escalating check is `unavailable`, not `failed`, and the
+        # distinction is the whole reason this stage exists: a verification
+        # that could not run is not evidence that the work was not done, and
+        # uncertainty here has always resolved to "still to do".
+        if result.outcome == RETRY:
             return Evidence(
                 kind=RUNNABLE,
                 outcome="timeout",
                 detail=f"`{rendered}` exceeded {self.verify_timeout:g}s",
             )
-        except OSError as exc:
-            return Evidence(
-                kind=RUNNABLE, outcome="unavailable", detail=f"`{rendered}` could not run: {exc}"
-            )
-        if passed:
-            return Evidence(kind=RUNNABLE, outcome="passed", detail=f"`{rendered}` succeeded")
-        return Evidence(kind=RUNNABLE, outcome="failed", detail=failure)
+        if result.outcome == ESCALATE:
+            return Evidence(kind=RUNNABLE, outcome="unavailable", detail=result.detail)
+        return Evidence(kind=RUNNABLE, outcome="failed", detail=result.detail)
 
     # ------------------------------------------------------------ decision
 

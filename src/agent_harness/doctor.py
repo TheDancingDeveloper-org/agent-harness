@@ -196,6 +196,23 @@ def _checkout_finding(project: Any) -> Finding:
     return Finding("checkout", OK, str(path))
 
 
+def _clean_checkout_finding(project: Any) -> Finding | None:
+    """What a run would destroy in the checkout, said before it runs.
+
+    `doctor` reports it as blocking for the same reason preflight refuses on
+    it: a headless run discards the working tree, and uncommitted work is not
+    recoverable once it has. Shares preflight's probe so the two cannot
+    disagree about the same directory.
+    """
+    work_dir = getattr(project, "work_dir", None)
+    if not work_dir or not (Path(work_dir) / ".git").exists():
+        return None
+    from .preflight import _is_clean_tree
+
+    ok, detail = _is_clean_tree(str(work_dir))
+    return Finding("clean checkout", OK if ok else FAIL, detail, blocking=not ok)
+
+
 def _disk_finding(project: Any) -> Finding | None:
     work_dir = getattr(project, "work_dir", None)
     if not work_dir or not Path(work_dir).exists():
@@ -498,6 +515,9 @@ def diagnose(queue: Any, projects: list[Any], *, ask: Any = None) -> Report:
             **routes_from_map(getattr(project, "roles", None) or {}),
         }
         found.findings.append(_checkout_finding(project))
+        clean = _clean_checkout_finding(project)
+        if clean is not None:
+            found.findings.append(clean)
         disk = _disk_finding(project)
         if disk is not None:
             found.findings.append(disk)

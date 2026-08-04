@@ -80,6 +80,7 @@ OFFLINE = {
     "git_probe": ok_git,
     "github_probe": ok_gh,
     "disk_probe": lambda path, floor: (True, f"100 GiB free at {path}"),
+    "clean_probe": lambda path: (True, "clean"),
 }
 
 

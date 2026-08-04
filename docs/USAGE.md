@@ -491,6 +491,34 @@ It is per item, and it is not the project's check command. The project's
 checks say the tree is healthy; `verify:` says one specific item is delivered.
 `run` does not execute it — only `adopt` does.
 
+**Write one that fails when the work is absent, and check that it does.** This
+is the trap, and it is easy to fall into: in most test runners **a name filter
+that matches nothing is a pass**.
+
+```markdown
+verify: ["cargo", "test", "-p", "gateway", "secure_cookies"]
+```
+
+That looks like "the test for this item passes". On a tree where the item has
+not been done, the test does not exist, `cargo test` runs zero tests and exits
+`0` — and adoption reports:
+
+```
+R2 -> done  [proposed done]
+    runnable/passed: `cargo test -p gateway secure_cookies` succeeded
+```
+
+`pytest -k`, `go test -run` and `npm test -- -t` behave the same way;
+`pytest path::name` is the exception, exiting 4 when the name is absent. The
+harness cannot tell the difference, and deliberately will not try: reading
+another ecosystem's output to guess what it meant is exactly what an adapter is
+for, and a wrong guess here **drops work that is then never done**.
+
+So before trusting a `verify:`, run it on a tree where the item is *not*
+finished and confirm it fails. A command that asserts a fact about the tree —
+`grep -q`, a file existing, a whole test file rather than a filtered name —
+fails honestly when the work is missing.
+
 ### Dependencies say what kind of thing they are waiting for
 
 A dependency is not just an id. `depends on:` takes **tokens**, and the token
@@ -714,6 +742,69 @@ unavailable, not against running out of budget: a spend cap belongs to the
 account, so it parks every model behind that endpoint. And `/api/roles`,
 readiness and the independence warning all report the *preferred* route — a
 fallback that has not been needed is not what you configured.
+
+### Headless works in your checkout, and clears it first
+
+Worth its own heading, because the two modes differ and the diagram above is
+the session one.
+
+**With `--session-host`**, each item gets its own `git worktree` and your
+checkout is untouched.
+
+**Without it**, the harness works **in place** in the directory you passed as
+`--work`, and every attempt starts by putting that directory on a known state:
+
+```bash
+git checkout -- .   # every uncommitted change to a tracked file: reverted
+git clean -fd       # every untracked file and directory: DELETED
+```
+
+That is right for the harness's own leftovers — a worker killed mid-apply ends
+nothing and leaves a half-applied diff — and it does not distinguish those from
+yours.
+
+So **a dirty checkout is refused before anything is claimed**:
+
+```console
+$ agent-harness run --work ./my-project …
+refusing to start: 14 uncommitted change(s) and 3 untracked path(s) in
+./my-project. A run discards both — tracked files are reverted and untracked
+ones are DELETED — so this work would be lost and could not be recovered.
+Commit or stash it, or pass --allow-dirty if it is genuinely disposable.
+```
+
+`doctor` reports the same thing before you get that far, and `--allow-dirty`
+overrides it — loudly, and recorded in the preflight report, because the whole
+point is that the loss is silent and irreversible.
+
+One consequence of working in place: **one worker per checkout**. Two headless
+workers on one directory would check branches out over each other.
+
+### The role flags are a seed, not a setting
+
+```bash
+agent-harness run --implementer some-model …
+```
+
+On a **fresh** database that stores `some-model` and uses it. On a database
+that has run before, the **stored role map wins** — because a stored route is
+how `PUT /api/roles` re-routes a live deployment without a restart, and the
+command line must not silently undo that.
+
+The consequence surprises people, so the harness now says it in the log:
+
+```
+WARNING a stored role map overrides the command line: implementer=old-model
+        (you asked for some-model). The flags seed the map on first use only;
+        after that the stored map wins. Pass --reroute to make the command
+        line win, or PUT /api/roles.
+```
+
+`--reroute` inverts it for that run and stores the result. Without it, changing
+a model meant editing the `settings` table by hand or deleting the queue.
+
+A complete stored map needs **no role flags at all** — `run` consults it before
+deciding a role is unconfigured.
 
 ### What it guarantees either way
 

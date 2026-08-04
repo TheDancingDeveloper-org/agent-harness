@@ -558,8 +558,42 @@ class PlanParseResult(BaseModel):
     )
     unresolved_dependencies: dict[str, list[str]] = Field(
         default_factory=dict,
-        description="Dependencies naming items that do not exist. A typo here would "
-        "block an item forever, silently.",
+        description="LOCAL dependencies naming items this plan does not define. A typo "
+        "here blocks the item — explicitly, with a reason, rather than silently running "
+        "it. External, decision and cross-project targets are reported separately "
+        "because they are legitimate and need a different fix.",
+    )
+    external_dependencies: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Item id -> declared `external:RESOLVER:IDENTITY` tokens. Legitimate, "
+        "and satisfied only once that resolver reports an outcome.",
+    )
+    decision_dependencies: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Item id -> declared `decision:ID` tokens. A decision must exist as "
+        "work in the project before it can be made.",
+    )
+    cross_project_dependencies: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Item id -> declared `project:PROJECT/ITEM` tokens.",
+    )
+    malformed_dependencies: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Item id -> tokens whose grammar could not be read, with what was "
+        "wrong. Carried rather than raised, so a bad line blocks its own item instead of "
+        "failing the whole parse.",
+    )
+    dependency_cycles: list[list[str]] = Field(
+        default_factory=list,
+        description="Loops through required local dependencies. A plan containing one "
+        "can never finish, and the cheapest place to hear that is before it becomes a "
+        "backlog.",
+    )
+    unattached_arrows: list[str] = Field(
+        default_factory=list,
+        description="Lines in a ```dependencies block that named no item in this plan, "
+        "or were not arrows at all. An arrow that lands nowhere would otherwise be "
+        "discarded silently.",
     )
 
 
@@ -588,6 +622,158 @@ class PlanSyncResult(BaseModel):
     labels_created: list[str] = Field(default_factory=list)
     milestones_created: list[str] = Field(default_factory=list)
     dry_run: bool
+
+
+# -------------------------------------------------------------------- graph
+
+TargetKind = Literal["local_work", "external_reference", "human_decision", "cross_project_work"]
+EdgeState = Literal["unresolved", "blocked", "satisfied"]
+
+
+class DependencyEdgeModel(BaseModel):
+    """One dependency edge, as the graph holds it."""
+
+    source_item: str = Field(description="The item that is waiting.")
+    target_kind: TargetKind = Field(
+        description="What sort of thing is being waited for. `local_work` is an item in "
+        "the same project; `external_reference` is outside the harness and needs a "
+        "resolver; `human_decision` is a decision parked as work; `cross_project_work` "
+        "is an item in another project, named `PROJECT/ITEM`."
+    )
+    target_id: str = Field(description="Identity of the target, within its kind.")
+    required: bool = Field(
+        description="Required edges gate admission. Advisory edges (`?T9` in a plan) are "
+        "reported and never block -- an advisory edge that vanished silently would be "
+        "indistinguishable from one that was never declared."
+    )
+    resolver: str | None = Field(
+        None,
+        description="Which resolver answers for an external target. An external target "
+        "with no resolver stays `unresolved`, because nothing here can say whether it "
+        "is done.",
+    )
+    state: EdgeState = Field(
+        description="`unresolved` means the graph does not know and is NEVER a synonym "
+        "for satisfied; `blocked` means the target is known and unfinished; `satisfied` "
+        "means it is finished."
+    )
+    evidence: str = Field(
+        description="Why the edge is in that state, in words. A satisfied external "
+        "dependency with no stated reason is exactly the assumption this graph exists "
+        "to remove."
+    )
+    provenance: str = Field(
+        description="Where the edge came from, e.g. `work.depends_on` or `rebuild`."
+    )
+    revision: int = Field(description="Graph revision this edge was last written at.")
+
+
+class ReadinessReasonModel(BaseModel):
+    """One reason an item is not ready."""
+
+    kind: str = Field(
+        description="`dependency` for an unsatisfied edge, `cycle` for a loop that can "
+        "never resolve. Present so a client can branch on something other than English."
+    )
+    explanation: str = Field(description="The reason in words, safe to show a human.")
+    target_kind: TargetKind | None = Field(None, description="Kind of the target involved.")
+    target_id: str | None = Field(None, description="Identity of the target involved.")
+    required: bool = Field(True, description="Whether this edge gates admission.")
+    resolver: str | None = Field(None, description="Resolver for an external target.")
+    state: EdgeState | None = Field(None, description="Resolution state of the edge.")
+    evidence: str | None = Field(
+        None, description="Evidence behind the state; for a cycle, the loop itself."
+    )
+
+
+class ItemReadiness(BaseModel):
+    """Whether one item may be admitted, and why not."""
+
+    project_id: str
+    item_id: str
+    ready: bool = Field(
+        description="Whether the graph would admit this item right now. The SAME "
+        "evaluation `claim` makes and the same one the executor repeats before the "
+        "expensive gate -- two implementations would be two answers."
+    )
+    graph_revision: int = Field(
+        description="The authoritative graph revision this answer was computed at. "
+        "Admission records the revision it admitted at, so a later check can say the "
+        "graph moved rather than only that the item is no longer eligible."
+    )
+    admitted_revision: int | None = Field(
+        None,
+        description="Graph revision the item's current claim was admitted at, when it "
+        "is claimed. 0 for an item never claimed under a graph-aware build.",
+    )
+    reasons: list[ReadinessReasonModel] = Field(
+        default_factory=list, description="Every required edge or cycle blocking the item."
+    )
+    advisory: list[ReadinessReasonModel] = Field(
+        default_factory=list,
+        description="Unsatisfied advisory edges. Reported, never blocking.",
+    )
+    overridden: bool = Field(
+        False,
+        description="Whether an operator override at this exact revision is what makes "
+        "the item ready. An override is scoped to the revision it was granted at, so a "
+        "later graph correction re-blocks the item rather than inheriting a decision "
+        "nobody made about it.",
+    )
+    override_reason: str | None = Field(
+        None, description="The recorded reason for that override, with who recorded it."
+    )
+    explanation: str = Field(
+        description="The whole answer as one sentence, for a log line or an event detail."
+    )
+
+
+class DependencyGraphReport(BaseModel):
+    """The whole dependency graph for one project."""
+
+    project_id: str
+    revision: int = Field(description="Current authoritative graph revision.")
+    edges: list[DependencyEdgeModel] = Field(
+        default_factory=list, description="Every declared edge, with its current state."
+    )
+    cycles: list[list[str]] = Field(
+        default_factory=list,
+        description="Loops through required local edges. Every member is unclaimable, "
+        "and saying so is the difference between a queue that is waiting and a queue "
+        "that can never finish.",
+    )
+    ready: list[str] = Field(
+        default_factory=list, description="Items the graph would admit right now."
+    )
+    not_ready: list[ItemReadiness] = Field(
+        default_factory=list, description="Items it would not, each with its reasons."
+    )
+
+
+class DependencyOverrideRequest(BaseModel):
+    """Admitting blocked work deliberately, and recording who did."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(
+        min_length=1,
+        description="Why the block is being overridden, and REQUIRED. An override with "
+        "no reason is indistinguishable from a gate that was never there.",
+    )
+    who: str | None = Field(
+        None, description="Who took responsibility. Recorded with the reason, not verified."
+    )
+
+
+class DependencyOverrideResult(BaseModel):
+    ok: bool
+    project_id: str
+    item_id: str
+    revision: int = Field(
+        description="The graph revision the override was granted at. It applies to THAT "
+        "revision only: a later correction to the graph re-blocks the item."
+    )
+    readiness: ItemReadiness = Field(description="The item's readiness after the override.")
 
 
 # ------------------------------------------------------------------- errors

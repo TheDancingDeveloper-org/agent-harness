@@ -205,6 +205,11 @@ class SessionExecutor:
         self.owner = worker_identity()
         self._partial: Outcome | None = None
         self._heartbeat: LeaseHeartbeat | None = None
+        #: Whether this item already has an open question. One hold per
+        #: waiting agent, not one per poll: the session host reports "waiting"
+        #: every few seconds, and a question per poll would be an inbox nobody
+        #: could read.
+        self._held = False
 
     # ------------------------------------------------------------- driving
 
@@ -228,6 +233,7 @@ class SessionExecutor:
         record = self.queue.claim(self.owner, project_id=self.project_id)
         if record is None:
             return None
+        self._held = False
         try:
             outcome = self._execute_with_heartbeat(record)
         except ClaimLost as exc:
@@ -678,17 +684,64 @@ class SessionExecutor:
     def _on_waiting(self, record: WorkRecord, session: Session) -> None:
         """The agent is asking a human something.
 
-        Not an error and not completion. The lease is extended because the
-        work is genuinely alive, and the event carries the session id so the
-        UI can put a human straight into the terminal that is asking.
+        Not an error and not completion — and, since Stage J, **not a
+        heartbeat either**. This used to extend the lease and emit an event,
+        so a lease whose whole purpose is to distinguish slow from dead was
+        being used to hold open a human's inbox: nothing bounded it, nothing
+        survived the worker dying, and the answer could only come from the
+        process that happened to be attached.
+
+        A durable hold is opened instead. It is a state of the item, it
+        outlives this process, and it is answerable from a phone.
+
+        The hold is best-effort. A queue that will not record it must not turn
+        an agent asking a question into a failed item — the old behaviour
+        (extend the lease, say so in the stream) is still there underneath and
+        is still better than nothing.
         """
         self._keepalive(record)
+        url = session.tab_url(self.ui_base_url) if self.ui_base_url else None
         self._emit(
             record,
             "waiting_for_input",
             session_id=session.id,
             detail="the agent is asking for input",
-            url=session.tab_url(self.ui_base_url) if self.ui_base_url else None,
+            url=url,
+        )
+        if self._held:
+            return
+        try:
+            hold = self.queue.hold(
+                record.item_id,
+                # The agent's own question is not available here: the session
+                # host reports *that* it is waiting, not what it asked. Said
+                # plainly rather than invented, and the deep link is what a
+                # person actually needs to see the prompt.
+                question=(
+                    "the agent is waiting for input in its terminal session"
+                    + (f" — attach at {url}" if url else "")
+                ),
+                owner=self.owner,
+                reason="the session host reported the agent is waiting for input",
+                session_id=session.id,
+                session_url=url,
+                project_id=self.project_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - a hold must not fail an item
+            self._emit(record, "hold_failed", detail=str(exc)[:300], session_id=session.id)
+            return
+        self._held = True
+        self._emit(
+            record,
+            "held",
+            session_id=session.id,
+            detail=(
+                "the item is held on a question and no other worker can claim it; "
+                f"answer with the resume token, expiring at {hold.expires_at:.0f}"
+                if hold.expires_at
+                else "the item is held on a question and no other worker can claim it"
+            ),
+            url=url,
         )
 
     def _review(self, record: WorkRecord, tree: Path, passed: bool, failure: str) -> str:

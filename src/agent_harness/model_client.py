@@ -27,12 +27,20 @@ preference:
 State is per-process and per-endpoint by construction: a plain dict, no file,
 no lock. Parking one endpoint cannot park another, and cannot affect another
 worker at all.
+
+What this module deliberately does **not** know is what a request looks like on
+the wire. A `Route` names a preset; the preset supplies the request adapter,
+the authentication strategy, the response reader and the failure classifier
+(see `protocols.py`). Adding a vendor is a new preset and a name in
+configuration — there is nothing in this file to edit for one, and nothing in
+this file imports an adapter.
 """
 
 from __future__ import annotations
 
 import contextlib
 import itertools
+import logging
 import random
 import time
 import uuid
@@ -40,9 +48,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import protocols
 from . import providers as P
-from .pricing import PriceTable, load_price_table, usage_fields
+from .pricing import PriceTable, load_price_table, price_fields
+from .protocols import RoutePreset, UnknownPreset
 from .providers import Classification, Provider
+
+log = logging.getLogger(__name__)
 
 
 class CapExhausted(Exception):
@@ -185,14 +197,70 @@ class EndpointParks:
 
 @dataclass(frozen=True)
 class Route:
-    """Where one role's calls go."""
+    """Where one role's calls go, and how that endpoint is spoken to.
+
+    Six things, per §7.1 of the proposal, named either explicitly or through a
+    documented preset:
+
+    - `model` and `endpoint`, always explicit;
+    - `preset`, which supplies the wire protocol, the authentication strategy,
+      the response/usage reader and a failure classifier at once;
+    - `provider`, an explicit classifier that overrides the preset's when a
+      deployment knows better than the protocol does;
+    - `price_ref`, the name this model is priced under when the price table
+      does not use the model id.
+
+    An unnamed preset is the **generic** one: a JSON POST to the endpoint as
+    configured, classification from HTTP alone, no vendor claim anywhere. That
+    is the default because a wrong default here is invisible — a request goes to
+    a URL nobody chose and comes back as an error the classifier cannot
+    explain — and "generic" is the only default that cannot be wrong in that
+    way.
+    """
 
     model: str
     endpoint: str
-    provider: Provider = P.GENERIC
+    #: The classifier, when the deployment names one directly. `None` means the
+    #: preset's, which for an unnamed preset is `providers.GENERIC`.
+    provider: Provider | None = None
     api_key: str | None = None
     #: Anything the transport should pass through (temperature, max_tokens…).
     options: Mapping[str, Any] = field(default_factory=dict)
+    #: A registered preset name. Empty is the generic core preset.
+    preset: str = ""
+    #: What to look this model up as in the price table, when that is not its
+    #: model id. Unknown either way stays unknown, never zero.
+    price_ref: str | None = None
+
+    @property
+    def preset_name(self) -> str:
+        """The preset this route uses, as it appears in configuration."""
+        return self.preset or protocols.GENERIC_PRESET.name
+
+    def resolve(self) -> RoutePreset:
+        """The preset, loading its module the first time it is asked for.
+
+        A method rather than a property because it can import an adapter and
+        can raise `UnknownPreset`. Both are worth being able to see at the call
+        site.
+        """
+        return protocols.resolve(self.preset)
+
+    @property
+    def classifier(self) -> Provider:
+        """What reads this route's failures.
+
+        The explicitly configured one wins. Otherwise the preset's — which is
+        the point of a preset: a gateway that states its reasons in a body
+        brings the classifier that can read them along with the wire shape it
+        belongs to.
+        """
+        return self.provider if self.provider is not None else self.resolve().classifier
+
+    @property
+    def pricing_key(self) -> str:
+        """The name this route's spend is priced under."""
+        return self.price_ref or self.model
 
 
 #: One role's routes, in the order they are tried. A single `Route` is the
@@ -233,7 +301,7 @@ def routes_from_map(
     stored: Mapping[str, Mapping[str, Any]] | None,
     *,
     api_key: str | None = None,
-    default_provider: Provider = P.CLAW_BAY,
+    default_preset: str = "",
 ) -> dict[str, Route]:
     """The persisted role map, as routes.
 
@@ -245,7 +313,7 @@ def routes_from_map(
     """
     routes: dict[str, Route] = {}
     for name, spec in (stored or {}).items():
-        chain = _chain_from_spec(spec, api_key=api_key, default_provider=default_provider)
+        chain = _chain_from_spec(spec, api_key=api_key, default_preset=default_preset)
         if chain:
             routes[name] = chain[0]
     return routes
@@ -255,7 +323,7 @@ def chains_from_map(
     stored: Mapping[str, Mapping[str, Any]] | None,
     *,
     api_key: str | None = None,
-    default_provider: Provider = P.CLAW_BAY,
+    default_preset: str = "",
 ) -> dict[str, Chain]:
     """The persisted role map, as fallback chains.
 
@@ -266,15 +334,32 @@ def chains_from_map(
     """
     chains: dict[str, Chain] = {}
     for name, spec in (stored or {}).items():
-        chain = _chain_from_spec(spec, api_key=api_key, default_provider=default_provider)
+        chain = _chain_from_spec(spec, api_key=api_key, default_preset=default_preset)
         if chain:
             chains[name] = chain
     return chains
 
 
-def _chain_from_spec(
-    spec: Mapping[str, Any], *, api_key: str | None, default_provider: Provider
-) -> Chain:
+def _preset_named(name: str, *, what: str) -> RoutePreset | None:
+    """A preset, or a warning and None. Never a substitution.
+
+    Loud but not fatal: a role map is edited live through the API, and one
+    misspelled name must not take down the readiness report that would show
+    the operator what they misspelled.
+    """
+    preset = protocols.find(name)
+    if preset is None:
+        log.warning(
+            "route: no preset named %r (%s); using the generic one, which cannot "
+            "tell a spend cap from a burst limit. Declared presets: %s",
+            name,
+            what,
+            ", ".join(protocols.names()),
+        )
+    return preset
+
+
+def _chain_from_spec(spec: Mapping[str, Any], *, api_key: str | None, default_preset: str) -> Chain:
     """One role's stored spec as an ordered chain.
 
     Accepts `model` as a single name or as a list, so a map written before
@@ -282,6 +367,17 @@ def _chain_from_spec(
     not forced into list syntax. A role missing a model or an endpoint is
     dropped rather than half-built: it is not a route, and preflight's job is
     to name it as missing rather than to fail on the first call that uses it.
+
+    Two spellings, and they mean different things on purpose:
+
+    - **`preset`** names the whole bundle — wire protocol, authentication,
+      reader and classifier.
+    - **`provider`** is the older field, and it only ever chose a *classifier*;
+      the wire shape came from whatever transport the deployment had wired in.
+      It keeps doing exactly that: the named preset's classifier is taken, and
+      the protocol comes from this deployment's default. A map written before
+      this stage therefore calls the same URL with the same credential and
+      classifies failures the same way.
     """
     endpoint = spec.get("endpoint")
     models = spec.get("models") or spec.get("model")
@@ -289,9 +385,28 @@ def _chain_from_spec(
         return ()
     if isinstance(models, str):
         models = [models]
-    provider = P.PROVIDERS.get(str(spec.get("provider", "")), default_provider)
+
+    named = str(spec.get("preset") or "").strip()
+    legacy = str(spec.get("provider") or "").strip()
+    price_ref = str(spec.get("price_ref") or "").strip() or None
+
+    if named:
+        preset = named if _preset_named(named, what="route preset") is not None else default_preset
+        classifier: Provider | None = None
+    else:
+        preset = default_preset
+        found = _preset_named(legacy, what="legacy provider field") if legacy else None
+        classifier = found.classifier if found is not None else (P.GENERIC if legacy else None)
+
     return tuple(
-        Route(str(model), str(endpoint), provider, api_key=api_key)
+        Route(
+            str(model),
+            str(endpoint),
+            classifier,
+            api_key=api_key,
+            preset=preset,
+            price_ref=price_ref,
+        )
         for model in models
         if str(model).strip()
     )
@@ -350,10 +465,10 @@ def reviewer_independence(
             f"reviewer and implementer are the same model ({reviewer.model}): "
             "every review is a model grading its own work",
         )
-    if reviewer.provider.name == implementer.provider.name:
+    if reviewer.classifier.name == implementer.classifier.name:
         return (
             False,
-            f"reviewer and implementer share a provider ({reviewer.provider.name}): "
+            f"reviewer and implementer share a provider ({reviewer.classifier.name}): "
             "reviews are independent of the model but not of the vendor",
         )
     return (True, f"{reviewer.model} reviews {implementer.model}")
@@ -493,7 +608,7 @@ class ModelClient:
             )
         if 200 <= response.status < 300:
             return (True, f"{route.model} answered")
-        verdict = route.provider.classify(response.status, response.headers, response.body)
+        verdict = route.classifier.classify(response.status, response.headers, response.body)
         return (
             False,
             f"{route.model} returned HTTP {response.status}"
@@ -629,12 +744,14 @@ class ModelClient:
                         None,
                         attempt=attempt,
                         latency=latency,
-                        usage=usage_fields(response.body, route.model, self.prices),
+                        usage=self._usage(route, response.body),
                         detail=_fell_back(chain, route),
                     )
                     return response
 
-                verdict = route.provider.classify(response.status, response.headers, response.body)
+                verdict = route.classifier.classify(
+                    response.status, response.headers, response.body
+                )
                 last = verdict
                 kinds.append(verdict.kind)
                 self._emit(role, route, "error", verdict, attempt=attempt, latency=latency)
@@ -688,6 +805,55 @@ class ModelClient:
             last=last,
         )
 
+    def _usage(self, route: Route, body: bytes | str) -> Mapping[str, Any]:
+        """What this call consumed, read by the route's own reader.
+
+        Conservative twice over. A reader that recognises nothing returns None
+        and the event carries no usage keys at all, because an event with zeros
+        is a claim that the call was free. And an unknown model gets its token
+        counts with no price, because a missing price is not a price of zero —
+        the API counts it as `unpriced` rather than adding nothing to a total.
+        """
+        try:
+            usage = route.resolve().reader.usage(body)
+        except UnknownPreset:
+            # Telemetry is never load-bearing, and a route that got this far
+            # has already classified with the generic fallback.
+            usage = protocols.GENERIC_PRESET.reader.usage(body)
+        return price_fields(usage, route.pricing_key, self.prices)
+
+    def _identity(self, route: Route) -> dict[str, Any]:
+        """Which route, which protocol, which classifier — on every event.
+
+        Named rather than inferred: "provider=claw-bay" used to be the only
+        clue about a call, and it answered neither "what did we send" nor
+        "which endpoint shape rejected it". A stream that cannot answer those
+        cannot be used to compare two protocols, which is what §7.2 asks of it.
+
+        Resolution is defended because emitting an event must never be able to
+        fail a call that otherwise succeeded.
+        """
+        try:
+            preset = route.resolve()
+        except UnknownPreset:
+            return {
+                "provider": route.classifier.name if route.provider is not None else P.GENERIC.name,
+                "preset": route.preset_name,
+                "protocol": None,
+                "classifier": (
+                    route.provider.name if route.provider is not None else P.GENERIC.name
+                ),
+            }
+        classifier = route.provider.name if route.provider is not None else preset.classifier.name
+        return {
+            # Kept under its original name: every consumer of this stream reads
+            # `provider`, and it has always meant "what classified this".
+            "provider": classifier,
+            "preset": route.preset_name,
+            "protocol": preset.request.name,
+            "classifier": classifier,
+        }
+
     def _emit(
         self,
         role: str,
@@ -717,7 +883,7 @@ class ModelClient:
                     "role": role,
                     "model": route.model,
                     "endpoint": route.endpoint,
-                    "provider": route.provider.name,
+                    **self._identity(route),
                     "outcome": outcome,
                     "error_class": verdict.kind if verdict else None,
                     "attempt": attempt,

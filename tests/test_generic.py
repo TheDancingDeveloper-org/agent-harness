@@ -24,6 +24,7 @@ EXECUTION_PATH = [
     "executor.py",
     "model_client.py",
     "providers.py",
+    "protocols.py",
     "pricing.py",
     "plan.py",
     "github.py",
@@ -101,3 +102,37 @@ def test_the_core_package_does_not_import_adapters_at_all() -> None:
     """Importing agent_harness must not drag a workload's log format in."""
     init = SRC / "__init__.py"
     assert "adapters" not in imports_of(init), "the package root imports an adapter"
+
+
+def test_no_module_on_the_path_names_a_vendor_preset() -> None:
+    """A route preset is resolved by name at runtime, from metadata. An
+    importable module path to an adapter, written into core as a string, would
+    be an import wearing a string's clothes: lazy, but still core knowing what
+    a particular vendor is called.
+
+    Prose is fine — pointing a reader at the worked example is the opposite of
+    depending on it — so only dotted module paths count.
+    """
+    import re
+
+    offenders = {}
+    for name in EXECUTION_PATH:
+        path = SRC / name
+        if not path.exists():
+            continue
+        hits = re.findall(r"[\w.]*adapters\.\w+", path.read_text())
+        if hits:
+            offenders[name] = sorted(set(hits))
+    assert not offenders, f"core names an adapter module: {offenders}"
+
+
+def test_the_shipped_presets_are_declared_rather_than_imported() -> None:
+    """They reach the harness through the distribution's entry points, which is
+    the same door a third party's package uses. If it were not, "add a vendor
+    without editing core" would be true only for vendors we ship."""
+    import tomllib
+
+    manifest = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text())
+    declared = manifest["project"]["entry-points"]["agent_harness.route_presets"]
+    assert set(declared) == {"chat-completions", "claw-bay"}
+    assert all(value.startswith("agent_harness.adapters.") for value in declared.values())

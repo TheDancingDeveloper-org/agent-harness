@@ -13,12 +13,17 @@ It is **not tied to any particular project, language or workload.** You supply t
 provider and the checks; the harness supplies the queue, the claims, the failure model and
 the record of what happened.
 
-## Status: pre-alpha — every path is tested, none is proven against a real workload
+## Status: pre-alpha — deterministic paths are tested; real use is observed, not proven
 
 It runs, it is deployed inside [AIDevEnv](https://github.com/TheDancingDeveloper-org/aidevenv),
-and every stage has been driven end to end against a real git repository with a scripted
-model. **It has never executed a real agent against a real provider.** Nothing here is
-proven until it does.
+and direct execution has been driven end to end against a real git repository with a
+scripted model. A first supervised NGMS attempt and later direct calls used real agents and
+providers, and exposed defects; the surviving evidence is reconstructed in
+[`docs/evidence/2026-08-03-04-ngms-first-sustained-run-v1.md`](docs/evidence/2026-08-03-04-ngms-first-sustained-run-v1.md).
+It lacks a common run ID, complete configuration, raw-artifact checksums and a comparable
+follow-up run, so it is an observation, not proof that the harness works against a real
+fleet. Deterministic fixture success proves wiring, not model quality or unattended
+reliability.
 
 | Module | What it does |
 |---|---|

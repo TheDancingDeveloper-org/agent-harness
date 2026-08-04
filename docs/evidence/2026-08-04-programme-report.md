@@ -197,3 +197,29 @@ branches. The superseded claim is retained here rather than only overwritten,
 per [`README.md`](README.md).
 
 Nothing else in this report depends on that number, and no measurement changed.
+
+## Note on commit identifiers, 2026-08-04
+
+**Every commit sha quoted in this report and in the per-stage reports beside it
+refers to the branch as it was verified, and those shas are not reachable from
+`main`.**
+
+`main` requires linear history, and the verified branch contained four merge
+commits — one per integrated stage branch. There is therefore no way to land it
+on `main` that preserves the identifiers: a merge is refused, a rebase replays
+every commit under a new sha, and a squash discards them all. The branch was
+rebased into a linear history whose **tree is byte-identical** to the verified
+commit `cf5a0e6` (`git rev-parse cf5a0e6^{tree}` and the rebased head both give
+`3607b82d`), so what landed is the same code, verified under the same gates,
+with different names for the commits.
+
+The quoted identifiers remain reachable from two places, both pushed:
+
+- `archive/fit-for-purpose-2026-08-04` — the integration branch exactly as
+  verified, merge commits and all, at `cf5a0e6`.
+- `codex/fit-stage0`, `-a`, `-e2`, `-e1`, `-c`, `-g`, `-b` — each stage as it
+  was verified alone, which is what the per-stage reports' shas point into.
+
+This note exists because a report citing a sha nobody can resolve is a report
+that cannot be checked, and "the shas changed in the merge" is exactly the sort
+of thing that is obvious today and unrecoverable in six months.

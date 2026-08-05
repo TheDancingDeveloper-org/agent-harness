@@ -84,6 +84,15 @@ A fix is declared per project, keyed to a check command verbatim:
 The item still fails; somebody now knows what would clear it, and the fix is
 announced in the event stream as `fix_available`.
 
+**Superseded in part, 2026-08-05 (#155).** "Never run" was right about a test
+and wrong about a formatter, and the cost was measured: four of seven attempts
+at one `rdpapp` item were refused by `cargo fmt --all -- --check` and by nothing
+else. A project may now set `apply_fixes`, and a declared fix is then run once
+and its check re-run, with the re-run as the verdict. The default is unchanged —
+recorded, not applied — and a failing *test* is still never fixed and re-run.
+`docs/USAGE.md` §6b has the boundary and the guards; what this section describes
+is what the default still does.
+
 A fix keyed to a command that is not a check is **refused**, not ignored. It is
 almost always a typo, and a fix that silently never applies is worse than no
 fix because someone believes it is there.

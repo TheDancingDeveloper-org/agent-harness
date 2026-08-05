@@ -113,8 +113,11 @@ CREATE TABLE IF NOT EXISTS projects (
     base_branch TEXT NOT NULL DEFAULT 'main',
     checks      TEXT NOT NULL DEFAULT '[]',
     -- Stage K: `check command -> argv believed to clear it`. Recorded when a
-    -- check fails, never run.
+    -- check fails; run only when `apply_fixes` is on.
     fixes       TEXT NOT NULL DEFAULT '{}',
+    -- #155. Whether a declared fix may be run and its check re-run. Zero by
+    -- default, so an upgrade changes nothing until an operator says so.
+    apply_fixes INTEGER NOT NULL DEFAULT 0,
     -- Stage H: how often an attempt at this project is made durable.
     durability  TEXT NOT NULL DEFAULT '',
     -- Stage L. Per-item ceilings for this project. Zero is unlimited, which
@@ -387,9 +390,15 @@ class Project:
     checks: list[str] = field(default_factory=list)
     #: `check command -> argv believed to clear it`. Declared, because only
     #: the person who wrote the check knows that `ruff format` fixes what
-    #: `ruff format --check` reports. Recorded when the check fails and
-    #: **never run** — see `outcomes.CheckResult.fix`.
+    #: `ruff format --check` reports. Always recorded when the check fails;
+    #: run only if `apply_fixes` is on.
     fixes: dict[str, list[str]] = field(default_factory=dict)
+    #: Whether a declared fix may be **run**, with its check then re-run and
+    #: the re-run taken as the verdict (#155). Off by default: turning it on
+    #: is the operator asserting that every command they declared a fix for is
+    #: mechanically fixable — true of a formatter, false of a test suite, and
+    #: not something the harness can check. See `executor.Checks`.
+    apply_fixes: bool = False
     #: How often this project's attempts are made durable: `exit`, `boundary`
     #: or `sync`. Empty takes the deployment's default. See `attempts.py`.
     durability: str = ""
@@ -416,6 +425,7 @@ class Project:
         data = dict(row)
         data["checks"] = json.loads(data.get("checks") or "[]")
         data["fixes"] = json.loads(data.get("fixes") or "{}")
+        data["apply_fixes"] = bool(data.get("apply_fixes"))
         data["durability"] = data.get("durability") or ""
         data["roles"] = json.loads(data["roles"]) if data.get("roles") else None
         return cls(**data)
@@ -586,6 +596,9 @@ class WorkQueue:
             # Stage K. Additive; an older build ignores it and a project that
             # declares no fix reads as `{}`.
             "fixes": "TEXT NOT NULL DEFAULT '{}'",
+            # #155. Additive on the same terms: an older build ignores it, and
+            # a database that predates it reads as off, which is the default.
+            "apply_fixes": "INTEGER NOT NULL DEFAULT 0",
             # Stage H, additive on the same terms.
             "durability": "TEXT NOT NULL DEFAULT ''",
             "max_item_seconds": "REAL NOT NULL DEFAULT 0",
@@ -720,14 +733,15 @@ class WorkQueue:
         try:
             conn.execute(
                 "INSERT INTO projects (project_id, name, repo, work_dir, base_branch, "
-                "checks, fixes, durability, max_item_seconds, max_item_spend_usd, "
+                "checks, fixes, apply_fixes, durability, max_item_seconds, max_item_spend_usd, "
                 "max_hold_seconds, plan_path, roles, max_workers, max_attempts, "
                 "min_free_disk_gb, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET "
                 "name=excluded.name, repo=excluded.repo, work_dir=excluded.work_dir, "
                 "base_branch=excluded.base_branch, checks=excluded.checks, "
-                "fixes=excluded.fixes, durability=excluded.durability, "
+                "fixes=excluded.fixes, apply_fixes=excluded.apply_fixes, "
+                "durability=excluded.durability, "
                 "max_item_seconds=excluded.max_item_seconds, "
                 "max_item_spend_usd=excluded.max_item_spend_usd, "
                 "max_hold_seconds=excluded.max_hold_seconds, "
@@ -743,6 +757,7 @@ class WorkQueue:
                     project.base_branch,
                     json.dumps(project.checks),
                     json.dumps(project.fixes),
+                    int(project.apply_fixes),
                     project.durability,
                     project.max_item_seconds,
                     project.max_item_spend_usd,

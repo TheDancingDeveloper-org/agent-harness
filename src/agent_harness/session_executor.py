@@ -139,7 +139,7 @@ A reviewer then reads your diff against the item above and can reject it.
 #: items were rejected for exactly the artefacts those fixes had already
 #: retired — in the other file (#167).
 from .executor import REVIEW_PROMPT as REVIEW_PROMPT  # noqa: E402
-from .executor import review_reason  # noqa: E402
+from .executor import record_follow_ups, review_reason  # noqa: E402
 
 
 @dataclass
@@ -175,6 +175,7 @@ class SessionExecutor:
         branch_prefix: str = "harness/",
         worktrees: Path | None = None,
         context_budget: int = DEFAULT_CONTEXT_BUDGET,
+        follow_ups: Path | None = None,
         ui_base_url: str = "",
         session_max_age: float = DEFAULT_MAX_AGE_SECONDS,
         on_event: Callable[[dict[str, Any]], None] | None = None,
@@ -207,6 +208,9 @@ class SessionExecutor:
         #: The headless executor has taken this from configuration since #150.
         #: Session mode reviewing large files needs the same lever.
         self.context_budget = context_budget
+        #: Where a reviewer's "it should also have done X" is kept, when it
+        #: approved. None keeps nothing and changes nothing.
+        self.follow_ups = follow_ups
         self.ui_base_url = ui_base_url
         self.session_max_age = session_max_age
         self.on_event = on_event
@@ -648,6 +652,15 @@ class SessionExecutor:
             verdict_text = self._review(record, tree, True, "", base=base)
             outcome.stages.append("review")
             verdict = APPROVED if verdict_text.strip().upper().startswith("APPROVED") else REJECTED
+            for proposal in record_follow_ups(
+                self.follow_ups,
+                self.project_id,
+                record.item_id,
+                verdict,
+                verdict_text,
+                time.time(),
+            ):
+                self._emit(record, "follow_up_proposed", detail=proposal, session_id=session.id)
             outcome.verdict = verdict
             self._emit(
                 record, f"review_{verdict}", detail=verdict_text[:2000], session_id=session.id

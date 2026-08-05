@@ -299,3 +299,88 @@ def test_the_session_reviewer_budget_is_configurable(tmp_path: Any) -> None:
 
     assert default.context_budget == DEFAULT_CONTEXT_BUDGET, "unchanged by default"
     assert raised.context_budget == 700_000, "and a deployment can raise it"
+
+
+# ------------------------------- a follow-up is not a refusal (#171)
+
+
+def test_surplus_insight_is_kept_when_the_reviewer_approves(tmp_path: Any) -> None:
+    """A reviewer's "it should also have done X" is a proposal, not a
+    condition. Refusing work that did what it was asked discards the work
+    *and* the observation — the item goes back to be rewritten identically and
+    nothing records what was noticed.
+
+    Both of the observations that motivated this were real: that two other
+    Support-bundle controls explained nothing, and that a doc comment is all
+    that stops `Snippet::text` reaching the bundle. Each cost an approval and
+    was recorded nowhere.
+    """
+    from agent_harness.executor import APPROVED, record_follow_ups
+
+    verdict = (
+        "APPROVED\n\n"
+        "3. **Why** — it does what was asked.\n\n"
+        "4. **Follow-ups**\n"
+        "- the other two Support bundle controls explain nothing\n"
+        "- nothing structurally stops Snippet::text reaching the bundle\n"
+    )
+
+    found = record_follow_ups(tmp_path, "rdpapp", "R4", APPROVED, verdict, 1000.0)
+
+    assert len(found) == 2
+    kept = (tmp_path / "FOLLOW-UPS.md").read_text()
+    assert "the other two Support bundle controls" in kept
+    assert "R4" in kept and "rdpapp" in kept
+    assert "Nothing is" in kept and "queued" in kept, "and it must say nothing waits on them"
+
+
+def test_a_rejection_never_produces_follow_ups(tmp_path: Any) -> None:
+    """The safety property, and the reason this cannot become a way to wave
+    work through. A rejection has already said what is wrong; a second channel
+    there would let "approve and defer" grow over a failed criterion."""
+    from agent_harness.executor import REJECTED, record_follow_ups
+
+    verdict = (
+        "REJECTED\n\n3. **Why** — it fails criterion 2.\n\n"
+        "4. **Follow-ups**\n- something else entirely\n"
+    )
+
+    found = record_follow_ups(tmp_path, "rdpapp", "R4", REJECTED, verdict, 1000.0)
+
+    assert found == ()
+    assert not (tmp_path / "FOLLOW-UPS.md").exists()
+
+
+def test_no_follow_ups_writes_nothing(tmp_path: Any) -> None:
+    """A reviewer answering "none" has answered the question. Turning that
+    into a file would fill a backlog with the absence of findings."""
+    from agent_harness.executor import APPROVED, record_follow_ups
+
+    assert record_follow_ups(tmp_path, "p", "T1", APPROVED, "APPROVED\n\n- none", 1.0) == ()
+    assert not (tmp_path / "FOLLOW-UPS.md").exists()
+
+
+def test_prose_after_the_list_is_not_swallowed_as_an_item() -> None:
+    """Attributing a proposal the reviewer did not make is worse than missing
+    one: a person triages it, finds nothing behind it, and trusts the next
+    one less."""
+    from agent_harness.executor import parse_follow_ups
+
+    verdict = (
+        "APPROVED\n\n4. **Follow-ups**\n"
+        "- a real one\n\n"
+        "I should add that the overall design seems sound.\n"
+    )
+
+    assert parse_follow_ups(verdict) == ("a real one",)
+
+
+def test_the_rubric_tells_the_reviewer_a_follow_up_is_not_a_rejection() -> None:
+    """The behaviour lives in the prompt; without this the parser has nothing
+    to parse."""
+    from agent_harness.executor import REVIEW_PROMPT
+
+    assert "A follow-up is not a rejection" in REVIEW_PROMPT
+    assert "proposed work items for a person to accept or discard" in REVIEW_PROMPT
+    # And the boundary must survive alongside it.
+    assert "no follow-up substitutes for one" in REVIEW_PROMPT

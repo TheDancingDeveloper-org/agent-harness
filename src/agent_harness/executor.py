@@ -1293,6 +1293,27 @@ First line exactly APPROVED or REJECTED. Then, in order:
    as not included is genuinely unavailable to you, and "the diff does not
    show it" is not a reason when the file does.
 3. **Why** — one paragraph.
+4. **Follow-ups** — only when you APPROVED. One per line, each starting with
+   `- `. Anything you noticed that this task did not ask for and that you
+   believe is worth doing: a gap the change leaves, a hazard it does not
+   introduce but does not close, work its existence implies. Write `- none`
+   if there is nothing.
+
+   These become **proposed work items for a person to accept or discard**.
+   They are not conditions on this change and nothing waits for them.
+
+## A follow-up is not a rejection
+
+If the change meets every criterion the task states, approve it — and put
+what else you would have done under Follow-ups.
+
+"It should also have done X" is a proposal. Refusing work that did what it was
+asked, because you would additionally have done something else, discards the
+work *and* the observation: the item goes back to be rewritten identically,
+and nothing records what you noticed.
+
+This does not soften anything below. A criterion the task states and the
+change does not meet is a rejection, and no follow-up substitutes for one.
 
 ## Reject if
 
@@ -1376,6 +1397,89 @@ def review_reason(verdict_text: str, limit: int = 1200) -> str:
         if 0 <= cut < limit // 2:
             return "…" + tail[cut:].strip()
     return "…" + tail.strip()
+
+
+def parse_follow_ups(verdict_text: str) -> tuple[str, ...]:
+    """What the reviewer would also have done, from its own answer.
+
+    Only the bullets under the Follow-ups heading, and only ones with content:
+    a reviewer that writes "- none" has answered the question, and turning that
+    into an item would fill a backlog with the absence of findings.
+
+    Deliberately forgiving about the heading — models vary on `## Follow-ups`,
+    `4. **Follow-ups**` and `**Follow-ups**` — and deliberately strict about
+    what counts as an entry, because the cost of a false one is a person
+    triaging noise.
+    """
+    lowered = verdict_text.lower()
+    marker = lowered.rfind("follow-up")
+    if marker == -1:
+        return ()
+    found: list[str] = []
+    for raw in verdict_text[marker:].splitlines()[1:]:
+        line = raw.strip()
+        if not line:
+            continue
+        if not line.startswith(("- ", "* ")):
+            # The section has ended. A reviewer that carries on in prose has
+            # stopped listing, and swallowing that as an item would attribute
+            # a proposal it did not make.
+            break
+        entry = line[2:].strip().strip("*_` ")
+        if not entry or entry.lower() in {"none", "n/a", "nothing", "none."}:
+            continue
+        found.append(entry)
+    return tuple(found)
+
+
+def record_follow_ups(
+    directory: Any,
+    project_id: str,
+    item_id: str,
+    verdict: str,
+    verdict_text: str,
+    now: float,
+) -> tuple[str, ...]:
+    """Keep what the reviewer would also have done, when it approved.
+
+    **Only on approval, and that is the whole safety property.** A rejection
+    has already said what is wrong and needs no second channel; allowing
+    follow-ups there would let "approve and defer" grow into a way to wave a
+    failed criterion through, which is the gate-weakening this exists to avoid.
+    """
+    if verdict != APPROVED or directory is None:
+        return ()
+    found = parse_follow_ups(verdict_text)
+    if not found:
+        return ()
+    with contextlib.suppress(Exception):
+        path = Path(directory)
+        path.mkdir(parents=True, exist_ok=True)
+        target = path / "FOLLOW-UPS.md"
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(render_follow_ups(project_id, item_id, found, now))
+    return found
+
+
+def render_follow_ups(project_id: str, item_id: str, follow_ups: Sequence[str], now: float) -> str:
+    """The proposals as plan-shaped markdown, for a person to accept.
+
+    A plan document, not queue rows. Writing straight to the queue would fork
+    the pipeline into a generated path and a hand-written one that diverge
+    forever — the same reasoning that keeps `inception` producing a `PLAN.md`.
+    Nothing here is admitted to anything until a human moves it into a plan.
+    """
+    lines = [
+        f"### Follow-ups from reviewing {item_id} ({project_id})",
+        "",
+        "Proposed by the reviewer while approving that item. **Nothing is",
+        "queued and nothing waits on these** — move one into a plan to make it",
+        "work, or delete it.",
+        "",
+    ]
+    lines.extend(f"- {entry}" for entry in follow_ups)
+    lines.append("")
+    return "\n".join(lines)
 
 
 def review_context(repo: Path, diff: str, budget: int) -> str:
@@ -2427,6 +2531,13 @@ class Executor:
             mode=mode,
         )
         outcome.verdict = verdict
+        for proposal in record_follow_ups(
+            self.artifacts, self.project_id, record.item_id, verdict, verdict_text, self.now()
+        ):
+            # An event as well as a file: the stream is the source of truth,
+            # and a coordinator can read this without knowing where the file
+            # is.
+            self._emit(record, "follow_up_proposed", detail=proposal)
         self._emit(
             record,
             f"review_{verdict}",

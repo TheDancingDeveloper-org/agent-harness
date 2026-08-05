@@ -104,8 +104,10 @@ class WorkItem(BaseModel):
         description="WHY the item is in `state`, from the Stage K taxonomy: "
         "`completed`, `refused` (a gate said no about this item's work), `crashed` "
         "(the worker or harness broke, and nothing judged the work), `withheld` "
-        "(never attempted, or discarded through no fault of the item) or `escalated` "
-        "(a person has to resolve something). `state` alone cannot tell a reviewer's "
+        "(never attempted, or discarded through no fault of the item), `escalated` "
+        "(a person has to resolve something) or `blocked_by_policy` (the harness "
+        "refused to run a command on this item's behalf, which is terminal: the item "
+        "is never handed back to the agent to retry). `state` alone cannot tell a reviewer's "
         "rejection from a crashed worker — both are `failed` — and those want "
         "different responses. Empty means nobody has finished with it yet, which is "
         "not a sixth disposition.",
@@ -117,7 +119,9 @@ class WorkItem(BaseModel):
         "`review_rejected`, `patch_rejected`, `no_target`, `worker_error`, "
         "`provider_exhausted`, `budget_exhausted`, `dependency_invalidated`, "
         "`agent_timeout`, `claim_lost`, `item_wall_clock`, `item_spend`, "
-        "`hold_expired`, `context_unavailable`.",
+        "`hold_expired`, `context_unavailable`, `item_impossible`, `command_blocked` "
+        "(a command matched this deployment's refusal list) or `path_escape` (a "
+        "command named a path outside the item's worktree).",
     )
     branch: str | None = None
     pr_url: str | None = None

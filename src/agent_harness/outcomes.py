@@ -214,8 +214,27 @@ WITHHELD = "withheld"
 #: A person has to resolve something before this can be attempted again. Not a
 #: failure of the item and not a transient condition.
 ESCALATED = "escalated"
+#: The harness refused to run a command on the item's behalf: it matched the
+#: deployment's refusal list, or it reached outside the item's tree. See
+#: `guard.py`.
+#:
+#: Kept apart from `REFUSED`, which is a gate's verdict *about the work*, and
+#: from `CRASHED`, which is the harness breaking. Neither is true here: the work
+#: was never judged, and nothing broke — the harness declined, on purpose, and
+#: an operator reading the queue must be able to see that without opening a log.
+#: It is also apart from `ESCALATED` because the two answer different questions:
+#: escalated is "nobody could decide this", and this is "the harness decided,
+#: and the answer is no".
+#:
+#: **A refusal is terminal (owner decision, 2026-08-05.)** The command is
+#: blocked, the item stops in `blocked`, and it is not handed back to the agent
+#: as a correction to retry: terminal is the safest of the two answers, the
+#: cheapest, and it cannot loop. The cost accepted with it is that an agent
+#: reaching for a forbidden command that had a permitted equivalent loses the
+#: whole item and needs a person.
+BLOCKED_BY_POLICY = "blocked_by_policy"
 
-DISPOSITIONS = (COMPLETED, REFUSED, CRASHED, WITHHELD, ESCALATED)
+DISPOSITIONS = (COMPLETED, REFUSED, CRASHED, WITHHELD, ESCALATED, BLOCKED_BY_POLICY)
 
 
 # ------------------------------------------------------------- reason kinds
@@ -258,6 +277,15 @@ CONTEXT_UNAVAILABLE = "context_unavailable"
 #: Retrying is pointless — the brief is the brief — so this needs a person to
 #: rewrite or withdraw the item, which is why it escalates rather than failing.
 ITEM_IMPOSSIBLE = "item_impossible"
+#: A command matched this deployment's refusal list. The command is named in
+#: the detail along with the pattern that refused it, so the answer to "why did
+#: this stop?" is one line of the queue rather than a session scrollback.
+COMMAND_BLOCKED = "command_blocked"
+#: A command the harness was asked to run named a path outside the item's tree.
+#: Kept apart from `COMMAND_BLOCKED` because the two need different responses: a
+#: pattern hit is answered by looking at the policy, and this is answered by
+#: looking at what the command was reaching for.
+PATH_ESCAPE = "path_escape"
 
 REASON_KINDS = (
     CHECKS_FAILED,
@@ -277,6 +305,8 @@ REASON_KINDS = (
     HOLD_EXPIRED,
     CONTEXT_UNAVAILABLE,
     ITEM_IMPOSSIBLE,
+    COMMAND_BLOCKED,
+    PATH_ESCAPE,
 )
 
 
@@ -342,12 +372,14 @@ class Stop:
 #: An attempt that ends in one of these is history; one that ends in
 #: `withheld`, or that never ends at all because its worker was killed, is a
 #: position to continue from.
-DECIDED = frozenset({COMPLETED, REFUSED, ESCALATED, CRASHED})
+DECIDED = frozenset({COMPLETED, REFUSED, ESCALATED, CRASHED, BLOCKED_BY_POLICY})
 
 
 #: Dispositions a human should be looking at rather than waiting through.
 #: `REFUSED` is absent on purpose: a rejected diff is the system working.
-NEEDS_A_PERSON = frozenset({ESCALATED})
+#: `BLOCKED_BY_POLICY` is present because the refusal is terminal — nothing will
+#: pick the item up again, so if no person looks at it, nobody ever does.
+NEEDS_A_PERSON = frozenset({ESCALATED, BLOCKED_BY_POLICY})
 
 
 def stop_for(result: CheckResult) -> Stop:

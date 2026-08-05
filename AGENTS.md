@@ -85,6 +85,7 @@ trade and it is rejected.
 | Can this project finish an item? | `src/agent_harness/preflight.py` — refuses a start rather than failing every item |
 | Typed dependency graph | `src/agent_harness/graph.py` — contract in `docs/COORDINATION-PLANE.md` §8 |
 | What a gate answered, and what stopped an item | `src/agent_harness/outcomes.py` — **not** `providers.py`, which is what a *provider* answered |
+| Commands the harness will not run | `agent-harness guard`; `src/agent_harness/guard.py` — a deterministic refusal list and a worktree path boundary. A refusal is **terminal**: `blocked_by_policy`, never handed back to the agent. Screening, not a sandbox |
 | Where an attempt got to, durably | `src/agent_harness/attempts.py` — a fixed stage list, **not** a workflow engine |
 | How long one item may take, and what it may spend | `src/agent_harness/budgets.py` — **not** a provider cost cap, and never parks an endpoint |
 | An item waiting on a person | `src/agent_harness/holds.py` — a state of the item, **not** a projection over events, and **not** the coordination plane |

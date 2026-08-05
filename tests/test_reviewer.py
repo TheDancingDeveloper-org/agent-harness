@@ -98,3 +98,75 @@ def test_the_prompt_demands_evidence_not_just_a_verdict() -> None:
     assert "What I could not verify" in REVIEW_PROMPT
     assert "Assume it is wrong" in REVIEW_PROMPT
     assert "cannot name any, that is a REJECTED" in REVIEW_PROMPT
+
+
+def test_both_executors_review_against_one_rubric() -> None:
+    """Two copies drifted, and two items were rejected for it.
+
+    The rubric used to be duplicated in `executor.py` and
+    `session_executor.py`. Every correction made from measurement landed in
+    the headless one: that a diff is the whole change, that the harness ran
+    the checks, that the touched files are supplied, that scope belongs to the
+    task. The session reviewer had none of them, and rejected real work for
+    precisely the artefacts those fixes had already retired — in the other
+    file.
+
+    Identity, not similarity: a test that allows "roughly the same" is a test
+    that allows the drift back.
+    """
+    from agent_harness import executor, session_executor
+
+    assert session_executor.REVIEW_PROMPT is executor.REVIEW_PROMPT
+
+
+def test_the_session_reviewer_is_given_what_the_headless_one_is() -> None:
+    """The rubric names fields; supplying an empty string for them would keep
+    the two prompts identical and the two reviewers unequal."""
+    import inspect
+
+    from agent_harness import session_executor
+
+    source = inspect.getsource(session_executor.SessionExecutor._review)
+    assert "review_context(" in source, "the touched files must reach the session reviewer"
+    assert "review_checks_prompt(" in source, "and what actually ran the checks"
+    assert "...HEAD" in source, "and the diff must be against the base, not the working tree"
+
+
+def test_a_session_retry_is_told_why_the_last_attempt_was_refused(tmp_path: Any) -> None:
+    """A session attempt is minutes of a real agent, not one API call, so
+    repeating one blind is the most expensive avoidable thing here.
+
+    Measured: an item was rejected for widening a repository trait's return
+    type — a specific, actionable criticism — and the retry would have been
+    sent the identical brief with no mention of it.
+    """
+    from agent_harness.session_executor import PROMPT_TEMPLATE, SessionExecutor
+    from agent_harness.work import WorkQueue, WorkRecord
+
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    executor = SessionExecutor(queue, type("Host", (), {})(), tmp_path)
+
+    refused = WorkRecord(
+        item_id="R3",
+        title="t",
+        brief="b",
+        last_error="review rejected: it widens the repository trait's return type",
+    )
+    prompt = PROMPT_TEMPLATE.format(
+        title=refused.title,
+        brief=refused.brief,
+        checks_description="none",
+        prior=executor._prior_failure(refused),
+    )
+
+    assert "widens the repository trait" in prompt
+    assert "not continuing that attempt" in prompt, "a new attempt, not a resumption"
+
+    # A first attempt must read exactly as it did before this existed.
+    fresh = PROMPT_TEMPLATE.format(
+        title="t",
+        brief="b",
+        checks_description="none",
+        prior=executor._prior_failure(WorkRecord(item_id="R3", title="t", brief="b")),
+    )
+    assert "What happened last time" not in fresh

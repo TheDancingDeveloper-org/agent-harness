@@ -36,7 +36,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .executor import APPROVED, REJECTED, Checks, Outcome, is_disk_exhaustion, run_git
+from .executor import (
+    APPROVED,
+    DEFAULT_CONTEXT_BUDGET,
+    REJECTED,
+    Checks,
+    Outcome,
+    is_disk_exhaustion,
+    run_git,
+)
 from .graph import LOCAL_WORK
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
 from .outcomes import (
@@ -77,6 +85,25 @@ log = logging.getLogger(__name__)
 #: prompt an agent was given stays on disk next to its result.
 DEFAULT_AGENT_COMMAND = ("claude", "-p", "{prompt_file}", "--permission-mode", "acceptEdits")
 
+#: Why the last attempt was refused, for the attempt replacing it. A session
+#: attempt is minutes of a real agent rather than one API call, so repeating
+#: one blind is the most expensive avoidable thing here — and until now the
+#: agent's prompt carried the title, the brief and the checks, and nothing
+#: else. Measured: an item was rejected for widening a trait's return type,
+#: and a retry would have been sent the identical brief with no mention of it.
+#:
+#: **Not resumption.** The item is re-read from the current brief, no prior
+#: diff is fed back, and a guided attempt consumes an attempt exactly as an
+#: unguided one does.
+PRIOR_FAILURE_PROMPT = """
+## What happened last time
+
+A previous attempt at this item was refused. You are starting again from the
+brief above, not continuing that attempt — but do not reproduce the fault:
+
+{error}
+"""
+
 PROMPT_TEMPLATE = """\
 You are working one item from a plan. Work only on this item.
 
@@ -92,7 +119,7 @@ anything is proposed. Specifically:
 {checks_description}
 
 A reviewer then reads your diff against the item above and can reject it.
-
+{prior}
 ## Rules
 
 - Change only what this item asks for. Unrelated edits will be rejected.
@@ -104,44 +131,14 @@ A reviewer then reads your diff against the item above and can reject it.
   around it is not.
 """
 
-REVIEW_PROMPT = """\
-Review this change. You did not write it, and your job is not to be agreeable.
-
-Assume it is wrong until the diff shows otherwise. Most changes that fail
-review fail because they do something *adjacent* to what was asked, or claim
-more than they did — not because they are obviously broken.
-
-The task:
-{brief}
-
-The diff:
-```diff
-{diff}
-```
-
-Checks: {checks}
-
-## Answer
-
-First line exactly APPROVED or REJECTED. Then, in order:
-
-1. **What I verified** — the specific things in the diff you actually checked
-   against the task. If you cannot name any, that is a REJECTED.
-2. **What I could not verify** — anything the diff claims that the diff alone
-   does not show. Say it, do not assume it.
-3. **Why** — one paragraph.
-
-## Reject if
-
-- It does not do what the task asked, or does more than the task asked.
-- It claims an effect the diff does not demonstrate.
-- It changes something unrelated, however small.
-- The task cannot be judged from what you were given.
-
-Approving work that does not do what was asked is the expensive failure here:
-it reaches a pull request, a human reads it as reviewed, and the cost lands
-much later. An unnecessary rejection costs one retry.
-"""
+#: The review rubric lives with the headless executor and is imported, not
+#: copied. It used to be copied, and every correction made from measurement
+#: landed in one of the two: the session reviewer was never told that a diff is
+#: the whole change, never told the harness ran the checks, never given the
+#: files the diff touched, and never told that scope belongs to the task. Two
+#: items were rejected for exactly the artefacts those fixes had already
+#: retired — in the other file (#167).
+from .executor import REVIEW_PROMPT as REVIEW_PROMPT  # noqa: E402
 
 
 @dataclass
@@ -484,6 +481,7 @@ class SessionExecutor:
                     title=record.title,
                     brief=record.brief,
                     checks_description=self._describe_checks(),
+                    prior=self._prior_failure(record),
                 )
             )
 
@@ -634,7 +632,7 @@ class SessionExecutor:
                         record, "draft_pr_opened", detail=outcome.pr_url, session_id=session.id
                     )
 
-            verdict_text = self._review(record, tree, True, "")
+            verdict_text = self._review(record, tree, True, "", base=base)
             outcome.stages.append("review")
             verdict = APPROVED if verdict_text.strip().upper().startswith("APPROVED") else REJECTED
             outcome.verdict = verdict
@@ -744,17 +742,39 @@ class SessionExecutor:
             url=url,
         )
 
-    def _review(self, record: WorkRecord, tree: Path, passed: bool, failure: str) -> str:
+    def _prior_failure(self, record: WorkRecord) -> str:
+        """Why the last attempt was refused, bounded.
+
+        `requeue` keeps `last_error` deliberately — "the only record of why the
+        item failed" — and until now nothing passed it to the agent about to
+        repeat the mistake (#166).
+        """
+        error = (record.last_error or "").strip()
+        return PRIOR_FAILURE_PROMPT.format(error=error[:4000]) if error else ""
+
+    def _review(
+        self, record: WorkRecord, tree: Path, passed: bool, failure: str, base: str = ""
+    ) -> str:
         if self.reviewer is None:
             # Checked before the diff is computed: there is no point building
             # a diff nobody will read. Says so rather than silently treating
             # unreviewed work as approved.
             return "REJECTED\nNo reviewer is configured, so nothing has reviewed this."
-        diff = run_git(tree, "diff", "HEAD")
+        # Against the BASE, not the working tree. `git diff HEAD` asks "what is
+        # uncommitted?", and by the time a reviewer is called the answer is
+        # always "nothing" — the checkpoint before the expensive gate has just
+        # committed all of it. Every session-mode reviewer was shown an empty
+        # diff and rejected on it, so nothing could ever be approved (#162).
+        diff = run_git(tree, "diff", f"{base}...HEAD") if base else run_git(tree, "diff", "HEAD")
+        from .executor import review_checks_prompt, review_context
+
         prompt = REVIEW_PROMPT.format(
             brief=record.brief,
             diff=diff[:20000],
-            checks="passed" if passed else failure,
+            # The same helpers the headless reviewer uses, so a correction to
+            # either cannot land in one executor and not the other (#167).
+            context=review_context(tree, diff, DEFAULT_CONTEXT_BUDGET),
+            checks=review_checks_prompt(self.checks.commands),
         )
         try:
             response = self.reviewer.call("reviewer", [{"role": "user", "content": prompt}])

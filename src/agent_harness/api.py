@@ -98,6 +98,8 @@ from .schemas import (
     RoleMapView,
     RoleRoute,
     RoutedRole,
+    RouteReachability,
+    RoutesHealthView,
     ScopeRequest,
     SetFleetControl,
     StopProjectRequest,
@@ -1476,6 +1478,44 @@ def create_api(
         queue.set_control(request.state, request.reason)
         state, reason = queue.control()
         return FleetControl(state=state, reason=reason)
+
+    @app.get(
+        "/api/routes/health",
+        tags=["control"],
+        summary="Which endpoints and models are answering",
+        response_model=RoutesHealthView,
+    )
+    def routes_health(_: None = Depends(require_token)) -> RoutesHealthView:
+        """Reachability, retained from traffic this process already made.
+
+        The classifier decides per call whether an endpoint said "slow down",
+        "you are out of budget" or "no". That verdict picked the next retry
+        and was then discarded, so the first question an operator asks — *what
+        is up right now?* — could only be answered by leaving the harness and
+        running `curl` by hand.
+
+        **Nothing here probes.** Asking a model whether it answers costs money
+        and can itself be rate limited; `doctor --probe-models` is where a
+        deliberate, paid-for question belongs, and it reports *not asked*
+        rather than passing. A route with no traffic is absent from this view,
+        because unknown and healthy are different answers.
+
+        Read `independence_possible` before trusting a review taken today: it
+        is false when only one vendor is reachable, and no routing can satisfy
+        the reviewer rule while that holds.
+        """
+        client = getattr(app.state, "model_client", None)
+        routes = list(client.availability.all()) if client is not None else []
+        # Counted by endpoint rather than by model. Two models from one
+        # gateway are not two vendors, and treating them as such would report
+        # independence that does not exist -- the precise error this exists to
+        # make visible.
+        vendors = len({r["endpoint"] for r in routes if r["answering"]})
+        return RoutesHealthView(
+            vendors_answering=vendors,
+            independence_possible=vendors >= 2,
+            routes=[RouteReachability(**r) for r in routes],
+        )
 
     @app.get(
         "/api/roles",

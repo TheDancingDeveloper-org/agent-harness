@@ -399,6 +399,58 @@ class RoleMap(BaseModel):
     )
 
 
+class RouteReachability(BaseModel):
+    """What one endpoint and model have actually been doing."""
+
+    endpoint: str = Field(description="Where the calls went.")
+    model: str = Field(description="Which model was named.")
+    answering: bool = Field(
+        description="True only if it has succeeded at least once AND its most recent "
+        "call succeeded. A route that has only ever failed is never reported as "
+        "healthy, and a route with no traffic is absent rather than assumed well."
+    )
+    last_outcome: str = Field(description="`ok`, `error`, and so on -- the last one seen.")
+    last_error_class: str | None = Field(
+        None,
+        description="The classifier's verdict on the last failure: a burst limit, a "
+        "spent window, a spent cap or a refusal. Null after a success.",
+    )
+    last_seen: float = Field(description="When this route was last called.")
+    last_ok: float | None = Field(
+        None,
+        description="When it last answered. Null means never, which is not the same as "
+        "long ago and must not be rendered as though it were.",
+    )
+    consecutive_failures: int = Field(description="Failures since its last success.")
+    calls: int = Field(description="How many calls this process has made to it.")
+
+
+class RoutesHealthView(BaseModel):
+    """Which routes are answering, learned from traffic rather than probing.
+
+    Everything here is a by-product of calls the fleet was making anyway.
+    Nothing in this view costs a request, and nothing in it is a claim about a
+    route that has not been called: absence means unknown.
+    """
+
+    vendors_answering: int = Field(
+        description="How many distinct endpoints have a currently-answering model. "
+        "Reviewer independence requires the reviewer to be a different vendor from the "
+        "implementer, so when this is 1 that rule cannot be satisfied by any routing -- "
+        "and approvals taken during such a period are weaker than approvals taken "
+        "outside one, with nothing else recording the difference."
+    )
+    independence_possible: bool = Field(
+        description="False when fewer than two endpoints are answering. Says the "
+        "guarantee is unavailable, which is distinct from a deployment that has chosen "
+        "to run one vendor deliberately."
+    )
+    routes: list[RouteReachability] = Field(
+        default_factory=list,
+        description="Worst first: the reason to read this is that something is wrong.",
+    )
+
+
 class RoleMapView(BaseModel):
     """The role map as it will actually be used.
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import shlex
 import shutil
 import threading
@@ -88,6 +89,30 @@ log = logging.getLogger(__name__)
 #: file so a long brief is not mangled by shell quoting, and so the exact
 #: prompt an agent was given stays on disk next to its result.
 DEFAULT_AGENT_COMMAND = ("claude", "-p", "{prompt_file}", "--permission-mode", "acceptEdits")
+
+
+def default_agent_command() -> Sequence[str]:
+    """The agent command to run, deployment first.
+
+    `$HARNESS_AGENT_COMMAND` names it for deployments whose agent is not the
+    built-in one — a fleet routed at a single gateway must be able to say so
+    without editing core, the same way `$HARNESS_ENDPOINT` already does for
+    the model API.
+
+    **One default, resolved in one place.** The CLI and the executor disagreed
+    once: the executor's command granted edit permission and the CLI's did not,
+    so an agent was refused every write and reported no changes — which reads
+    as a model that considered the task and declined. Every caller comes
+    through here so that cannot recur, and so an override cannot apply to one
+    entry point and not another.
+
+    An override is taken as given. It is *not* checked for an edit-permission
+    flag, because only the agent named knows what its own flag is called, and
+    guessing would be core knowing a particular vendor.
+    """
+    override = os.environ.get("HARNESS_AGENT_COMMAND", "").strip()
+    return tuple(shlex.split(override)) if override else DEFAULT_AGENT_COMMAND
+
 
 #: Why the last attempt was refused, for the attempt replacing it. A session
 #: attempt is minutes of a real agent rather than one API call, so repeating

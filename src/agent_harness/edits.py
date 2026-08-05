@@ -148,8 +148,12 @@ def _resolve(root: Path, path: str) -> Path:
     return target
 
 
-def apply_edits(root: Path, edits: list[Edit]) -> list[str]:
-    """Apply every edit, or none of them. Returns the paths changed.
+def plan_edits(root: Path, edits: list[Edit]) -> dict[str, tuple[str, str]]:
+    """Validate every edit and return `path -> (before, after)`.
+
+    Nothing is written. Separated from applying so the same validation serves
+    both callers: the one that changes the tree, and the one that renders a
+    diff without touching it.
 
     All-or-nothing because a half-applied set is worse than a rejected one: the
     checks would run against a tree no model intended, and the reviewer would
@@ -161,6 +165,7 @@ def apply_edits(root: Path, edits: list[Edit]) -> list[str]:
         raise EditError("no edit blocks found")
 
     pending: dict[Path, str] = {}
+    original: dict[Path, str] = {}
     order: list[str] = []
 
     for index, edit in enumerate(edits, start=1):
@@ -171,10 +176,13 @@ def apply_edits(root: Path, edits: list[Edit]) -> list[str]:
             current = pending[target]
         elif target.exists():
             current = target.read_text()
+            original.setdefault(target, current)
         elif edit.creates:
             current = ""
+            original.setdefault(target, "")
         else:
             raise EditError(f"{where}: no such file, and its SEARCH block is not empty")
+        original.setdefault(target, current)
 
         if edit.creates:
             if current and current != edit.replace:
@@ -203,7 +211,52 @@ def apply_edits(root: Path, edits: list[Edit]) -> list[str]:
         if edit.path not in order:
             order.append(edit.path)
 
-    for target, content in pending.items():
+    # Keyed by the path as the model wrote it, in the order it first named
+    # each file, so a diff reads the way the edits were given.
+    by_path: dict[str, tuple[str, str]] = {}
+    for path in order:
+        target = _resolve(root, path)
+        by_path[path] = (original.get(target, ""), pending[target])
+    return by_path
+
+
+def apply_edits(root: Path, edits: list[Edit]) -> list[str]:
+    """Apply every edit, or none of them. Returns the paths changed."""
+    planned = plan_edits(root, edits)
+    for path, (_, after) in planned.items():
+        target = _resolve(root, path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
-    return order
+        target.write_text(after)
+    return list(planned)
+
+
+def to_diff(root: Path, edits: list[Edit]) -> str:
+    """The unified diff these edits describe, without touching the tree.
+
+    This is the point of the format. The model names text; *this* computes the
+    line numbers, from content it has actually read. A hunk header can no
+    longer disagree with its body, because nothing is asked to count.
+
+    Rendering a diff rather than writing the files keeps every gate downstream
+    exactly as it was -- the patch validator, the apply ladder, the checks, the
+    reviewer and the commit all still see a diff, and none of them needs to
+    learn a second way for changes to arrive.
+    """
+    import difflib
+
+    out: list[str] = []
+    for path, (before, after) in plan_edits(root, edits).items():
+        if before == after:
+            continue
+        out.extend(
+            difflib.unified_diff(
+                before.splitlines(keepends=True),
+                after.splitlines(keepends=True),
+                fromfile=f"a/{path}" if before else "/dev/null",
+                tofile=f"b/{path}",
+                n=3,
+            )
+        )
+        if out and not out[-1].endswith("\n"):
+            out.append("\n")
+    return "".join(out)

@@ -224,3 +224,70 @@ def test_a_multi_line_search_matches_on_line_boundaries(tmp_path: Path) -> None:
     target.write_text("a\nb\nc\n")
     apply_edits(tmp_path, [Edit("lib.rs", "a\nb", "x\ny\nz")])
     assert target.read_text() == "x\ny\nz\nc\n"
+
+
+# ------------------------------------ the diff the harness computes itself
+
+
+def test_the_harness_computes_the_line_numbers_from_the_text(tmp_path: Path) -> None:
+    """The whole point of the format.
+
+    The model names text; this works out `@@ -a,b +c,d @@` from content it has
+    actually read. A header can no longer disagree with its body, because
+    nothing is asked to count.
+    """
+    from agent_harness.edits import to_diff
+
+    target = tmp_path / "lib.rs"
+    target.write_text("\n".join(f"line {n}" for n in range(1, 21)) + "\n")
+    diff = to_diff(tmp_path, [Edit("lib.rs", "line 10", "line 10 changed")])
+
+    assert "--- a/lib.rs" in diff
+    assert "+++ b/lib.rs" in diff
+    assert "-line 10\n" in diff
+    assert "+line 10 changed\n" in diff
+    # The header is arithmetic nobody had to do: 3 lines of context each side.
+    assert "@@ -7,7 +7,7 @@" in diff
+    # And it must actually apply. This is what the executor hands the ladder.
+    assert target.read_text().count("line 10 changed") == 0, "the tree was touched"
+
+
+def test_rendering_a_diff_changes_nothing_on_disk(tmp_path: Path) -> None:
+    """`to_diff` is used before the apply ladder runs, which does the writing.
+
+    If it wrote too, the ladder would apply an already-applied patch and the
+    item would fail for a reason the model had nothing to do with.
+    """
+    from agent_harness.edits import to_diff
+
+    target = tmp_path / "lib.rs"
+    target.write_text("before\n")
+    to_diff(tmp_path, [Edit("lib.rs", "before", "after")])
+    assert target.read_text() == "before\n"
+
+
+def test_a_new_file_renders_as_an_addition(tmp_path: Path) -> None:
+    from agent_harness.edits import to_diff
+
+    diff = to_diff(tmp_path, [Edit("new.rs", "", "fn main() {}\n")])
+    assert "--- /dev/null" in diff
+    assert "+++ b/new.rs" in diff
+    assert "+fn main() {}" in diff
+
+
+def test_edits_that_change_nothing_render_no_diff(tmp_path: Path) -> None:
+    """Well-formed and inert. Reported as no change, not as a broken patch."""
+    from agent_harness.edits import to_diff
+
+    (tmp_path / "lib.rs").write_text("same\n")
+    assert to_diff(tmp_path, [Edit("lib.rs", "same", "same")]) == ""
+
+
+def test_several_edits_to_one_file_render_one_file_diff(tmp_path: Path) -> None:
+    from agent_harness.edits import to_diff
+
+    target = tmp_path / "lib.rs"
+    target.write_text("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n")
+    diff = to_diff(tmp_path, [Edit("lib.rs", "a", "A"), Edit("lib.rs", "l", "L")])
+    assert diff.count("--- a/lib.rs") == 1, "one file, one header"
+    assert "+A\n" in diff and "+L\n" in diff

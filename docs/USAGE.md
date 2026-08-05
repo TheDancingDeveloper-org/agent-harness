@@ -418,13 +418,16 @@ and no `--repo` (line-wrapped here to fit the page):
 ```
 project widgets: proposed
 repository /home/you/widgets
-3 plan item(s); 2 proposed as already delivered; 0 needing a human decision
+3 plan item(s); 2 proposed as already delivered (1 unconfirmed); 0 needing a
+  human decision
   W1 -> done  [proposed done]
       explicit/done: the plan item is checked
       would create queue row item W1 in project widgets: insert as done if this
         drop is approved, otherwise pending
-  W2 -> done  [proposed done]
-      runnable/passed: `python -m unittest -q tests.test_serials` succeeded
+  W2 -> pending  [possible drop, unconfirmed: droppable only if a human names it]
+      runnable/passed: `python -m unittest -q tests.test_serials` exited 0,
+        which says the command did not fail; it does not say the command
+        tested anything
       would create queue row item W2 in project widgets: insert as done if this
         drop is approved, otherwise pending
   W3 -> pending
@@ -449,8 +452,16 @@ Three rungs, in this order, and every rung that ran stays in the report:
 | Rung | What it is | What it can do |
 |---|---|---|
 | **explicit** | The plan item is checked, or a closed issue / merged PR names the item id exactly. | Propose a drop. |
-| **runnable** | The item's own `verify:` command exits 0. | Propose a drop. |
+| **runnable** | The item's own `verify:` command exits 0. | **Offer** a drop. On its own it proposes nothing — see below. |
 | **judged** | The `assessor` role says `done`, `partial` or `not_started`, with citations. | Propose a drop, and only with citations. |
+
+**An exit code is not a rung on its own.** A `verify:` that exits 0 has not
+failed; that is not the same fact as "the work is there", because in most test
+runners a name filter that matches nothing passes. So a passing `verify:`
+proposes `done` only when a second rung agrees — explicit evidence, or an
+assessor `done` with citations. Alone, the item is listed as a drop you *may*
+approve, marked `unconfirmed`, and it stays `pending` if you say nothing.
+[How to write one that fails when the work is absent](#verify--how-an-item-proves-it-is-already-done).
 
 **A proposal is not a decision.** Nothing enters the queue as `done` unless a
 human names it:
@@ -466,8 +477,9 @@ way and needs a reason: `--reject "W2 is not finished"` or `--revise "..."`.
 
 Uncertainty always resolves downwards. Two equally-good candidates for one
 item, an assessor that says `done` and cites nothing, an assessor whose route
-is down, or a `verify:` command that ran and *failed* while the assessor said
-`done` — all of them come back as work to do, flagged for a human.
+is down, a `verify:` command that ran and *failed* while the assessor said
+`done`, or a `verify:` that passed with nothing to corroborate it — all of them
+come back as work to do, flagged for a human.
 
 ### What it will and will not touch outside the harness
 
@@ -549,8 +561,10 @@ verify: ["python", "-m", "pytest", "-q", "tests/test_serials.py::test_duplicate"
 A **JSON array of argv strings**, never shell text. `adopt` runs it in the
 repository under exactly the same rules as a project check — fixed argv, no
 shell, a timeout (`--verify-timeout`, defaulting to the project-check
-timeout) — and an exit code of 0 is evidence that this item's work already
-exists.
+timeout) — and an exit code of 0 is *one* piece of evidence that this item's
+work already exists. On its own it never drops the item: read the next
+paragraph for why, because it is the reason the word "one" is doing work
+there.
 
 | | |
 |---|---|
@@ -572,18 +586,26 @@ verify: ["cargo", "test", "-p", "gateway", "secure_cookies"]
 
 That looks like "the test for this item passes". On a tree where the item has
 not been done, the test does not exist, `cargo test` runs zero tests and exits
-`0` — and adoption reports:
+`0`. `pytest -k`, `go test -run` and `npm test -- -t` behave the same way;
+`pytest path::name` is the exception, exiting 4 when the name is absent.
+
+The harness cannot tell those apart, and deliberately will not try: reading
+another ecosystem's output to guess how many tests it ran is exactly what an
+adapter is for, and a wrong guess here **drops work that is then never done**.
+What it does instead is refuse to decide on that one fact. Adoption reports:
 
 ```
-R2 -> done  [proposed done]
-    runnable/passed: `cargo test -p gateway secure_cookies` succeeded
+R2 -> pending  [possible drop, unconfirmed: droppable only if a human names it]
+    runnable/passed: `cargo test -p gateway secure_cookies` exited 0, which
+      says the command did not fail; it does not say the command tested
+      anything
 ```
 
-`pytest -k`, `go test -run` and `npm test -- -t` behave the same way;
-`pytest path::name` is the exception, exiting 4 when the name is absent. The
-harness cannot tell the difference, and deliberately will not try: reading
-another ecosystem's output to guess what it meant is exactly what an adapter is
-for, and a wrong guess here **drops work that is then never done**.
+The item is offered to `--approve-drop R2` — you may know the command is a
+real one — but nothing proposes it, and approving the report without naming it
+leaves the work to do. A second rung changes that: an assessor `done` with
+citations, or a closed issue naming the item, and the drop is proposed
+outright.
 
 So before trusting a `verify:`, run it on a tree where the item is *not*
 finished and confirm it fails. A command that asserts a fact about the tree —

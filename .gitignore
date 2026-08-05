@@ -14,3 +14,9 @@ build/
 
 # Session-local agent scratch; the worktrees under here are separate checkouts.
 .claude/
+
+# Run artefacts. A run writes its event stream and queue wherever it is
+# started, and neither belongs to the harness's own history.
+events.jsonl
+*.sqlite
+*.sqlite-*

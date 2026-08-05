@@ -841,15 +841,41 @@ def run_summary(outcomes: Sequence[Any]) -> list[str]:
     return lines
 
 
+def _role_chain(
+    models: str,
+    endpoint: str,
+    api_key: str,
+    preset: str = "",
+) -> list[Any]:
+    """One role's models, preferred first, from a comma-separated name.
+
+    Every command that names a role comes through here. `run` had fallback
+    chains and the single-call commands did not, because each built its own
+    route: a `Route` holds one model, and only `run` split its flags on
+    commas. Measured cost of that divergence: a surveyor retried one model
+    returning 524 for fifteen minutes while another model on the *same
+    endpoint* was answering 200, and the run only moved because a human
+    noticed and restarted it by hand.
+
+    "One model call" is why a chain matters more here, not less. `run` can
+    lose an item and re-claim it under a lease; a single-call command that
+    fails returns nothing and leaves nothing behind.
+    """
+    from .model_client import Route
+
+    names = [m.strip() for m in models.split(",") if m.strip()]
+    return [Route(name, endpoint, api_key=api_key, preset=preset) for name in names]
+
+
 def _assessor(args: argparse.Namespace) -> Any:
     """The optional `assessor` role, over the same transport `run` uses."""
     from .adoption import ASSESSOR, ModelAssessor
     from .executor import _text_of
-    from .model_client import ModelClient, Route
+    from .model_client import ModelClient
 
     api_key = os.environ.get("HARNESS_API_KEY", "")
     client = ModelClient(
-        roles={ASSESSOR: Route(args.assessor_model, args.endpoint, api_key=api_key)},
+        roles={ASSESSOR: _role_chain(args.assessor_model, args.endpoint, api_key)},
         transport=_http_transport(api_key),
     )
 
@@ -869,7 +895,8 @@ def _survey(args: argparse.Namespace) -> int:
     than no plan, and catching it here costs one function call.
     """
     from .executor import _text_of
-    from .model_client import ModelClient, Route
+    from .model_client import ModelClient
+    from .outputs import OutputBusy, claiming
     from .survey import SURVEYOR, survey
 
     if not (args.work / ".git").exists():
@@ -877,18 +904,29 @@ def _survey(args: argparse.Namespace) -> int:
         return 2
     if not args.surveyor:
         print(
-            "--surveyor MODEL is required: this command's whole job is one model call",
+            "--surveyor MODEL is required (comma-separated names are a "
+            "fallback chain, tried in order)",
             file=sys.stderr,
         )
         return 2
     if not args.endpoint:
         print("--endpoint or $HARNESS_ENDPOINT is required", file=sys.stderr)
         return 2
+    # Checked before the model call, not after it. Refusing to overwrite is
+    # only useful if it happens before the minutes and the money are spent.
+    if args.out is not None and args.out.exists() and not args.replace:
+        print(
+            f"refusing to overwrite {args.out}. A plan under review is the "
+            f"thing this command exists to produce; pass --replace to "
+            f"discard it, or point --out somewhere else.",
+            file=sys.stderr,
+        )
+        return 2
 
     api_key = os.environ.get("HARNESS_API_KEY", "")
     client = ModelClient(
         roles={
-            SURVEYOR: Route(args.surveyor, args.endpoint, api_key=api_key, preset=args.preset),
+            SURVEYOR: _role_chain(args.surveyor, args.endpoint, api_key, args.preset),
         },
         transport=_http_transport(api_key),
     )
@@ -896,14 +934,19 @@ def _survey(args: argparse.Namespace) -> int:
     def ask(prompt: str) -> str:
         return str(_text_of(client.call(SURVEYOR, [{"role": "user", "content": prompt}]).body))
 
-    report = survey(
-        args.objective,
-        args.work,
-        ask=ask,
-        docs=list(args.doc),
-        name=args.name,
-        now=time.time(),
-    )
+    try:
+        with claiming(args.out):
+            report = survey(
+                args.objective,
+                args.work,
+                ask=ask,
+                docs=list(args.doc),
+                name=args.name,
+                now=time.time(),
+            )
+    except OutputBusy as busy:
+        print(str(busy), file=sys.stderr)
+        return 2
     for line in report.lines():
         print(line)
 
@@ -1010,7 +1053,7 @@ def main(argv: list[str] | None = None) -> int:
     # starts for `--help` on a machine with no queue and no credentials, and
     # only the default value is needed to print it.
     from .executor import DEFAULT_CONTEXT_BUDGET
-    from .session_executor import DEFAULT_AGENT_COMMAND
+    from .session_executor import default_agent_command
 
     parser = argparse.ArgumentParser(prog="agent-harness", description=__doc__)
     parser.add_argument(
@@ -1124,7 +1167,20 @@ def main(argv: list[str] | None = None) -> int:
         "reported rather than skipped silently.",
     )
     p_survey.add_argument("--name", default="Plan", help="title for the generated plan")
-    p_survey.add_argument("--surveyor", default="", help="model for the surveyor role")
+    p_survey.add_argument(
+        "--surveyor",
+        default=os.environ.get("HARNESS_SURVEYOR", ""),
+        help="model for the surveyor role (or $HARNESS_SURVEYOR). Several, "
+        "comma-separated, are a fallback chain in preference order — the "
+        "first that answers does the work.",
+    )
+    p_survey.add_argument(
+        "--replace",
+        action="store_true",
+        help="overwrite an existing --out. Without this an existing plan is "
+        "kept: it is the artefact under review, and re-running would discard "
+        "the version being argued over.",
+    )
     p_survey.add_argument(
         "--endpoint",
         default=os.environ.get("HARNESS_ENDPOINT", ""),
@@ -1189,10 +1245,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_adopt.add_argument(
         "--assessor-model",
-        default="",
+        default=os.environ.get("HARNESS_ASSESSOR", ""),
         metavar="MODEL",
-        help="ask a model whether unverifiable items already exist. It can only "
-        "propose; a drop still needs --approve-drop.",
+        help="ask a model whether unverifiable items already exist (or "
+        "$HARNESS_ASSESSOR). It can only propose; a drop still needs "
+        "--approve-drop.",
     )
     p_adopt.add_argument(
         "--endpoint",
@@ -1297,12 +1354,13 @@ def main(argv: list[str] | None = None) -> int:
         # not, so `run --session-host` without this flag produced an agent that
         # could not write. It reported no changes and read as a model that had
         # considered the task and declined — measured, and it cost a run.
-        default=" ".join(DEFAULT_AGENT_COMMAND),
+        default=" ".join(default_agent_command()),
         metavar="CMD",
-        help="CLI agent to run per item. `{prompt_file}` is substituted. "
-        "Defaults to the agent command the session executor declares, which "
-        "grants edit permission — an agent that cannot write reports no "
-        "changes, which is indistinguishable from one that chose to make none.",
+        help="CLI agent to run per item (or $HARNESS_AGENT_COMMAND). "
+        "`{prompt_file}` is substituted. Defaults to the agent command the "
+        "session executor declares, which grants edit permission — an agent "
+        "that cannot write reports no changes, which is indistinguishable "
+        "from one that chose to make none.",
     )
     p_run.add_argument("--limit", type=int, help="stop after N items")
     p_run.add_argument(
@@ -1342,13 +1400,22 @@ def main(argv: list[str] | None = None) -> int:
         "overrides this; its older `provider` field selects only the classifier. "
         "Register your own — nothing here needs editing to add a vendor.",
     )
-    p_run.add_argument("--planner", default="", help="model for the planner role")
-    p_run.add_argument("--implementer", default="", help="model for the implementer role")
+    p_run.add_argument(
+        "--planner",
+        default=os.environ.get("HARNESS_PLANNER", ""),
+        help="model for the planner role (or $HARNESS_PLANNER)",
+    )
+    p_run.add_argument(
+        "--implementer",
+        default=os.environ.get("HARNESS_IMPLEMENTER", ""),
+        help="model for the implementer role (or $HARNESS_IMPLEMENTER)",
+    )
     p_run.add_argument(
         "--reviewer",
-        default="",
-        help="model for the reviewer role — use a DIFFERENT vendor "
-        "from the implementer, so a model does not grade its own work",
+        default=os.environ.get("HARNESS_REVIEWER", ""),
+        help="model for the reviewer role (or $HARNESS_REVIEWER) — use a "
+        "DIFFERENT vendor from the implementer, so a model does not grade "
+        "its own work",
     )
     p_run.add_argument(
         "--dry-run", action="store_true", help="show what would run, call nothing, change nothing"
@@ -1444,9 +1511,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_serve.add_argument(
         "--agent",
-        default="claude -p {prompt_file}",
+        # The same resolved default as `run`, and for the same reason. This
+        # one was a second literal, and it had drifted: it carried no
+        # `--permission-mode`, so a supervised deployment started agents that
+        # were refused every write and reported no changes.
+        default=" ".join(default_agent_command()),
         metavar="CMD",
-        help="CLI agent to run per item. `{prompt_file}` is substituted.",
+        help="CLI agent to run per item (or $HARNESS_AGENT_COMMAND). "
+        "`{prompt_file}` is substituted.",
     )
     p_serve.add_argument(
         "--endpoint",

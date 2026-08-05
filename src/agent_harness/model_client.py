@@ -53,6 +53,7 @@ from . import providers as P
 from .pricing import PriceTable, load_price_table, price_fields
 from .protocols import RoutePreset, UnknownPreset
 from .providers import Classification, Provider
+from .redaction import from_environment
 
 log = logging.getLogger(__name__)
 
@@ -271,6 +272,115 @@ Chain = tuple[Route, ...]
 
 def _as_chain(value: Route | Sequence[Route]) -> Chain:
     return (value,) if isinstance(value, Route) else tuple(value)
+
+
+#: How much of a model's answer is kept per call. Generous enough to hold a
+#: review or a plan, bounded so one runaway response cannot dominate a store
+#: that is never compacted.
+DEFAULT_ANSWER_LIMIT = 200_000
+
+
+@dataclass
+class Reachability:
+    """What is known about one (endpoint, model), from traffic alone."""
+
+    endpoint: str
+    model: str
+    last_outcome: str = ""
+    last_error_class: str | None = None
+    last_seen: float = 0.0
+    #: Absent until it answers once. Never defaulted to "now": a route that
+    #: has only ever failed must not read as recently healthy.
+    last_ok: float | None = None
+    consecutive_failures: int = 0
+    calls: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "endpoint": self.endpoint,
+            "model": self.model,
+            "last_outcome": self.last_outcome,
+            "last_error_class": self.last_error_class,
+            "last_seen": self.last_seen,
+            "last_ok": self.last_ok,
+            "consecutive_failures": self.consecutive_failures,
+            "calls": self.calls,
+            "answering": self.consecutive_failures == 0 and self.last_ok is not None,
+        }
+
+
+class Availability:
+    """Which routes are answering, learned from calls already being made.
+
+    The classifier already decides, per call, whether an endpoint said "slow
+    down", "you are out of budget" or "no". That verdict was used to pick the
+    next retry and then thrown away, so nothing could answer the question an
+    operator actually asks first: *what is up right now?*
+
+    Two things depend on the answer and neither could get it:
+
+    - **Reviewer independence.** The rule is that the reviewer is a different
+      vendor, so a model does not grade its own work. When only one vendor is
+      reachable that rule cannot be met, and a run that proceeds anyway
+      produces approvals materially weaker than approvals taken later --
+      with nothing recorded to tell them apart.
+    - **Chain ordering.** `--implementer a,b,c` exists precisely because a
+      provider being down is ordinary, and there was no evidence on which to
+      order a,b,c beyond guessing.
+
+    Derived from traffic, never by probing. Asking a model whether it answers
+    costs money and can itself be rate limited; `doctor --probe-models` is
+    where a deliberate, paid-for question belongs.
+    """
+
+    def __init__(self) -> None:
+        self._seen: dict[tuple[str, str], Reachability] = {}
+
+    #: Outcomes that are not evidence about the endpoint. A wait is this
+    #: process pausing and a skip is this process choosing not to ask, so
+    #: counting either as a failure would defame a route nobody called.
+    IGNORED = frozenset({"retry_wait", "skipped", "parked"})
+
+    def record(
+        self,
+        route: Route,
+        outcome: str,
+        verdict: Classification | None,
+        now: float,
+    ) -> None:
+        if outcome in self.IGNORED:
+            return
+        key = (route.endpoint, route.model)
+        seen = self._seen.get(key) or Reachability(route.endpoint, route.model)
+        seen.last_outcome = outcome
+        seen.last_seen = now
+        seen.calls += 1
+        if outcome == "ok":
+            seen.last_ok = now
+            seen.consecutive_failures = 0
+            seen.last_error_class = None
+        else:
+            seen.consecutive_failures += 1
+            seen.last_error_class = verdict.kind if verdict else None
+        self._seen[key] = seen
+
+    def all(self) -> list[dict[str, Any]]:
+        """Every route this process has called, worst first.
+
+        Worst first because the reason to read this is that something is
+        wrong; a healthy fleet's entries are the ones nobody needs to see.
+        """
+        return [
+            r.as_dict()
+            for r in sorted(
+                self._seen.values(),
+                key=lambda r: (-r.consecutive_failures, r.endpoint, r.model),
+            )
+        ]
+
+    def answering(self) -> list[str]:
+        """Models that answered most recently, in no meaningful order."""
+        return sorted(r.model for r in self._seen.values() if r.consecutive_failures == 0)
 
 
 def _chain_names(chain: Chain) -> str:
@@ -507,6 +617,8 @@ class ModelClient:
         parks: EndpointParks | None = None,
         run_id: str | None = None,
         routes_provider: Callable[[], Mapping[str, Route | Sequence[Route]]] | None = None,
+        redact: Callable[[str | None], str | None] | None = None,
+        answer_limit: int = DEFAULT_ANSWER_LIMIT,
     ) -> None:
         # Either form, on purpose: this is a public attribute that callers and
         # tests assign to, and a bare `Route` put there by hand is the
@@ -522,6 +634,16 @@ class ModelClient:
         self.transport = transport
         self.policy = policy or RetryPolicy()
         self.on_event = on_event
+        # What this process has learned about each endpoint and model, kept
+        # from ordinary traffic. Free: every call already produces a
+        # classified verdict, and this retains it instead of discarding it.
+        self.availability = Availability()
+        # Applied to a model's words before they reach any sink. Defaults to
+        # this process's own credentials, because those are the ones an agent
+        # is most likely to echo and the ones whose exposure is entirely
+        # self-inflicted.
+        self.redact = redact if redact is not None else from_environment()
+        self.answer_limit = answer_limit
         # Loaded once. Unknown models stay unpriced rather than free -- the
         # cost lands as null and the API counts it separately, which is the
         # only way an incomplete total can announce itself.
@@ -746,6 +868,7 @@ class ModelClient:
                         latency=latency,
                         usage=self._usage(route, response.body),
                         detail=_fell_back(chain, route),
+                        body=response.body,
                     )
                     return response
 
@@ -876,12 +999,19 @@ class ModelClient:
         latency: float | None = None,
         detail: str | None = None,
         usage: Mapping[str, Any] | None = None,
+        body: bytes | str | None = None,
     ) -> None:
         """Append one structured outcome.
 
         Best-effort by contract: telemetry must never be able to fail a call
         that otherwise succeeded.
         """
+        # Before the sink check, and outside it. Availability is what this
+        # process learned about the endpoint, and it stays true whether or not
+        # anyone is listening -- a deployment with no event sink still needs
+        # to know which of its routes are answering.
+        with contextlib.suppress(Exception):
+            self.availability.record(route, outcome, verdict, self.now())
         if self.on_event is None:
             return
         # Telemetry is never load-bearing: a broken sink must not turn a
@@ -905,5 +1035,48 @@ class ModelClient:
                     # An event carrying zeros is a claim that the call was
                     # free; an event with no usage keys is honestly silent.
                     **(dict(usage) if usage else {}),
+                    **self._answer(route, body),
                 }
             )
+
+    def _answer(self, route: Route, body: bytes | str | None) -> Mapping[str, Any]:
+        """What the model actually said, redacted and bounded.
+
+        The stream recorded the price of an answer and never the answer, so
+        "why did this item produce that diff" and "what did the reviewer
+        object to" were unanswerable once the process exited. Nothing else
+        held it: a terminal's scrollback is not durable, not queryable, and
+        does not exist at all for a direct API call.
+
+        Three constraints, each a failure this avoids rather than a
+        preference:
+
+        - **Redacted before it is returned**, never after. The store is
+          append-only, so a credential written here can only be rotated, not
+          removed. See `redaction`, and note what it does not promise.
+        - **Bounded.** A response is capped at `answer_limit`, with the
+          truncation said out loud. A record that quietly stops is one nobody
+          can tell from a model that stopped.
+        - **Never load-bearing.** A body that cannot be read contributes no
+          keys at all rather than raising, exactly as usage does.
+        """
+        if body is None or self.answer_limit <= 0:
+            return {}
+        try:
+            text = route.resolve().reader.text(body)
+        except Exception:
+            return {}
+        if not text:
+            return {}
+        clean = self.redact(text) or ""
+        out: dict[str, Any] = {
+            "answer_chars": len(text),
+            "answer_redacted": clean != text,
+        }
+        if len(clean) > self.answer_limit:
+            out["answer"] = clean[: self.answer_limit]
+            out["answer_truncated"] = True
+        else:
+            out["answer"] = clean
+            out["answer_truncated"] = False
+        return out

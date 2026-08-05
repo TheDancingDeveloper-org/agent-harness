@@ -303,20 +303,58 @@ def test_the_cli_agent_default_is_the_executor_s() -> None:
     Asserted against the source rather than a parsed value, because the defect
     was *a second default existing at all* — a literal here that happens to
     match today would drift again tomorrow.
+
+    `serve` had exactly that second literal, and it had already drifted: it
+    carried no `--permission-mode`, so a supervised deployment started agents
+    that were refused every write. Both entry points now resolve through
+    `default_agent_command()`, and this asserts there is no third.
     """
     import inspect
+    import re
 
     from agent_harness import __main__
     from agent_harness.session_executor import DEFAULT_AGENT_COMMAND
 
     source = inspect.getsource(__main__)
-    assert 'default=" ".join(DEFAULT_AGENT_COMMAND)' in source, (
-        "the CLI must take the executor's agent command, not declare its own"
+    agent_defaults = re.findall(r'"--agent",\n(?:.*\n)*?\s+default=(.+),\n', source)
+    assert agent_defaults, "the --agent flags moved; this guard must move with them"
+    assert all('" ".join(default_agent_command())' in d for d in agent_defaults), (
+        f"every --agent default must resolve through the executor's, got {agent_defaults}"
     )
     assert '"--permission-mode"' in inspect.getsource(
         __import__("agent_harness.session_executor", fromlist=["x"])
     ), "and that command must still grant edit permission"
     assert "--permission-mode" in " ".join(DEFAULT_AGENT_COMMAND)
+
+
+def test_the_agent_command_can_be_named_by_the_deployment() -> None:
+    """A fleet routed at one gateway must be able to say which agent it runs.
+
+    Without this the built-in agent is the only one reachable without editing
+    core, which is the coupling AGENTS.md rules out — and it is a vendor's
+    name, so a deployment forbidden from using that vendor had no way to
+    comply.
+
+    The override is taken as given and is NOT checked for an edit-permission
+    flag: only the named agent knows what its own flag is called, and guessing
+    would be core knowing a particular vendor.
+    """
+    import os
+    from unittest import mock
+
+    from agent_harness.session_executor import DEFAULT_AGENT_COMMAND, default_agent_command
+
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("HARNESS_AGENT_COMMAND", None)
+        assert default_agent_command() == DEFAULT_AGENT_COMMAND
+
+    with mock.patch.dict(os.environ, {"HARNESS_AGENT_COMMAND": "other -q {prompt_file}"}):
+        assert default_agent_command() == ("other", "-q", "{prompt_file}")
+
+    # Blank is not an override. An empty variable is how a shell says "unset",
+    # and honouring it would leave the deployment with no agent at all.
+    with mock.patch.dict(os.environ, {"HARNESS_AGENT_COMMAND": "   "}):
+        assert default_agent_command() == DEFAULT_AGENT_COMMAND
 
 
 # ------------------------------------- an escalation is not a failed run

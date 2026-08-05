@@ -53,23 +53,39 @@ def scripted(*commands: str) -> tuple[ModelClient, list[list[dict[str, str]]]]:
     back to it, which is the difference between a loop and a sequence.
     """
     asked: list[list[dict[str, str]]] = []
+    sent: list[dict[str, Any]] = []
     replies = iter(commands)
 
     def transport(route: Route, messages: Any, options: Any) -> Response:
         asked.append(list(messages))
+        sent.append(dict(options))
         try:
             command = next(replies)
         except StopIteration:  # pragma: no cover - a test script ran out
             command = DONE
         import json
 
+        # A tool call, which is what the loop's v2 path expects. The legacy
+        # text-regex shape is deliberately not used here: measured against a
+        # real model, it returned four turns of prose in one reply and
+        # submitted having executed nothing.
         body = json.dumps(
             {
                 "choices": [
                     {
                         "message": {
-                            "content": f"Doing the next thing.\n\n"
-                            f"```mswea_bash_command\n{command}\n```"
+                            "role": "assistant",
+                            "content": "doing the next thing",
+                            "tool_calls": [
+                                {
+                                    "id": f"call_{len(asked)}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "bash",
+                                        "arguments": json.dumps({"command": command}),
+                                    },
+                                }
+                            ],
                         }
                     }
                 ]
@@ -81,6 +97,7 @@ def scripted(*commands: str) -> tuple[ModelClient, list[list[dict[str, str]]]]:
         roles={"implementer": Route("scripted", "https://e.example", preset="chat-completions")},
         transport=transport,
     )
+    client.sent_options = sent  # type: ignore[attr-defined]
     return client, asked
 
 
@@ -240,3 +257,40 @@ def test_what_reaches_the_wire_is_a_chat_message_and_nothing_else(repo: Path) ->
             assert set(message) == {"role", "content"}, f"extra fields on the wire: {message}"
             assert message["role"] in {"system", "user", "assistant"}, message["role"]
             assert isinstance(message["content"], str)
+
+
+def test_the_bash_tool_is_offered_on_every_call(repo: Path) -> None:
+    """Tool calls, not text parsing -- and this is what makes it one.
+
+    Measured against a real model on the legacy text-regex path: it returned
+    four turns' worth of `THOUGHT:` prose in a single reply and one action,
+    and that action was the finish marker. It submitted on turn one having
+    executed nothing. `mini-swe-agent` v2 recommends tool calls for this
+    reason; a run that quietly stopped sending the tool would regress to it.
+    """
+    client, _ = scripted("ls", DONE)
+    build(client, repo).run("Look around, then finish.")
+
+    options = client.sent_options  # type: ignore[attr-defined]
+    assert options, "nothing reached the transport"
+    for sent in options:
+        names = [t["function"]["name"] for t in sent.get("tools", [])]
+        assert names == ["bash"], f"the bash tool was not offered: {sent.get('tools')}"
+
+
+def test_an_observation_goes_back_as_a_well_formed_turn(repo: Path) -> None:
+    """A `tool` message needs its `tool_call_id`, and ours are stripped.
+
+    `_for_the_wire` reduces a message to `role` and `content`, so a `tool`
+    role would arrive without the id it must answer -- a malformed request,
+    which is what `upstream_rejected` was. The output goes back as a user
+    turn instead: the pairing is lost, which costs nothing when there is one
+    tool, and the conversation stays valid.
+    """
+    client, asked = scripted("cat answer.txt", DONE)
+    build(client, repo).run("Read it, then finish.")
+
+    last = asked[-1]
+    assert all(m["role"] in {"system", "user", "assistant"} for m in last), last
+    seen = "\n".join(m["content"] for m in last)
+    assert "wrong" in seen, "the command output never returned to the model"

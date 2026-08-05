@@ -162,6 +162,45 @@ def _for_the_wire(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]
     return out
 
 
+def _attributes(value: Any) -> Any:
+    """JSON as objects, because their parser reads `call.function.name`.
+
+    It was written against LiteLLM's response objects, which use attribute
+    access. Our transport returns JSON, so a dict reaches it and fails with
+    `'dict' object has no attribute 'function'`.
+
+    Converted rather than reimplemented: their parser also validates the tool
+    name and the argument JSON, and a second copy of that would be a second
+    thing to keep in step with a format that is theirs.
+    """
+    from types import SimpleNamespace
+
+    if isinstance(value, dict):
+        return SimpleNamespace(**{k: _attributes(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return [_attributes(item) for item in value]
+    return value
+
+
+def _message_of(body: Any) -> dict[str, Any]:
+    """The assistant message from a chat-completions body.
+
+    Read here rather than through the preset's reader because the reader
+    returns text, and a tool call is not text: `tool_calls` sits beside
+    `content` and would be dropped. Conservative -- an unreadable body is an
+    empty message, and the loop then reports a format error rather than this
+    layer raising something the loop cannot answer.
+    """
+    import json
+
+    try:
+        payload = json.loads(body if isinstance(body, str) else bytes(body).decode())
+        message = payload["choices"][0]["message"]
+        return message if isinstance(message, dict) else {}
+    except Exception:
+        return {}
+
+
 @dataclass
 class HarnessModel:
     """`mini-swe-agent`'s `Model`, answered by this harness's client.
@@ -192,31 +231,43 @@ class HarnessModel:
     observation_template: str = "<returncode>{{output.returncode}}</returncode>\n{{output.output}}"
 
     def query(self, messages: list[dict[str, str]], **kwargs: Any) -> dict[str, Any]:
-        """One turn: ask the role, and parse the command out of the answer.
+        """One turn, as a tool call.
 
-        The parsing is **theirs**, not a reimplementation. The loop takes its
-        actions from `message["extra"]["actions"]`, so a model that returns
-        only `content` produces a loop that executes nothing and terminates
-        looking healthy -- which is exactly what the first version of this did.
-        Calling their parser means the action format stays their business and
-        cannot drift out of step with the templates that describe it.
+        **Tool calls, not text parsing.** `mini-swe-agent` v2 says so itself --
+        "we strongly recommend to use toolcalls instead" -- and the difference
+        is not cosmetic. Measured against `gpt-5.6`: with the legacy
+        text-regex path the model returned four turns' worth of `THOUGHT:`
+        prose in one reply and a single action, and that action was the finish
+        marker. It submitted having executed nothing, on turn one. The spike
+        that worked used the tool-calling path.
+
+        The tool definition is theirs (`BASH_TOOL`), passed as a call option,
+        which `JsonChatRequest.render` already forwards into the payload -- so
+        no protocol change was needed to reach it.
         """
-        from minisweagent.models.utils.actions_text import parse_regex_actions
+        from minisweagent.models.utils.actions_toolcall import BASH_TOOL, parse_toolcall_actions
 
-        from ..executor import _text_of
-
-        reply = self.client.call(self.role, _for_the_wire(messages), **kwargs)
+        reply = self.client.call(
+            self.role,
+            _for_the_wire(messages),
+            tools=[BASH_TOOL],
+            tool_choice="auto",
+            **kwargs,
+        )
         self.n_calls += 1
-        content = _text_of(reply.body) or ""
-        # A FormatError is not caught here: the loop handles it by telling the
-        # model what it did wrong and asking again, which is a better answer
-        # than anything this layer could invent.
-        actions = parse_regex_actions(
-            content,
-            action_regex=self.action_regex,
+        message = _message_of(reply.body)
+        # Not caught: their loop answers a FormatError by telling the model
+        # what it did wrong and asking again, which beats anything invented
+        # here.
+        actions = parse_toolcall_actions(
+            _attributes(message.get("tool_calls") or []),
             format_error_template=self.format_error_template,
         )
-        return {"role": "assistant", "content": content, "extra": {"actions": actions}}
+        return {
+            "role": "assistant",
+            "content": message.get("content") or "",
+            "extra": {"actions": actions},
+        }
 
     def format_message(self, **kwargs: Any) -> dict[str, Any]:
         return dict(kwargs)
@@ -230,13 +281,23 @@ class HarnessModel:
         outputs: list[dict[str, Any]],
         template_vars: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        from minisweagent.models.utils.actions_text import format_observation_messages
+        """An observation is a plain user turn.
 
-        return format_observation_messages(
-            outputs,
-            observation_template=self.observation_template,
-            template_vars=template_vars,
-        )
+        Their tool-call formatter pairs each observation with the `tool_call_id`
+        it answers. That is the correct shape, and it is not used here because
+        `_for_the_wire` strips a message to `role` and `content` -- a `tool`
+        message without its id is a malformed request, which is the failure
+        that produced `upstream_rejected`. Giving the output back as a user
+        turn keeps the conversation well-formed at the cost of the pairing,
+        which the model does not need when there is one tool.
+        """
+        return [
+            {
+                "role": "user",
+                "content": f"<returncode>{o.get('returncode')}</returncode>\n{o.get('output', '')}",
+            }
+            for o in outputs
+        ]
 
     def serialize(self) -> dict[str, Any]:
         return {"role": self.role, "n_calls": self.n_calls}

@@ -32,12 +32,14 @@ def _client(calls: list[tuple[str, Any]]) -> ModelClient:
         return Response(
             status=200,
             headers={},
-            # A reply in the loop's own action format. "ok" alone is not a
-            # valid turn: the parser requires exactly one command, and a test
-            # that ignored that would assert against a shape the loop rejects.
+            # A tool call, which is the loop's v2 path and the one the
+            # adapter uses. The legacy text shape is not used: measured
+            # against a real model it produced four turns of prose in one
+            # reply and submitted having executed nothing.
             body=(
-                '{"choices":[{"message":{"content":'
-                '"thinking\\n\\n```mswea_bash_command\\necho ok\\n```"}}]}'
+                '{"choices":[{"message":{"role":"assistant","content":"thinking",'
+                '"tool_calls":[{"id":"c1","type":"function","function":'
+                '{"name":"bash","arguments":"{\\"command\\": \\"echo ok\\"}"}}]}}]}'
             ),
         )
 
@@ -60,7 +62,8 @@ def test_every_call_goes_through_the_harness_client() -> None:
     calls: list[tuple[str, Any]] = []
     model = HarnessModel(client=_client(calls))
     reply = model.query([{"role": "user", "content": "hello"}])
-    assert reply["extra"]["actions"] == [{"command": "echo ok"}]
+    (action,) = reply["extra"]["actions"]
+    assert action["command"] == "echo ok"
     assert [name for name, _ in calls] == ["m"], "the call did not go through ModelClient"
 
 

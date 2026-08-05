@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Append-only history</p><h1>Events</h1></div><span class="mode-badge" id="stream-state">Cursor {{ events.cursor }}</span></div>
+  <p class="muted">The stream resumes after the last monotonic cursor. A reconnect is visible and never silently replaces the event store.</p>
+  <ol class="timeline" id="event-timeline" hx-ext="sse" sse-connect="{{ root_path }}/api/events/stream?since_id={{ events.cursor }}" sse-swap="harness" hx-swap="afterbegin">{% for event in events.events %}<li><strong>{{ event.outcome or event.kind }}</strong><span class="muted">{{ event.ts|datetime }}</span><p>{{ event.data.detail or event.source }}</p></li>{% else %}<li class="muted">No events have been recorded.</li>{% endfor %}</ol>
+{% endblock %}

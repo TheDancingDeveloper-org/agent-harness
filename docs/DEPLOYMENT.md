@@ -1,8 +1,8 @@
 # Deploying `agent-harness serve`
 
-The contract between whatever starts this process — systemd, a compose file,
-a Kubernetes manifest, a session host's supervisor — and what the service can
-then actually do.
+The contract between whatever starts this process — systemd, a compose file or
+a Kubernetes manifest — and what the service can then actually do. The JSON API
+and browser GUI are served directly; no host application is required.
 
 There are **two supported modes**, and the difference is deliberate rather
 than a degraded state:
@@ -15,7 +15,7 @@ than a degraded state:
 | Who it is for | a dashboard over someone else's harness | the deployment that does the work |
 
 The trap this document exists to close: **a monitoring-only process is
-healthy.** `/healthz` returns `ok`, the API answers, the Work tab renders a
+healthy.** `/healthz` returns `ok`, the API answers, the GUI renders a
 backlog — and nothing can execute a single item. A process manager started
 with only the monitoring arguments produces exactly that, and nothing about it
 looks wrong until someone presses start.

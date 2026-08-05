@@ -196,8 +196,9 @@ The API should support cursor-based reads and long polling initially. A later
 streaming transport can improve latency without changing the message model.
 All routes require explicit response models and documented fields.
 
-The rendered room belongs in the session host, such as AIDevEnv. This
-repository continues to serve JSON and does not add a second GUI.
+The coordination data remains a typed JSON contract. The packaged browser GUI in this
+repository may render that contract directly; a session host such as AIDevEnv remains an
+optional execution adapter, not a GUI dependency.
 
 ### 5.1 Do not inject arbitrary text into terminals
 
@@ -437,7 +438,8 @@ The coordination work is not complete until tests prove that:
 - the oversight model cannot directly mutate storage or write to GitHub;
 - corrections and access restrictions preserve the original message;
 - the API exposes named, described schemas for every route and field;
-- the session host can render rooms without this repository adding a GUI.
+- the browser GUI and JSON API can render the same coordination state without requiring a
+  session host; a host may still provide optional execution terminals.
 
 This framework has not run against a real fleet. The coordination plane must
 be described and measured accordingly rather than presented as proven before

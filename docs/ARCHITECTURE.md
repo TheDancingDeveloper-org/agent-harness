@@ -1,7 +1,8 @@
 # Architecture
 
-How AIDevEnv and agent-harness fit together, and what happens inside the
-harness when work runs.
+How the agent-harness JSON API, browser control plane and execution adapters fit
+together, and what happens inside the harness when work runs. The GUI is owned,
+packaged and served by this repository; MyDevEnv and AIDevEnv are not required.
 
 Every diagram here describes what the code does today. Where something is
 planned but not built, it says so.
@@ -10,9 +11,10 @@ planned but not built, it says so.
 
 ## 1. The whole system
 
-Two processes, one pod. AIDevEnv owns the browser, the auth and the terminal
-sessions; the harness owns the queue and the record of what happened. Neither
-reaches into the other's storage.
+One service, one origin. agent-harness owns the browser, authentication, queue,
+audit history and JSON API. An optional session host owns PTY processes only;
+the harness reaches it through a generic execution protocol and remains usable
+in monitoring-only mode without it.
 
 ```mermaid
 graph TB
@@ -20,15 +22,13 @@ graph TB
         browser["Browser / PWA<br/>phone, tablet, laptop"]
     end
 
-    subgraph pod["AIDevEnv pod (Node B)"]
+    subgraph pod["agent-harness process"]
         direction TB
-        server["AIDevEnv server<br/>Rust + Axum<br/>:8910"]
+        server["FastAPI UI + JSON API<br/>:8099"]
         pty["PTY sessions<br/>claude · codex · opencode"]
         harness["agent-harness<br/>FastAPI<br/>127.0.0.1:8099"]
 
-        server -->|"spawns, owns"| pty
-        server -->|"proxies /api/harness/*<br/>adds the token"| harness
-        harness -->|"create session,<br/>wait for exit"| server
+        server -->|"optional executor adapter"| pty
     end
 
     subgraph state["/var/lib/aidevenv — bind mount"]
@@ -41,7 +41,7 @@ graph TB
         models["Model providers"]
     end
 
-    browser -->|"HTTPS + bearer token"| server
+    browser -->|"HTTPS + opaque browser session"| server
     harness --> queue
     harness --> audit
     harness -->|"sync plan, open PRs"| github
@@ -56,10 +56,11 @@ graph TB
     class queue throwaway
 ```
 
-**Why the harness has no UI of its own.** The session host already owns tabs,
-authentication, push notifications, mobile layout and the terminals agents run
-in. A second web UI would mean a second URL and a second login to do the same
-job worse, so the harness serves JSON and AIDevEnv renders it.
+**Why the browser lives here.** The operator needs one URL, one source of truth
+and one security boundary. Server-rendered templates and packaged assets are a
+first-party client over shared typed query/command services; templates never
+read SQLite or bypass gates. An optional session host can still provide a PTY,
+but it does not provide the GUI, browser auth, proxy or deployment topology.
 
 **Why two databases.** The queue is mutable, gets migrated in place, and is a
 reasonable thing to delete and rebuild from the plan. Anything sharing that
@@ -77,9 +78,9 @@ on.
 sequenceDiagram
     autonumber
     participant You
-    participant GUI as AIDevEnv Work tab
+    participant GUI as agent-harness browser GUI
     participant H as agent-harness
-    participant S as Session host
+    participant S as optional session host adapter
     participant A as claude / codex
     participant G as GitHub
 
@@ -206,7 +207,7 @@ back from it.
 | `audit` | Append-only history, its own database, no mutation surface |
 | `maintenance` | Rolls up complete days, then thins what is covered |
 | `reconcile` | Merged / closed / reverted, fetched from GitHub |
-| `api` | Documented HTTP API + Swagger. No GUI — the session host renders it |
+| `api` / `ui` | Typed HTTP API + Swagger and packaged server-rendered GUI |
 
 ---
 

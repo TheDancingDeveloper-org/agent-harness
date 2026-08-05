@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Deployment</p><h1>Settings</h1></div><span class="mode-badge">{{ mode }}</span></div>
+  {% if mode == 'monitoring-only' %}
+    <section class="alert warning" role="status"><strong>Monitoring-only deployment.</strong> No worker pool is attached, so execution controls are disabled. This is a readiness condition, not a failed action.</section>
+  {% endif %}
+  <section class="card"><h2>Readiness</h2><p class="muted">This page never probes or mutates execution. Use the typed readiness API for an explicit, potentially expensive check.</p><dl class="detail-facts"><dt>Queue</dt><dd>{{ 'configured' if queue_configured else 'not configured' }}</dd><dt>Browser identity</dt><dd>{{ session.operator }}</dd><dt>Audit</dt><dd>Append-only history is shown separately from queue state.</dd></dl><p><a class="button secondary" href="{{ root_path }}/docs">Open API documentation</a></p></section>
+{% endblock %}

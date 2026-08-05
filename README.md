@@ -15,7 +15,8 @@ the record of what happened.
 
 ## Status: pre-alpha — deterministic paths are tested; real use is observed, not proven
 
-It runs, it is deployed inside [AIDevEnv](https://github.com/TheDancingDeveloper-org/aidevenv),
+It runs as a standalone service; [AIDevEnv](https://github.com/TheDancingDeveloper-org/aidevenv)
+is an optional reference session host,
 and direct execution has been driven end to end against a real git repository with a
 scripted model. A first supervised NGMS attempt and later direct calls used real agents and
 providers, and exposed defects; the surviving evidence is reconstructed in
@@ -67,7 +68,7 @@ blocked on runs this repository cannot perform on its own.
 | `protocols` | What a route is made of: wire protocol, auth, response reader, classifier — resolved by name |
 | `model_client` | Routes roles to models; per-worker jittered retry; per-endpoint parking |
 | `store` / `ingest` / `sources` | Append-only SQLite event store, idempotent ingest |
-| `api` | Documented HTTP API + Swagger. No GUI — the session host renders it |
+| `api` / `ui` | Typed JSON API, Swagger, and the self-contained browser control plane |
 | `adapters` | Opt-in readers for other tools' logs |
 
 ### Two ideas worth stealing
@@ -296,10 +297,12 @@ name; no core module changes, and nothing in core imports it. See
 
 ### The API
 
-There is **no GUI here on purpose.** The session host already owns tabs, auth,
-push notifications, mobile and the terminal sessions agents run in; a second
-web UI would mean a second URL and a second login to do the same job worse.
-The harness serves JSON and the host renders it.
+`agent-harness serve` exposes both this API and the responsive browser control
+plane from one process and origin. The GUI is packaged here and needs no
+MyDevEnv, AIDevEnv, host proxy, CDN or separate frontend service. An optional
+session host remains one way to execute agents; it is not a browser dependency.
+The harness serves HTML and JSON from one origin. The API remains independently
+usable by CLI and generated clients.
 
 What it does own is a **documented API**: every route typed, every field
 described, and the schema served next to it.
@@ -360,8 +363,9 @@ being kept. A fleet running unaudited looks exactly like one running audited.
 | `/redoc` | ReDoc |
 | `/openapi.json` | the schema — generate a client from it |
 
-Auth is a bearer token, and inside a session host it is the **same token that
-reaches the GUI**: one credential, one thing to rotate.
+API clients use the bearer token. A browser submits it once at `/login` and
+receives a bounded, opaque, HttpOnly server-side session; the bearer credential
+is not exposed to frontend code or browser storage.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" localhost:8099/api/work
@@ -372,8 +376,8 @@ curl -H "Authorization: Bearer $TOKEN" -X POST localhost:8099/api/work/T4/retry
 Behind a proxy, pass `--root-path /api/harness` so the schema advertises URLs
 a client can actually call.
 
-[AIDevEnv](https://github.com/TheDancingDeveloper-org/aidevenv) is the
-reference host and ships a Work tab that consumes this API.
+Open the same URL in a browser to use the packaged control plane. A reverse
+proxy may add TLS and a path prefix, but no host application is required.
 
 ```bash
 uv sync --all-extras

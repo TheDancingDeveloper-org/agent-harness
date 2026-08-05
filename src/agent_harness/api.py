@@ -1,20 +1,14 @@
-"""The harness's HTTP API. Headless — no HTML, no templates, no GUI.
+"""The harness's JSON API and self-contained browser application.
 
-The GUI lives in the session host (AIDevEnv is the reference one), which
-already owns tabs, auth, push notifications, mobile and the terminal sessions
-the agents run in. A second web UI here would mean a second URL and a second
-login to do the same job worse.
+The public API remains typed and documented. Every JSON route names a response
+model, every field has a description, and OpenAPI is served alongside Swagger
+UI. The browser application is an additional first-party client in this same
+process and origin; it does not replace or weaken the JSON contract.
 
-What this DOES own is a documented API. Every route is typed, every field has
-a description, and the OpenAPI document is served alongside Swagger UI — so a
-person with `curl`, an agent with a shell, or a generated client can all drive
-the harness without reading its source.
-
-Auth is a bearer token. Deployed inside a session host it is the SAME token
-that reaches the GUI: one credential, one thing to rotate, and no second
-secret to keep track of. The service fails closed — with no token configured
-every authenticated route refuses, because coming up open is not an acceptable
-default for something reachable over a network.
+API clients authenticate with the configured bearer token. A browser exchanges
+that token once for a bounded opaque server-side session, so the credential is
+never placed in a URL, rendered page, script, browser storage or log. With no
+configured token, both surfaces fail closed.
 
     /docs          Swagger UI, with an Authorize button
     /redoc         ReDoc
@@ -105,10 +99,12 @@ from .schemas import (
     StopProjectRequest,
     Summary,
     WaitingItem,
+    WorkEvidence,
     WorkItem,
     WorkList,
 )
 from .store import EventStore
+from .ui import install_ui
 from .work import (
     BLOCKED,
     CLAIMED,
@@ -141,9 +137,10 @@ DESCRIPTION = """\
 Plans work, claims it, runs it as an agent in a terminal session, and records
 what happened.
 
-**Auth** — every route except `/healthz` needs `Authorization: Bearer <token>`.
-Deployed inside a session host this is the same token that reaches the GUI.
-Use **Authorize** above to try these against a live instance.
+**Auth** — every JSON data route needs `Authorization: Bearer <token>`.
+`/healthz`, `/docs`, `/redoc` and `/openapi.json` remain public. Use
+**Authorize** above to try the API against a live instance. Browser sessions
+are separate opaque credentials established at `/login`.
 
 **Reading the numbers.** Two things this API is careful about, because both are
 easy to get wrong and expensive when you do:
@@ -335,6 +332,30 @@ def create_api(
             queue.holds.current(project_id, item_id) if record.state == HELD else None,
             queue.now(),
         )
+
+    @app.get(
+        "/api/work/{item_id}/evidence",
+        tags=["work"],
+        summary="Durable evidence for one item",
+        response_model=WorkEvidence,
+        responses={404: {"description": "No such item"}},
+    )
+    def work_evidence(
+        item_id: str = PathParam(description="Plan id, e.g. `T4`."),
+        project_id: str = Query("default", description="Which project the item is in."),
+        _: None = Depends(require_token),
+    ) -> WorkEvidence:
+        from .query_service import HarnessQueries
+
+        evidence = HarnessQueries(
+            store,
+            app.state.queue,
+            audit=app.state.audit,
+            fleet=app.state.fleet,
+        ).evidence(project_id, item_id)
+        if evidence is None:
+            raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
+        return evidence
 
     @app.post(
         "/api/work",
@@ -1456,6 +1477,42 @@ def create_api(
         return _project_summary(queue, project_id, app.state.fleet)
 
     @app.post(
+        "/api/projects/{project_id}/control",
+        tags=["control"],
+        summary="Pause or drain one project",
+        response_model=ProjectSummary,
+        responses={409: {"description": "Resume requires the explicit start contract"}},
+    )
+    def project_control(
+        request: SetFleetControl,
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> ProjectSummary:
+        """Change a project's claiming state without starting work implicitly.
+
+        `running` is intentionally not accepted here: continuing execution is
+        the expensive, preflight-gated start contract above. Pause, drain and
+        stop remain safe next-boundary controls and are also available to a
+        monitoring deployment, where they only change durable operator intent.
+        """
+        if request.state == "running":
+            raise HTTPException(
+                status_code=409,
+                detail="resume uses POST /api/projects/{project_id}/start so preflight is explicit",
+            )
+        queue = need_queue()
+        if queue.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+        fleet_ = app.state.fleet
+        if fleet_ is not None and request.state == STOPPED and hasattr(fleet_, "request_stop"):
+            fleet_.request_stop(project_id, reason=request.reason)
+        elif fleet_ is not None and request.state == STOPPED:
+            fleet_.stop(project_id, reason=request.reason)
+        else:
+            queue.set_control(request.state, request.reason, project_id=project_id)
+        return _project_summary(queue, project_id, app.state.fleet)
+
+    @app.post(
         "/api/control",
         tags=["control"],
         summary="Pause, drain or resume the fleet",
@@ -1758,6 +1815,27 @@ def create_api(
             ],
         )
 
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next: Any) -> Any:
+        response = await call_next(request)
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; "
+            "style-src 'self'; connect-src 'self'; img-src 'self' data:; "
+            "font-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; "
+            "form-action 'self'",
+        )
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault(
+            "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
+        )
+        if request.url.path.startswith("/assets/"):
+            response.headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
+        return response
+
+    install_ui(app)
     return app
 
 
@@ -2059,6 +2137,7 @@ def _item_model(
 ) -> WorkItem:
     now = time.time() if now is None else now
     return WorkItem(
+        project_id=record.project_id,
         hold=HoldView(**hold.as_dict(now)) if hold is not None else None,
         item_id=record.item_id,
         title=record.title,

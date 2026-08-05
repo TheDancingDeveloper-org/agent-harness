@@ -90,7 +90,7 @@ trade and it is rejected.
 | Telemetry export | `src/agent_harness/adapters/otlp.py` — opt-in, lazily loaded, **export only**; the event store stays the source of truth |
 | Queue schema migration | `docs/MIGRATION-graph.md` — backup, export, rebuild, rollback |
 | Log readers | `src/agent_harness/ingest.py` |
-| JSON API (no GUI) | `src/agent_harness/api.py` |
+| JSON API and in-process browser GUI | `src/agent_harness/api.py`; `src/agent_harness/ui.py` |
 | Session host client | `src/agent_harness/session_host.py` |
 | Agent loop | `src/agent_harness/session_executor.py` |
 | The worker and its 13 gates | `swack-tools/oxidex` — `scripts/model_fix_loop.py` |
@@ -149,14 +149,24 @@ with Swagger UI. Treat it as a contract:
 Tests assert these properties, not just status codes — see
 `tests/test_api.py`.
 
-## Do not add a GUI here
+## The GUI belongs here
 
-The GUI belongs to the session host — AIDevEnv is the reference one. It
-already has tabs, token auth, push
-notifications, an Android PWA, and the PTY sessions the agents run in. A web
-UI in this repo means a second URL, a second login, no notifications and no
-phone story — worse, for the same work. This service serves JSON; the host
-renders it as a Work tab.
+`agent-harness serve` owns and serves the browser GUI from the same process and
+origin as its public JSON API. Templates, static assets, browser authentication,
+tests and documentation live in this repository and ship in its distribution.
+
+The GUI has no dependency on MyDevEnv, AIDevEnv or another session host: it must
+not import their code, consume their assets or authentication, require their
+proxy, or assume their session and terminal model. An optional session host may
+still execute agents through the generic `session_host` protocol; that execution
+adapter is not the owner or host of the GUI.
+
+HTML controllers delegate to the same typed query and command services as JSON
+routes. They never read SQLite directly or duplicate a gate. Browser actions
+require authenticated operator identity, CSRF validation and explicit review;
+navigation and drag-and-drop never imply permission for a state transition.
+The JSON API remains public, typed and documented, and normal GUI operation
+must not require a CDN or a separately deployed frontend.
 
 ## Two invariants the store must keep
 

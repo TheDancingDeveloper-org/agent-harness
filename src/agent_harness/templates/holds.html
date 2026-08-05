@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Human-in-the-loop</p><h1>Holds</h1></div><span class="mode-badge">Answers arrive in Milestone 2</span></div>
+  <p class="muted">Questions are durable item state, not a projection over recent logs. They keep their claim and show age and expiry.</p>
+  {% if not holds.open %}<section class="empty"><h2>No open holds</h2><p>Nothing is waiting on an operator.</p></section>{% else %}<div class="list">{% for hold in holds.open %}<article class="card hold-card"><div class="card-heading"><div><p class="eyebrow">{{ hold.project_id }} / {{ hold.item_id }}</p><h2><a href="{{ url_for('work_item_page', item_id=hold.item_id) }}?project_id={{ hold.project_id|urlencode }}">{{ hold.question }}</a></h2></div><span class="attention">{{ '%.0f'|format(hold.age_seconds) }}s waiting</span></div><p>{{ hold.reason or 'No additional reason supplied.' }}</p><dl class="detail-facts"><dt>Allowed answerer</dt><dd>{{ hold.who_may_answer }}</dd><dt>Expires</dt><dd>{{ hold.expires_at|datetime if hold.expires_at else 'Never' }}</dd><dt>Attempt</dt><dd>{{ hold.attempt }}</dd></dl><p class="muted small">Answering is intentionally unavailable in this read-only milestone.</p></article>{% endfor %}</div>{% endif %}
+{% endblock %}

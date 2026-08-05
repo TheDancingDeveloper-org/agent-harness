@@ -43,6 +43,7 @@ class LatestEvent(BaseModel):
 
 
 class WorkItem(BaseModel):
+    project_id: str = Field(description="Project scope of this item.")
     item_id: str = Field(description="Stable id from the plan, e.g. `T4`.")
     title: str
     brief: str = Field(description="The full specification given to the agent.")
@@ -154,6 +155,12 @@ class WorkList(BaseModel):
 class HoldView(BaseModel):
     """A question an item is waiting on, and how long it has been waiting."""
 
+    project_id: str = Field(
+        description="Project containing the held item. Together with `item_id`, this "
+        "is the stable identity used by detail and answer routes."
+    )
+    item_id: str = Field(description="Plan id of the item waiting for this answer.")
+    attempt: int = Field(0, description="Attempt that asked the question.")
     state: str = Field(description="`open`, `answered`, `expired` or `cancelled`.")
     question: str = Field(
         description="What is being asked. Never empty — a hold with no "
@@ -1298,6 +1305,43 @@ class Event(BaseModel):
 class EventPage(BaseModel):
     events: list[Event]
     cursor: int = Field(description="Pass as `since_id` next time. Unchanged when empty.")
+
+
+class AttemptStageEvidence(BaseModel):
+    """One durable boundary reached by one attempt."""
+
+    attempt: int = Field(description="One-based attempt number.")
+    stage: str = Field(description="A member of the executor's fixed stage list.")
+    admitted_revision: int = Field(
+        description="Dependency-graph revision against which the attempt was admitted."
+    )
+    mode: str = Field(description="Durability mode that recorded this boundary.")
+    recorded_at: float = Field(description="Unix timestamp when this boundary was recorded.")
+    artefact: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Retained typed stage data. Missing keys mean the evidence was not "
+        "recorded; clients must not infer them.",
+    )
+
+
+class WorkEvidence(BaseModel):
+    """Item-scoped history without fabricated gaps."""
+
+    project_id: str = Field(description="Project containing the item.")
+    item_id: str = Field(description="Stable plan id.")
+    events: list[Event] = Field(
+        default_factory=list,
+        description="Recorded events for this item, oldest first. Empty means no retained "
+        "event evidence is available, not that nothing happened.",
+    )
+    stages: list[AttemptStageEvidence] = Field(
+        default_factory=list,
+        description="Durable attempt stages, oldest first.",
+    )
+    holds: list[HoldView] = Field(
+        default_factory=list,
+        description="Every retained question for the item, including closed questions.",
+    )
 
 
 # ------------------------------------------------------------------ summary

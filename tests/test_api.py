@@ -65,6 +65,9 @@ def test_healthz_is_open(client: TestClient) -> None:
 #: exactly what stopped anyone checking. A list that does not grow with the
 #: thing it describes is worse than no list, because it reads as coverage.
 OPEN_ROUTES = {
+    "/": "the browser entry point redirects to login or the authenticated app",
+    "/login": "the browser credential exchange",
+    "/assets": "packaged, immutable browser assets",
     "/healthz": "liveness, checked before a credential is available",
     "/docs": "the schema is not secret; the backlog is",
     "/docs/oauth2-redirect": "mounted by FastAPI for Swagger UI",
@@ -125,12 +128,12 @@ def test_no_token_configured_fails_closed(store: EventStore) -> None:
         assert c.get("/healthz").status_code == 200
 
 
-def test_there_is_no_html_anywhere(client: TestClient) -> None:
-    """The GUI belongs to the session host. If HTML creeps back in here, so
-    does a second UI."""
+def test_browser_html_is_separate_from_json_api(client: TestClient) -> None:
+    """The first-party browser client never changes the JSON API contract."""
     response = client.get("/api/work", headers=auth())
     assert response.headers["content-type"].startswith("application/json")
-    assert client.get("/").status_code == 404
+    assert client.get("/", follow_redirects=False).headers["location"].endswith("/login")
+    assert client.get("/login").headers["content-type"].startswith("text/html")
 
 
 # ------------------------------------------------------------------- work
@@ -507,6 +510,16 @@ def test_one_item_can_be_fetched(client: TestClient) -> None:
     payload = client.get("/api/work/W1", headers=auth()).json()
     assert payload["item_id"] == "W1"
     assert payload["title"] == "First"
+
+
+def test_project_control_never_resumes_without_start_gate(client: TestClient) -> None:
+    response = client.post(
+        "/api/projects/p/control",
+        headers=auth(),
+        json={"state": "running", "reason": "clicked by operator"},
+    )
+    assert response.status_code == 409
+    assert "preflight" in response.json()["detail"]
 
 
 def test_an_unknown_item_is_404(client: TestClient) -> None:

@@ -504,6 +504,18 @@ class AuditStore:
             )
         ]
 
+    def item_events(self, project_id: str, item_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+        """Retained history for one item, oldest first."""
+        if self.degraded:
+            return []
+        return [
+            dict(row)
+            for row in self._connect().execute(
+                "SELECT * FROM events WHERE project_id = ? AND item_id = ? ORDER BY id LIMIT ?",
+                (project_id, item_id, limit),
+            )
+        ]
+
     def max_id(self) -> int:
         if self.degraded:
             return 0

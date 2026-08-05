@@ -18,7 +18,19 @@ import pytest
 from agent_harness import providers as P
 from agent_harness.executor import Checks, is_disk_exhaustion
 from agent_harness.model_client import ModelClient, Response, RetryExhausted, Route
-from agent_harness.session_executor import AgentSpec, SessionExecutor
+from agent_harness.outcomes import (
+    BLOCKED,
+    ESCALATED,
+    ITEM_IMPOSSIBLE,
+    NEEDS_A_PERSON,
+    NO_TARGET,
+)
+from agent_harness.session_executor import (
+    REFUSAL_FILE,
+    REFUSAL_LIMIT,
+    AgentSpec,
+    SessionExecutor,
+)
 from agent_harness.session_host import IDLE, RUNNING, WAITING, Session
 from agent_harness.work import DONE, FAILED, WorkQueue, WorkRecord
 from conftest import make_queue
@@ -698,3 +710,137 @@ def test_an_agent_slower_than_the_lease_keeps_its_item(repo: Path, tmp_path: Pat
     assert outcome.state == DONE, outcome.reason
     record = queue.get("W1")
     assert record is not None and record.state == DONE
+
+
+# ------------------------------------------------ refusing an impossible item
+
+
+def refuse(reason: str) -> Callable[[Path], None]:
+    """An agent that reads the item, decides it cannot be done, and says why."""
+
+    def agent(tree: Path) -> None:
+        (tree / REFUSAL_FILE).write_text(reason)
+
+    return agent
+
+
+def test_a_reasoned_refusal_escalates_and_carries_the_reason(repo: Path, tmp_path: Path) -> None:
+    reason = "calc.py has no Decimal support, and the item requires exact money arithmetic."
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=refuse(reason)))
+    add_item(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.stop is not None
+    assert outcome.stop.disposition == ESCALATED
+    assert outcome.stop.reason_kind == ITEM_IMPOSSIBLE
+    assert outcome.stop.state == BLOCKED
+    assert reason in outcome.stop.detail
+
+
+def test_a_refusal_does_not_cost_the_item_an_attempt(repo: Path, tmp_path: Path) -> None:
+    """The brief is what is wrong. Spending tries to rediscover that is waste."""
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=refuse("the item contradicts itself")))
+    add_item(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.stop is not None
+    assert outcome.stop.consumes_attempt is False
+    item = queue.get("W1")
+    assert item is not None
+    assert item.attempts == 0
+
+
+def test_a_refusal_is_something_a_person_is_asked_to_look_at(repo: Path, tmp_path: Path) -> None:
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=refuse("no such module exists")))
+    add_item(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.stop is not None
+    assert outcome.stop.disposition in NEEDS_A_PERSON
+
+
+def test_the_refusal_note_is_never_committed_or_reviewed(repo: Path, tmp_path: Path) -> None:
+    """It is the agent's answer about the item, not a change to the repository."""
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=refuse("cannot be done")))
+    add_item(queue)
+
+    executor.run_once()
+
+    # The branch exists — it is cut before the agent starts — but nothing was
+    # ever committed onto it, so the note reached no history and no reviewer.
+    assert git(repo, "log", "--oneline", "main..harness/w1").strip() == ""
+    assert not (tmp_path / "trees" / "W1" / REFUSAL_FILE).exists()
+
+
+def test_a_refusal_alongside_real_changes_is_treated_as_the_work(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A tree with edits in it is not a refusal, whatever else the agent wrote."""
+
+    def hedging_agent(tree: Path) -> None:
+        add_multiply(tree)
+        (tree / REFUSAL_FILE).write_text("I was not sure about this one.")
+
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=hedging_agent))
+    add_item(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.state == DONE, outcome.reason
+    # The note must not reach the branch, or a reviewer reads the agent's
+    # hedging as part of the diff it is judging.
+    assert REFUSAL_FILE not in git(repo, "show", "--stat", "harness/w1")
+
+
+def test_a_silent_empty_attempt_also_needs_a_person_and_names_the_session(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Ambiguous on purpose: 'impossible' and 'did nothing' look identical here.
+
+    Both want a human, so both escalate; the reason is what tells them apart,
+    and when there is no reason the operator is pointed at the session that
+    holds one.
+    """
+    executor, queue = build(repo, tmp_path, FakeDevEnv())
+    add_item(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.stop is not None
+    assert outcome.stop.disposition == ESCALATED
+    assert outcome.stop.reason_kind == NO_TARGET
+    assert "sess-1" in outcome.stop.detail
+
+
+def test_a_long_refusal_is_kept_but_bounded(repo: Path, tmp_path: Path) -> None:
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=refuse("x" * 20_000)))
+    add_item(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.stop is not None
+    assert len(outcome.stop.detail) == REFUSAL_LIMIT
+
+
+def test_the_agent_is_told_where_to_put_a_refusal(repo: Path, tmp_path: Path) -> None:
+    """A rule to explain yourself is worthless if it names no place to do it."""
+    seen: list[str] = []
+
+    def read_prompt(tree: Path) -> None:
+        seen.append((tree / ".harness-prompt.md").read_text())
+        add_multiply(tree)
+
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=read_prompt))
+    add_item(queue)
+    executor.run_once()
+
+    assert REFUSAL_FILE in seen[0]

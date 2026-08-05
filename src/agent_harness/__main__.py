@@ -724,6 +724,7 @@ def _run(args: argparse.Namespace) -> int:
             github=GitHub(args.repo) if args.repo else None,
             base_branch=args.base,
             ui_base_url=args.session_host,
+            context_budget=args.context_budget,
             on_event=emit,
             push=not args.no_push,
             project_id=args.project,

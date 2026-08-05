@@ -274,3 +274,28 @@ def test_a_short_verdict_is_kept_whole() -> None:
     from agent_harness.executor import review_reason
 
     assert review_reason("REJECTED\nToo narrow.") == "REJECTED\nToo narrow."
+
+
+def test_the_session_reviewer_budget_is_configurable(tmp_path: Any) -> None:
+    """A 272 KB file was always "too large to include", so the reviewer was
+    denied the evidence it then correctly rejected for lacking:
+
+        "web/src/main.tsx is not included in full and I cannot inspect the
+         surrounding markup"
+
+    The headless executor has taken this from configuration since #150; when
+    the review helpers were shared the session side got the default hardcoded
+    instead, which is a ceiling no deployment could raise.
+    """
+    from agent_harness.executor import DEFAULT_CONTEXT_BUDGET
+    from agent_harness.session_executor import SessionExecutor
+    from agent_harness.work import WorkQueue
+
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    host = type("Host", (), {})()
+
+    default = SessionExecutor(queue, host, tmp_path)
+    raised = SessionExecutor(queue, host, tmp_path, context_budget=700_000)
+
+    assert default.context_budget == DEFAULT_CONTEXT_BUDGET, "unchanged by default"
+    assert raised.context_budget == 700_000, "and a deployment can raise it"

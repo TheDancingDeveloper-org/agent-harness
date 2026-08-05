@@ -174,6 +174,7 @@ class SessionExecutor:
         base_branch: str = "main",
         branch_prefix: str = "harness/",
         worktrees: Path | None = None,
+        context_budget: int = DEFAULT_CONTEXT_BUDGET,
         ui_base_url: str = "",
         session_max_age: float = DEFAULT_MAX_AGE_SECONDS,
         on_event: Callable[[dict[str, Any]], None] | None = None,
@@ -195,6 +196,17 @@ class SessionExecutor:
         self.base_branch = base_branch
         self.branch_prefix = branch_prefix
         self.worktrees = Path(worktrees) if worktrees else self.repo.parent / ".harness-work"
+        #: How much of a touched file the reviewer may be shown. Hardcoded to
+        #: the default when the review helpers were shared, which meant a
+        #: 272 KB file was always "too large to include" — and the reviewer
+        #: said so and rejected, correctly, for evidence it had been denied:
+        #:
+        #:   "web/src/main.tsx is not included in full and I cannot inspect
+        #:    the surrounding markup"
+        #:
+        #: The headless executor has taken this from configuration since #150.
+        #: Session mode reviewing large files needs the same lever.
+        self.context_budget = context_budget
         self.ui_base_url = ui_base_url
         self.session_max_age = session_max_age
         self.on_event = on_event
@@ -774,7 +786,7 @@ class SessionExecutor:
             diff=diff[:20000],
             # The same helpers the headless reviewer uses, so a correction to
             # either cannot land in one executor and not the other (#167).
-            context=review_context(tree, diff, DEFAULT_CONTEXT_BUDGET),
+            context=review_context(tree, diff, self.context_budget),
             checks=review_checks_prompt(self.checks.commands),
         )
         try:

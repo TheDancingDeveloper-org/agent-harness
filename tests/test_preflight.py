@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from agent_harness.preflight import (
+    STALE_BASE_LIMIT,
     Answer,
     _is_clean_tree,
     clean_checks_probe,
@@ -406,3 +407,123 @@ def test_allow_dirty_lets_it_start_and_still_says_what_is_at_risk(tmp_path: Path
     assert check["ok"]
     assert "3 uncommitted change(s)" in check["detail"]
     assert "Allowed by --allow-dirty" in check["detail"]
+
+
+# --------------------------------------------- a base that has fallen behind
+
+
+def _repo_with_remote(tmp_path: Path, *, behind: int, remote: str = "origin") -> Path:
+    """A checkout whose `work` branch is `behind` commits behind its remote."""
+    upstream = tmp_path / f"{remote}-upstream"
+    upstream.mkdir()
+    _git_init(upstream)
+    (upstream / "f.txt").write_text("0\n")
+    _run(upstream, "add", "-A")
+    _run(upstream, "commit", "-qm", "base")
+
+    local = tmp_path / f"local-{remote}-{behind}"
+    _run(tmp_path, "clone", "-q", str(upstream), str(local))
+    _run(local, "config", "user.email", "t@t")
+    _run(local, "config", "user.name", "t")
+    _run(local, "checkout", "-qb", "work")
+
+    for n in range(behind):
+        (upstream / "f.txt").write_text(f"{n + 1}\n")
+        _run(upstream, "add", "-A")
+        _run(upstream, "commit", "-qm", f"upstream {n}")
+    return local
+
+
+def _git_init(path: Path) -> None:
+    _run(path, "init", "-q", "-b", "main")
+    _run(path, "config", "user.email", "t@t")
+    _run(path, "config", "user.name", "t")
+
+
+def _run(path: Path, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(path), *args], capture_output=True, text=True, check=True
+    ).stdout
+
+
+def test_a_base_far_behind_its_upstream_is_refused(tmp_path: Path) -> None:
+    """The rdpapp failure: 121 commits behind, and every later stage said ok."""
+    from agent_harness.preflight import _base_is_current
+
+    repo = _repo_with_remote(tmp_path, behind=STALE_BASE_LIMIT + 5)
+
+    ok, why = _base_is_current(str(repo), "work")
+
+    assert ok is False
+    assert f"{STALE_BASE_LIMIT + 5} commit(s) behind" in why
+    assert "--allow-stale-base" in why
+
+
+def test_a_base_slightly_behind_is_reported_but_not_refused(tmp_path: Path) -> None:
+    """Every branch is a few commits behind. Blocking on that is noise nobody reads."""
+    from agent_harness.preflight import _base_is_current
+
+    repo = _repo_with_remote(tmp_path, behind=2)
+
+    ok, why = _base_is_current(str(repo), "work")
+
+    assert ok is True
+    assert "2 commit(s) behind" in why
+
+
+def test_a_current_base_says_so(tmp_path: Path) -> None:
+    from agent_harness.preflight import _base_is_current
+
+    repo = _repo_with_remote(tmp_path, behind=0)
+
+    ok, why = _base_is_current(str(repo), "work")
+
+    assert ok is True
+    assert "current with" in why
+
+
+def test_a_branch_tracking_nothing_is_still_measured_against_every_remote(
+    tmp_path: Path,
+) -> None:
+    """The bug in the first draft of this check, and the exact rdpapp shape.
+
+    `harness/base` tracked nothing and the repository had two remotes, so the
+    check returned "no single obvious line of work to compare against" and said
+    nothing while the base sat 121 commits behind the authoritative one.
+    """
+    from agent_harness.preflight import _base_is_current
+
+    repo = _repo_with_remote(tmp_path, behind=STALE_BASE_LIMIT + 5)
+    # A second remote, exactly as rdpapp has a Forgejo origin and a GitHub one.
+    other = tmp_path / "second"
+    other.mkdir()
+    _git_init(other)
+    (other / "g.txt").write_text("x\n")
+    _run(other, "add", "-A")
+    _run(other, "commit", "-qm", "unrelated")
+    _run(repo, "remote", "add", "github", str(other))
+    _run(repo, "fetch", "-q", "github")
+    # `work` has no upstream by construction — it was cut locally with
+    # `checkout -b`, which is the ordinary case and the one that went unnoticed.
+
+    ok, why = _base_is_current(str(repo), "work")
+
+    assert ok is False, why
+    assert "behind" in why
+
+
+def test_an_unreachable_remote_is_not_evidence_that_the_base_is_stale(
+    tmp_path: Path,
+) -> None:
+    """A network fact must not be reported as a fact about the lineage."""
+    from agent_harness.preflight import _base_is_current
+
+    repo = _repo_with_remote(tmp_path, behind=0)
+    _run(repo, "remote", "set-url", "origin", str(tmp_path / "does-not-exist"))
+
+    ok, why = _base_is_current(str(repo), "work")
+
+    assert ok is True
+    assert "could not" in why

@@ -139,6 +139,7 @@ A reviewer then reads your diff against the item above and can reject it.
 #: items were rejected for exactly the artefacts those fixes had already
 #: retired — in the other file (#167).
 from .executor import REVIEW_PROMPT as REVIEW_PROMPT  # noqa: E402
+from .executor import review_reason  # noqa: E402
 
 
 @dataclass
@@ -647,7 +648,7 @@ class SessionExecutor:
                 self._record_verdict(record, outcome.pr_url, verdict, verdict_text)
 
             if verdict != APPROVED:
-                outcome.reason = f"review rejected: {verdict_text.strip()[:500]}"
+                outcome.reason = f"review rejected: {review_reason(verdict_text)}"
                 outcome.stop = Stop(REFUSED, REVIEW_REJECTED, detail=outcome.reason)
                 return outcome
 

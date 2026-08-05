@@ -1350,6 +1350,34 @@ The files it touched, as they now stand:
 """
 
 
+def review_reason(verdict_text: str, limit: int = 1200) -> str:
+    """The reviewer's verdict, kept from the end rather than the beginning.
+
+    `last_error` is what a retry is told and what an operator reads, and it
+    used to be the first 500 characters of the verdict. The rubric asks for
+    "what I verified" first and "why" last, so those 500 characters were the
+    list of things the reviewer was *happy* with, and the objection — the only
+    part anyone can act on — was cut off.
+
+    Measured: two items were rejected twice for the same fault after being
+    told, both times, only the preamble praising the parts that were fine.
+
+    So the tail wins when something has to go. The head is a summary of the
+    diff, which the reader already has; the tail is the decision.
+    """
+    text = verdict_text.strip()
+    if len(text) <= limit:
+        return text
+    # Prefer starting at a section boundary, so a retry is not handed half a
+    # sentence about something it cannot see the start of.
+    tail = text[-limit:]
+    for marker in ("\n3. ", "\n2. ", "\n\n"):
+        cut = tail.find(marker)
+        if 0 <= cut < limit // 2:
+            return "…" + tail[cut:].strip()
+    return "…" + tail.strip()
+
+
 def review_context(repo: Path, diff: str, budget: int) -> str:
     """The touched files as they now stand, for the reviewer.
 
@@ -2413,7 +2441,7 @@ class Executor:
         if outcome.pr_url and self.github is not None:
             self._record_verdict(record, outcome.pr_url, verdict, verdict_text)
         if verdict != APPROVED:
-            outcome.reason = f"review rejected: {verdict_text.strip()[:500]}"
+            outcome.reason = f"review rejected: {review_reason(verdict_text)}"
             outcome.stop = Stop(REFUSED, REVIEW_REJECTED, detail=outcome.reason)
             return outcome
 

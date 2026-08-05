@@ -15,6 +15,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The in-process agent loop. Opt-in: nothing in core imports it, and a build
+# without it loads none of it. Adopted rather than rebuilt because it delivered
+# an item the single-shot executor could not, using the same models on the same
+# gateway -- see `adapters/minisweagent.py` for the measurement.
+agent-loop = [
+    "mini-swe-agent>=2.4",
+    "pyyaml>=6",
+]
 dev = [
     # Starlette's TestClient needs a specific HTTP client, and which one
     # changed: older releases wanted `httpx`, current ones want `httpx2`.
@@ -82,6 +90,13 @@ strict = true
 # the package may be absent.
 [[tool.mypy.overrides]]
 module = ["opentelemetry.*"]
+ignore_missing_imports = true
+
+# Optional, on the same terms as the OTLP exporter above: the agent loop is an
+# extra, so a build without it must still type-check. The adapter is the only
+# place either name appears.
+[[tool.mypy.overrides]]
+module = ["minisweagent.*", "yaml"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -318,6 +318,28 @@ class LeaseHeartbeat:
                 return
 
 
+#: States a rewritten brief rescues an item from. `done` is absent on purpose —
+#: editing the description of finished work does not un-finish it — and so are
+#: `claimed` and `pending`, which are not stuck.
+STALLED = frozenset({FAILED, BLOCKED})
+
+
+def revives(state: str, was: str | None, now: str | None) -> bool:
+    """Does this refresh un-stick a stalled item?
+
+    Only a changed **brief** does. Re-syncing an unchanged plan must leave
+    every state exactly where it was, and fixing a typo in a title or adding a
+    label is not an answer to whatever stopped the item.
+
+    A changed brief is different in the one way that matters: the attempt that
+    failed was made against wording that no longer exists. Leaving it `failed`
+    records a verdict on a question nobody is asking any more — and it is
+    silent, so a person who rewrites an item in response to an agent refusing
+    it as impossible (#174) watches the next run say "nothing to do" (#178).
+    """
+    return state in STALLED and (was or "").strip() != (now or "").strip()
+
+
 def _process_alive(pid: int) -> bool:
     """Whether a pid on this host is still running.
 
@@ -782,7 +804,7 @@ class WorkQueue:
         )
         for record in records:
             existing = conn.execute(
-                "SELECT state FROM work WHERE project_id = ? AND item_id = ?",
+                "SELECT state, brief FROM work WHERE project_id = ? AND item_id = ?",
                 (project_id, record.item_id),
             ).fetchone()
             if existing is None:
@@ -815,6 +837,24 @@ class WorkQueue:
                         record.item_id,
                     ),
                 )
+                if revives(existing["state"], existing["brief"], record.brief):
+                    # The verdict that stopped this item was reached against
+                    # wording that no longer exists, so it is no longer a
+                    # verdict on anything. Clearing `last_error` with it: the
+                    # next attempt is told what the previous one was refused
+                    # for, and that refusal is about a question nobody is
+                    # asking any more.
+                    conn.execute(
+                        "UPDATE work SET state = ?, last_error = NULL "
+                        "WHERE project_id = ? AND item_id = ?",
+                        (PENDING, project_id, record.item_id),
+                    )
+                    log.info(
+                        "%s/%s: brief rewritten, returning it to pending from %s",
+                        project_id,
+                        record.item_id,
+                        existing["state"],
+                    )
             self.graph.set_edges(
                 project_id,
                 record.item_id,

@@ -589,7 +589,19 @@ def test_prior_harness_attempts_are_evidence_and_history_is_retained(
 ) -> None:
     audit = AuditStore(tmp_path / "audit.sqlite")
     sink = event_sink(audit, source="stage-c")
-    queue.add([WorkRecord(item_id="T5", title="Never started")], project_id="existing")
+    # Seeded with the brief the plan carries, so this is a re-sync that changes
+    # nothing. A refresh that *rewrites* the brief deliberately does move the
+    # state, which the test below this one covers.
+    queue.add(
+        [
+            WorkRecord(
+                item_id="T5",
+                title="Never started",
+                brief="Never started\n\nNothing anywhere refers to this.",
+            )
+        ],
+        project_id="existing",
+    )
     queue.set_control("running", project_id="existing")
     claimed = queue.claim("worker-1", project_id="existing")
     assert claimed is not None and claimed.item_id == "T5"
@@ -892,3 +904,43 @@ def test_adopt_cli_dry_run_leaves_no_trace(tmp_path: Path, repo: Path, capsys: A
     stored = WorkQueue(str(db))
     assert stored.items() == []
     assert stored.get_setting("adoption:existing") is None
+
+
+def test_a_rewritten_brief_revives_a_failed_item_and_the_report_says_so(
+    tmp_path: Path, queue: WorkQueue, repo: Path
+) -> None:
+    """#178: the half of the refusal loop that acts on the human's answer.
+
+    The report used to say `T5 -> pending` in its heading and `state stays
+    failed` in the mutation line two lines below, and the second one was true.
+    A human who rewrote an item in response to an agent refusing it as
+    impossible was then told "nothing to do".
+    """
+    queue.add(
+        [WorkRecord(item_id="T5", title="Never started", brief="the original wording")],
+        project_id="existing",
+    )
+    queue.set_control("running", project_id="existing")
+    queue.claim("worker-1", project_id="existing")
+    queue.release(
+        "T5", FAILED, error="cannot be done as specified", owner="worker-1", project_id="existing"
+    )
+
+    adopter = adoption(queue, repo)
+    report = adopter.inspect("existing", parse_plan(PLAN))
+
+    t5 = by_id(report)["T5"]
+    refresh = next(m for m in t5.mutations if m.kind == "refresh queue row")
+    assert "state returns to pending" in refresh.detail
+    assert "state stays" not in refresh.detail
+
+    adopter.approve("existing", approved_drops=[])
+    adopter.reconcile("existing")
+
+    record = queue.get("T5", project_id="existing")
+    assert record is not None
+    assert record.state == PENDING
+    assert not record.last_error
+    # The attempt itself is history and stays history. What changed is the
+    # question, not the fact that it was once attempted.
+    assert record.attempts == 1

@@ -255,7 +255,10 @@ def test_verification_runs_under_the_project_check_rules(queue: WorkQueue, repo:
     assert items["S2"].evidence[0].outcome == "timeout"
     assert "0.5s" in items["S2"].evidence[0].detail
     assert items["S3"].evidence[0].outcome == "passed"
-    assert items["S3"].proposed_state == DONE
+    # It ran in the repository and it exited 0 -- which is what this test is
+    # about. What that exit code is worth on its own is the test below.
+    assert items["S3"].proposed_state == PENDING
+    assert items["S3"].requires_drop_approval is True
 
 
 # ---------------------------------------------- §5.1 read-only inspection
@@ -276,8 +279,11 @@ def test_inspection_is_read_only_and_ranks_its_evidence(queue: WorkQueue, repo: 
     assert items["T1"].proposed_state == DONE
     assert items["T1"].requires_drop_approval is True
 
-    assert [e.kind for e in items["T2"].evidence] == ["runnable"]
+    # The verification passed, so the ladder does not stop there: the assessor
+    # is asked anyway, and its answer is what decides. Both rungs are kept.
+    assert [e.kind for e in items["T2"].evidence] == ["runnable", "judged"]
     assert items["T2"].evidence[0].outcome == "passed"
+    assert items["T2"].proposed_state == PENDING
 
     assert [e.kind for e in items["T3"].evidence] == ["judged"]
     assert items["T3"].evidence[0].citations == [
@@ -384,6 +390,123 @@ def test_a_failed_verification_outranks_a_judged_done(queue: WorkQueue, repo: Pa
     assert item.proposed_state == PENDING
     assert item.requires_drop_approval is False
     assert item.ambiguity is not None and "verification failed" in item.ambiguity
+
+
+#: A test runner asked for a name that does not exist in this tree. Every
+#: runner that takes a name filter behaves this way -- `cargo test <name>`,
+#: `pytest -k`, `go test -run`, `npm test -- -t`: it reports that it ran
+#: nothing, and it exits 0, because not-failing is what it was asked about.
+MATCHED_NOTHING = [
+    "python",
+    "-c",
+    "print('running 0 tests'); print('test result: ok. 0 passed; 0 failed')",
+]
+
+
+def unassessed(queue: WorkQueue, repo: Path) -> Adoption:
+    """Adoption with no assessor role at all, which is the default `adopt`.
+
+    The `adoption` helper above substitutes the fixture for `assessor=None`,
+    so this is the only way to ask what one rung on its own is worth.
+    """
+    return Adoption(queue, repo, assessor=None, branches=lambda _repo: [], now=lambda: 1000.0)
+
+
+FILTERED_PLAN = (
+    "### R2 — Refuse an insecure-cookie start behind an HTTPS origin\n\n"
+    f"verify: {json.dumps(MATCHED_NOTHING)}\n"
+)
+
+
+def test_a_verification_that_matched_nothing_never_drops_the_work(
+    queue: WorkQueue, repo: Path
+) -> None:
+    """The #149 reproduction: exit 0 from a filter that matched no tests.
+
+    The item's work does not exist and its named test was never written, so
+    the runner ran zero tests and exited 0. Adoption used to stop the ladder
+    right there and report `R2 -> done`, and the sentence under it read as
+    evidence -- which is how a real import came within one approval of
+    deleting work that then nobody would ever do.
+
+    The command's exit code is still reported, because it is a fact. What it
+    no longer does is decide: with nothing corroborating it the item is
+    proposed `pending`, and approving the report as it stands leaves the work
+    in the queue to be done.
+    """
+    adopter = unassessed(queue, repo)
+    report = adopter.inspect("existing", parse_plan(FILTERED_PLAN))
+
+    item = by_id(report)["R2"]
+    assert [e.kind for e in item.evidence] == ["runnable"]
+    assert item.evidence[0].outcome == "passed"
+    assert "does not say the command tested anything" in item.evidence[0].detail
+    assert item.proposed_state == PENDING
+
+    adopter.approve("existing", approved_drops=[])
+    adopter.reconcile("existing")
+    record = queue.get("R2", project_id="existing")
+    assert record is not None and record.state == PENDING
+
+
+def test_a_passing_verification_alone_is_offered_and_never_asserted(
+    queue: WorkQueue, repo: Path
+) -> None:
+    """It is still a drop a human may name — the report just does not claim it.
+
+    Taking the option away would be the opposite error: the person reading the
+    report may know the command is a real one, and adoption would then be
+    unable to record something true. So the item stays in `proposed_drops`,
+    the summary says out loud that nothing confirmed it, and the state that
+    follows from saying nothing is `pending`.
+    """
+    adopter = unassessed(queue, repo)
+    report = adopter.inspect("existing", parse_plan(FILTERED_PLAN))
+
+    assert report.proposed_drops() == ["R2"]
+    assert report.unconfirmed_drops() == ["R2"]
+    summary = report.summary()
+    assert "1 proposed as already delivered (1 unconfirmed)" in summary
+    assert "R2 -> pending" in summary
+    assert "possible drop, unconfirmed" in summary
+    assert "proposed done" not in summary
+
+    adopter.approve("existing", approved_drops=["R2"])
+    adopter.reconcile("existing")
+    record = queue.get("R2", project_id="existing")
+    assert record is not None and record.state == DONE
+
+
+@pytest.mark.parametrize(
+    ("judgement", "expected"),
+    [
+        (Judgement("done", ["src/gateway/cookies.rs:secure"], "the guard is there"), DONE),
+        (Judgement("done", [], "I am sure"), PENDING),
+        (Judgement("partial", ["src/gateway/cookies.rs"], "half of it"), PENDING),
+        (Judgement("not_started", [], "nothing found"), PENDING),
+    ],
+)
+def test_a_passing_verification_proposes_done_only_with_a_second_rung(
+    queue: WorkQueue, repo: Path, judgement: Judgement, expected: str
+) -> None:
+    """Corroboration is what turns exit 0 into a proposal, not the exit code.
+
+    The harness cannot tell a runner that proved something from one that ran
+    nothing without reading that ecosystem's output and guessing at it, which
+    is an adapter's job and a wrong guess besides. What it can do is decline
+    to decide on one rung: a `done` that cites the code agrees with the
+    command, and two rungs are a proposal. A `done` that cites nothing is not
+    a rung at all, and anything short of `done` leaves the work to do.
+    """
+    adopter = adoption(queue, repo, assessor=AssessorFixture({"R2": judgement}))
+    report = adopter.inspect("existing", parse_plan(FILTERED_PLAN))
+
+    item = by_id(report)["R2"]
+    assert [e.kind for e in item.evidence] == ["runnable", "judged"]
+    assert item.proposed_state == expected
+    # Either way it is a candidate a human may name; only the default differs.
+    assert item.requires_drop_approval is True
+    assert item.ambiguity is None
 
 
 def test_a_model_assessor_parses_conservatively() -> None:
@@ -575,7 +698,8 @@ def test_a_title_lookalike_issue_is_never_edited(queue: WorkQueue, repo: Path) -
 
     t2 = by_id(report)["T2"]
     assert t2.candidates[0].confidence == "medium"
-    assert t2.proposed_state == DONE
+    assert t2.proposed_state == PENDING
+    assert t2.requires_drop_approval is True
     assert {m.kind for m in t2.mutations} == {"create queue row"}
 
     adopter.approve("existing", approved_drops=["T2"])
@@ -761,8 +885,10 @@ def test_adoption_appends_events_a_projection_can_read(
 
     rows = audit.since_id(0)
     outcomes = [row["outcome"] for row in rows]
-    assert outcomes.count("adoption_proposed_done") == 3
-    assert outcomes.count("adoption_proposed_pending") == 1
+    # T1 (explicit) and T3 (judged) are proposed done; T2's verification
+    # passed and nothing corroborated it, so it is proposed pending like T5.
+    assert outcomes.count("adoption_proposed_done") == 2
+    assert outcomes.count("adoption_proposed_pending") == 2
     assert outcomes.count("adoption_ambiguous") == 1
     assert outcomes.index("adoption_approved") < outcomes.index("adoption_marker_backfilled")
     assert outcomes[-1] == "adoption_stopped"
@@ -791,7 +917,10 @@ def test_report_is_storable_and_reviewable(queue: WorkQueue, repo: Path) -> None
     assert restored["items"][0]["candidates"][0]["identity"] == "17"
 
     text = report.summary()
-    assert "5 plan item(s); 3 proposed as already delivered; 1 needing a human decision" in text
+    assert (
+        "5 plan item(s); 3 proposed as already delivered (1 unconfirmed); "
+        "1 needing a human decision"
+    ) in text
     assert "would append issue marker issue 17 in o/r" in text
 
 

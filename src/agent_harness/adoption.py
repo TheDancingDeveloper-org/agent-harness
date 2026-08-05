@@ -24,6 +24,20 @@ delivered is exactly that. `approve` takes the item ids a human named, and
 nothing else is dropped. Uncertainty — competing candidates, a judgement
 without citations, a verification that failed — biases towards `not_started`.
 
+**Exit 0 is not proof, and this is the expensive direction.** A `verify:`
+command that exits 0 has not failed; it has not necessarily *tested* anything.
+Every test runner that takes a name filter passes when the filter matches
+nothing — `cargo test <name>`, `pytest -k`, `go test -run`, `npm test -- -t` —
+so the most natural `verify:` anyone writes, "run the test this item adds",
+exits 0 on precisely the tree where the item has not been done (#149). Reading
+a runner's output to count what it ran is an adapter's job and a guess besides.
+So a passing verification no longer decides on its own: it proposes a drop only
+when a second rung agrees — explicit evidence, or an assessor `done` with
+citations. Alone, it is reported as a **candidate a human must confirm**, and
+the item stays `pending` until they name it. Being wrong that way costs a
+re-run; being wrong the other way deletes work from the backlog silently, and
+the report reads as evidence that it was right to.
+
 **Prior harness attempts are evidence, not authority.** An item the queue has
 already failed keeps its attempts and its event history. Adoption reports the
 prior failure so a human can decide; it never overrules it.
@@ -83,6 +97,14 @@ EXPLICIT = "explicit"
 RUNNABLE = "runnable"
 JUDGED = "judged"
 PRIOR_ATTEMPT = "prior_attempt"
+
+#: What a `verify:` command did, as the report says it. `passed` is the exit
+#: code and nothing more — see the module docstring for why that is not the
+#: same fact as "this item is done".
+VERIFY_PASSED = "passed"
+VERIFY_FAILED = "failed"
+VERIFY_TIMEOUT = "timeout"
+VERIFY_UNAVAILABLE = "unavailable"
 
 #: The branch prefix both executors use. A branch that matches it is a lead,
 #: never proof: a human can name a branch anything at all, including this.
@@ -241,6 +263,19 @@ class AdoptionReport:
     def proposed_drops(self) -> list[str]:
         return [item.item_id for item in self.items if item.requires_drop_approval]
 
+    def unconfirmed_drops(self) -> list[str]:
+        """Drops a human may approve that nothing in the report proposes.
+
+        A passing `verify:` with no second rung behind it lands here: it is
+        offered, it is not asserted, and if nobody names it the item stays
+        `pending`.
+        """
+        return [
+            item.item_id
+            for item in self.items
+            if item.requires_drop_approval and item.proposed_state != DONE
+        ]
+
     def ambiguous(self) -> list[AdoptionItem]:
         return [item for item in self.items if item.ambiguity]
 
@@ -250,13 +285,19 @@ class AdoptionReport:
             f"project {self.project_id}: {self.state}",
             f"repository {self.repository}",
             f"{len(self.items)} plan item(s); "
-            f"{len(self.proposed_drops())} proposed as already delivered; "
+            f"{len(self.proposed_drops())} proposed as already delivered "
+            f"({len(self.unconfirmed_drops())} unconfirmed); "
             f"{len(self.ambiguous())} needing a human decision",
         ]
         for item in self.items:
             marks = []
-            if item.requires_drop_approval:
+            if item.requires_drop_approval and item.proposed_state == DONE:
                 marks.append("proposed done")
+            elif item.requires_drop_approval:
+                # A drop a human may name, that nothing here proposes. Said
+                # differently from "proposed done" because the reader's next
+                # action is different: this one has to be checked first.
+                marks.append("possible drop, unconfirmed: droppable only if a human names it")
             if item.ambiguity:
                 marks.append(f"ambiguous: {item.ambiguity}")
             if item.prior_failure:
@@ -652,11 +693,14 @@ class Adoption:
         if item.verification:
             verified = self._run_verification(item.verification)
             result.evidence.append(verified)
-            if verified.outcome == "passed":
-                _propose_done(result)
-                self._add_mutations(project_id, result)
-                return result
 
+        # The verification no longer short-circuits the ladder. It used to
+        # return here on exit 0, which made one exit code the whole decision --
+        # and a name-filtered test command exits 0 on a tree that does not
+        # contain the test (#149). The assessor is asked anyway, because a
+        # second rung is the only corroboration available that does not mean
+        # reading another ecosystem's output and guessing what it meant.
+        judgement: Judgement | None = None
         if self.assessor is not None:
             judgement = self._judge(item)
             result.evidence.append(
@@ -667,15 +711,23 @@ class Adoption:
                     citations=list(judgement.citations),
                 )
             )
-            if judgement.disposition == DONE_DISPOSITION and verified is not None:
-                # A declared verification that ran and failed is stronger than
-                # a model saying the work is there. Believing the model here
-                # is exactly the silent drop the stage exists to prevent.
-                result.ambiguity = (
-                    f"the assessor says done but the item's own verification {verified.outcome}"
-                )
-            elif judgement.disposition == DONE_DISPOSITION:
-                _propose_done(result)
+
+        judged_done = judgement is not None and judgement.disposition == DONE_DISPOSITION
+        proved = verified is not None and verified.outcome == VERIFY_PASSED
+
+        if judged_done and verified is not None and not proved:
+            # A declared verification that ran and did not pass is stronger
+            # than a model saying the work is there. Believing the model here
+            # is exactly the silent drop the stage exists to prevent.
+            result.ambiguity = (
+                f"the assessor says done but the item's own verification {verified.outcome}"
+            )
+        elif judged_done:
+            # Either nothing was declared to run, or what was declared agrees
+            # with a citation-carrying `done`. Two rungs, not one exit code.
+            _propose_done(result)
+        elif proved:
+            _propose_unconfirmed_drop(result)
         self._add_mutations(project_id, result)
         return result
 
@@ -777,7 +829,17 @@ class Adoption:
         rendered = " ".join(argv)
         result = checks.run(self.repository)
         if result.ok:
-            return Evidence(kind=RUNNABLE, outcome="passed", detail=f"`{rendered}` succeeded")
+            # Say what happened, not what it means. "succeeded" was read by
+            # every reader -- human and report -- as "the work is there", and
+            # the command may have run nothing at all.
+            return Evidence(
+                kind=RUNNABLE,
+                outcome=VERIFY_PASSED,
+                detail=(
+                    f"`{rendered}` exited 0, which says the command did not fail; "
+                    "it does not say the command tested anything"
+                ),
+            )
         # The four not-ok outcomes, mapped to the three adoption already
         # distinguishes. `Checks` classifies these itself now, so a timeout
         # and a missing interpreter no longer arrive here as exceptions this
@@ -791,12 +853,12 @@ class Adoption:
         if result.outcome == RETRY:
             return Evidence(
                 kind=RUNNABLE,
-                outcome="timeout",
+                outcome=VERIFY_TIMEOUT,
                 detail=f"`{rendered}` exceeded {self.verify_timeout:g}s",
             )
         if result.outcome == ESCALATE:
-            return Evidence(kind=RUNNABLE, outcome="unavailable", detail=result.detail)
-        return Evidence(kind=RUNNABLE, outcome="failed", detail=result.detail)
+            return Evidence(kind=RUNNABLE, outcome=VERIFY_UNAVAILABLE, detail=result.detail)
+        return Evidence(kind=RUNNABLE, outcome=VERIFY_FAILED, detail=result.detail)
 
     # ------------------------------------------------------------ decision
 
@@ -1075,6 +1137,23 @@ def _can_backfill(candidate: ExternalCandidate) -> bool:
 def _propose_done(result: AdoptionItem) -> None:
     """Propose — never decide. The flag is what a human is asked to approve."""
     result.proposed_state = DONE
+    result.requires_drop_approval = True
+
+
+def _propose_unconfirmed_drop(result: AdoptionItem) -> None:
+    """A `verify:` exited 0 and nothing else agrees that the work is there.
+
+    The item is still offered to `--approve-drop`, because the person reading
+    the report may know the command is a real one — that is the whole shape of
+    "a proposal is never a decision", and taking the option away would make
+    adoption unable to record something true.
+
+    What it does *not* do is propose `done`. `proposed_state` stays `pending`,
+    so the outcome of approving nothing is that the work is still to do rather
+    than silently gone (#149). The two flags say different things on purpose:
+    one is what a human may confirm, the other is what happens if they say
+    nothing, and the answer to silence is always "still to do".
+    """
     result.requires_drop_approval = True
 
 

@@ -172,8 +172,36 @@ def _resolvers_finding() -> Finding:
     return Finding("dependency resolvers", OK, f"declared: {', '.join(names)}")
 
 
+def _redaction_finding() -> Finding:
+    """What the write-boundary filter can and cannot promise.
+
+    Deliberately `unknown` rather than `ok`. Pattern redaction cannot catch a
+    credential whose shape it does not know and whose value it was not given,
+    so reporting it as a passed check would be the one thing this must not
+    claim. What it can state is the part that has no false negatives: how
+    many exact values this process was handed.
+    """
+    from .redaction import from_environment
+
+    known = len(from_environment().secrets)
+    return Finding(
+        "credential redaction",
+        UNKNOWN,
+        f"events are redacted before they are written; {known} exact value(s) known to "
+        "this process, plus credential shapes. It reduces exposure, it does not remove "
+        "it: a credential of an unknown shape whose value was not supplied still lands, "
+        "and the stores are append-only, so the remedy then is rotation, not deletion.",
+    )
+
+
 def environment_findings() -> list[Finding]:
-    return [_git_finding(), _gh_finding(), _presets_finding(), _resolvers_finding()]
+    return [
+        _git_finding(),
+        _gh_finding(),
+        _presets_finding(),
+        _resolvers_finding(),
+        _redaction_finding(),
+    ]
 
 
 # --------------------------------------------------------------- per project

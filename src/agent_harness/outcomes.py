@@ -206,6 +206,12 @@ HOLD_EXPIRED = "hold_expired"
 #: nothing — the file is the size it is — so it needs a person to raise the
 #: budget or split the file, which is why it escalates.
 CONTEXT_UNAVAILABLE = "context_unavailable"
+#: The agent read the repository, concluded the item cannot be done as written,
+#: and said why. Kept apart from `NO_TARGET`, which is the agent finding nothing
+#: to change: here it found the target and the *brief* is what does not work.
+#: Retrying is pointless — the brief is the brief — so this needs a person to
+#: rewrite or withdraw the item, which is why it escalates rather than failing.
+ITEM_IMPOSSIBLE = "item_impossible"
 
 REASON_KINDS = (
     CHECKS_FAILED,
@@ -224,6 +230,7 @@ REASON_KINDS = (
     ITEM_SPEND,
     HOLD_EXPIRED,
     CONTEXT_UNAVAILABLE,
+    ITEM_IMPOSSIBLE,
 )
 
 

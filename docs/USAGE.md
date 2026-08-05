@@ -1289,7 +1289,37 @@ can branch on it: `checks_failed`, `check_escalated`, `check_transient`,
 `review_rejected`, `patch_rejected`, `no_target`, `worker_error`,
 `provider_exhausted`, `budget_exhausted`, `dependency_invalidated`,
 `agent_timeout`, `claim_lost`, `item_wall_clock`, `item_spend`,
-`hold_expired`, `context_unavailable`.
+`hold_expired`, `context_unavailable`, `item_impossible`.
+
+### 6a.0 When the agent says the item cannot be done
+
+An agent in session mode is told, in its prompt, that if the item is ambiguous,
+contradicts the code, or depends on something absent, it should write its
+reasoning to `.harness-refusal.md` and change nothing else.
+
+That is a correct outcome, and the harness records it as one:
+
+```json
+{"state": "blocked", "disposition": "escalated",
+ "reason_kind": "item_impossible", "attempts": 0,
+ "last_error": "The item asks for a snippet timestamp, but every route to one
+                is forbidden by its own criteria: …"}
+```
+
+**It costs no attempt.** What is wrong is the brief, and no number of retries
+rewrites a brief — so the item waits for you rather than spending its budget
+proving the same point three more times. It appears wherever your deployment
+surfaces `escalated`, which is the set of dispositions meaning *a person, not a
+timer, is what this is waiting on*.
+
+The note itself never reaches a commit, a diff or a reviewer: it is read and
+deleted before the worktree is inspected. An agent that leaves the note *and*
+makes real changes has not refused, and is judged on the changes as usual.
+
+A session that ends with a clean tree and **no** note escalates too, with
+`reason_kind: no_target` and the session id in `last_error` — an agent that
+did nothing and an agent that could not say why both want a human, and the
+session is where the explanation is.
 
 ### 6a.1 When the target does not fit in the prompt
 

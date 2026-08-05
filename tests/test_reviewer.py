@@ -140,7 +140,11 @@ def test_a_session_retry_is_told_why_the_last_attempt_was_refused(tmp_path: Any)
     type — a specific, actionable criticism — and the retry would have been
     sent the identical brief with no mention of it.
     """
-    from agent_harness.session_executor import PROMPT_TEMPLATE, SessionExecutor
+    from agent_harness.session_executor import (
+        PROMPT_TEMPLATE,
+        REFUSAL_FILE,
+        SessionExecutor,
+    )
     from agent_harness.work import WorkQueue, WorkRecord
 
     queue = WorkQueue(str(tmp_path / "w.sqlite"))
@@ -157,6 +161,7 @@ def test_a_session_retry_is_told_why_the_last_attempt_was_refused(tmp_path: Any)
         brief=refused.brief,
         checks_description="none",
         prior=executor._prior_failure(refused),
+        refusal_file=REFUSAL_FILE,
     )
 
     assert "widens the repository trait" in prompt
@@ -168,6 +173,7 @@ def test_a_session_retry_is_told_why_the_last_attempt_was_refused(tmp_path: Any)
         brief="b",
         checks_description="none",
         prior=executor._prior_failure(WorkRecord(item_id="R3", title="t", brief="b")),
+        refusal_file=REFUSAL_FILE,
     )
     assert "What happened last time" not in fresh
 

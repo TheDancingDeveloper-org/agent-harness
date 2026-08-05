@@ -49,11 +49,14 @@ from .graph import LOCAL_WORK
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
 from .outcomes import (
     AGENT_TIMEOUT,
+    BLOCKED,
     BUDGET_EXHAUSTED,
     CLAIM_LOST,
     COMPLETED,
     CRASHED,
     DEPENDENCY_INVALIDATED,
+    ESCALATED,
+    ITEM_IMPOSSIBLE,
     NO_TARGET,
     PROVIDER_EXHAUSTED,
     REFUSED,
@@ -126,10 +129,53 @@ A reviewer then reads your diff against the item above and can reject it.
 - Do not commit; the harness commits what you leave in the working tree.
 - Do not push, and do not open a pull request.
 - If the item cannot be done as written — it is ambiguous, contradicts the
-  code, or depends on something absent — stop and say so plainly. Saying
-  "this cannot be done as specified" is a correct outcome; inventing a way
-  around it is not.
+  code, or depends on something absent — **write your reasoning to
+  `{refusal_file}` in this directory and make no other change.** Say which
+  part of the item cannot be met and what you found that rules it out, citing
+  the files you read. Saying "this cannot be done as specified" is a correct
+  outcome; inventing a way around it is not.
+
+  Write that file only when you are refusing the whole item. If you can do
+  what the item asks, do it and leave the file absent.
 """
+
+#: Where a refusing agent leaves its reasoning.
+#:
+#: The rule above used to end at "stop and say so plainly", which told the
+#: agent to explain itself **to a terminal nobody reads**. The explanation went
+#: into the session scrollback, the harness saw only a clean worktree, and the
+#: item was recorded `refused / no_target — "the agent made no changes"`: an
+#: ordinary failure, costing an attempt, invisible to anyone looking for work
+#: that needs them (#174).
+#:
+#: A file, inside the tree, because that is the one channel the agent certainly
+#: has — it is there to edit files. Read and deleted before the tree is
+#: inspected, so it cannot itself be mistaken for a change or reach a commit.
+REFUSAL_FILE = ".harness-refusal.md"
+
+#: How much of a refusal reaches `last_error`. Generous next to the other
+#: limits here, because this is the one text a person is being asked to act on
+#: and there is no second copy of it once the worktree is gone.
+REFUSAL_LIMIT = 4000
+
+
+def _take_refusal(tree: Path) -> str:
+    """The agent's refusal, removed from the tree as it is read.
+
+    Removed rather than ignored so that the file cannot be committed, cannot
+    show up in a diff a reviewer reads, and cannot make a genuinely empty
+    attempt look like a change. Returns an empty string if no note was left,
+    which is the ordinary case.
+    """
+    note = tree / REFUSAL_FILE
+    try:
+        text = note.read_text(errors="replace").strip()
+    except OSError:
+        return ""
+    finally:
+        note.unlink(missing_ok=True)
+    return text[:REFUSAL_LIMIT] if text else ""
+
 
 #: The review rubric lives with the headless executor and is imported, not
 #: copied. It used to be copied, and every correction made from measurement
@@ -499,6 +545,7 @@ class SessionExecutor:
                     brief=record.brief,
                     checks_description=self._describe_checks(),
                     prior=self._prior_failure(record),
+                    refusal_file=REFUSAL_FILE,
                 )
             )
 
@@ -561,11 +608,33 @@ class SessionExecutor:
             # was impossible leaves a clean tree, and that is a real answer,
             # not a failure to paper over.
             prompt_file.unlink(missing_ok=True)
+            # Read and remove before the tree is inspected: a refusal note is
+            # the agent's answer *about* the item, never a change to it, and
+            # leaving it would make a refusing agent look like a working one.
+            refusal = _take_refusal(tree)
             diff = run_git(tree, "diff", "HEAD")
             if not diff.strip() and not run_git(tree, "status", "--porcelain").strip():
-                outcome.reason = "the agent made no changes"
-                self._emit(record, "no_changes", session_id=session.id)
-                outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
+                # Nobody has judged this item and nobody can: the agent is
+                # telling us the brief is wrong, or it left without saying
+                # anything at all. Both need a person to read them, and
+                # neither is worth spending an attempt to discover twice.
+                outcome.reason = refusal or (
+                    "the agent made no changes and left no reason; "
+                    f"read session {session.id} before retrying"
+                )
+                self._emit(
+                    record,
+                    "refused_as_impossible" if refusal else "no_changes",
+                    detail=outcome.reason,
+                    session_id=session.id,
+                )
+                outcome.stop = Stop(
+                    ESCALATED,
+                    ITEM_IMPOSSIBLE if refusal else NO_TARGET,
+                    detail=outcome.reason,
+                    state=BLOCKED,
+                    consumes_attempt=False,
+                )
                 return outcome
             outcome.stages.append("changes")
 

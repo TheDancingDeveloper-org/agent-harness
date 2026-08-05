@@ -84,13 +84,24 @@ from .graph import (
 #: treating it as one would fill the backlog with the document's structure.
 ID = r"[A-Z][A-Z0-9]{0,7}-?\d{1,4}(?:\.\d{1,3})*"
 
+#: What an item produces. `code` is a diff, judged by the checks and a reviewer
+#: reading that diff. `findings` is an answer \u2014 a feasibility verdict, a
+#: comparison, a recommendation \u2014 where there may be nothing to commit, and
+#: where an empty worktree is the expected shape rather than a failure.
+#:
+#: Two kinds, not a taxonomy. A third would need a third review rubric and a
+#: third definition of done, and neither exists yet.
+CODE = "code"
+FINDINGS = "findings"
+DELIVERABLES = (CODE, FINDINGS)
+
 _SEP = r"[:.)\s\u2010-\u2015-]+"
 _HEADING = re.compile(rf"^(#{{2,6}})\s+({ID}){_SEP}\s*(.+?)\s*$")
 _PLAIN_HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _CHECKBOX = re.compile(rf"^\s*[-*]\s+\[( |x|X)\]\s+(?:({ID}){_SEP}\s*)?(.+?)\s*$")
 _TABLE_ROW = re.compile(rf"^\|\s*({ID})\s*\|(.+)$")
 _META = re.compile(
-    r"^\s*(labels?|milestone|phase|depends[ _-]?on|size|risk|verify)\s*:\s*(.+?)\s*$",
+    r"^\s*(labels?|milestone|phase|depends[ _-]?on|size|risk|verify|deliverable)\s*:\s*(.+?)\s*$",
     re.IGNORECASE,
 )
 _TABLE_SEP = re.compile(r"^\|[\s:|-]+\|$")
@@ -122,6 +133,14 @@ class WorkItem:
     verification: list[str] | None = None
     #: Line number in the source plan, so a reader can find it again.
     line: int = 0
+    #: What this item produces, from `deliverable:`. `code` is the default and
+    #: means a diff. `findings` means the answer *is* the output — "is X
+    #: feasible", "compare these three approaches" — and there may be nothing
+    #: to commit at all.
+    #:
+    #: **The item declares this; the agent never chooses it.** Otherwise the
+    #: first hard test failure becomes an essay about why the test was wrong.
+    deliverable: str = CODE
 
     def brief(self) -> str:
         """What an agent is told to do. The title alone is rarely enough;
@@ -465,6 +484,14 @@ def _apply_metadata(item: WorkItem) -> None:
             item.depends_on.extend(_split(value))
         elif key in ("size", "risk"):
             item.labels.append(f"{key}:{value.lower()}")
+        elif key == "deliverable":
+            kind = value.strip().lower()
+            if kind not in DELIVERABLES:
+                raise ValueError(
+                    f"item {item.id} deliverable must be one of {', '.join(DELIVERABLES)}, "
+                    f"not {value.strip()!r}"
+                )
+            item.deliverable = kind
         elif key == "verify":
             try:
                 argv = json.loads(value)

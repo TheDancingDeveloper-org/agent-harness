@@ -6,6 +6,8 @@ parser that finds three items in a fifty-item plan looks like it worked.
 
 from __future__ import annotations
 
+import pytest
+
 from agent_harness.plan import parse_plan
 
 PLAN = """\
@@ -235,3 +237,33 @@ depends on: P0.1
     )
     assert plan.items[1].depends_on == ["P0.1"]
     assert plan.unresolved_dependencies() == {}
+
+
+# ---------------------------------------- what an item says it produces
+
+
+def test_an_item_declares_what_it_produces() -> None:
+    """#182. The plan says it; the agent never chooses it, or the first hard
+    test failure becomes an essay about why the test was wrong."""
+    from agent_harness.plan import CODE, FINDINGS
+
+    plan = parse_plan(
+        "### T1 — Compare three approaches\n\n"
+        "Which of tsnet, a sidecar or the host daemon fits.\n\n"
+        "deliverable: findings\n\n"
+        "### T2 — Implement the chosen one\n\n"
+        "Ordinary work.\n"
+    )
+
+    items = {i.id: i for i in plan.items}
+    assert items["T1"].deliverable == FINDINGS
+    assert items["T2"].deliverable == CODE, "the default is a diff, as it always was"
+    # Bookkeeping is removed from the brief: an agent should read the
+    # specification, not the metadata.
+    assert "deliverable:" not in items["T1"].brief()
+
+
+def test_an_unrecognised_deliverable_is_refused() -> None:
+    """Two kinds, not a taxonomy. A third needs a third review rubric."""
+    with pytest.raises(ValueError, match="deliverable must be one of"):
+        parse_plan("### T1 — A thing\n\ndeliverable: interpretive dance\n")

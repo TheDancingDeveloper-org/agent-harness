@@ -193,11 +193,22 @@ def parse_proposal(text: str, revision: int, now: float, feedback: str | None = 
     )
 
 
-def render_plan(proposal: Proposal, name: str) -> str:
+def render_plan(proposal: Proposal, name: str, *, phases_as_items: bool = True) -> str:
     """A proposal as a PLAN.md the existing parser can read.
 
     Headings use the `### T1 — Title` shape the parser recognises, so the
     generated plan goes through exactly the same path as a hand-written one.
+
+    **`phases_as_items` decides whether a phase heading is itself work.** A
+    heading of `## P0 Upgrade` matches the parser's item pattern, because `P0`
+    is a well-formed id, so by default each phase becomes an item as well as a
+    container. That is deliberate for `inception` — real hand-written plans do
+    track phases as issues, and a generated plan should behave like one.
+
+    It is wrong for a plan meant to be executed straight away. The phase item's
+    brief is the phase's *rationale* — "because we need the runtime current" —
+    which is not a specification, and an agent that claims it is being asked to
+    implement a reason. `survey` therefore passes False.
     """
     out: list[str] = [f"# {name}", ""]
     if proposal.goal:
@@ -231,7 +242,13 @@ def render_plan(proposal: Proposal, name: str) -> str:
     out += ["## Work", ""]
     for phase in proposal.phases:
         title = phase.get("title") or phase.get("id") or "Phase"
-        out += [f"## {phase.get('id', '')} {title}".strip(), ""]
+        if phases_as_items:
+            out += [f"## {phase.get('id', '')} {title}".strip(), ""]
+        else:
+            # "Phase" first: the word cannot start an id, so the heading stays
+            # readable and stops matching the item pattern.
+            marker = f"Phase {phase['id']} — " if phase.get("id") else "Phase — "
+            out += [f"## {marker}{title}".rstrip(), ""]
         if phase.get("why"):
             out += [str(phase["why"]), ""]
         for item in phase.get("items") or []:

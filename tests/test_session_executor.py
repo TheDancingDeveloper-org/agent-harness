@@ -20,12 +20,15 @@ from agent_harness.executor import Checks, is_disk_exhaustion
 from agent_harness.model_client import ModelClient, Response, RetryExhausted, Route
 from agent_harness.outcomes import (
     BLOCKED,
+    COMPLETED,
     ESCALATED,
     ITEM_IMPOSSIBLE,
     NEEDS_A_PERSON,
     NO_TARGET,
 )
+from agent_harness.plan import FINDINGS
 from agent_harness.session_executor import (
+    FINDINGS_FILE,
     REFUSAL_FILE,
     REFUSAL_LIMIT,
     AgentSpec,
@@ -869,3 +872,127 @@ def test_a_refusal_lands_in_blocked_not_failed(repo: Path, tmp_path: Path) -> No
     item = queue.get("W1")
     assert item is not None
     assert item.state == BLOCKED
+
+
+# ------------------------------- an item whose deliverable is an answer
+
+
+def answer(text: str) -> Callable[[Path], None]:
+    """An agent given a question, which writes the answer and changes nothing."""
+
+    def agent(tree: Path) -> None:
+        (tree / FINDINGS_FILE).write_text(text)
+
+    return agent
+
+
+def add_question(queue: WorkQueue, item_id: str = "W1") -> None:
+    queue.add(
+        [
+            WorkRecord(
+                item_id=item_id,
+                title="Is multiply feasible",
+                brief="Say whether calc.py can support exact decimal arithmetic.",
+                deliverable=FINDINGS,
+            )
+        ]
+    )
+
+
+def test_a_findings_item_completes_on_its_answer(repo: Path, tmp_path: Path) -> None:
+    """The whole of #182: an investigation is finished when it has an answer.
+
+    Before this, a findings item left a clean tree, hit the clean-tree path,
+    and was recorded `escalated / no_target` — a completed investigation was
+    indistinguishable from an agent that did nothing.
+    """
+    found = "calc.py uses floats throughout (calc.py:1). Decimal would need a new module."
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=answer(found)))
+    add_question(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.state == DONE, outcome.reason
+    assert outcome.stop is not None
+    assert outcome.stop.disposition == COMPLETED
+    assert found in outcome.reason
+
+
+def test_the_answer_is_not_committed(repo: Path, tmp_path: Path) -> None:
+    """The answer is the item's result, not a change to the repository."""
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=answer("no, and here is why")))
+    add_question(queue)
+
+    executor.run_once()
+
+    assert git(repo, "log", "--oneline", "main..harness/w1").strip() == ""
+    assert not (tmp_path / "trees" / "W1" / FINDINGS_FILE).exists()
+
+
+def test_a_findings_item_is_told_what_to_produce(repo: Path, tmp_path: Path) -> None:
+    seen: list[str] = []
+
+    def read_prompt(tree: Path) -> None:
+        seen.append((tree / ".harness-prompt.md").read_text())
+        (tree / FINDINGS_FILE).write_text("an answer")
+
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=read_prompt))
+    add_question(queue)
+    executor.run_once()
+
+    assert FINDINGS_FILE in seen[0]
+    assert "deliverable is an answer, not a change" in seen[0]
+    # Its checks cannot apply, and saying so beats describing gates that will
+    # never run against a change it is told not to make.
+    assert "changes no code" in seen[0]
+
+
+def test_a_code_item_is_told_none_of_that(repo: Path, tmp_path: Path) -> None:
+    """The default is unchanged: an ordinary item never hears about findings."""
+    seen: list[str] = []
+
+    def read_prompt(tree: Path) -> None:
+        seen.append((tree / ".harness-prompt.md").read_text())
+        add_multiply(tree)
+
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=read_prompt))
+    add_item(queue)
+    executor.run_once()
+
+    assert FINDINGS_FILE not in seen[0]
+
+
+def test_a_refusal_still_wins_over_an_answer(repo: Path, tmp_path: Path) -> None:
+    """ "This question cannot be answered here" is an escalation, whatever the
+    item was asked to produce."""
+
+    def refuse_the_question(tree: Path) -> None:
+        (tree / FINDINGS_FILE).write_text("a half-hearted guess")
+        (tree / REFUSAL_FILE).write_text("the module this asks about does not exist")
+
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=refuse_the_question))
+    add_question(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.stop is not None
+    assert outcome.stop.disposition == ESCALATED
+    assert outcome.stop.reason_kind == ITEM_IMPOSSIBLE
+
+
+def test_a_findings_item_that_answers_nothing_still_needs_a_person(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Asked for an answer, given nothing, and not told why. That is the
+    clean-tree case exactly, and it belongs there."""
+    executor, queue = build(repo, tmp_path, FakeDevEnv())
+    add_question(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.stop is not None
+    assert outcome.stop.disposition == ESCALATED
+    assert outcome.state == BLOCKED

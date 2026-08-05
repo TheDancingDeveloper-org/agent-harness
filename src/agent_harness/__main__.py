@@ -409,6 +409,7 @@ def _run(args: argparse.Namespace) -> int:
 
     from .executor import Checks, ContextPolicy, Executor
     from .github import GitHub
+    from .holds import fanout, webhook_hook
     from .model_client import Chain, ModelClient, chains_from_map
     from .work import RUNNING, WorkQueue, WorkRecord
 
@@ -573,6 +574,14 @@ def _run(args: argparse.Namespace) -> int:
                 "telemetry: --otel was passed but no OTEL_EXPORTER_OTLP_ENDPOINT is set, "
                 "so nothing is exported and nothing else changes"
             )
+
+    # A question now says so, once, instead of waiting to be discovered by a
+    # poll (#188). The stream is always a consumer; the webhook is the one
+    # thing an operator configures. Neither can reach the item: `holds.fanout`
+    # drops what either of them raises.
+    queue.holds.on_hold = fanout(emit, webhook_hook(args.hold_webhook))
+    if args.hold_webhook:
+        print(f"holds: notices POSTed to {args.hold_webhook}")
 
     from .api import ROLE_MAP_KEY
 
@@ -1326,6 +1335,16 @@ def main(argv: list[str] | None = None) -> int:
         "--events", type=Path, default=Path("events.jsonl"), help="where to append the event stream"
     )
     p_run.add_argument(
+        "--hold-webhook",
+        default=os.environ.get("HARNESS_HOLD_WEBHOOK", ""),
+        metavar="URL",
+        help="POST a JSON notice here when an item stops to ask a person something "
+        "(or $HARNESS_HOLD_WEBHOOK). One URL is the whole configuration: what is on "
+        "the other end is not this service's business. Delivery is best-effort and "
+        "can never fail or stall the item — without it the question is still in "
+        "`GET /api/holds` and the event stream.",
+    )
+    p_run.add_argument(
         "--artifacts",
         type=Path,
         default=None,
@@ -1567,6 +1586,15 @@ def main(argv: list[str] | None = None) -> int:
         help="where the fleet appends its event stream. Defaults to events.jsonl beside --db.",
     )
     p_serve.add_argument(
+        "--hold-webhook",
+        default=os.environ.get("HARNESS_HOLD_WEBHOOK", ""),
+        metavar="URL",
+        help="POST a JSON notice here when an item stops to ask a person something "
+        "(or $HARNESS_HOLD_WEBHOOK). One URL is the whole configuration; the receiver "
+        "decides what a question means to it. Delivery is best-effort and can never "
+        "fail or stall the item.",
+    )
+    p_serve.add_argument(
         "--no-push", action="store_true", help="commit locally but do not push or open PRs"
     )
     p_serve.add_argument(
@@ -1650,6 +1678,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from .api import create_api
     from .audit import open_audit_store
+    from .holds import webhook_hook
     from .maintenance import DEFAULT_RETENTION_DAYS, MaintenanceLoop
     from .work import WorkQueue
 
@@ -1682,7 +1711,12 @@ def main(argv: list[str] | None = None) -> int:
     # Started here rather than left to cron: retention that depends on an
     # external scheduler silently stops when nobody installs it, and the
     # symptom is a database that grows for months before anyone notices.
-    queue_for_serve = WorkQueue(args.db)
+    # Configured before the fleet exists, because the operator's hook is the
+    # one consumer that does not depend on this deployment being supervised.
+    # `_fleet_for_serve` adds the event stream to it when there is one.
+    queue_for_serve = WorkQueue(args.db, on_hold=webhook_hook(args.hold_webhook))
+    if args.hold_webhook:
+        print(f"holds: notices POSTed to {args.hold_webhook}")
     maintenance = MaintenanceLoop(
         audit,
         retention_days=int(os.environ.get("HARNESS_AUDIT_RETENTION_DAYS", DEFAULT_RETENTION_DAYS)),
@@ -1755,6 +1789,7 @@ def _fleet_for_serve(
     from .events import KINDS, MODEL_CALL, Event
     from .fleet import Fleet
     from .github import GitHub
+    from .holds import fanout
     from .model_client import Chain, ModelClient, chains_from_map, effective_routes
     from .runtime import ExecutorRoles, session_executor_factory
     from .session_executor import AgentSpec
@@ -1871,6 +1906,11 @@ def _fleet_for_serve(
             )
         except Exception:  # telemetry is never load-bearing
             log.warning("audit: could not append live event", exc_info=True)
+
+    # The question goes into the same stream as the work it stopped, next to
+    # whatever the operator already configured (#188). Composed rather than
+    # replaced, so `--hold-webhook` keeps working in a supervised deployment.
+    queue.holds.on_hold = fanout(emit, queue.holds.on_hold)
 
     reviewer_client = ModelClient(
         roles=routes,

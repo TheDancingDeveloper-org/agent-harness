@@ -418,13 +418,16 @@ and no `--repo` (line-wrapped here to fit the page):
 ```
 project widgets: proposed
 repository /home/you/widgets
-3 plan item(s); 2 proposed as already delivered; 0 needing a human decision
+3 plan item(s); 2 proposed as already delivered (1 unconfirmed); 0 needing a
+  human decision
   W1 -> done  [proposed done]
       explicit/done: the plan item is checked
       would create queue row item W1 in project widgets: insert as done if this
         drop is approved, otherwise pending
-  W2 -> done  [proposed done]
-      runnable/passed: `python -m unittest -q tests.test_serials` succeeded
+  W2 -> pending  [possible drop, unconfirmed: droppable only if a human names it]
+      runnable/passed: `python -m unittest -q tests.test_serials` exited 0,
+        which says the command did not fail; it does not say the command
+        tested anything
       would create queue row item W2 in project widgets: insert as done if this
         drop is approved, otherwise pending
   W3 -> pending
@@ -449,8 +452,16 @@ Three rungs, in this order, and every rung that ran stays in the report:
 | Rung | What it is | What it can do |
 |---|---|---|
 | **explicit** | The plan item is checked, or a closed issue / merged PR names the item id exactly. | Propose a drop. |
-| **runnable** | The item's own `verify:` command exits 0. | Propose a drop. |
+| **runnable** | The item's own `verify:` command exits 0. | **Offer** a drop. On its own it proposes nothing — see below. |
 | **judged** | The `assessor` role says `done`, `partial` or `not_started`, with citations. | Propose a drop, and only with citations. |
+
+**An exit code is not a rung on its own.** A `verify:` that exits 0 has not
+failed; that is not the same fact as "the work is there", because in most test
+runners a name filter that matches nothing passes. So a passing `verify:`
+proposes `done` only when a second rung agrees — explicit evidence, or an
+assessor `done` with citations. Alone, the item is listed as a drop you *may*
+approve, marked `unconfirmed`, and it stays `pending` if you say nothing.
+[How to write one that fails when the work is absent](#verify--how-an-item-proves-it-is-already-done).
 
 **A proposal is not a decision.** Nothing enters the queue as `done` unless a
 human names it:
@@ -466,8 +477,9 @@ way and needs a reason: `--reject "W2 is not finished"` or `--revise "..."`.
 
 Uncertainty always resolves downwards. Two equally-good candidates for one
 item, an assessor that says `done` and cites nothing, an assessor whose route
-is down, or a `verify:` command that ran and *failed* while the assessor said
-`done` — all of them come back as work to do, flagged for a human.
+is down, a `verify:` command that ran and *failed* while the assessor said
+`done`, or a `verify:` that passed with nothing to corroborate it — all of them
+come back as work to do, flagged for a human.
 
 ### What it will and will not touch outside the harness
 
@@ -549,8 +561,10 @@ verify: ["python", "-m", "pytest", "-q", "tests/test_serials.py::test_duplicate"
 A **JSON array of argv strings**, never shell text. `adopt` runs it in the
 repository under exactly the same rules as a project check — fixed argv, no
 shell, a timeout (`--verify-timeout`, defaulting to the project-check
-timeout) — and an exit code of 0 is evidence that this item's work already
-exists.
+timeout) — and an exit code of 0 is *one* piece of evidence that this item's
+work already exists. On its own it never drops the item: read the next
+paragraph for why, because it is the reason the word "one" is doing work
+there.
 
 | | |
 |---|---|
@@ -572,18 +586,26 @@ verify: ["cargo", "test", "-p", "gateway", "secure_cookies"]
 
 That looks like "the test for this item passes". On a tree where the item has
 not been done, the test does not exist, `cargo test` runs zero tests and exits
-`0` — and adoption reports:
+`0`. `pytest -k`, `go test -run` and `npm test -- -t` behave the same way;
+`pytest path::name` is the exception, exiting 4 when the name is absent.
+
+The harness cannot tell those apart, and deliberately will not try: reading
+another ecosystem's output to guess how many tests it ran is exactly what an
+adapter is for, and a wrong guess here **drops work that is then never done**.
+What it does instead is refuse to decide on that one fact. Adoption reports:
 
 ```
-R2 -> done  [proposed done]
-    runnable/passed: `cargo test -p gateway secure_cookies` succeeded
+R2 -> pending  [possible drop, unconfirmed: droppable only if a human names it]
+    runnable/passed: `cargo test -p gateway secure_cookies` exited 0, which
+      says the command did not fail; it does not say the command tested
+      anything
 ```
 
-`pytest -k`, `go test -run` and `npm test -- -t` behave the same way;
-`pytest path::name` is the exception, exiting 4 when the name is absent. The
-harness cannot tell the difference, and deliberately will not try: reading
-another ecosystem's output to guess what it meant is exactly what an adapter is
-for, and a wrong guess here **drops work that is then never done**.
+The item is offered to `--approve-drop R2` — you may know the command is a
+real one — but nothing proposes it, and approving the report without naming it
+leaves the work to do. A second rung changes that: an assessor `done` with
+citations, or a closed issue naming the item, and the drop is proposed
+outright.
 
 So before trusting a `verify:`, run it on a tree where the item is *not*
 finished and confirm it fails. A command that asserts a fact about the tree —
@@ -1622,6 +1644,50 @@ durable stage.
   for ever — a hold keeps its claim, so unlike the budgets its default is
   deliberately **not** unlimited.
 
+#### Being told, instead of thinking to look
+
+A hold used to be durable and completely silent (#188): every route to one was
+a pull, so an item could sit on a thirty-second question overnight while every
+dashboard read healthy.
+
+Opening a hold now emits one notice — into the event stream the run already
+writes, and to one URL you name:
+
+```bash
+uv run agent-harness --db harness.sqlite serve --hold-webhook https://your-host/holds
+# or: HARNESS_HOLD_WEBHOOK=https://your-host/holds
+```
+
+```json
+{"kind": "work", "outcome": "hold_opened", "ts": 1754000000.0,
+ "project_id": "default", "item_id": "T4", "worker": "worker-1",
+ "question": "Which database should this use?",
+ "reason": "the schema is not decided",
+ "who_may_answer": "anyone", "expires_at": 1754021600.0,
+ "session_url": "https://…/t/abc",
+ "answer_path": "/api/work/T4/answer?project_id=default",
+ "detail": "T4 is waiting on a person: Which database should this use?"}
+```
+
+Three things about it are deliberate.
+
+- **It is not a notification system.** One URL, one POST, no retries and no
+  queue. What is on the other end — a session host that already has push
+  notifications, a chat relay you wrote, a log file — is not this service's
+  business, and adding a product here would be the coupling `AGENTS.md`
+  forbids.
+- **A failed delivery is dropped, never raised.** It cannot fail the item,
+  stall it, or un-hold it. This is the rule telemetry already follows, for the
+  same reason: the fleet must not depend on it.
+- **It carries no resume token.** `answer_path` says where the answer goes;
+  spending it is an authenticated call to the API, which looks the token up
+  itself.
+
+Configure nothing and nothing changes: the inbox is still `GET /api/holds`, and
+`GET /api/summary` reports `holds_open` plus a `holds_overdue` entry for any
+question still open past its own deadline — a status line that reads healthy
+while one of those exists is exactly the failure this closes.
+
 ---
 
 ## Configuration reference
@@ -1632,6 +1698,7 @@ durable stage.
 | `HARNESS_DB` | all | SQLite path. Default `./harness.sqlite`. |
 | `HARNESS_API_KEY` | `run`, `serve` | Key for the model provider. In `serve` it is the reviewer's. |
 | `HARNESS_ENDPOINT` | `run`, `serve` | Model API base URL. |
+| `HARNESS_HOLD_WEBHOOK` | `run`, `serve` | URL POSTed a JSON notice when an item stops to ask a person something (`--hold-webhook`). Unset means nothing is sent and the pull routes are unchanged. Delivery is best-effort: it can never fail or stall the item. |
 | `HARNESS_ROUTE_PRESET` | `run`, `serve` | Default route preset (`--preset`) for roles that name none: the wire protocol, the authentication header, the response reader and a failure classifier, as one name. Default `chat-completions`. |
 | `HARNESS_ROUTE_PRESETS` | all | Extra presets to make resolvable, as `name=module:attribute` pairs. For a preset that lives in your own code rather than in an installed distribution's entry points. |
 | `HARNESS_CONTEXT_BUDGET` | `run` | The most characters of repository the implementer may be shown (`--context-budget`, default 60000). A file bigger than this cannot be supplied at all — see [§6a.1](#6a1-when-the-target-does-not-fit-in-the-prompt). A ceiling, not a target. |

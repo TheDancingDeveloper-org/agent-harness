@@ -8,9 +8,11 @@ from pathlib import Path
 import pytest
 
 from agent_harness.graph import ResolverOutcome
+from agent_harness.outcomes import BLOCKED
 from agent_harness.work import (
     CLAIMED,
     DONE,
+    FAILED,
     PENDING,
     WorkQueue,
     WorkRecord,
@@ -329,3 +331,85 @@ def test_settings_are_shared_across_processes(tmp_path: Path) -> None:
 
 def test_an_unset_setting_is_none_not_an_error(queue: WorkQueue) -> None:
     assert queue.get_setting("nope") is None
+
+
+# ------------------------------- a rewritten brief revives a stalled item
+
+
+def _stalled(tmp_path: Path, state: str, *, brief: str = "the brief") -> WorkQueue:
+    """An item the queue has stopped, ready for a plan re-sync to land on."""
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue.add([WorkRecord(item_id="R7", title="t", brief=brief)])
+    queue.set_control("running")
+    queue.claim(owner="w")
+    queue.release("R7", state, owner="w", error="cannot be done as specified")
+    return queue
+
+
+def test_a_rewritten_brief_returns_a_blocked_item_to_pending(tmp_path: Path) -> None:
+    """The second half of the refusal loop (#178).
+
+    An agent refuses an item as impossible, a human rewrites it in response,
+    and until this the rewrite was inert: the brief updated, the item stayed
+    put, and the next run said "nothing to do".
+    """
+    queue = _stalled(tmp_path, BLOCKED)
+
+    queue.add([WorkRecord(item_id="R7", title="t", brief="an achievable thing instead")])
+
+    item = queue.get("R7")
+    assert item is not None
+    assert item.state == PENDING
+    assert item.brief == "an achievable thing instead"
+    # Feeding the old refusal to the next attempt would be telling it not to
+    # repeat a fault it can no longer commit.
+    assert not item.last_error
+
+
+def test_a_rewritten_brief_also_revives_a_failed_item(tmp_path: Path) -> None:
+    queue = _stalled(tmp_path, FAILED)
+
+    queue.add([WorkRecord(item_id="R7", title="t", brief="something else entirely")])
+
+    item = queue.get("R7")
+    assert item is not None
+    assert item.state == PENDING
+
+
+def test_an_unchanged_brief_leaves_a_failed_item_where_it_was(tmp_path: Path) -> None:
+    """A routine re-sync must not un-fail work, and a better title is not an answer."""
+    queue = _stalled(tmp_path, FAILED)
+
+    queue.add([WorkRecord(item_id="R7", title="a better title", brief="the brief")])
+
+    item = queue.get("R7")
+    assert item is not None
+    assert item.state == FAILED
+    assert item.title == "a better title"
+    assert item.last_error == "cannot be done as specified"
+
+
+def test_whitespace_alone_is_not_a_rewrite(tmp_path: Path) -> None:
+    """Re-parsing a plan must not revive an item because a newline moved."""
+    queue = _stalled(tmp_path, FAILED)
+
+    queue.add([WorkRecord(item_id="R7", title="t", brief="  the brief\n")])
+
+    item = queue.get("R7")
+    assert item is not None
+    assert item.state == FAILED
+
+
+def test_rewriting_the_brief_of_finished_work_does_not_unfinish_it(tmp_path: Path) -> None:
+    """`done` is not stalled, and editing a description is not a reason to redo it."""
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue.add([WorkRecord(item_id="R1", title="t", brief="the brief")])
+    queue.set_control("running")
+    queue.claim(owner="w")
+    queue.release("R1", DONE, owner="w")
+
+    queue.add([WorkRecord(item_id="R1", title="t", brief="a completely different brief")])
+
+    item = queue.get("R1")
+    assert item is not None
+    assert item.state == DONE

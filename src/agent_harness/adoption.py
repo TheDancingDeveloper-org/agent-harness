@@ -25,8 +25,17 @@ nothing else is dropped. Uncertainty — competing candidates, a judgement
 without citations, a verification that failed — biases towards `not_started`.
 
 **Prior harness attempts are evidence, not authority.** An item the queue has
-already failed keeps its attempts, its error and its event history. Adoption
-reports the prior failure so a human can decide; it never rewrites it.
+already failed keeps its attempts and its event history. Adoption reports the
+prior failure so a human can decide; it never overrules it.
+
+**Except when the question changed.** A refresh that **rewrites an item's
+brief** returns it to `pending` from `failed` or `blocked`, and clears the
+error with it. The attempt that failed was made against wording that no longer
+exists, so keeping the verdict records a decision about a question nobody is
+asking. This is the second half of the loop that lets an agent refuse an
+impossible item: without it, a human who rewrites the item in response is told
+"nothing to do" (#178). Nothing else moves state — a changed title, label or
+dependency leaves it exactly where it was.
 """
 
 from __future__ import annotations
@@ -44,7 +53,7 @@ from .executor import Checks
 from .github import MARKER, GitHub
 from .outcomes import ESCALATE, RETRY
 from .plan import ParsedPlan, WorkItem
-from .work import CLAIMED, DONE, PENDING, Project, WorkQueue, WorkRecord
+from .work import CLAIMED, DONE, PENDING, Project, WorkQueue, WorkRecord, revives
 
 #: The lifecycle of one adoption (proposal §5.1). `rejected` and `revise` are
 #: the two ways out of `proposed` that do not mutate anything.
@@ -183,6 +192,9 @@ class AdoptionItem:
     #: What the queue already says about this item, if anything. Adoption
     #: reports it rather than overwriting it.
     queue_state: str | None = None
+    #: The brief the queue is holding, so the report can tell a re-sync that
+    #: changes nothing from one that rewrites the item.
+    queue_brief: str | None = None
     proposed_state: str = PENDING
     evidence: list[Evidence] = field(default_factory=list)
     candidates: list[ExternalCandidate] = field(default_factory=list)
@@ -582,6 +594,7 @@ class Adoption:
             brief=item.brief(),
             depends_on=list(item.depends_on),
             queue_state=existing.state if existing else None,
+            queue_brief=existing.brief if existing else None,
             candidates=list(candidates),
         )
 
@@ -700,8 +713,19 @@ class Adoption:
                 ProposedMutation(
                     kind="refresh queue row",
                     target=f"item {result.item_id} in project {project_id}",
+                    # The report used to say `R7 -> pending` in its heading and
+                    # `state stays failed` in this line, which is the report
+                    # contradicting itself two lines apart. Say what will
+                    # happen: a rewritten brief revives a stalled item, and
+                    # nothing else moves it.
                     detail=(
-                        f"update title, brief and dependencies; state stays {result.queue_state}"
+                        "update title, brief and dependencies; "
+                        + (
+                            f"the brief changed, so state returns to pending "
+                            f"from {result.queue_state}"
+                            if revives(result.queue_state or "", result.queue_brief, result.brief)
+                            else f"state stays {result.queue_state}"
+                        )
                     ),
                 )
             )

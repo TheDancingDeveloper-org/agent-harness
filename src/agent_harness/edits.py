@@ -147,6 +147,47 @@ def _reindented(text: str, needle: str) -> tuple[int, int, str] | None:
     return start, end, " " * shift if shift > 0 else ""
 
 
+def _nearest(text: str, needle: str, span: int = 6) -> str:
+    """The file's own text where the SEARCH nearly matched, quoted back.
+
+    A failed match tells the model it was wrong and nothing more, so the retry
+    is another guess at text it has already misremembered. Measured on rdpapp:
+    the same item failed this way on three consecutive attempts, each time on
+    a block whose *first* line was present and whose later lines were not.
+
+    Quoting the real text turns an unactionable refusal into a correction. The
+    model does not have to remember the file -- it is being shown it.
+
+    Deliberately bounded, and deliberately silent when there is nothing useful
+    to say: a guess at the wrong place, quoted confidently, would be worse
+    than no hint at all.
+    """
+    want = [line.strip() for line in needle.split("\n") if line.strip()]
+    have = text.split("\n")
+    if not want:
+        return ""
+    stripped = [line.strip() for line in have]
+    try:
+        anchor = stripped.index(want[0])
+    except ValueError:
+        return " No line of it matches the file; check the path and re-read the file."
+
+    # How far the model got before diverging, so the message can say where.
+    matched = 0
+    for offset, wanted in enumerate(want):
+        if anchor + offset >= len(stripped) or stripped[anchor + offset] != wanted:
+            break
+        matched = offset + 1
+
+    window = have[anchor : anchor + max(len(want), span)]
+    quoted = "\n".join(window)
+    return (
+        f" Its first {matched} line(s) match at line {anchor + 1}, then it diverges. "
+        f"The file actually contains, from that point:\n{quoted}\n"
+        f"Reproduce that text exactly in SEARCH."
+    )
+
+
 @dataclass(frozen=True)
 class Edit:
     """One exact-text replacement in one file."""
@@ -263,8 +304,7 @@ def plan_edits(root: Path, edits: list[Edit]) -> dict[str, tuple[str, str]]:
                 if loose is None:
                     raise EditError(
                         f"{where}: the SEARCH text does not occur in the file as whole "
-                        f"lines, even ignoring indentation. It must reproduce the "
-                        f"existing text exactly."
+                        f"lines, even ignoring indentation." + _nearest(current, search)
                     )
                 start, end, shift = loose
                 shifted = "\n".join(

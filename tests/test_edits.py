@@ -314,3 +314,28 @@ def test_several_edits_to_one_file_render_one_file_diff(tmp_path: Path) -> None:
     diff = to_diff(tmp_path, [Edit("lib.rs", "a", "A"), Edit("lib.rs", "l", "L")])
     assert diff.count("--- a/lib.rs") == 1, "one file, one header"
     assert "+A\n" in diff and "+L\n" in diff
+
+
+def test_a_failed_match_quotes_the_file_back(tmp_path: Path) -> None:
+    """A refusal the model cannot act on produces another guess.
+
+    Measured on rdpapp: the same item failed three consecutive attempts on a
+    block whose first line was present and whose later lines were not. The
+    model was told it was wrong and never told what the file says, so each
+    retry re-guessed text it had already misremembered.
+    """
+    target = tmp_path / "lib.rs"
+    target.write_text("fn keep() {\n    let real = 1;\n    let other = 2;\n}\n")
+    with pytest.raises(EditError) as raised:
+        apply_edits(tmp_path, [Edit("lib.rs", "fn keep() {\n    let imagined = 1;", "x")])
+    message = str(raised.value)
+    assert "line 1" in message, "it should say where the divergence starts"
+    assert "let real = 1;" in message, "the file's own text must be quoted back"
+    assert "Reproduce that text exactly" in message
+
+
+def test_a_search_matching_nothing_at_all_says_so_plainly(tmp_path: Path) -> None:
+    """No anchor means quoting a location would be inventing one."""
+    (tmp_path / "lib.rs").write_text("fn keep() {}\n")
+    with pytest.raises(EditError, match="No line of it matches"):
+        apply_edits(tmp_path, [Edit("lib.rs", "fn absent() {}", "x")])

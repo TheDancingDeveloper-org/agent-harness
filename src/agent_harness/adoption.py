@@ -65,6 +65,7 @@ from typing import Any, Protocol
 
 from .executor import Checks
 from .github import MARKER, GitHub
+from .guard import CommandRefused
 from .outcomes import ESCALATE, RETRY
 from .plan import CODE, ParsedPlan, WorkItem
 from .work import CLAIMED, DONE, PENDING, Project, WorkQueue, WorkRecord, revives
@@ -827,7 +828,16 @@ class Adoption:
         """
         checks = Checks(commands=[list(argv)], timeout=self.verify_timeout)
         rendered = " ".join(argv)
-        result = checks.run(self.repository)
+        try:
+            result = checks.run(self.repository)
+        except CommandRefused as exc:
+            # `verify:` is argv read out of a document, and a document is
+            # something a model writes. The guard refuses it before it runs;
+            # adoption reports that as `unavailable` — the verification did not
+            # happen, so it is not evidence the work was done, and adoption's
+            # existing rule that uncertainty resolves to "still to do" carries
+            # it the rest of the way. Nothing is dropped on a refused check.
+            return Evidence(kind=RUNNABLE, outcome="unavailable", detail=exc.refusal.detail)
         if result.ok:
             # Say what happened, not what it means. "succeeded" was read by
             # every reader -- human and report -- as "the work is there", and

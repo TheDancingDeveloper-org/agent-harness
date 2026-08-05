@@ -49,6 +49,7 @@ from .budgets import WALL_CLOCK as BUDGET_WALL_CLOCK
 from .budgets import Budget, BudgetExceeded, Spend, budget_for
 from .budgets import check as budget_check
 from .graph import LOCAL_WORK
+from .guard import CommandGuard, CommandRefused, guard_field
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
 from .outcomes import (
     BUDGET_EXHAUSTED,
@@ -1277,6 +1278,11 @@ class Checks:
     - **Never silent.** Every fix that runs is recorded on the result as an
       `AppliedFix` naming the paths it rewrote, is emitted as an event, and is
       stated to the reviewer. See `review_checks_prompt`.
+    - **Refused by the deployment's policy, like any other command.** `guard`
+      screens the check argv and the fix argv both, before either subprocess
+      exists. That is a different question from the confinement above — it is
+      "is this deployment willing to run this at all?" — and it is terminal
+      rather than an escalation. See `guard.py`.
 
     **What is not enforceable, stated plainly:** the harness cannot tell a
     formatter from a test runner. `apply_fixes` is off by default, is per
@@ -1289,6 +1295,12 @@ class Checks:
 
     commands: Sequence[Sequence[str]] = ()
     timeout: float = 900.0
+    #: What this deployment will not run, and the boundary it will not run
+    #: outside. Screened here rather than at configuration time because a check
+    #: command is not always something an operator typed: `verify:` in a plan is
+    #: argv, and a plan is a document a model may have written. A refusal raises
+    #: `CommandRefused` — see `guard.py` for why it is not a check outcome.
+    guard: CommandGuard = guard_field()
     #: `command index or program name -> argv that is believed to clear it`.
     #: Declared by the caller, because only the caller knows that
     #: `ruff format` fixes what `ruff format --check` reports. Always recorded
@@ -1312,6 +1324,11 @@ class Checks:
         """One gate, asked once. The classification, and nothing else."""
         argv = list(command)
         label = " ".join(argv)
+        # Before the subprocess exists, not after it has done something. Here
+        # rather than in `run`, so every path that asks a gate a question --
+        # the first pass, a post-fix re-run, and the re-run of the gates a fix
+        # invalidated -- is screened by the same call.
+        self.guard.enforce(argv, cwd=repo)
         try:
             result = subprocess.run(  # noqa: S603 - caller-supplied argv, no shell
                 argv,
@@ -1412,6 +1429,17 @@ class Checks:
                 ),
                 None,
             )
+        # A declared fix is argv the harness runs on an item's behalf, so the
+        # deployment's refusal list applies to it exactly as it applies to a
+        # check. It is screened *after* `unconfined_argument` on purpose: that
+        # is the narrower, more specific gate, it already answers the "reaches
+        # outside the tree" question for a fix with its own message, and a
+        # second answer to a question already answered would be two policies
+        # disagreeing. What the guard adds here is the dimension #155 cannot
+        # see at all -- `sudo`, a force push, a program this deployment has
+        # named -- none of which is a path, and none of which a formatter
+        # needs. A hit is terminal, like every other refusal.
+        self.guard.enforce(argv, cwd=repo)
         before = worktree_tree_id(repo)
         if not before:
             # Without git there is no way to say what the fix changed, and an
@@ -2164,6 +2192,42 @@ class Executor:
                 partial.stop = stop
                 return partial
             return Outcome(record.item_id, BLOCKED, reason=exc.detail, stop=stop)
+        except CommandRefused as exc:
+            # Refused by policy, and that is the last word on this item (owner
+            # decision, 2026-08-05). It is caught here, above the generic
+            # handler, so it lands as `blocked_by_policy` with the rule that
+            # fired rather than as `crashed / worker_error` — which is exactly
+            # the "unexplained failure" this guard exists to avoid being.
+            refusal = exc.refusal
+            self._emit(
+                record,
+                "command_blocked",
+                detail=refusal.detail,
+                error_class=refusal.reason_kind,
+                evidence={"rule": refusal.rule},
+            )
+            self.queue.attempts_log.flush(self.durability)
+            self._persist_spend(record)
+            stop = refusal.stop()
+            partial = self._partial_for(record)
+            self.queue.release(
+                record.item_id,
+                stop.state,
+                error=refusal.detail,
+                branch=partial.branch if partial else None,
+                pr_url=partial.pr_url if partial else None,
+                owner=self.owner,
+                consume_attempt=stop.consumes_attempt,
+                disposition=stop.disposition,
+                reason_kind=stop.reason_kind,
+                project_id=self.project_id,
+            )
+            if partial is not None:
+                partial.state = stop.state
+                partial.reason = refusal.detail
+                partial.stop = stop
+                return partial
+            return Outcome(record.item_id, stop.state, reason=refusal.detail, stop=stop)
         except RetryExhausted as exc:
             self._emit(record, "retry_exhausted", detail=str(exc), error_class=exc.kind)
             self.queue.attempts_log.flush(self.durability)

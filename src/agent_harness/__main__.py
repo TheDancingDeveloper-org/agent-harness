@@ -223,6 +223,56 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0 if report.ok else 1
 
 
+def _guard(args: argparse.Namespace) -> int:
+    """Show or set what this deployment refuses to run.
+
+    Configuration, not code: what must never run here is a property of the
+    machine, the credentials on its disk and the people sharing its remote —
+    none of which this framework can know. The built-in default is deliberately
+    tiny and names nothing belonging to any workload.
+
+    Printing is the default action because the common question is "what is in
+    force?", and a command that changes policy by accident is worse than one
+    that has to be asked twice.
+    """
+    from .guard import DEFAULT_REFUSALS, GUARD_KEY, CommandGuard
+    from .work import WorkQueue
+
+    queue = WorkQueue(args.db)
+    if args.clear:
+        queue.set_setting(GUARD_KEY, None)
+        print("command guard policy cleared; the built-in default is in force")
+        print("doctor now reports the guard as NOT CONFIGURED, which is what it is")
+        return 0
+
+    changing = bool(args.refuse) or args.no_defaults or args.no_confine
+    if changing:
+        guard = CommandGuard(
+            refusals=tuple(args.refuse),
+            defaults=not args.no_defaults,
+            confine=not args.no_confine,
+            configured=True,
+        )
+        queue.set_setting(GUARD_KEY, guard.as_settings())
+    else:
+        guard = CommandGuard.from_settings(queue.get_setting(GUARD_KEY))
+
+    print(f"command guard: {guard.describe()}")
+    print(f"  configured by this deployment: {'yes' if guard.configured else 'no'}")
+    for pattern in guard.refusals:
+        print(f"  refuse  {pattern}")
+    if guard.defaults:
+        for pattern in DEFAULT_REFUSALS:
+            print(f"  refuse  {pattern}   (built-in default)")
+    if not guard.active:
+        print("  NOTHING IS REFUSED. Every command a plan or a check names will run.")
+    print(
+        "A refused command is terminal for its item: it stops in `blocked` with "
+        "disposition `blocked_by_policy`, and is never retried."
+    )
+    return 0
+
+
 def _graph(args: argparse.Namespace) -> int:
     """Inspect, back up or rebuild the dependency graph.
 
@@ -409,6 +459,7 @@ def _run(args: argparse.Namespace) -> int:
 
     from .executor import Checks, ContextPolicy, Executor
     from .github import GitHub
+    from .guard import GUARD_KEY, CommandGuard
     from .holds import fanout, webhook_hook
     from .model_client import Chain, ModelClient, chains_from_map
     from .work import RUNNING, WorkQueue, WorkRecord
@@ -516,7 +567,12 @@ def _run(args: argparse.Namespace) -> int:
         )
         print(f"loaded {added} new items from {args.plan}")
 
-    checks = Checks(commands=[shlex.split(c) for c in args.check])
+    # The deployment's refusal list, read from the database rather than from
+    # this command's flags: it governs every worker in this deployment, and a
+    # policy that depended on which flags one operator typed would be a policy
+    # that varies per terminal. `agent-harness guard` writes it.
+    guard = CommandGuard.from_settings(queue.get_setting(GUARD_KEY))
+    checks = Checks(commands=[shlex.split(c) for c in args.check], guard=guard)
     # This project's counts, not the rollup. `--project` decides which queue
     # this run works, so a cross-project total here would report items no
     # worker in this process can claim.
@@ -747,6 +803,7 @@ def _run(args: argparse.Namespace) -> int:
             args.work,
             agent=AgentSpec(command=tuple(shlex.split(args.agent))),
             checks=checks,
+            guard=guard,
             reviewer=client,
             github=GitHub(args.repo) if args.repo else None,
             base_branch=args.base,
@@ -1316,6 +1373,45 @@ def main(argv: list[str] | None = None) -> int:
         help="model API base url for --probe-models (or $HARNESS_ENDPOINT)",
     )
 
+    p_guard = sub.add_parser(
+        "guard",
+        help="show or set the commands this deployment refuses to run",
+        description="What the harness will not run on an agent's behalf. With no "
+        "arguments it prints the current policy and changes nothing. A refusal is "
+        "TERMINAL for the item that triggers it (owner decision, 2026-08-05): the "
+        "command is blocked, the item stops in `blocked` with disposition "
+        "`blocked_by_policy`, and it is never handed back to the agent to retry.",
+    )
+    p_guard.add_argument(
+        "--refuse",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="a command pattern to refuse, e.g. --refuse 'sh -c'. The first word "
+        "matches the program (by basename too), the rest match anywhere in its "
+        "arguments. Repeatable; together they REPLACE this deployment's list.",
+    )
+    p_guard.add_argument(
+        "--no-defaults",
+        action="store_true",
+        help="drop the built-in default refusals. They are small and generic "
+        "(privilege escalation, host lifecycle, force push) and dropping them is a "
+        "deliberate widening.",
+    )
+    p_guard.add_argument(
+        "--no-confine",
+        action="store_true",
+        help="allow a guarded command to name paths outside the item's worktree. "
+        "This is the boundary that makes ~/.ssh, /etc and `rm -rf /` unreachable; "
+        "turning it off is a deliberate widening.",
+    )
+    p_guard.add_argument(
+        "--clear",
+        action="store_true",
+        help="forget this deployment's policy. The built-in default returns, and "
+        "doctor goes back to reporting the guard as NOT CONFIGURED.",
+    )
+
     p_run = sub.add_parser("run", help="execute claimed work items")
     p_run.add_argument(
         "--repo",
@@ -1635,6 +1731,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         return _doctor(args)
+
+    if args.command == "guard":
+        return _guard(args)
 
     if args.command == "graph":
         return _graph(args)

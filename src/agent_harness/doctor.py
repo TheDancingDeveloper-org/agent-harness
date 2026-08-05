@@ -194,6 +194,45 @@ def _redaction_finding() -> Finding:
     )
 
 
+def _guard_finding(stored: Any = None) -> Finding:
+    """Whether any command policy is in force, and whether anybody chose it.
+
+    Said in the same voice as reviewer independence and GitHub mutation: it
+    reports what would happen, in both directions, rather than only complaining.
+
+    **An unconfigured guard is reported as not configured, never as a pass.**
+    The built-in default is in force and it does refuse things — but nobody in
+    this deployment decided what must never run here, and reading `ok` against
+    a policy nobody wrote is exactly the false comfort this module's second rule
+    forbids. A guard nobody enabled is not a guard.
+    """
+    from .guard import DEFAULT_REFUSALS, CommandGuard
+
+    guard = CommandGuard.from_settings(stored)
+    if not guard.active:
+        return Finding(
+            "command guard",
+            FAIL,
+            "every refusal is switched off: the harness will run any command a plan, a "
+            "check or $HARNESS_AGENT_COMMAND names, anywhere on this filesystem",
+        )
+    if not guard.configured:
+        return Finding(
+            "command guard",
+            WARN,
+            "not configured — the built-in default is in force "
+            f"({guard.describe()}: {', '.join(DEFAULT_REFUSALS)}), and it knows nothing "
+            "about what THIS deployment must never run. `agent-harness guard --refuse "
+            "PATTERN` writes a policy; until then nobody has chosen one.",
+        )
+    return Finding(
+        "command guard",
+        OK,
+        f"{guard.describe()}"
+        + (f"; configured: {', '.join(guard.refusals)}" if guard.refusals else ""),
+    )
+
+
 def environment_findings() -> list[Finding]:
     return [
         _git_finding(),
@@ -530,9 +569,13 @@ NEEDED_ROLES = ("planner", "implementer", "reviewer")
 def diagnose(queue: Any, projects: list[Any], *, ask: Any = None) -> Report:
     """The whole report. Reads; never writes."""
     from .api import ROLE_MAP_KEY
+    from .guard import GUARD_KEY
     from .model_client import routes_from_map
 
     report = Report(environment=environment_findings())
+    # Deployment-wide, like the role map: the worktrees, the host and the
+    # credentials on disk are shared by every project in one database.
+    report.environment.append(_guard_finding(queue.get_setting(GUARD_KEY)))
     stored = queue.get_setting(ROLE_MAP_KEY) or {}
 
     for project in projects:

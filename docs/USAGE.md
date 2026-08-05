@@ -115,6 +115,7 @@ environment
   ?     gh cli: gh at /usr/bin/gh; whether it can WRITE is not checked here …
   ok    route presets: resolvable by name: chat-completions, claw-bay, generic
   ok    dependency resolvers: declared: github-issue
+  warn  command guard: not configured — the built-in default is in force …
 
 project demo
   ok    checkout: /home/you/demo/repo
@@ -142,6 +143,38 @@ usable in a script. `--json` gives the same report machine-readably.
 filesystem and installed package metadata. `--probe-models` opts into the one
 question that needs a network, and needs `HARNESS_API_KEY` and `--endpoint` to
 do it. A `?` is never a pass — it is a thing nobody has checked.
+
+### 0a.2 Say what this machine must never be asked to run
+
+An item's work happens in a real worktree on a real filesystem, and the argv the
+harness executes on an item's behalf is not always something you typed: a plan's
+`verify:` line is argv, and a plan is a document a model may have written.
+
+```console
+$ agent-harness --db harness.sqlite guard --refuse 'sh -c' --refuse 'aws s3 rm'
+command guard: 12 refusal pattern(s); paths confined to the item's tree
+  configured by this deployment: yes
+  refuse  sh -c
+  refuse  aws s3 rm
+  refuse  sudo   (built-in default)
+  …
+A refused command is terminal for its item: it stops in `blocked` with
+disposition `blocked_by_policy`, and is never retried.
+```
+
+Two rules, both deterministic and neither asking a model to co-operate: a
+**refusal list**, matched against argv however the command is spelled, and a
+**path boundary** — an argument naming anything outside the item's worktree is
+refused, which is what puts `~/.ssh`, `/etc` and `rm -rf /` out of reach.
+
+Until you run this, `doctor` reports the guard as `warn … not configured`. The
+built-in default is small, generic and in force regardless, but nobody in this
+deployment chose it, and a guard nobody enabled is not a guard.
+
+**It is screening, not a sandbox.** It bounds the commands *the harness* runs;
+it cannot see what an agent types inside its own session — that is the session
+host's isolation to own — and it cannot read inside `sh -c '…'`, which is one
+opaque token to it. Add the interpreter to your own list if that matters here.
 
 `doctor` and `preflight` overlap on purpose and share their probes, so the
 report cannot disagree with the gate that actually refuses a start. What

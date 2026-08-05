@@ -26,7 +26,7 @@ import socket
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -491,6 +491,7 @@ class WorkQueue:
         *,
         resolvers: Mapping[str, Resolver] | None = None,
         durability: str = DEFAULT_DURABILITY,
+        on_hold: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.path = path
         self.lease_seconds = lease_seconds
@@ -506,7 +507,10 @@ class WorkQueue:
         #: Items waiting on a person. Same file for the same reason: a
         #: question that can vanish independently of the item it is about is a
         #: question somebody answers into nothing.
-        self.holds = Holds(self._connect, now=now)
+        #: `on_hold` is told once, when a question is opened, so a held item
+        #: is not something only a poll can discover (#188). Delivery cannot
+        #: reach the item: see `holds.deliver`.
+        self.holds = Holds(self._connect, now=now, on_hold=on_hold)
         self._migrate()
         with self._connect() as conn:
             conn.executescript(SCHEMA)

@@ -77,6 +77,7 @@ from .schemas import (
     MaintenanceResult,
     NewBaseline,
     OpenQuestion,
+    OverdueHold,
     PlanItem,
     PlanParseResult,
     PlanSyncRequest,
@@ -1742,6 +1743,12 @@ def create_api(
             for event in store.recent(kind="work", limit=200)
             if event["outcome"] == "waiting_for_input"
         ]
+        # Deliberately NOT swept first, unlike `/api/holds`. Sweeping here
+        # would expire the very holds this is meant to show and the field
+        # would read empty for ever — the status line looking healthy while
+        # an item waits is the thing #188 is about.
+        now = queue.now() if queue else time.time()
+        overdue = queue.holds.due(now) if queue else []
         return Summary(
             running=counts.get(CLAIMED, 0),
             pending=counts.get(PENDING, 0),
@@ -1755,6 +1762,18 @@ def create_api(
                     session_url=e["data"].get("session_url"),
                 )
                 for e in waiting[:5]
+            ],
+            holds_open=len(queue.holds.open_holds()) if queue else 0,
+            holds_overdue=[
+                OverdueHold(
+                    project_id=hold.project_id,
+                    item_id=hold.item_id,
+                    question=hold.question,
+                    age_seconds=round(hold.age(now), 1),
+                    overdue_seconds=round(max(0.0, now - hold.expires_at), 1),
+                    session_url=hold.session_url,
+                )
+                for hold in overdue
             ],
         )
 

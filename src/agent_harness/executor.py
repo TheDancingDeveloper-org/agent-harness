@@ -48,6 +48,7 @@ from .budgets import SPEND as BUDGET_SPEND
 from .budgets import WALL_CLOCK as BUDGET_WALL_CLOCK
 from .budgets import Budget, BudgetExceeded, Spend, budget_for
 from .budgets import check as budget_check
+from .edits import EditError, parse_edits, to_diff
 from .graph import LOCAL_WORK
 from .guard import CommandGuard, CommandRefused, guard_field
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
@@ -1652,7 +1653,7 @@ Files in this repository:
 """
 
 IMPLEMENT_PROMPT = """\
-Implement this change and reply with a unified diff and nothing else.
+Implement this change and reply with edit blocks and nothing else.
 
 {brief}
 
@@ -1662,8 +1663,28 @@ Your plan:
 Repository context:
 {context}
 {unavailable}{checks}{guidance}{prior}
-Reply with a single unified diff (`diff --git` / `---` / `+++` / `@@`) that
-applies cleanly at the repository root. No commentary outside the diff.
+Reply with one or more edit blocks, in this exact form:
+
+path/to/file.ext
+<<<<<<< SEARCH
+the exact existing text to find
+=======
+the exact text to put in its place
+>>>>>>> REPLACE
+
+Rules, each of which is refused rather than guessed at:
+
+- SEARCH must reproduce the existing text **exactly**, including indentation,
+  and must match whole lines.
+- SEARCH must appear exactly once in that file. If the text you want appears
+  more than once, include more surrounding lines until it is unique.
+- To create a new file, leave SEARCH empty.
+- Give a separate block for each place you change. Several blocks may name the
+  same file; they are applied in the order you write them.
+
+Do not write a unified diff. Do not compute line numbers -- the harness works
+them out from the text you name, which is the point: a miscounted hunk header
+loses the whole item, and there is nothing here to miscount.
 """
 
 #: Supporting targets the budget could not carry. Named rather than silently
@@ -2721,11 +2742,8 @@ class Executor:
             ),
         )
         outcome.stages.append("implement")
-        diff = extract_diff(reply)
-        if not diff:
-            self._emit(record, "no_diff")
-            outcome.reason = "the implementer returned no diff"
-            outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
+        diff = self._changes_from(record, outcome, reply)
+        if diff is None:
             return outcome
         log.record(
             self.project_id,
@@ -2739,6 +2757,58 @@ class Executor:
         return self._from_diff(
             record, outcome, planner, diff, base, stacked_on, resume, log, attempt, mode
         )
+
+    def _changes_from(self, record: WorkRecord, outcome: Outcome, reply: str) -> str | None:
+        """The diff this reply describes, however the model chose to say it.
+
+        Edit blocks are what the implementer is now asked for, because a
+        unified diff makes it compute `@@ -401,7 +401,12 @@` blind and one
+        miscount loses the item. Measured on rdpapp, 2026-08-05: two items in
+        one run, both refused for hunk headers disagreeing with their bodies,
+        neither for misunderstanding the task.
+
+        The blocks are turned into a diff **here**, from file content the
+        harness has read, so every gate downstream is untouched -- the patch
+        validator, the apply ladder, the checks, the reviewer and the commit
+        all still see a diff, and none of them learns a second way for changes
+        to arrive.
+
+        A unified diff is still accepted. Models that ignore the instruction,
+        a `--implementer` pointed at something with its own habits, and every
+        durable attempt recorded before this change all still work; refusing
+        them would turn a format preference into an outage.
+        """
+        blocks = parse_edits(reply)
+        if blocks:
+            try:
+                diff = to_diff(self.repo, blocks)
+            except EditError as exc:
+                # The model named text that is not there, or named it
+                # ambiguously. Both are its mistake and cost an attempt --
+                # and unlike a bad hunk header, the reason can be said back
+                # to it plainly enough to be fixed next time.
+                self._emit(record, "edits_rejected", detail=str(exc))
+                outcome.reason = f"the implementer's edits could not be applied: {exc}"
+                outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
+                return None
+            if diff:
+                self._emit(record, "edits_parsed", detail=f"{len(blocks)} edit block(s)")
+                return diff
+            # Well-formed, and changes nothing: every SEARCH already equals its
+            # REPLACE. Reported as no change rather than as a broken patch,
+            # because that is what it is.
+            self._emit(record, "no_diff", detail="edit blocks that change nothing")
+            outcome.reason = "the implementer's edits change nothing"
+            outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
+            return None
+
+        extracted = extract_diff(reply)
+        if not extracted:
+            self._emit(record, "no_diff")
+            outcome.reason = "the implementer returned no diff"
+            outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
+            return None
+        return extracted
 
     def _from_diff(
         self,

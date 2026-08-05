@@ -89,16 +89,39 @@ def test_an_empty_search_creates_a_file(tmp_path: Path) -> None:
     assert (tmp_path / "new/deep/file.rs").read_text() == "fn main() {}\n"
 
 
-def test_indentation_must_match(tmp_path: Path) -> None:
-    """Whitespace is part of the text. A near-miss is a miss.
+def test_a_uniform_indentation_shift_is_tolerated_when_it_is_unique(tmp_path: Path) -> None:
+    """A model that named the right lines and mis-indented them has not guessed.
 
-    Being lenient here would mean guessing which of several similar lines the
-    model meant, which is the ambiguity this format exists to remove.
+    Refusing this costs an item for a mistake with no ambiguity in it, which
+    was the dominant failure once hunk arithmetic was removed. The replacement
+    is shifted to match the file, so the result keeps the file's indentation
+    rather than the model's.
     """
     target = tmp_path / "lib.rs"
-    target.write_text("    indented = 1\n")
+    target.write_text("fn a() {\n    let x = 1;\n    let y = 2;\n}\n")
+    apply_edits(tmp_path, [Edit("lib.rs", "let x = 1;\nlet y = 2;", "let x = 9;\nlet y = 8;")])
+    assert target.read_text() == "fn a() {\n    let x = 9;\n    let y = 8;\n}\n"
+
+
+def test_a_shift_is_refused_when_it_could_mean_two_places(tmp_path: Path) -> None:
+    """Uniqueness is not relaxed. Two candidates is still not a location."""
+    target = tmp_path / "lib.rs"
+    target.write_text("fn a() {\n    call();\n}\nfn b() {\n        call();\n}\n")
+    with pytest.raises(EditError, match="does not occur|occurs 2 times"):
+        apply_edits(tmp_path, [Edit("lib.rs", "call();", "other();")])
+    assert target.read_text().count("other();") == 0
+
+
+def test_a_changed_shape_is_refused_not_reindented(tmp_path: Path) -> None:
+    """Lines must move together, or it is a different shape, not a shift.
+
+    Here the model's block has both lines flush; the file nests the second.
+    Accepting that would be choosing an indentation nobody wrote.
+    """
+    target = tmp_path / "lib.rs"
+    target.write_text("    if x {\n            y();\n")
     with pytest.raises(EditError, match="does not occur"):
-        apply_edits(tmp_path, [Edit("lib.rs", "indented = 1", "indented = 2")])
+        apply_edits(tmp_path, [Edit("lib.rs", "if x {\ny();", "if x {\nz();")])
 
 
 # ------------------------------------------------------------ refusing

@@ -96,6 +96,57 @@ def _occurrences(text: str, needle: str) -> list[int]:
     return found
 
 
+def _reindented(text: str, needle: str) -> tuple[int, int, str] | None:
+    """One region matching `needle` ignoring how far each line is indented.
+
+    Returns `(start, end, indent_delta)` for a **unique** match, else None.
+
+    Why this is not the guessing the exact matcher refuses. A model that
+    reproduces the right lines but shifts them all by two spaces has named a
+    location correctly and formatted it wrongly; refusing that costs an item
+    for a mistake with no ambiguity in it. What is still refused is anything
+    with a *choice* in it: the stripped lines must correspond one for one, the
+    relative shape must be preserved (every line moves by the same amount),
+    and it must match in exactly one place. Two candidates is still not a
+    location, and is still refused.
+
+    Blank lines are compared as blank regardless of trailing whitespace,
+    because an editor stripping it is not a difference anybody means.
+    """
+    want = needle.split("\n")
+    have = text.split("\n")
+    if not want:
+        return None
+    stripped = [line.strip() for line in want]
+
+    hits: list[int] = []
+    for first in range(len(have) - len(want) + 1):
+        window = have[first : first + len(want)]
+        if [line.strip() for line in window] != stripped:
+            continue
+        # Every line must move by the same amount, or this is a different
+        # shape wearing the same words -- which is a choice, so it is refused.
+        deltas = {
+            len(line) - len(line.lstrip()) - (len(w) - len(w.lstrip()))
+            for line, w in zip(window, want, strict=True)
+            if line.strip()
+        }
+        if len(deltas) == 1:
+            hits.append(first)
+
+    if len(hits) != 1:
+        return None
+    first = hits[0]
+    shift = next(
+        len(line) - len(line.lstrip()) - (len(w) - len(w.lstrip()))
+        for line, w in zip(have[first : first + len(want)], want, strict=True)
+        if line.strip()
+    )
+    start = sum(len(line) + 1 for line in have[:first])
+    end = start + sum(len(line) + 1 for line in have[first : first + len(want)]) - 1
+    return start, end, " " * shift if shift > 0 else ""
+
+
 @dataclass(frozen=True)
 class Edit:
     """One exact-text replacement in one file."""
@@ -192,21 +243,34 @@ def plan_edits(root: Path, edits: list[Edit]) -> dict[str, tuple[str, str]]:
             pending[target] = edit.replace
         else:
             search = edit.search.rstrip("\n")
+            replace = edit.replace.rstrip("\n")
             at = _occurrences(current, search)
-            if not at:
-                raise EditError(
-                    f"{where}: the SEARCH text does not occur in the file as whole lines. "
-                    f"It must match exactly, including indentation."
-                )
             if len(at) > 1:
                 raise EditError(
                     f"{where}: the SEARCH text occurs {len(at)} times and is therefore not a "
                     f"location. Include enough surrounding lines to make it unique."
                 )
-            cut = at[0]
-            pending[target] = (
-                current[:cut] + edit.replace.rstrip("\n") + current[cut + len(search) :]
-            )
+            if at:
+                cut = at[0]
+                pending[target] = current[:cut] + replace + current[cut + len(search) :]
+            else:
+                # Exact match failed. Before refusing, allow the one difference
+                # that carries no ambiguity: the same lines, uniquely located,
+                # indented differently. The replacement is shifted by the same
+                # amount so the result keeps the file's own indentation rather
+                # than the model's.
+                loose = _reindented(current, search)
+                if loose is None:
+                    raise EditError(
+                        f"{where}: the SEARCH text does not occur in the file as whole "
+                        f"lines, even ignoring indentation. It must reproduce the "
+                        f"existing text exactly."
+                    )
+                start, end, shift = loose
+                shifted = "\n".join(
+                    (shift + line) if line.strip() else line for line in replace.split("\n")
+                )
+                pending[target] = current[:start] + shifted + current[end:]
 
         if edit.path not in order:
             order.append(edit.path)

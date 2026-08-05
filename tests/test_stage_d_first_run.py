@@ -376,9 +376,28 @@ def test_doctor_is_read_only(tmp_path: Path) -> None:
         """
         return sorted(p.name for p in where.iterdir() if not p.name.endswith(("-wal", "-shm")))
 
+    def content_of(db: Path) -> str:
+        """Everything the database holds, as SQL.
+
+        Not the file's bytes. Opening a WAL-mode database and closing it
+        checkpoints the log into the main file and allocates pages, so the
+        bytes change with no logical change at all -- measured on an untouched
+        `main`: 12,288 bytes before, 126,976 after, and a full dump identical.
+        The byte comparison therefore failed on every branch including `main`
+        itself, and said nothing about whether `doctor` had changed anything.
+
+        This asserts what the test is actually named for: that `doctor`
+        changes no data. It is stronger than the byte check in the way that
+        matters, because a dump that differs is a real difference.
+        """
+        import sqlite3
+
+        with sqlite3.connect(db) as conn:
+            return "\n".join(conn.iterdump())
+
     target = tmp_path / "demo"
     assert main(["init", "--demo", "--into", str(target)]) == 0
-    before = (target / "queue.sqlite").read_bytes()
+    before = content_of(target / "queue.sqlite")
     listing = listing_of(target)
 
     queue = WorkQueue(str(target / "queue.sqlite"))
@@ -386,7 +405,7 @@ def test_doctor_is_read_only(tmp_path: Path) -> None:
     diagnose(queue, queue.projects())
 
     assert listing_of(target) == listing
-    assert (target / "queue.sqlite").read_bytes() == before
+    assert content_of(target / "queue.sqlite") == before
 
 
 def test_doctor_blocks_and_exits_nonzero_when_the_checkout_is_gone(tmp_path: Path) -> None:

@@ -210,6 +210,11 @@ def run_git(repo: Path, *args: str, check: bool = True) -> str:
 #: cannot be worked on at all until it is raised, and no number chosen here is
 #: right for every project. `run --context-budget` and `HARNESS_CONTEXT_BUDGET`
 #: set it.
+#:
+#: It is a **ceiling**: raising it so one large target fits does not enlarge
+#: what every other item is shown, because selection stops when relevance runs
+#: out rather than when the budget does, and the surroundings are bounded
+#: separately by `ContextPolicy.fallback_allowance`.
 DEFAULT_CONTEXT_BUDGET = 60_000
 
 #: Why a file was left out, as tokens rather than prose. The difference is
@@ -218,6 +223,21 @@ DEFAULT_CONTEXT_BUDGET = 60_000
 #: is about to be asked to edit something it cannot see.
 TARGET_OVER_BUDGET = "named target exceeds remaining content budget"
 BUDGET_SPENT = "content budget exhausted"
+
+#: Why a *fallback* file was left out while the budget still had room. The
+#: budget is a ceiling, not a quota to spend: a file sharing no term with the
+#: brief, the plan or a target path — and not sitting beside one — buys the
+#: implementer nothing, and paying for it on every item is money for nothing.
+#: Measured on an imported repository: 299,985 of a 300,000-character budget
+#: spent on an item whose entire change was one line, the padding being
+#: lockfiles and a vendored patch directory.
+NO_RELEVANCE = "no term in common with the brief, the plan or a target path"
+
+#: Why a relevant fallback file was still left out. The ceiling has to be
+#: raised to whatever the largest *target* in a repository needs (#150); the
+#: surroundings do not become more useful because it was, so they keep an
+#: allowance of their own.
+FALLBACK_ALLOWANCE_SPENT = "surrounding-context allowance spent"
 
 #: What a coordinator says that a worker should act on. `decision` is absent
 #: because that is what an **escalation** is recorded as, addressed to an
@@ -369,6 +389,20 @@ class ContextPolicy:
 
     budget: int = DEFAULT_CONTEXT_BUDGET
     generated_paths: tuple[str, ...] = ()
+    #: How much of the ceiling the *surroundings* may use. `None` means the
+    #: allowance the harness has always supplied — `DEFAULT_CONTEXT_BUDGET`,
+    #: clamped to the ceiling — which is a measured amount of behaviour rather
+    #: than a fraction invented here. A deployment that has measured how much
+    #: surrounding context improves its diffs sets its own; raising `budget`
+    #: so one large target fits never raises this on its own.
+    fallback_budget: int | None = None
+
+    @property
+    def fallback_allowance(self) -> int:
+        return min(
+            self.budget,
+            DEFAULT_CONTEXT_BUDGET if self.fallback_budget is None else self.fallback_budget,
+        )
 
 
 @dataclass(frozen=True)
@@ -383,6 +417,17 @@ class ContextSelection:
     omitted: tuple[tuple[str, str], ...]
     fallback_relevance: bool
     targets: tuple[PlannerTarget, ...]
+    #: What the budget was actually spent on, so an operator can see the
+    #: difference between context and padding rather than one total that is
+    #: always approximately the ceiling.
+    target_files: tuple[str, ...] = ()
+    fallback_files: tuple[str, ...] = ()
+    target_characters: int = 0
+    fallback_characters: int = 0
+    fallback_allowance: int = 0
+    #: Fallback candidates dropped for irrelevance while room remained. A
+    #: non-zero count is the ceiling behaving as a ceiling.
+    fallback_skipped: int = 0
 
 
 def parse_planner_result(reply: str) -> PlannerResult:
@@ -466,6 +511,23 @@ def _normalise_target(repo: Path, path: str) -> tuple[str | None, str | None]:
     return normalised, None
 
 
+def _terms(text: str) -> set[str]:
+    """Words a path and a brief can be compared on.
+
+    Deliberately generous in both directions: a component is kept whole *and*
+    split on the separators identifiers use, so `executor.py` matches a brief
+    that says "executor" and `main.tsx` matches one that says "main". Being
+    generous here is the conservative choice — this set decides what is worth
+    supplying, and the defect being fixed is padding, not selectivity.
+    """
+    found: set[str] = set()
+    for token in re.findall(r"[a-z0-9][a-z0-9_.-]*", text.lower()):
+        if len(token) > 2:
+            found.add(token)
+        found.update(part for part in re.split(r"[._-]+", token) if len(part) > 2)
+    return found
+
+
 def _configured_generated(path: str, configured: Sequence[str]) -> bool:
     candidate = Path(path)
     return any(
@@ -481,7 +543,21 @@ def select_repo_context(
     policy: ContextPolicy | None = None,
     ref: str | None = None,
 ) -> ContextSelection:
-    """Select target-first repository context and retain selection evidence."""
+    """Select target-first repository context and retain selection evidence.
+
+    The budget is a **ceiling, not a target**, and two rules keep it one.
+    Planner targets are supplied whole up to it, unchanged. The surroundings
+    stop when *relevance* runs out rather than when the budget does, and are
+    separately bounded by `ContextPolicy.fallback_allowance` — because a
+    ceiling raised so one 600 KB target fits (#150) says nothing about how
+    much padding the next one-line item deserves.
+
+    How much surrounding context actually improves a diff is unmeasured, and
+    no fraction of the ceiling is invented here to pretend otherwise: the
+    allowance defaults to the amount the harness has always supplied, and the
+    per-item evidence needed to answer the question properly is recorded in
+    `context_selected`.
+    """
     policy = policy or ContextPolicy()
     planner = planner or PlannerResult(
         plan="No structured planner result was supplied.",
@@ -539,30 +615,55 @@ def select_repo_context(
             *(f"{target.path} {target.reason}" for target in validated),
         ]
     ).lower()
-    terms = {term for term in re.findall(r"[a-z0-9][a-z0-9_.-]+", brief) if len(term) > 2}
+    terms = _terms(brief)
+    # A file sitting beside one the planner named is relevant whether or not
+    # its name happens to share a word: it is where that directory's
+    # conventions are written down, and it is the cheapest thing to be wrong
+    # about in the safe direction.
+    target_dirs = {path.rpartition("/")[0] for path in named}
+
+    def score(path: str) -> int:
+        return len(terms & _terms(path))
 
     def relevance(path: str) -> tuple[int, int, str]:
-        components = set(re.findall(r"[a-z0-9][a-z0-9_.-]+", path.lower()))
-        return (-len(terms & components), len(path), path)
+        return (-score(path), len(path), path)
 
-    fallback = sorted(
-        (
-            path
-            for path in tracked
-            if path not in named and not path.lower().endswith(_UNINTERESTING)
-        ),
-        key=relevance,
-    )
+    candidates = []
+    for path in tracked:
+        if path in named or path.lower().endswith(_UNINTERESTING):
+            continue
+        # Named ahead of relevance, so a deployment that told the harness a
+        # path is generated still reads that back rather than a weaker reason
+        # that happens to be true as well.
+        if _configured_generated(path, policy.generated_paths):
+            omitted.append((path, "configured generated artefact"))
+            continue
+        candidates.append(path)
+    candidates.sort(key=relevance)
+    fallback = [
+        path for path in candidates if score(path) > 0 or path.rpartition("/")[0] in target_dirs
+    ]
+    kept = set(fallback)
+    irrelevant = [path for path in candidates if path not in kept]
+    # The one case where padding is the safer answer: nothing was named and
+    # nothing matched, so there is no signal to select on. An implementer
+    # handed only a file listing writes a patch blind, which is the failure
+    # #146 was about — worse than paying for files it may not need.
+    if not fallback and not any(target.usable for target in validated):
+        fallback, irrelevant = candidates, []
+    omitted.extend((path, NO_RELEVANCE) for path in irrelevant)
 
     parts: list[str] = []
     supplied: list[str] = []
+    supplied_targets: list[str] = []
+    supplied_fallback: list[str] = []
+    target_characters = 0
+    fallback_characters = 0
+    allowance = policy.fallback_allowance
     spent = 0
     truncated = False
     for path in [*named, *fallback]:
         explicit = path in named
-        if not explicit and _configured_generated(path, policy.generated_paths):
-            omitted.append((path, "configured generated artefact"))
-            continue
         # Reading a worktree symlink follows it, which could turn an innocent
         # context selection into arbitrary access outside the repository. Git
         # stores the link target, not the pointed-to bytes; the implementer
@@ -583,9 +684,19 @@ def select_repo_context(
             truncated = True
             omitted.append((path, TARGET_OVER_BUDGET if explicit else BUDGET_SPENT))
             continue
+        if not explicit and fallback_characters + len(block) > allowance:
+            truncated = True
+            omitted.append((path, FALLBACK_ALLOWANCE_SPENT))
+            continue
         parts.append(block)
         supplied.append(path)
         spent += len(block)
+        if explicit:
+            supplied_targets.append(path)
+            target_characters += len(block)
+        else:
+            supplied_fallback.append(path)
+            fallback_characters += len(block)
 
     # Listing comes after file content and is bounded by the same budget. It
     # is orientation, not a reason to evict a file the planner named.
@@ -610,6 +721,12 @@ def select_repo_context(
         omitted=tuple(omitted),
         fallback_relevance=bool(fallback),
         targets=tuple(validated),
+        target_files=tuple(supplied_targets),
+        fallback_files=tuple(supplied_fallback),
+        target_characters=target_characters,
+        fallback_characters=fallback_characters,
+        fallback_allowance=allowance,
+        fallback_skipped=len(irrelevant),
     )
 
 
@@ -631,9 +748,11 @@ def repo_context(
 
     Files named in the brief come first and whole: they are the ones being
     edited, and a patch against a file the model has only seen the name of is
-    a patch written blind. The rest fills the remaining budget smallest-first,
-    on the grounds that many small files tell a model more about a codebase's
-    conventions than one large one.
+    a patch written blind. The rest is supplied most-relevant-first and
+    smallest-first within that, on the grounds that many small files tell a
+    model more about a codebase's conventions than one large one — and stops
+    at the point where a candidate has nothing in common with the item, which
+    is well before the budget in any repository large enough to matter.
 
     `ref` is the commit the patch will actually be applied to, and reading
     from it rather than the working tree is the whole point: the tree still
@@ -2132,8 +2251,22 @@ class Executor:
                         for target in context.targets
                     ],
                     "files": list(context.files),
+                    "target_files": list(context.target_files),
+                    "fallback_files": list(context.fallback_files),
                     "character_budget": context.budget,
                     "characters": context.characters,
+                    # What the ceiling was spent on. One total is always
+                    # approximately the budget and therefore says nothing;
+                    # this says how much of the prompt was the work and how
+                    # much was surroundings, which is the question an operator
+                    # asking "why did that item cost that much" has.
+                    "target_characters": context.target_characters,
+                    "fallback_characters": context.fallback_characters,
+                    "fallback_character_allowance": context.fallback_allowance,
+                    "listing_characters": (
+                        context.characters - context.target_characters - context.fallback_characters
+                    ),
+                    "fallback_skipped_irrelevant": context.fallback_skipped,
                     "truncated": context.truncated,
                     "omitted": [
                         {"path": path, "reason": reason} for path, reason in context.omitted

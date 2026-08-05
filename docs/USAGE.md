@@ -1448,6 +1448,29 @@ window, which the harness does not know and will not guess — a budget large
 enough to overflow it turns a working item into a provider error, so raise it
 deliberately rather than to the maximum.
 
+Raising it is safe for everything else, because **the budget is a ceiling and
+not a target**. Selection stops when relevance runs out: a file sharing no word
+with the brief, the plan or a target path — and not sitting beside one — is not
+supplied at all, however much room is left. The surroundings are also bounded
+separately from the ceiling:
+
+```bash
+agent-harness run --context-budget 700000 --context-fallback-budget 60000 …
+```
+
+`--context-fallback-budget` (or `$HARNESS_CONTEXT_FALLBACK_BUDGET`) defaults to
+60,000 — what the harness has always supplied — and is never more than
+`--context-budget`. Targets are unaffected by it and are still supplied whole.
+So one 612 KB file in one repository no longer taxes every trivial item in it:
+before this split, an item whose whole change was one line of `.gitignore` was
+measured spending 299,985 characters of a 300,000-character budget on a
+lockfile and a vendored patch directory.
+
+The `context_selected` event says where the characters went, so the trade is
+observable rather than asserted: `target_characters`, `fallback_characters`,
+`listing_characters`, `fallback_character_allowance` and
+`fallback_skipped_irrelevant`, alongside the files themselves.
+
 ### 6b. A check has five answers, not two
 
 `Checks` classifies **how the subprocess ended**, never what your project's
@@ -1678,7 +1701,8 @@ while one of those exists is exactly the failure this closes.
 | `HARNESS_HOLD_WEBHOOK` | `run`, `serve` | URL POSTed a JSON notice when an item stops to ask a person something (`--hold-webhook`). Unset means nothing is sent and the pull routes are unchanged. Delivery is best-effort: it can never fail or stall the item. |
 | `HARNESS_ROUTE_PRESET` | `run`, `serve` | Default route preset (`--preset`) for roles that name none: the wire protocol, the authentication header, the response reader and a failure classifier, as one name. Default `chat-completions`. |
 | `HARNESS_ROUTE_PRESETS` | all | Extra presets to make resolvable, as `name=module:attribute` pairs. For a preset that lives in your own code rather than in an installed distribution's entry points. |
-| `HARNESS_CONTEXT_BUDGET` | `run` | How many characters of repository the implementer is shown (`--context-budget`, default 60000). A file bigger than this cannot be supplied at all — see [§6a.1](#6a1-when-the-target-does-not-fit-in-the-prompt). |
+| `HARNESS_CONTEXT_BUDGET` | `run` | The most characters of repository the implementer may be shown (`--context-budget`, default 60000). A file bigger than this cannot be supplied at all — see [§6a.1](#6a1-when-the-target-does-not-fit-in-the-prompt). A ceiling, not a target. |
+| `HARNESS_CONTEXT_FALLBACK_BUDGET` | `run` | How much of that the *surroundings* — files the planner did not name — may use (`--context-fallback-budget`, default 60000, never more than the budget). Raising the budget for one large target does not raise this. |
 | `HARNESS_ROOT_PATH` | `serve` | Prefix when behind a proxy, e.g. `/api/harness`. |
 | `AIDEVENV_URL` | `run`, `serve` | Session host, enabling attachable agents. In `serve` it is what makes the deployment supervised rather than monitoring-only. |
 | `AIDEVENV_TOKEN` | `run`, `serve` | Session host token. |

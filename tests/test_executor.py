@@ -20,6 +20,8 @@ import pytest
 from agent_harness import providers as P
 from agent_harness.executor import (
     APPROVED,
+    FALLBACK_ALLOWANCE_SPENT,
+    NO_RELEVANCE,
     Checks,
     ContextPolicy,
     Executor,
@@ -1238,6 +1240,160 @@ diff --git a/SECURITY.md b/SECURITY.md
     assert (repo / "SECURITY.md").read_text().startswith("<!-- GPL header stays first -->")
 
 
+def _padding_repo(repo: Path) -> None:
+    """A repository shaped like the one #152 was measured on.
+
+    One tiny target, a handful of files that genuinely relate to the item, and
+    a great deal that does not: a lockfile and a vendored patch directory,
+    which is exactly what the observed run spent its budget on.
+    """
+    (repo / ".gitignore").write_text("node_modules/\n")
+    web = repo / "web"
+    web.mkdir()
+    (web / "index.html").write_text("<!doctype html><title>web</title>\n")
+    (web / "pnpm-lock.yaml").write_text("lockEntry: sha512-aaaa\n" * 12_000)
+    vendored = repo / "third_party" / "upstream-diffs"
+    vendored.mkdir(parents=True)
+    for index in range(40):
+        (vendored / f"{index:03}-upstream.patch").write_text("@@ -1 +1 @@\n-old\n+new\n" * 400)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "a repository with a lot that is beside the point")
+
+
+def test_the_context_budget_is_a_ceiling_not_a_quota_to_spend(repo: Path) -> None:
+    """The budget said how much to supply, not merely how much was allowed.
+
+    Measured on an imported repository: 299,985 characters of a 300,000
+    character budget went to an item whose whole change was one line, because
+    selection walked every tracked file in relevance order and stopped only
+    when the budget ran out. Since #150 the ceiling must be raised to hold the
+    largest file any item touches, so a padding rule tied to the ceiling makes
+    every trivial item cost what the hardest one does.
+
+    This fails without the fix: the old rule spends essentially the whole
+    budget here, and the assertion is that the new one spends a fraction of it
+    while still supplying the file the work is in.
+    """
+    _padding_repo(repo)
+    budget = 300_000
+    planner = PlannerResult(
+        plan="Add the build output directory to the ignore file.",
+        targets=(PlannerTarget(".gitignore", "the ignore rules live here"),),
+    )
+    record = WorkRecord(
+        item_id="T152",
+        title="Ignore the web build output",
+        brief="Add /web/dist/ to .gitignore so built assets are not committed.",
+    )
+
+    # What the old rule did, reproduced here so the difference is measured and
+    # not asserted: every candidate in relevance order until the budget went.
+    tracked = [path for path in git(repo, "ls-files").splitlines() if path.strip()]
+    old_spent = 0
+    for path in tracked:
+        block = f"--- {path} ---\n{(repo / path).read_text()}\n"
+        if old_spent + len(block) > budget:
+            continue
+        old_spent += len(block)
+    assert old_spent > budget * 0.9, "fixture no longer reproduces #152"
+
+    selected = select_repo_context(
+        repo, record, planner=planner, policy=ContextPolicy(budget=budget)
+    )
+
+    assert ".gitignore" in selected.files, "the file the work is in is still supplied whole"
+    assert selected.characters < budget // 10, (
+        f"{selected.characters} of {budget} characters: the ceiling is being spent, not respected"
+    )
+    assert not any(path.startswith("third_party/") for path in selected.files), (
+        "a vendored patch directory shares nothing with the item"
+    )
+    assert "web/pnpm-lock.yaml" not in selected.files
+    assert selected.fallback_skipped > 0, "the vendored patches were dropped for irrelevance"
+    # A lockfile under a directory the brief happens to name is *nominally*
+    # relevant, which is why relevance alone is not enough: the surroundings
+    # get an allowance that a ceiling raised for a large target does not lift.
+    assert ("web/pnpm-lock.yaml", FALLBACK_ALLOWANCE_SPENT) in selected.omitted
+    assert (
+        "third_party/upstream-diffs/000-upstream.patch",
+        NO_RELEVANCE,
+    ) in selected.omitted
+
+
+def test_a_ceiling_raised_for_one_item_does_not_enlarge_another(repo: Path) -> None:
+    """The two jobs one number was doing, separated.
+
+    #150 forces the ceiling up to whatever the largest target needs. If that
+    also decides how much padding a small item gets, one 612 KB file in one
+    repository taxes every other item in it forever. Selection must therefore
+    give the same answer at both ceilings.
+    """
+    _padding_repo(repo)
+    record = WorkRecord(
+        item_id="T152",
+        title="Ignore the web build output",
+        brief="Add /web/dist/ to .gitignore so built assets are not committed.",
+    )
+    planner = PlannerResult(
+        plan="Add the build output directory to the ignore file.",
+        targets=(PlannerTarget(".gitignore", "the ignore rules live here"),),
+    )
+
+    small = select_repo_context(repo, record, planner=planner, policy=ContextPolicy(budget=60_000))
+    large = select_repo_context(repo, record, planner=planner, policy=ContextPolicy(budget=900_000))
+
+    assert large.files == small.files
+    assert large.characters == small.characters, "a raised ceiling bought more prompt, not more fit"
+
+
+def test_a_file_beside_the_target_is_supplied_even_sharing_no_word(repo: Path) -> None:
+    """Under-filling is the risk the fix must not trade into.
+
+    A file in the same directory as the planner's target is where that
+    directory's conventions are written down, and its name need not share a
+    word with the brief to be worth showing. Excluding it would be the fix
+    starving an item of context it needs, which is worse than the padding.
+    """
+    package = repo / "svc"
+    package.mkdir()
+    (package / "widget.py").write_text("WIDGET = 1\n")
+    (package / "unrelated_sibling.py").write_text("SIBLING = 2\n")
+    (repo / "far_away.py").write_text("FAR = 3\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "a package")
+
+    selected = select_repo_context(
+        repo,
+        WorkRecord(item_id="T", title="Widget", brief="Change the widget."),
+        planner=PlannerResult(
+            plan="Edit the widget.", targets=(PlannerTarget("svc/widget.py", "the widget"),)
+        ),
+        policy=ContextPolicy(budget=60_000),
+    )
+
+    assert "svc/widget.py" in selected.files
+    assert "svc/unrelated_sibling.py" in selected.files, "a sibling of the target is context"
+    assert "far_away.py" not in selected.files
+
+
+def test_an_item_with_no_signal_at_all_is_not_starved(repo: Path) -> None:
+    """No target and nothing matching is the one case where padding is safer.
+
+    An implementer shown only a file listing patches a file it has not read,
+    which is #146. Where there is no signal to select on there is nothing to
+    stop on either, so the old behaviour stands rather than an empty prompt.
+    """
+    selected = select_repo_context(
+        repo,
+        WorkRecord(item_id="T", title="zzzz", brief="qqqq"),
+        planner=PlannerResult(plan="wwww", cannot_identify_target="nothing named"),
+        policy=ContextPolicy(budget=60_000),
+    )
+
+    assert "hello.txt" in selected.files
+    assert selected.fallback_skipped == 0
+
+
 def test_context_selection_and_planner_targets_are_observable_events(
     repo: Path, tmp_path: Path
 ) -> None:
@@ -1270,6 +1426,51 @@ def test_context_selection_and_planner_targets_are_observable_events(
     assert context["character_budget"] == 60_000
     assert context["truncated"] is False
     assert context["fallback_relevance"] is False
+
+
+def test_the_context_event_says_what_the_budget_was_spent_on(repo: Path, tmp_path: Path) -> None:
+    """One character total is always approximately the ceiling, so it says
+    nothing. An operator asking why an item cost what it did needs the split:
+    how much was the file being changed, how much was surroundings, and how
+    many candidates were dropped for having nothing to do with the item.
+    Without that, the padding #152 describes is invisible in the event stream
+    that is supposed to be the evidence for it."""
+    events: list[dict[str, Any]] = []
+    executor, queue, _ = build(
+        repo,
+        tmp_path,
+        {
+            "planner": json.dumps(
+                {
+                    "plan": "Edit and verify hello.txt.",
+                    "targets": [{"path": "hello.txt", "reason": "contains greeting"}],
+                    "cannot_identify_target": None,
+                }
+            ),
+            "implementer": DIFF,
+            "reviewer": "APPROVED\nfine",
+        },
+        events=events,
+    )
+    _padding_repo(repo)
+    add_item(queue)
+
+    executor.run_once()
+
+    context = json.loads(
+        next(event for event in events if event["outcome"] == "context_selected")["detail"]
+    )
+    assert context["target_files"] == ["hello.txt"]
+    assert "web/pnpm-lock.yaml" not in context["fallback_files"]
+    assert context["target_characters"] > 0
+    assert context["fallback_skipped_irrelevant"] > 0
+    assert (
+        context["target_characters"]
+        + context["fallback_characters"]
+        + context["listing_characters"]
+        == context["characters"]
+    ), "the breakdown must add up to the total, or it is decoration"
+    assert context["characters"] < context["character_budget"] // 10
 
 
 def test_a_target_that_cannot_be_shown_stops_the_item_before_the_implementer(

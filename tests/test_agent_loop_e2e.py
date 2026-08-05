@@ -294,3 +294,28 @@ def test_an_observation_goes_back_as_a_well_formed_turn(repo: Path) -> None:
     assert all(m["role"] in {"system", "user", "assistant"} for m in last), last
     seen = "\n".join(m["content"] for m in last)
     assert "wrong" in seen, "the command output never returned to the model"
+
+
+def test_the_prompts_match_the_protocol() -> None:
+    """Prompts and protocol must agree, and once they did not.
+
+    `default.yaml` instructs the model to emit ```mswea_bash_command``` fences
+    -- the text path. Pairing it with tool calls produced five consecutive
+    replies containing no tool call and a `RepeatedFormatError`. The model did
+    what it was told; it was told the wrong thing.
+
+    Asserted against the config actually loaded, so the two cannot drift apart
+    silently again.
+    """
+    from pathlib import Path
+
+    import minisweagent
+    import yaml
+
+    from agent_harness.adapters.minisweagent import CONFIG
+
+    text = (Path(minisweagent.package_dir) / "config" / CONFIG).read_text()
+    prompts = yaml.safe_load(text)["agent"]
+    joined = prompts["system_template"] + prompts["instance_template"]
+    assert "mswea_bash_command" not in joined, "these prompts ask for the TEXT protocol"
+    assert "tool call" in joined.lower(), "these prompts do not ask for a tool call"

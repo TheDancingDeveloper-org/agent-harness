@@ -42,12 +42,15 @@ One of those keys is executable, and its syntax is deliberately narrow:
     verify: ["python", "-m", "pytest", "-q", "tests/test_serials.py"]
 
 `verify:` is a **JSON array of argv strings**, never shell text. Adoption runs
-it to decide whether an item's work already exists, under the same rules as a
-project check — fixed argv, no shell, a timeout. A plan is a document people
-edit and paste into; letting it carry `&&`, redirection or globbing would make
-reading a plan equivalent to granting it a shell, and `verify: rm -rf build`
-would look no different from anything else on the page. A value that is not a
-non-empty JSON array of non-empty strings is refused rather than reinterpreted.
+it as one input into whether an item's work already exists, under the same
+rules as a project check — fixed argv, no shell, a timeout. Exit 0 does not
+decide on its own: write one that *fails* on a tree where the work is absent,
+because a name-filtered test command does not (see `adoption`). A plan is a
+document people edit and paste into; letting it carry `&&`, redirection or
+globbing would make reading a plan equivalent to granting it a shell, and
+`verify: rm -rf build` would look no different from anything else on the page.
+A value that is not a non-empty JSON array of non-empty strings is refused
+rather than reinterpreted.
 
 It is also *per item*, and is not the project's check command: the project's
 checks say the tree is healthy, and `verify:` says one specific item is

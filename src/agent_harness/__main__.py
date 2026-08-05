@@ -888,6 +888,7 @@ def main(argv: list[str] | None = None) -> int:
     # starts for `--help` on a machine with no queue and no credentials, and
     # only the default value is needed to print it.
     from .executor import DEFAULT_CONTEXT_BUDGET
+    from .session_executor import DEFAULT_AGENT_COMMAND
 
     parser = argparse.ArgumentParser(prog="agent-harness", description=__doc__)
     parser.add_argument(
@@ -1123,9 +1124,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_run.add_argument(
         "--agent",
-        default="claude -p {prompt_file}",
+        # The executor's default, not a second one. They disagreed: the
+        # executor's carried `--permission-mode acceptEdits` and the CLI's did
+        # not, so `run --session-host` without this flag produced an agent that
+        # could not write. It reported no changes and read as a model that had
+        # considered the task and declined — measured, and it cost a run.
+        default=" ".join(DEFAULT_AGENT_COMMAND),
         metavar="CMD",
-        help="CLI agent to run per item. `{prompt_file}` is substituted.",
+        help="CLI agent to run per item. `{prompt_file}` is substituted. "
+        "Defaults to the agent command the session executor declares, which "
+        "grants edit permission — an agent that cannot write reports no "
+        "changes, which is indistinguishable from one that chose to make none.",
     )
     p_run.add_argument("--limit", type=int, help="stop after N items")
     p_run.add_argument(

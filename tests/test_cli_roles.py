@@ -287,3 +287,33 @@ def test_the_transport_renders_the_request_the_preset_describes(
     assert "timeout" not in sent["json"] and "role" not in sent["json"]
     assert sent["headers"]["x-api-key"] == "shared-key"
     assert "Authorization" not in sent["headers"]
+
+
+def test_the_cli_agent_default_is_the_executor_s() -> None:
+    """They disagreed, and the CLI's was the one that could not write.
+
+    `session_executor.DEFAULT_AGENT_COMMAND` carries `--permission-mode
+    acceptEdits`; the CLI's `--agent` default did not. So `run --session-host`
+    without the flag produced an agent that was refused every Edit, reported
+    no changes, and read as a model that had considered the task and declined.
+
+    Measured: it cost a full agent run, and the agent's own account of the
+    refusal sat in a scrollback nothing reads.
+
+    Asserted against the source rather than a parsed value, because the defect
+    was *a second default existing at all* — a literal here that happens to
+    match today would drift again tomorrow.
+    """
+    import inspect
+
+    from agent_harness import __main__
+    from agent_harness.session_executor import DEFAULT_AGENT_COMMAND
+
+    source = inspect.getsource(__main__)
+    assert 'default=" ".join(DEFAULT_AGENT_COMMAND)' in source, (
+        "the CLI must take the executor's agent command, not declare its own"
+    )
+    assert '"--permission-mode"' in inspect.getsource(
+        __import__("agent_harness.session_executor", fromlist=["x"])
+    ), "and that command must still grant edit permission"
+    assert "--permission-mode" in " ".join(DEFAULT_AGENT_COMMAND)

@@ -681,6 +681,22 @@ def _run(args: argparse.Namespace) -> int:
         if not clean:
             log.warning("--allow-dirty: %s", why)
 
+    # Applies to BOTH modes, unlike the check above. A worktree cut from a base
+    # that has fallen behind is the rdpapp failure exactly: session mode gives
+    # each item a pristine worktree, and a pristine worktree of the wrong
+    # lineage is still the wrong lineage (#180).
+    if args.work and args.base and (Path(args.work) / ".git").exists():
+        from .preflight import _base_is_current
+
+        current, where = _base_is_current(str(args.work), args.base)
+        if not current and not args.allow_stale_base:
+            print(f"refusing to start: {where}", file=sys.stderr)
+            return 2
+        if not current:
+            log.warning("--allow-stale-base: %s", where)
+        else:
+            log.info("base: %s", where)
+
     if demo_mode:
         from .demo import demo_transport
 
@@ -1263,6 +1279,15 @@ def main(argv: list[str] | None = None) -> int:
         "attempt — tracked changes are reverted and untracked files are deleted, "
         "neither recoverably — so a dirty checkout is refused by default. Pass "
         "this only when the tree is genuinely disposable.",
+    )
+    p_run.add_argument(
+        "--allow-stale-base",
+        action="store_true",
+        help="run against a base branch that has fallen well behind its upstream. "
+        "A stale base is the one wrong setting every later stage reports as a "
+        "success — the agent works, the checks pass, the reviewer approves, and "
+        "the commit lands on a lineage nobody develops on any more — so it is "
+        "refused by default. Pass this when the base really is the line of work.",
     )
     p_run.add_argument(
         "--context-budget",

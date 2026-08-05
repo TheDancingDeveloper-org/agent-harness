@@ -136,6 +136,129 @@ def _is_clean_tree(path: str) -> tuple[bool, str]:
     )
 
 
+#: How far behind its upstream a base may be before the run is refused. A few
+#: commits behind is the ordinary state of any branch and blocking on it would
+#: make the check noise nobody reads. Two dozen is a different repository.
+STALE_BASE_LIMIT = 25
+
+
+def _git(path: str, *args: str, timeout: float = 60.0) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["git", "-C", path, *args],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (1, "", str(exc))
+    return (result.returncode, result.stdout.strip(), result.stderr.strip())
+
+
+def _base_is_current(path: str, base: str) -> tuple[bool, str]:
+    """Whether the base branch still resembles the line of work it came from.
+
+    **This is the one wrong configuration every downstream stage reports as a
+    success.** The agent works, the checks pass, the reviewer approves and the
+    commit lands — onto a branch nobody is developing on any more. There is no
+    failure to notice, so nothing notices, and the cost is not one item but
+    every item in the run.
+
+    Measured on `rdpapp`: a base cut from a local working tree turned out to be
+    121 commits behind `origin/master` and 27 ahead, carrying an alternate
+    implementation that was never promoted. Six items were delivered onto it
+    before a human who knew the lineage said so (#180).
+
+    Deliberately quiet about what it cannot answer. A branch with no upstream,
+    a repository with no remote, an unreachable remote — none of those are
+    evidence that the base is stale, and reporting them as failures would train
+    people to pass the override flag by default.
+    """
+    upstreams = _upstreams_for(path, base)
+    if not upstreams:
+        return (True, f"nothing to compare {base} against: no upstream and no remote default")
+
+    # Behind *every* candidate is the finding. A base cut locally for one run
+    # legitimately tracks nothing, and a repository can have several remotes
+    # only one of which is authoritative — so being current with any one of
+    # them is enough to believe the base is on a live line of work.
+    #
+    # The first draft of this returned early when a branch tracked nothing and
+    # the repository had more than one remote, which is exactly the shape of
+    # the case it was written for: `harness/base` tracked nothing, `rdpapp` has
+    # a Forgejo `origin` and a GitHub secondary, and the check said nothing at
+    # all while the base sat 121 commits behind.
+    results: list[tuple[int | None, str]] = []
+    for upstream in upstreams:
+        remote = upstream.split("/", 1)[0]
+        code, _, err = _git(path, "fetch", "--quiet", remote, timeout=120.0)
+        if code == 0 and _git(path, "merge-base", base, upstream)[0] != 0:
+            # No common ancestor: a different project that happens to be a
+            # remote of this checkout, not a line of work this base could have
+            # come from. Counting it would let an unrelated remote with two
+            # commits in it vouch for a base that is a hundred behind the one
+            # that matters.
+            continue
+        if code != 0:
+            # Unreachable is a fact about the network, not about the base.
+            results.append((None, f"could not reach {remote}: {err[:100]}"))
+            continue
+        code, counts, _ = _git(path, "rev-list", "--left-right", "--count", f"{base}...{upstream}")
+        if code != 0 or "\t" not in counts:
+            results.append((None, f"could not compare {base} against {upstream}"))
+            continue
+        ahead_s, _, behind_s = counts.partition("\t")
+        try:
+            ahead, behind = int(ahead_s), int(behind_s.strip())
+        except ValueError:  # pragma: no cover - git's output is two integers
+            results.append((None, f"could not read {base}...{upstream}"))
+            continue
+        results.append(
+            (
+                behind,
+                f"{behind} commit(s) behind {upstream}" + (f" and {ahead} ahead" if ahead else ""),
+            )
+        )
+
+    measured = [(behind, text) for behind, text in results if behind is not None]
+    if not measured:
+        return (True, f"could not compare {base}: " + "; ".join(text for _, text in results))
+
+    closest, detail = min(measured, key=lambda pair: pair[0])
+    if closest == 0:
+        return (True, f"{base} is current with {detail.split(' behind ', 1)[-1]}")
+    where = f"{base} is " + "; ".join(text for _, text in measured)
+    if closest <= STALE_BASE_LIMIT:
+        return (True, where)
+    return (
+        False,
+        f"{where}. Work based here lands on a lineage that has moved on, and every "
+        "stage after this one — the agent, the checks, the reviewer, the commit — "
+        "will report success while it happens. Rebase or cut a new base from the "
+        "current head, or pass --allow-stale-base if this really is the line of work.",
+    )
+
+
+def _upstreams_for(path: str, base: str) -> list[str]:
+    """Every remote ref this base could reasonably be measured against.
+
+    Its own tracking branch when it has one, since that is the answer the
+    person who made the branch already gave. Otherwise every remote's default
+    head — plural on purpose, because "which remote is authoritative" is not a
+    question a preflight check can answer and not one it should guess at.
+    """
+    code, upstream, _ = _git(path, "rev-parse", "--abbrev-ref", f"{base}@{{upstream}}")
+    if code == 0 and upstream:
+        return [upstream]
+    code, remotes, _ = _git(path, "remote")
+    heads = []
+    for remote in (name.strip() for name in remotes.splitlines() if name.strip()):
+        code, head, _ = _git(path, "symbolic-ref", "--short", f"refs/remotes/{remote}/HEAD")
+        if code == 0 and head:
+            heads.append(head)
+    return heads
+
+
 def _gh_can_write(repo: str) -> tuple[bool, str]:
     """Whether `gh` can actually write to the repo.
 
@@ -504,6 +627,8 @@ def preflight_project(
     disk_probe: Callable[[str, float], tuple[bool, str]] = disk_space_probe,
     clean_probe: Callable[[str], tuple[bool, str]] = _is_clean_tree,
     allow_dirty: bool = False,
+    base_probe: Callable[[str, str], tuple[bool, str]] = _base_is_current,
+    allow_stale_base: bool = False,
 ) -> Preflight:
     """Everything that must hold before this project can produce a pull request."""
     checks: list[Check] = []
@@ -555,6 +680,19 @@ def preflight_project(
                     else f"{clean_detail}{' Allowed by --allow-dirty.' if allow_dirty else ''}",
                 )
             )
+            base = str(getattr(project, "base_branch", "") or "")
+            if base:
+                base_ok, base_detail = base_probe(work_dir, base)
+                checks.append(
+                    Check(
+                        "base branch",
+                        base_ok or allow_stale_base,
+                        base_detail
+                        if base_ok
+                        else f"{base_detail}"
+                        + (" Allowed by --allow-stale-base." if allow_stale_base else ""),
+                    )
+                )
         disk_ok, disk_detail = disk_probe(
             work_dir, float(getattr(project, "min_free_disk_gb", 0.0) or 0.0)
         )

@@ -21,6 +21,15 @@ The pre-change baseline was recorded before feature edits:
 | `uv run ruff format --check .` | passed |
 | `TMPDIR=/tmp/agent-harness-gui-baseline.HoeEBo uv run mypy` | passed, 106 source files |
 
+The same gates were run after the browser shell and guarded action bridge:
+
+| Command | Result |
+|---|---|
+| `TMPDIR=/tmp/agent-harness-gui-baseline.HoeEBo uv run pytest -q` | passed at 100%, 1 skipped |
+| `uv run ruff check .` | passed |
+| `uv run ruff format --check .` | passed, 116 files formatted |
+| `TMPDIR=/tmp/agent-harness-gui-baseline.HoeEBo uv run mypy` | passed, 111 source files |
+
 An earlier concurrent setup attempt and an earlier `/dev/shm` pytest attempt are
 not evidence: the former raced virtualenv creation and the latter filled the
 64 MiB tmpfs. They are retained here only to explain why the valid baseline uses

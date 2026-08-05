@@ -240,3 +240,37 @@ def test_the_reviewer_sees_the_work_after_the_checkpoint_committed_it(tmp_path: 
 
     assert "hello harness" in seen["prompt"], "the reviewer was not shown the committed work"
     assert "-hello world" in seen["prompt"], "nor what it replaced"
+
+
+def test_the_kept_reason_is_the_objection_not_the_praise() -> None:
+    """`last_error` is what a retry is told, and it kept the wrong end.
+
+    The rubric asks for "what I verified" first and "why" last. Keeping the
+    first 500 characters therefore kept the list of things the reviewer was
+    happy with and cut off the objection — the only part anyone can act on.
+
+    Measured: two items were rejected twice for the same fault, each retry
+    having been told only the preamble praising the parts that were fine.
+    """
+    from agent_harness.executor import review_reason
+
+    verdict = (
+        "REJECTED\n\n"
+        "1. **What I verified** — " + "the call site is right, " * 60 + "\n\n"
+        "2. **What I could not verify** — " + "nothing much, " * 20 + "\n\n"
+        "3. **Why**\nIt widens the repository trait's return type."
+    )
+
+    kept = review_reason(verdict)
+
+    assert "widens the repository trait" in kept, "the objection must survive"
+    assert len(kept) <= 1300
+    # And the old behaviour must not come back: the head is a summary of a
+    # diff the reader already has.
+    assert not kept.startswith("REJECTED\n\n1. **What I verified**")
+
+
+def test_a_short_verdict_is_kept_whole() -> None:
+    from agent_harness.executor import review_reason
+
+    assert review_reason("REJECTED\nToo narrow.") == "REJECTED\nToo narrow."

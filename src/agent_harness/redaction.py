@@ -29,8 +29,16 @@ thing this repository rules out.
 
 from __future__ import annotations
 
+import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance only
+    from .events import Event
+
+log = logging.getLogger(__name__)
 
 #: What replaces a redacted value. Deliberately visible: a reader must be able
 #: to tell "a secret was removed here" from "the model said nothing", because
@@ -43,6 +51,18 @@ MARK = "[redacted]"
 #: and redacting every occurrence would corrupt the text while protecting
 #: nothing that was secret in the first place.
 MIN_SECRET_LEN = 8
+
+#: Set in an event's `data` when this module removed something from it. The
+#: mark inside the text says *where*; this says *that it happened at all*, so
+#: a reader of the audit is never left comparing a record against what an
+#: agent said and finding a silent difference.
+REDACTED_FLAG = "redacted"
+
+#: Set instead when redacting the payload raised. The event is still written
+#: -- an event that never lands is indistinguishable from a call that never
+#: happened, which is a worse record than a lossy one -- but its payload is
+#: dropped rather than passed through unexamined. See `redact_event`.
+REDACTION_FAILED = "redaction_failed"
 
 #: Credential *shapes*, for values this deployment was never told about.
 #: Each keeps its label and replaces only the value, so the record still says
@@ -97,6 +117,76 @@ class Redactor:
         silently differ from what the model actually said.
         """
         return bool(text) and self(text) != text
+
+
+#: What a store hands this module: `str | None -> str | None`.
+Redact = Callable[[str | None], str | None]
+
+
+def redact_text(value: Any, redact: Redact) -> Any:
+    """Redact every string reachable inside `value`, structure preserved.
+
+    Walks lists, tuples and dicts because an event's payload is arbitrary
+    JSON: the credential-carrying cases -- an agent's output, a check
+    command's stderr, a provider's error envelope -- arrive nested about as
+    often as they arrive at the top level.
+
+    Dictionary *keys* are left alone. A key is a field name chosen by the
+    writer, not text a credential arrives in, and rewriting keys would change
+    the shape of the record every reader is written against.
+    """
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {k: redact_text(v, redact) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_text(v, redact) for v in value]
+    if isinstance(value, tuple):
+        return tuple(redact_text(v, redact) for v in value)
+    return value
+
+
+def redact_payload(
+    data: dict[str, Any], endpoint: str | None, redact: Redact
+) -> tuple[dict[str, Any], str | None, bool]:
+    """Redact the two parts of a record a credential can actually reach.
+
+    `data` is where every free-text payload lives -- an agent's output, a
+    check command's stderr, a provider's error envelope, a diff. `endpoint`
+    is a URL, and a URL can carry a key in a query string. The remaining
+    columns are drawn from fixed vocabularies -- a kind, an outcome, an error
+    class, a role -- and are what the gates and the panels count. Nothing a
+    credential can reach arrives in them, and rewriting them would put this
+    module in a position to change a measured number, which it must never be
+    in.
+
+    Returns `(data, endpoint, changed)`. Never raises: observation must not
+    stop work. If redaction fails, the payload is dropped and marked rather
+    than passed through, because the store cannot unwrite what it has taken
+    -- a deliberate trade of detail for exposure, and a visible one.
+    """
+    try:
+        clean = redact_text(data, redact)
+        clean_endpoint = redact(endpoint)
+        if clean == data and clean_endpoint == endpoint:
+            return data, endpoint, False
+        return {**clean, REDACTED_FLAG: True}, clean_endpoint, True
+    except Exception as exc:  # noqa: BLE001 - a bug here must not lose the record
+        log.warning("redaction failed; payload dropped rather than written: %s", exc)
+        return {REDACTED_FLAG: True, REDACTION_FAILED: True}, endpoint, True
+
+
+def redact_event(event: Event, redact: Redact) -> Event:
+    """The one thing a store does to an event before writing it.
+
+    The event itself always survives, columns intact: an event that never
+    lands is indistinguishable from a call that never happened, which is a
+    worse record than a lossy one.
+    """
+    data, endpoint, changed = redact_payload(event.data, event.endpoint, redact)
+    if not changed:
+        return event
+    return replace(event, data=data, endpoint=endpoint)
 
 
 def from_environment(*extra: str | None) -> Redactor:

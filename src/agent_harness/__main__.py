@@ -768,7 +768,10 @@ def _run(args: argparse.Namespace) -> int:
             client,
             args.work,
             checks=checks,
-            context_policy=ContextPolicy(budget=args.context_budget),
+            context_policy=ContextPolicy(
+                budget=args.context_budget,
+                fallback_budget=args.context_fallback_budget,
+            ),
             durability=durability,
             github=GitHub(args.repo) if args.repo else None,
             base_branch=args.base,
@@ -1491,12 +1494,29 @@ def main(argv: list[str] | None = None) -> int:
         "--context-budget",
         type=int,
         default=int(os.environ.get("HARNESS_CONTEXT_BUDGET", "") or DEFAULT_CONTEXT_BUDGET),
-        help="how many characters of repository the implementer is shown "
+        help="the most characters of repository the implementer may be shown "
         f"(default {DEFAULT_CONTEXT_BUDGET}, or $HARNESS_CONTEXT_BUDGET). A file "
         "larger than this cannot be supplied at all, and an item whose target "
         "does not fit is stopped before the implementer is paid rather than "
         "asked to change a file it cannot see. Raise it for a repository with "
-        "large files; the ceiling that matters is the model's context window.",
+        "large files; the ceiling that matters is the model's context window. "
+        "It is a ceiling and not a target: an item is shown what is relevant "
+        "to it and no more, so raising this does not make every item cost more.",
+    )
+    p_run.add_argument(
+        "--context-fallback-budget",
+        type=int,
+        default=(
+            int(os.environ["HARNESS_CONTEXT_FALLBACK_BUDGET"])
+            if os.environ.get("HARNESS_CONTEXT_FALLBACK_BUDGET")
+            else None
+        ),
+        help="how many of those characters the surrounding context — files the "
+        "planner did not name — may use (default: the standard "
+        f"{DEFAULT_CONTEXT_BUDGET}, or $HARNESS_CONTEXT_FALLBACK_BUDGET, never "
+        "more than --context-budget). Targets are supplied whole up to the "
+        "budget regardless; this is what keeps a budget raised for one large "
+        "file from enlarging every other item's prompt.",
     )
     p_run.add_argument(
         "--demo",

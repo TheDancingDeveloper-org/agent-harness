@@ -77,6 +77,7 @@ trade and it is rejected.
 | What a route is made of, and how a vendor is added | `src/agent_harness/protocols.py` |
 | Event schema | `src/agent_harness/events.py` |
 | Event store (append-only) | `src/agent_harness/store.py` |
+| Credentials removed before the first write | `src/agent_harness/redaction.py` — applied in `store.append` and `audit.append`, the only ways in. **A reduction in exposure, never a guarantee** |
 | Scoping a project from a paragraph | `agent-harness inception`; `src/agent_harness/inception.py` — produces a `PLAN.md`, never queue rows |
 | A plan, parsed into work | `src/agent_harness/plan.py` — never silently drops a heading |
 | The queue, and what a claim is | `src/agent_harness/work.py` — a claim is a **lease**, not a lock |

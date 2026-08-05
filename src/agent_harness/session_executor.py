@@ -66,6 +66,7 @@ from .outcomes import (
     Stop,
     stop_for,
 )
+from .plan import FINDINGS
 from .reaper import DEFAULT_MAX_AGE_SECONDS, ReapReport, reap_abandoned_sessions
 from .session_host import Session, SessionHost
 from .work import (
@@ -139,6 +140,30 @@ A reviewer then reads your diff against the item above and can reject it.
   what the item asks, do it and leave the file absent.
 """
 
+FINDINGS_PROMPT = """\
+## What this item produces
+
+**This item's deliverable is an answer, not a change.** Write it to
+`{findings_file}` in this directory. Change nothing else — no implementation,
+no tests, no refactoring on the way past.
+
+The answer is the work, so it is judged as work: cite what you actually read,
+with paths and line numbers. If the item names alternatives, examine each one
+and say what you found, not what you expect. A recommendation the evidence does
+not support is worse than "I could not determine this".
+
+If you conclude the question itself cannot be answered from this repository,
+that is a refusal — use `{refusal_file}` and say why.
+"""
+
+#: Where an agent leaves an answer, for an item whose deliverable is findings.
+#:
+#: Separate from the refusal file on purpose. "Here is the answer you asked
+#: for" and "this item cannot be done" are different outcomes — one is
+#: `completed`, the other `escalated` — and a single file would make the
+#: harness guess which it was holding.
+FINDINGS_FILE = ".harness-findings.md"
+
 #: Where a refusing agent leaves its reasoning.
 #:
 #: The rule above used to end at "stop and say so plainly", which told the
@@ -158,6 +183,31 @@ REFUSAL_FILE = ".harness-refusal.md"
 #: and there is no second copy of it once the worktree is gone.
 REFUSAL_LIMIT = 4000
 
+#: How much of an answer reaches the outcome. Larger than a refusal's: an
+#: investigation's whole product is its text, and truncating the finding is
+#: throwing away the item's deliverable rather than trimming an explanation.
+FINDINGS_LIMIT = 16_000
+
+
+def _take_findings(tree: Path) -> str:
+    """The agent's answer, removed from the tree as it is read.
+
+    Removed for the same reason a refusal is: the answer is the item's
+    result, recorded in the outcome, and leaving it in the worktree would
+    turn a question into a commit nobody asked for.
+    """
+    return _take(tree / FINDINGS_FILE, FINDINGS_LIMIT)
+
+
+def _take(note: Path, limit: int) -> str:
+    try:
+        text = note.read_text(errors="replace").strip()
+    except OSError:
+        return ""
+    finally:
+        note.unlink(missing_ok=True)
+    return text[:limit] if text else ""
+
 
 def _take_refusal(tree: Path) -> str:
     """The agent's refusal, removed from the tree as it is read.
@@ -167,14 +217,7 @@ def _take_refusal(tree: Path) -> str:
     attempt look like a change. Returns an empty string if no note was left,
     which is the ordinary case.
     """
-    note = tree / REFUSAL_FILE
-    try:
-        text = note.read_text(errors="replace").strip()
-    except OSError:
-        return ""
-    finally:
-        note.unlink(missing_ok=True)
-    return text[:REFUSAL_LIMIT] if text else ""
+    return _take(tree / REFUSAL_FILE, REFUSAL_LIMIT)
 
 
 #: The review rubric lives with the headless executor and is imported, not
@@ -548,14 +591,24 @@ class SessionExecutor:
             self._emit(record, "stacked", detail=f"based on {base} ({stacked_on})")
 
         try:
+            findings_item = record.deliverable == FINDINGS
             prompt_file = tree / ".harness-prompt.md"
             prompt_file.write_text(
                 PROMPT_TEMPLATE.format(
                     title=record.title,
                     brief=record.brief,
-                    checks_description=self._describe_checks(),
+                    checks_description=(
+                        "Nothing is compiled or tested: this item changes no code."
+                        if findings_item
+                        else self._describe_checks()
+                    ),
                     prior=self._prior_failure(record),
                     refusal_file=REFUSAL_FILE,
+                )
+                + (
+                    FINDINGS_PROMPT.format(findings_file=FINDINGS_FILE, refusal_file=REFUSAL_FILE)
+                    if findings_item
+                    else ""
                 )
             )
 
@@ -621,7 +674,33 @@ class SessionExecutor:
             # Read and remove before the tree is inspected: a refusal note is
             # the agent's answer *about* the item, never a change to it, and
             # leaving it would make a refusing agent look like a working one.
+            # Both are the agent's answer *about* the item rather than a change
+            # to it, and both are taken unconditionally — a note left behind is
+            # a note that reaches a commit, a diff and a reviewer. Taking the
+            # findings file only when it was going to be used left it in the
+            # tree whenever a refusal won, which then read as an ordinary
+            # change and ran the whole code path over it.
             refusal = _take_refusal(tree)
+            findings = _take_findings(tree)
+            # A findings item is finished when it has an answer. Its worktree is
+            # *expected* to be clean, so it must be decided before the clean-tree
+            # path below, which would otherwise escalate every successful
+            # investigation as "the agent made no changes" (#182).
+            #
+            # A refusal still wins: "this question cannot be answered from this
+            # repository" is an escalation whatever the item was asked to
+            # produce.
+            #
+            # Falling through means asked for an answer and given nothing, and
+            # not told why. That is "an agent that did nothing", which the
+            # clean-tree path below already handles correctly.
+            if findings_item and not refusal and findings:
+                outcome.stages.append("findings")
+                outcome.reason = findings
+                self._emit(record, "findings", detail=findings, session_id=session.id)
+                outcome.state = DONE
+                outcome.stop = Stop(COMPLETED, detail=findings)
+                return outcome
             diff = run_git(tree, "diff", "HEAD")
             if not diff.strip() and not run_git(tree, "status", "--porcelain").strip():
                 # Nobody has judged this item and nobody can: the agent is

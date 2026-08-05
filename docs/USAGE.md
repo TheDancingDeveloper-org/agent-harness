@@ -324,6 +324,77 @@ and sync it, exactly as though you had written it by hand.
 
 ---
 
+## 0bb. Or point it at a project and state an objective
+
+`inception` scopes a **new** project from prose. `survey` does the same for one
+that already exists: you say what you want done, and the first run works out
+what the items should be instead of being handed them.
+
+```console
+$ agent-harness survey "review and generate a plan to upgrade to Node v22" \
+    --work ./service --doc docs/roadmap.md \
+    --surveyor claude-sonnet-4-6 --endpoint $HARNESS_ENDPOINT --out PLAN.md
+read 3 source(s): docs/roadmap.md, 412 tracked path(s), recent history
+9 work item(s), 4 heading(s) skipped as narrative
+blocking question: is the native addon in vendor/ still maintained upstream?
+wrote PLAN.md
+Review it, then: agent-harness adopt PLAN.md --project NAME --work ./service
+```
+
+**Name your roadmap with `--doc`.** Without it the harness guesses from a short
+list (`docs/current-state.md`, `ROADMAP.md`, `README.md`, …) and stops at two.
+A named file that is missing is *reported*, not skipped — the failure this
+command exists to prevent is a confident plan built without the document that
+states the project's direction.
+
+**The gate is the harness's own parser.** The generated plan is read back by
+`parse_plan`, the same function a hand-written plan goes through, so a plan the
+queue would read differently from how it looks is caught here rather than three
+commands later. If it cannot be read — no items, or duplicate ids, which cannot
+each become one issue — nothing is written. `--force` overrides that, and means
+executing a plan the harness has told you it does not understand.
+
+**Nothing external happens.** No queue rows, no issues, no branches. Without
+`--out` it prints the plan and writes nothing at all, which is the right
+default for output whose entire purpose is to be argued with.
+
+Blocking questions are reported and do **not** stop the file being written.
+They are questions for you, and your answer decides — the same rule
+`inception` applies at its approval gate.
+
+### 0bb.1 Items that produce an answer rather than a change
+
+Some work has no diff. "Compare these three approaches", "is this feasible",
+"which of these is the cause" — the answer *is* the deliverable, and an item
+like that used to leave a clean worktree and be recorded as
+`escalated / no_target`: indistinguishable from an agent that did nothing.
+
+An item can now say what it produces:
+
+```markdown
+### T1 — Choose the Tailnet attachment architecture
+
+Compare a host-managed daemon, a managed sidecar, and a tsnet bridge. Say
+which fits this deployment and what rules the others out.
+
+deliverable: findings
+```
+
+`deliverable: code` is the default and means a diff, judged exactly as before.
+`deliverable: findings` tells the agent to write its answer to
+`.harness-findings.md` and change nothing else. The answer becomes the item's
+result, the item completes, and the file is never committed.
+
+**The plan declares this; the agent never chooses it.** Otherwise the first
+hard test failure becomes an essay about why the test was wrong.
+
+A findings item can still refuse — "this question cannot be answered from this
+repository" is an escalation whatever the item was asked to produce — and one
+that answers nothing at all lands in the same clean-tree path as any other
+agent that did nothing, which is where it belongs.
+
+---
+
 ## 0c. Or adopt a project that is already half-built
 
 The common case is not a blank repository. It is a plan, a repository, some

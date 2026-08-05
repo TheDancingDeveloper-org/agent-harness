@@ -52,7 +52,7 @@ from typing import Any, Protocol
 from .executor import Checks
 from .github import MARKER, GitHub
 from .outcomes import ESCALATE, RETRY
-from .plan import ParsedPlan, WorkItem
+from .plan import CODE, ParsedPlan, WorkItem
 from .work import CLAIMED, DONE, PENDING, Project, WorkQueue, WorkRecord, revives
 
 #: The lifecycle of one adoption (proposal §5.1). `rejected` and `revise` are
@@ -195,6 +195,10 @@ class AdoptionItem:
     #: The brief the queue is holding, so the report can tell a re-sync that
     #: changes nothing from one that rewrites the item.
     queue_brief: str | None = None
+    #: What the plan says this item produces. Carried through rather than
+    #: defaulted, or a `deliverable: findings` item would be adopted as one
+    #: that must produce a diff (#182).
+    deliverable: str = CODE
     proposed_state: str = PENDING
     evidence: list[Evidence] = field(default_factory=list)
     candidates: list[ExternalCandidate] = field(default_factory=list)
@@ -595,6 +599,7 @@ class Adoption:
             depends_on=list(item.depends_on),
             queue_state=existing.state if existing else None,
             queue_brief=existing.brief if existing else None,
+            deliverable=item.deliverable,
             candidates=list(candidates),
         )
 
@@ -868,6 +873,7 @@ class Adoption:
                     title=item.title,
                     brief=item.brief,
                     depends_on=item.depends_on,
+                    deliverable=item.deliverable,
                     state=DONE if item.item_id in approved else PENDING,
                 )
                 for item in report.items

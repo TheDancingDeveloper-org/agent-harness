@@ -505,6 +505,7 @@ def _run(args: argparse.Namespace) -> int:
                     title=i.title,
                     brief=i.brief(),
                     depends_on=i.depends_on,
+                    deliverable=i.deliverable,
                     project_id=args.project,
                 )
                 for i in plan.deduplicated()
@@ -859,6 +860,71 @@ def _assessor(args: argparse.Namespace) -> Any:
     return ModelAssessor(ask)
 
 
+def _survey(args: argparse.Namespace) -> int:
+    """Read an existing project and propose a plan for a stated objective.
+
+    Writes nothing unless `--out` is given, and refuses to write a plan the
+    harness's own parser could not read. The parser is the gate on purpose: a
+    generated plan that the queue reads differently from how it looks is worse
+    than no plan, and catching it here costs one function call.
+    """
+    from .executor import _text_of
+    from .model_client import ModelClient, Route
+    from .survey import SURVEYOR, survey
+
+    if not (args.work / ".git").exists():
+        print(f"{args.work} is not a git repository", file=sys.stderr)
+        return 2
+    if not args.surveyor:
+        print(
+            "--surveyor MODEL is required: this command's whole job is one model call",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.endpoint:
+        print("--endpoint or $HARNESS_ENDPOINT is required", file=sys.stderr)
+        return 2
+
+    api_key = os.environ.get("HARNESS_API_KEY", "")
+    client = ModelClient(
+        roles={
+            SURVEYOR: Route(args.surveyor, args.endpoint, api_key=api_key, preset=args.preset),
+        },
+        transport=_http_transport(api_key),
+    )
+
+    def ask(prompt: str) -> str:
+        return str(_text_of(client.call(SURVEYOR, [{"role": "user", "content": prompt}]).body))
+
+    report = survey(
+        args.objective,
+        args.work,
+        ask=ask,
+        docs=list(args.doc),
+        name=args.name,
+        now=time.time(),
+    )
+    for line in report.lines():
+        print(line)
+
+    if not report.usable and not args.force:
+        print(
+            "refusing to write: the harness cannot read the plan it just generated. "
+            "Re-run, name the roadmap with --doc, or pass --force.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.out is None:
+        print()
+        print(report.markdown)
+        print("(nothing was written; pass --out PATH to keep it)")
+        return 0
+    args.out.write_text(report.markdown)
+    print(f"wrote {args.out}")
+    print(f"Review it, then: agent-harness adopt {args.out} --project NAME --work {args.work}")
+    return 0
+
+
 def _adopt(args: argparse.Namespace) -> int:
     """Inspect an existing project, then reconcile only with explicit approval.
 
@@ -1027,6 +1093,52 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         metavar="FILE",
         help="where `export` writes its JSON (default: stdout)",
+    )
+
+    p_survey = sub.add_parser(
+        "survey", help="read an existing project and propose a plan for an objective"
+    )
+    p_survey.add_argument(
+        "objective",
+        help='what you want done, in prose: "review and generate a plan to upgrade to Node v22"',
+    )
+    p_survey.add_argument(
+        "--work", type=Path, default=Path("."), help="the existing repository to read"
+    )
+    p_survey.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="write the proposed plan here. Without this it is printed and nothing is "
+        "written, which is the safe default for a command whose whole output is a "
+        "proposal to argue with.",
+    )
+    p_survey.add_argument(
+        "--doc",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="a document that states this project's direction, relative to the "
+        "repository. Repeatable. Naming them beats the guesses: a plan built without "
+        "the roadmap is confident and wrong, and a named file that is missing is "
+        "reported rather than skipped silently.",
+    )
+    p_survey.add_argument("--name", default="Plan", help="title for the generated plan")
+    p_survey.add_argument("--surveyor", default="", help="model for the surveyor role")
+    p_survey.add_argument(
+        "--endpoint",
+        default=os.environ.get("HARNESS_ENDPOINT", ""),
+        help="model API base url (or $HARNESS_ENDPOINT)",
+    )
+    p_survey.add_argument(
+        "--preset", default="", help="route preset, as for run: claw-bay, chat-completions, generic"
+    )
+    p_survey.add_argument(
+        "--force",
+        action="store_true",
+        help="write the plan even when the harness's own parser could not read it. "
+        "The parser is the gate here; overriding it means executing a plan the "
+        "queue will read differently from how it looks.",
     )
 
     p_adopt = sub.add_parser(
@@ -1409,6 +1521,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "adopt":
         return _adopt(args)
+
+    if args.command == "survey":
+        return _survey(args)
 
     store = EventStore(args.db)
 

@@ -153,6 +153,11 @@ CREATE TABLE IF NOT EXISTS work (
     last_error  TEXT,
     branch      TEXT,
     pr_url      TEXT,
+    -- What this item produces: 'code' (a diff) or 'findings' (an answer,
+    -- possibly with nothing to commit). Declared by the plan, never by the
+    -- agent. Defaults to 'code', which is what every row written before
+    -- this column existed meant.
+    deliverable TEXT NOT NULL DEFAULT 'code',
     -- The graph revision this claim was admitted at. Admission and the check
     -- before the expensive gate have to be talking about the same graph; this
     -- is how the second one can tell that the first one saw a different one.
@@ -429,6 +434,10 @@ class WorkRecord:
     attempts: int = 0
     last_error: str | None = None
     branch: str | None = None
+    #: What this item produces: `code` (a diff) or `findings` (an answer).
+    #: The plan declares it; the agent never chooses it, or the first hard
+    #: test failure becomes an essay about why the test was wrong (#182).
+    deliverable: str = "code"
     pr_url: str | None = None
     updated_at: float = 0.0
     project_id: str = DEFAULT_PROJECT
@@ -600,6 +609,9 @@ class WorkQueue:
             "first_started_at": "REAL NOT NULL DEFAULT 0",
             # Stage J, additive: an existing row reads as "not held".
             "held_until": "REAL NOT NULL DEFAULT 0",
+            # #182, additive: every existing item produces a diff, which is
+            # what it always did.
+            "deliverable": "TEXT NOT NULL DEFAULT 'code'",
         },
     }
 
@@ -810,7 +822,7 @@ class WorkQueue:
             if existing is None:
                 conn.execute(
                     "INSERT INTO work (project_id, item_id, issue, title, brief, depends_on, "
-                    "state, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "state, updated_at, deliverable) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         project_id,
                         record.item_id,
@@ -820,19 +832,21 @@ class WorkQueue:
                         json.dumps(record.depends_on),
                         record.state,
                         self.now(),
+                        record.deliverable,
                     ),
                 )
                 added += 1
             else:
                 conn.execute(
                     "UPDATE work SET title = ?, brief = ?, depends_on = ?, issue = ?, "
-                    "updated_at = ? WHERE project_id = ? AND item_id = ?",
+                    "updated_at = ?, deliverable = ? WHERE project_id = ? AND item_id = ?",
                     (
                         record.title,
                         record.brief,
                         json.dumps(record.depends_on),
                         record.issue,
                         self.now(),
+                        record.deliverable,
                         project_id,
                         record.item_id,
                     ),

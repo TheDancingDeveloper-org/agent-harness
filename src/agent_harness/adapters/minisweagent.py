@@ -62,6 +62,14 @@ IMPLEMENTER = "implementer"
 #: cannot stop.
 SUBMIT_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 
+#: Their tool-calling config, and their own default for `mini`. The prompts
+#: must match the protocol: `default.yaml` tells the model to emit
+#: ```mswea_bash_command``` fences, which is the *text* path. Pairing those
+#: prompts with tool calls produced five straight replies with no tool call
+#: and a `RepeatedFormatError` -- the model did exactly what it was told, and
+#: it was told the wrong thing.
+CONFIG = "mini.yaml"
+
 
 class NotInstalled(RuntimeError):
     """`mini-swe-agent` is not installed. Said once, plainly, up front."""
@@ -427,9 +435,9 @@ def build(
     import yaml
 
     agent_class = _require()
-    bundled = yaml.safe_load(
-        (Path(minisweagent.package_dir) / "config" / "default.yaml").read_text()
-    )["agent"]
+    bundled = yaml.safe_load((Path(minisweagent.package_dir) / "config" / CONFIG).read_text())[
+        "agent"
+    ]
     return agent_class(
         HarnessModel(client=client, role=role),
         HarnessEnvironment(repo=repo, guard=guard or CommandGuard()),

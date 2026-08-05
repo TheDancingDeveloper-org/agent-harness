@@ -41,6 +41,7 @@ from typing import Any
 
 from .events import Event
 from .pricing import cost_of
+from .redaction import Redact, from_environment, redact_event, redact_payload
 
 log = logging.getLogger(__name__)
 
@@ -134,9 +135,16 @@ class AuditStore:
 
     SCHEMA_VERSION = SCHEMA_VERSION
 
-    def __init__(self, path: Path | str, degraded: bool = False) -> None:
+    def __init__(
+        self, path: Path | str, degraded: bool = False, redact: Redact | None = None
+    ) -> None:
         self.path = Path(path)
         self.degraded = degraded
+        # This database is retained after `maintenance` thins the primary, so
+        # a credential landing here outlives everything around it. The filter
+        # sits on `append`, the only way in, for the same reason it does in
+        # `store`: nothing added later can route around it.
+        self.redact: Redact = redact if redact is not None else from_environment()
         # Thread-local, like EventStore: the API serves handlers from a
         # threadpool, and a sqlite3 connection is bound to the thread that
         # opened it.
@@ -174,12 +182,16 @@ class AuditStore:
 
         A repeated identity is a duplicate, never an amendment: taking the
         newer one would make history depend on write order.
+
+        Credentials are removed before the row exists, because this store has
+        no way to remove one afterwards.
         """
         if self.degraded:
             return 0
         conn = self._connect()
         written = 0
-        for event in events:
+        for raw in events:
+            event = redact_event(raw, self.redact)
             data = dict(event.data or {})
             try:
                 cursor = conn.execute(
@@ -231,6 +243,11 @@ class AuditStore:
         recoverable where a deleted one is not.
 
         Idempotent, because it runs at startup.
+
+        The copy is redacted like any other write. History adopted from a
+        database written before this filter existed is exactly the history
+        most likely to be carrying a credential, and this store keeps what
+        `maintenance` later thins from the primary.
         """
         if self.degraded:
             return 0
@@ -249,7 +266,9 @@ class AuditStore:
         conn = self._connect()
         written = 0
         for row in rows:
-            data = json.loads(row["data"] or "{}")
+            data, endpoint, _ = redact_payload(
+                json.loads(row["data"] or "{}"), row["endpoint"], self.redact
+            )
             cursor = conn.execute(
                 "INSERT OR IGNORE INTO events ("
                 "dedupe_key, schema_version, ts, kind, source, project_id, item_id, "
@@ -269,7 +288,7 @@ class AuditStore:
                     row["worker"],
                     row["role"],
                     row["model"],
-                    row["endpoint"],
+                    endpoint,
                     row["outcome"],
                     row["error_class"],
                     row["latency_s"],
@@ -280,7 +299,7 @@ class AuditStore:
                     data.get("price_in_per_mtok"),
                     data.get("price_out_per_mtok"),
                     data.get("price_table"),
-                    row["data"] or "{}",
+                    json.dumps(data, sort_keys=True),
                 ),
             )
             written += cursor.rowcount or 0

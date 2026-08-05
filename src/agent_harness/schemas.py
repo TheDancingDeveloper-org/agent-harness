@@ -1308,6 +1308,24 @@ class WaitingItem(BaseModel):
     session_url: str | None = None
 
 
+class OverdueHold(BaseModel):
+    """A question that has been open past the deadline it was given.
+
+    The pull path for anyone who configured no outbound hook (#188). A hold is
+    swept back to `blocked` by the next claim scan, so seeing one here means
+    either nothing is claiming for that project or the sweep has not run yet —
+    both of which are things an unattended fleet should be able to notice
+    without anyone thinking to look at the inbox.
+    """
+
+    project_id: str
+    item_id: str
+    question: str
+    age_seconds: float = Field(description="How long it has been unanswered.")
+    overdue_seconds: float = Field(description="How long past its own deadline it has been open.")
+    session_url: str | None = None
+
+
 class Summary(BaseModel):
     running: int
     pending: int
@@ -1324,6 +1342,17 @@ class Summary(BaseModel):
     waiting_for_input: list[WaitingItem] = Field(
         description="Agents that have stopped to ask a human something. Its own field "
         "rather than a count, because it is the one state that needs a person."
+    )
+    holds_open: int = Field(
+        0,
+        description="Unanswered questions on held items. A durable state of the work "
+        "item, unlike `waiting_for_input`, which is read from recent events.",
+    )
+    holds_overdue: list[OverdueHold] = Field(
+        default_factory=list,
+        description="Questions still open past their own deadline. Listed rather than "
+        "counted because each one names an item nobody answered, and a status line that "
+        "reads healthy while one of these exists is the failure issue #188 is about.",
     )
 
 

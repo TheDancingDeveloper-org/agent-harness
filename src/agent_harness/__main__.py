@@ -25,6 +25,7 @@ import shlex
 import shutil
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -777,13 +778,50 @@ def _run(args: argparse.Namespace) -> int:
     if not outcomes:
         print("nothing to do")
         return 0
+    for line in run_summary(outcomes):
+        print(line)
+    return 1 if any(_is_failure(o) for o in outcomes) else 0
+
+
+def _is_failure(outcome: Any) -> bool:
+    """Did this go wrong, as opposed to needing a person?
+
+    An escalation is not a failure. Nothing malfunctioned, no attempt was
+    wasted, and the item is waiting on a decision only a human can make — so
+    it must not colour the exit status, or a queue full of well-formed
+    questions reads to CI as a broken run.
+    """
+    from .outcomes import NEEDS_A_PERSON
+
+    if outcome.stop is not None and outcome.stop.disposition in NEEDS_A_PERSON:
+        return False
+    return not outcome.ok
+
+
+def run_summary(outcomes: Sequence[Any]) -> list[str]:
+    """The lines a finished run prints, as data so they can be tested.
+
+    `FAIL` and `ok` were the whole vocabulary, so an item that escalated —
+    nothing went wrong, a person is needed — was announced as a failure.
+    Measured on rdpapp R7: an agent correctly refused an impossible item, with
+    citations and no attempt spent, and the run's last word on it was `FAIL R7`.
+    """
+    from .outcomes import NEEDS_A_PERSON
+
+    lines = []
+    waiting = [o for o in outcomes if o.stop and o.stop.disposition in NEEDS_A_PERSON]
     for outcome in outcomes:
-        mark = "ok " if outcome.ok else "FAIL"
+        mark = "YOU" if outcome in waiting else ("ok " if outcome.ok else "FAIL")
         detail = outcome.pr_url or outcome.reason[:100]
-        print(f"  {mark} {outcome.item_id}: {' -> '.join(outcome.stages)}  {detail}")
-    failed = [o for o in outcomes if not o.ok]
-    print(f"{len(outcomes) - len(failed)}/{len(outcomes)} items completed")
-    return 1 if failed else 0
+        lines.append(f"  {mark} {outcome.item_id}: {' -> '.join(outcome.stages)}  {detail}")
+    done = [o for o in outcomes if o.ok]
+    lines.append(f"{len(done)}/{len(outcomes)} items completed")
+    if waiting:
+        lines.append(
+            f"{len(waiting)} waiting on you, not on a retry: "
+            + ", ".join(o.item_id for o in waiting)
+        )
+    return lines
 
 
 def _assessor(args: argparse.Namespace) -> Any:

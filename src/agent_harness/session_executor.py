@@ -373,6 +373,16 @@ class SessionExecutor:
                 partial.stop = stop
                 return partial
             return Outcome(record.item_id, FAILED, reason=str(exc), stop=stop)
+        # A `Stop` that names a state means it, and it is the last word: the
+        # checks path used to copy `stop.state` across by hand and every other
+        # path forgot to, so an item that escalated with `state=BLOCKED` was
+        # still released as `failed`. Measured on rdpapp R7 — correctly refused,
+        # correctly `escalated / item_impossible` with no attempt spent, and
+        # sitting in `failed` where nothing looking for work that needs a
+        # person would ever find it. An empty `state` still means the caller
+        # already chose, which is every path older than this taxonomy.
+        if outcome.stop is not None and outcome.stop.state:
+            outcome.state = outcome.stop.state
         self.queue.release(
             record.item_id,
             outcome.state,

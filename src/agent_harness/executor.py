@@ -1350,6 +1350,56 @@ The files it touched, as they now stand:
 """
 
 
+def review_context(repo: Path, diff: str, budget: int) -> str:
+    """The touched files as they now stand, for the reviewer.
+
+    The reviewer is asked whether a change is wired in where it should be
+    and whether anything unrelated moved, and was given only the change.
+    Measured on rdpapp: two of the three reasons in a rejection were "the
+    diff does not show whether …", which no diff ever can. That is a gate
+    rejecting for the shape of its own prompt.
+
+    The same budget bounds it, and a file too large to include is **named
+    as absent** rather than quietly left out — a reviewer that believes a
+    partial view is complete is worse than one that knows it is partial.
+    """
+    paths: list[str] = []
+    for line in diff.splitlines():
+        if line.startswith("+++ ") and not line.startswith("+++ /dev/null"):
+            path = line[4:].strip()
+            path = path[2:] if path.startswith("b/") else path
+            if path and path not in paths:
+                paths.append(path)
+    if not paths:
+        return ""
+
+    blocks: list[str] = []
+    missing: list[str] = []
+    spent = 0
+    for path in paths:
+        try:
+            body = (repo / path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            missing.append(f"  {path} — could not be read")
+            continue
+        block = f"--- {path} ---\n{body}\n"
+        if spent + len(block) > budget:
+            missing.append(f"  {path} — {len(body)} characters, too large to include")
+            continue
+        blocks.append(block)
+        spent += len(block)
+    omitted = "\nNot included, so you have not seen them:\n" + "\n".join(missing) if missing else ""
+    return REVIEW_CONTEXT_PROMPT.format(files="\n".join(blocks), omitted=omitted)
+
+
+def review_checks_prompt(commands: Sequence[Sequence[str]]) -> str:
+    """Which commands passed, and that the harness ran them."""
+    commands = [" ".join(command) for command in commands if command]
+    if not commands:
+        return REVIEW_NO_CHECKS_PROMPT
+    return REVIEW_CHECKS_PROMPT.format(commands="\n".join(f"  {command}" for command in commands))
+
+
 class Executor:
     """Drives work items through the model roles."""
 
@@ -2430,56 +2480,10 @@ class Executor:
         return first.branch, note
 
     def _review_context(self, diff: str) -> str:
-        """The touched files as they now stand, for the reviewer.
-
-        The reviewer is asked whether a change is wired in where it should be
-        and whether anything unrelated moved, and was given only the change.
-        Measured on rdpapp: two of the three reasons in a rejection were "the
-        diff does not show whether …", which no diff ever can. That is a gate
-        rejecting for the shape of its own prompt.
-
-        The same budget bounds it, and a file too large to include is **named
-        as absent** rather than quietly left out — a reviewer that believes a
-        partial view is complete is worse than one that knows it is partial.
-        """
-        paths: list[str] = []
-        for line in diff.splitlines():
-            if line.startswith("+++ ") and not line.startswith("+++ /dev/null"):
-                path = line[4:].strip()
-                path = path[2:] if path.startswith("b/") else path
-                if path and path not in paths:
-                    paths.append(path)
-        if not paths:
-            return ""
-
-        blocks: list[str] = []
-        missing: list[str] = []
-        spent = 0
-        for path in paths:
-            try:
-                body = (self.repo / path).read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                missing.append(f"  {path} — could not be read")
-                continue
-            block = f"--- {path} ---\n{body}\n"
-            if spent + len(block) > self.context_policy.budget:
-                missing.append(f"  {path} — {len(body)} characters, too large to include")
-                continue
-            blocks.append(block)
-            spent += len(block)
-        omitted = (
-            "\nNot included, so you have not seen them:\n" + "\n".join(missing) if missing else ""
-        )
-        return REVIEW_CONTEXT_PROMPT.format(files="\n".join(blocks), omitted=omitted)
+        return review_context(self.repo, diff, self.context_policy.budget)
 
     def _review_checks_prompt(self) -> str:
-        """Which commands passed, and that the harness ran them."""
-        commands = [" ".join(command) for command in self.checks.commands if command]
-        if not commands:
-            return REVIEW_NO_CHECKS_PROMPT
-        return REVIEW_CHECKS_PROMPT.format(
-            commands="\n".join(f"  {command}" for command in commands)
-        )
+        return review_checks_prompt(self.checks.commands)
 
     def _starved_prompt(self, starved: Sequence[str]) -> str:
         """Supporting targets that did not fit, named so they are not guessed at."""

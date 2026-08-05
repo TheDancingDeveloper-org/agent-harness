@@ -7,6 +7,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request
 
@@ -17,6 +18,7 @@ class BrowserSession:
     csrf_token: str
     operator: str
     expires_at: float
+    token_fingerprint: str
 
 
 class BrowserSessions:
@@ -53,13 +55,20 @@ class BrowserSessions:
                 failures.popleft()
             failures.append(moment)
 
-    def create(self, operator: str = "operator", *, now: float | None = None) -> BrowserSession:
+    def create(
+        self,
+        operator: str = "operator",
+        *,
+        token_fingerprint: str = "",
+        now: float | None = None,
+    ) -> BrowserSession:
         moment = time.time() if now is None else now
         session = BrowserSession(
             session_id=secrets.token_urlsafe(32),
             csrf_token=secrets.token_urlsafe(32),
             operator=operator,
             expires_at=moment + self.ttl_seconds,
+            token_fingerprint=token_fingerprint,
         )
         with self._lock:
             self._purge(moment)
@@ -86,6 +95,10 @@ class BrowserSessions:
         session = self.get(request.cookies.get("harness_session"))
         if session is None:
             raise HTTPException(status_code=401, detail="browser session required")
+        expected = request.app.state.token or ""
+        if not secrets.compare_digest(session.token_fingerprint, self.fingerprint(expected)):
+            self.revoke(session.session_id)
+            raise HTTPException(status_code=401, detail="browser session was revoked")
         return session
 
     def require_csrf(
@@ -95,11 +108,23 @@ class BrowserSessions:
         # header only so a missing token cannot be confused with an empty form.
         token = request.headers.get("X-CSRF-Token", "") or (submitted or "")
         origin = request.headers.get("Origin") or request.headers.get("Referer", "")
-        host = str(request.base_url).rstrip("/")
+        request_url = urlsplit(str(request.base_url))
         if not token or not secrets.compare_digest(token, session.csrf_token):
             raise HTTPException(status_code=403, detail="invalid CSRF token")
-        if origin and not origin.startswith(host):
-            raise HTTPException(status_code=403, detail="request origin is not this service")
+        if origin:
+            submitted_url = urlsplit(origin)
+            if (
+                submitted_url.scheme != request_url.scheme
+                or submitted_url.netloc != request_url.netloc
+            ):
+                raise HTTPException(status_code=403, detail="request origin is not this service")
+
+    @staticmethod
+    def fingerprint(token: str) -> str:
+        """Bind sessions to the configured token without retaining that token."""
+        import hashlib
+
+        return hashlib.sha256(token.encode()).hexdigest()
 
     def _purge(self, now: float) -> None:
         expired = [key for key, value in self._sessions.items() if value.expires_at <= now]

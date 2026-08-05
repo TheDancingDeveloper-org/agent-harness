@@ -8,5 +8,16 @@
     {% if entry.control.reason %}<p class="reason">{{ entry.control.reason }}</p>{% endif %}
     {% if entry.last_worker_error %}<p class="alert error">Latest worker failure: {{ entry.last_worker_error }}</p>{% endif %}
     <p><a class="button secondary" href="{{ url_for('work_page') }}?project_id={{ entry.project.project_id|urlencode }}">Inspect work</a></p>
+    <div class="action-row" aria-label="Project controls">
+      {% for target in ['paused', 'draining', 'stopped'] %}
+        <form method="post" action="{{ url_for('project_control_action') }}" data-csrf-form>
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+          <input type="hidden" name="project_id" value="{{ entry.project.project_id }}">
+          <input type="hidden" name="state" value="{{ target }}">
+          <button class="quiet" type="submit" {% if mode == 'monitoring-only' %}disabled title="Monitoring-only: no worker pool is attached"{% endif %}>{{ target|capitalize }}</button>
+        </form>
+      {% endfor %}
+    </div>
+    {% if mode == 'monitoring-only' %}<p class="muted small">Controls disabled: no supervised worker pool is attached.</p>{% endif %}
   </article>
 {% else %}<section class="empty"><h2>No projects configured</h2><p>Create a project through the typed API, then return here to inspect it.</p></section>{% endfor %}

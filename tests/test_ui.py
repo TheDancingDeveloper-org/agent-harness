@@ -59,10 +59,78 @@ def test_login_cookie_is_opaque_and_pages_are_read_only(tmp_path: Path) -> None:
         projects = client.get("/projects")
         assert projects.status_code == 200
         assert "Project P" in projects.text
-        assert "read-only" in projects.text.lower()
+        assert "monitoring-only" in projects.text.lower()
         assert client.get("/work?project_id=p").status_code == 200
         assert "First item" in client.get("/work?project_id=p").text
         assert client.post("/api/projects/p/start").status_code == 401
+
+
+def test_browser_controls_require_csrf_and_delegate_queue_rules(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        login(client)
+        page = client.get("/work/T1?project_id=p")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        assert (
+            client.post(
+                "/ui/actions/work/block",
+                data={"project_id": "p", "item_id": "T1", "reason": "needs a decision"},
+            ).status_code
+            == 403
+        )
+        response = client.post(
+            "/ui/actions/work/block",
+            data={
+                "csrf_token": csrf,
+                "project_id": "p",
+                "item_id": "T1",
+                "reason": "needs a decision",
+            },
+            headers={"X-CSRF-Token": csrf},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert client.get("/work/T1?project_id=p").text.count("blocked") >= 1
+        audit = client.app.state.store.recent(limit=10)  # type: ignore[attr-defined]
+        assert any(event["data"].get("operator") == "operator" for event in audit)
+
+
+def test_monitoring_only_disables_project_controls(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        login(client)
+        html = client.get("/projects").text
+        assert "monitoring-only" in html
+        assert "no supervised worker pool" in html
+        assert "disabled" in html
+
+
+def test_hold_answer_form_uses_opaque_resume_token_and_csrf(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        queue = client.app.state.queue  # type: ignore[attr-defined]
+        queue.set_control("running", project_id="p")
+        claimed = queue.claim(owner="worker", project_id="p")
+        assert claimed is not None
+        hold = queue.hold(
+            "T1", project_id="p", question="Choose a path", owner="worker", max_seconds=60
+        )
+        login(client)
+        html = client.get("/holds?project_id=p").text
+        assert hold.resume_token in html
+        csrf = html.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        response = client.post(
+            "/ui/actions/hold/answer",
+            data={
+                "csrf_token": csrf,
+                "project_id": "p",
+                "item_id": "T1",
+                "resume_token": hold.resume_token,
+                "text": "the safe path",
+                "data": '{"choice":"safe"}',
+            },
+            headers={"X-CSRF-Token": csrf},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert queue.holds.current("p", "T1") is None
 
 
 def test_ui_security_headers_and_packaged_assets(tmp_path: Path) -> None:
@@ -98,6 +166,13 @@ def test_logout_requires_csrf_and_revokes_session(tmp_path: Path) -> None:
             follow_redirects=False,
         )
         assert response.status_code == 303
+        assert client.get("/projects").status_code == 401
+
+
+def test_token_rotation_revokes_existing_browser_session(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        login(client)
+        client.app.state.token = "rotated-token"  # type: ignore[attr-defined]
         assert client.get("/projects").status_code == 401
 
 

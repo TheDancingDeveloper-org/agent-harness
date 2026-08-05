@@ -1,4 +1,4 @@
-# GUI Milestones 0–1 evidence
+# GUI Milestones 0–1 evidence and Milestone 2 control bridge
 
 Status: implementation slice complete; the full GUI program is not complete.
 
@@ -40,8 +40,10 @@ not evidence: the former raced virtualenv creation and the latter filled the
   `HttpOnly`, `SameSite=Strict` cookie. Login failures are rate-limited; restart
   and logout revoke sessions. State-changing browser requests require CSRF and
   same-origin checks.
-- Monitoring-only mode is visible in the shell and does not expose controls that
-  would fail later. No UI route mutates queue or gate state in this slice.
+- Monitoring-only mode is visible in the shell and disables controls that need a
+  supervised worker pool. The initial control bridge adds only explicit,
+  CSRF-protected pause/drain/stop, retry, block and hold-answer actions; each
+  delegates the existing queue validation and appends an operator audit event.
 - Typed item evidence exposes append-only events, durable attempt stages and
   retained holds without fabricating absent history or cost.
 - `/api/events/stream` resumes after a monotonic cursor and surfaces disconnects;
@@ -55,9 +57,9 @@ delivery, JSON/API isolation, evidence and cursor validation.
 
 ## Not yet exercised or complete
 
-Milestone 1 is not a release claim for the full `GUI_PLAN`: browser automation,
+This is not a release claim for the full `GUI_PLAN`: browser automation,
 screen-reader checks, forced reconnect with replayed events, and all additional
 accessibility/security/concurrency journeys remain to run. Milestones 2–8
-(mutations, plan/adoption wizards, routing/operations panels, internal sessions,
+(remaining mutations, plan/adoption wizards, routing/operations panels, internal sessions,
 extensions, automation, RBAC and recovery) remain explicitly incomplete. No
 real fleet or external deployment was used.

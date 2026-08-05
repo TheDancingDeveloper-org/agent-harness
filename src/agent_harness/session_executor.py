@@ -634,7 +634,7 @@ class SessionExecutor:
                         record, "draft_pr_opened", detail=outcome.pr_url, session_id=session.id
                     )
 
-            verdict_text = self._review(record, tree, True, "")
+            verdict_text = self._review(record, tree, True, "", base=base)
             outcome.stages.append("review")
             verdict = APPROVED if verdict_text.strip().upper().startswith("APPROVED") else REJECTED
             outcome.verdict = verdict
@@ -744,13 +744,26 @@ class SessionExecutor:
             url=url,
         )
 
-    def _review(self, record: WorkRecord, tree: Path, passed: bool, failure: str) -> str:
+    def _review(
+        self, record: WorkRecord, tree: Path, passed: bool, failure: str, base: str = ""
+    ) -> str:
         if self.reviewer is None:
             # Checked before the diff is computed: there is no point building
             # a diff nobody will read. Says so rather than silently treating
             # unreviewed work as approved.
             return "REJECTED\nNo reviewer is configured, so nothing has reviewed this."
-        diff = run_git(tree, "diff", "HEAD")
+        # Against the BASE, not the working tree. `git diff HEAD` answers
+        # "what is uncommitted?", and by the time a reviewer is called the
+        # answer is always "nothing": the checkpoint before the expensive
+        # gate has just committed all of it. So every session-mode reviewer
+        # was shown an empty diff, and said the only correct thing about one:
+        #
+        #   "The supplied diff is empty, so it demonstrates none of that and
+        #    cannot be judged as satisfying the request."
+        #
+        # Measured on a real 48-line change that had already passed its
+        # checks. No session-mode item could ever have been approved.
+        diff = run_git(tree, "diff", f"{base}...HEAD") if base else run_git(tree, "diff", "HEAD")
         prompt = REVIEW_PROMPT.format(
             brief=record.brief,
             diff=diff[:20000],

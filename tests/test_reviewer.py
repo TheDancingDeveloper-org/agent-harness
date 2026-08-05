@@ -98,3 +98,73 @@ def test_the_prompt_demands_evidence_not_just_a_verdict() -> None:
     assert "What I could not verify" in REVIEW_PROMPT
     assert "Assume it is wrong" in REVIEW_PROMPT
     assert "cannot name any, that is a REJECTED" in REVIEW_PROMPT
+
+
+def test_the_reviewer_sees_the_work_after_the_checkpoint_committed_it(tmp_path: Any) -> None:
+    """The measured bug: every session-mode reviewer was shown an empty diff.
+
+    The checkpoint before the expensive gate commits the work — deliberately,
+    so a worker killed during review does not lose what passed the cheap
+    gates. `git diff HEAD` then answers "what is uncommitted?", and the
+    answer is always "nothing". So the reviewer received an empty diff and
+    said the only correct thing about one:
+
+        "The supplied diff is empty, so it demonstrates none of that and
+         cannot be judged as satisfying the request."
+
+    Measured on a real 48-line change that had already passed its checks. No
+    session-mode item could ever have been approved.
+    """
+    import subprocess
+
+    from agent_harness.session_executor import SessionExecutor
+    from agent_harness.work import WorkQueue, WorkRecord
+
+    tree = tmp_path / "repo"
+    tree.mkdir()
+    for argv in (
+        ["init", "-q", "-b", "main"],
+        ["config", "user.email", "t@t"],
+        ["config", "user.name", "t"],
+    ):
+        subprocess.run(["git", "-C", str(tree), *argv], check=True, capture_output=True)
+    (tree / "hello.txt").write_text("hello world\n")
+    subprocess.run(["git", "-C", str(tree), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tree), "commit", "-q", "-m", "base"], check=True, capture_output=True
+    )
+    # The item's own branch, as the executor cuts one, then the agent's work
+    # committed onto it by the pre-review checkpoint.
+    subprocess.run(
+        ["git", "-C", str(tree), "checkout", "-q", "-b", "harness/t1"],
+        check=True,
+        capture_output=True,
+    )
+    (tree / "hello.txt").write_text("hello harness\n")
+    subprocess.run(["git", "-C", str(tree), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tree), "commit", "-q", "-m", "checkpoint"],
+        check=True,
+        capture_output=True,
+    )
+
+    seen: dict[str, str] = {}
+
+    class Reviewer:
+        def call(self, _role: str, messages: Any, **_: Any) -> Any:
+            seen["prompt"] = messages[-1]["content"]
+            body = {"choices": [{"message": {"content": "APPROVED\nok"}}]}
+            return type("R", (), {"body": body})()
+
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    executor = SessionExecutor(
+        queue,
+        type("Host", (), {})(),
+        tree,
+        reviewer=Reviewer(),  # type: ignore[arg-type]
+    )
+
+    executor._review(WorkRecord(item_id="T1", title="t", brief="b"), tree, True, "", base="main")
+
+    assert "hello harness" in seen["prompt"], "the reviewer was not shown the committed work"
+    assert "-hello world" in seen["prompt"], "nor what it replaced"

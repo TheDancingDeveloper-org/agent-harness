@@ -1647,6 +1647,50 @@ durable stage.
   for ever — a hold keeps its claim, so unlike the budgets its default is
   deliberately **not** unlimited.
 
+#### Being told, instead of thinking to look
+
+A hold used to be durable and completely silent (#188): every route to one was
+a pull, so an item could sit on a thirty-second question overnight while every
+dashboard read healthy.
+
+Opening a hold now emits one notice — into the event stream the run already
+writes, and to one URL you name:
+
+```bash
+uv run agent-harness --db harness.sqlite serve --hold-webhook https://your-host/holds
+# or: HARNESS_HOLD_WEBHOOK=https://your-host/holds
+```
+
+```json
+{"kind": "work", "outcome": "hold_opened", "ts": 1754000000.0,
+ "project_id": "default", "item_id": "T4", "worker": "worker-1",
+ "question": "Which database should this use?",
+ "reason": "the schema is not decided",
+ "who_may_answer": "anyone", "expires_at": 1754021600.0,
+ "session_url": "https://…/t/abc",
+ "answer_path": "/api/work/T4/answer?project_id=default",
+ "detail": "T4 is waiting on a person: Which database should this use?"}
+```
+
+Three things about it are deliberate.
+
+- **It is not a notification system.** One URL, one POST, no retries and no
+  queue. What is on the other end — a session host that already has push
+  notifications, a chat relay you wrote, a log file — is not this service's
+  business, and adding a product here would be the coupling `AGENTS.md`
+  forbids.
+- **A failed delivery is dropped, never raised.** It cannot fail the item,
+  stall it, or un-hold it. This is the rule telemetry already follows, for the
+  same reason: the fleet must not depend on it.
+- **It carries no resume token.** `answer_path` says where the answer goes;
+  spending it is an authenticated call to the API, which looks the token up
+  itself.
+
+Configure nothing and nothing changes: the inbox is still `GET /api/holds`, and
+`GET /api/summary` reports `holds_open` plus a `holds_overdue` entry for any
+question still open past its own deadline — a status line that reads healthy
+while one of those exists is exactly the failure this closes.
+
 ---
 
 ## Configuration reference
@@ -1657,6 +1701,7 @@ durable stage.
 | `HARNESS_DB` | all | SQLite path. Default `./harness.sqlite`. |
 | `HARNESS_API_KEY` | `run`, `serve` | Key for the model provider. In `serve` it is the reviewer's. |
 | `HARNESS_ENDPOINT` | `run`, `serve` | Model API base URL. |
+| `HARNESS_HOLD_WEBHOOK` | `run`, `serve` | URL POSTed a JSON notice when an item stops to ask a person something (`--hold-webhook`). Unset means nothing is sent and the pull routes are unchanged. Delivery is best-effort: it can never fail or stall the item. |
 | `HARNESS_ROUTE_PRESET` | `run`, `serve` | Default route preset (`--preset`) for roles that name none: the wire protocol, the authentication header, the response reader and a failure classifier, as one name. Default `chat-completions`. |
 | `HARNESS_ROUTE_PRESETS` | all | Extra presets to make resolvable, as `name=module:attribute` pairs. For a preset that lives in your own code rather than in an installed distribution's entry points. |
 | `HARNESS_CONTEXT_BUDGET` | `run` | How many characters of repository the implementer is shown (`--context-budget`, default 60000). A file bigger than this cannot be supplied at all — see [§6a.1](#6a1-when-the-target-does-not-fit-in-the-prompt). |

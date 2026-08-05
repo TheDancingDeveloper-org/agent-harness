@@ -317,3 +317,49 @@ def test_the_cli_agent_default_is_the_executor_s() -> None:
         __import__("agent_harness.session_executor", fromlist=["x"])
     ), "and that command must still grant edit permission"
     assert "--permission-mode" in " ".join(DEFAULT_AGENT_COMMAND)
+
+
+# ------------------------------------- an escalation is not a failed run
+
+
+def _outcome(item_id: str, *, ok: bool, disposition: str = "", reason: str = "") -> Any:
+    from agent_harness.executor import Outcome
+    from agent_harness.outcomes import Stop
+
+    out = Outcome(item_id, "done" if ok else "blocked", reason=reason)
+    if disposition:
+        out.stop = Stop(disposition, detail=reason)
+    return out
+
+
+def test_an_escalated_item_is_marked_for_a_person_not_as_a_failure() -> None:
+    """Measured on rdpapp R7: a correct refusal was announced as `FAIL R7`."""
+    from agent_harness.__main__ import run_summary
+    from agent_harness.outcomes import ESCALATED
+
+    lines = run_summary(
+        [_outcome("R7", ok=False, disposition=ESCALATED, reason="needs a live Postgres")]
+    )
+
+    assert lines[0].startswith("  YOU R7:")
+    assert "FAIL" not in "\n".join(lines)
+    assert "waiting on you, not on a retry: R7" in lines[-1]
+
+
+def test_a_real_failure_still_reads_as_one() -> None:
+    from agent_harness.__main__ import run_summary
+    from agent_harness.outcomes import REFUSED
+
+    lines = run_summary([_outcome("R2", ok=False, disposition=REFUSED, reason="review rejected")])
+
+    assert lines[0].startswith("  FAIL R2:")
+    assert "waiting on you" not in "\n".join(lines)
+
+
+def test_an_escalation_does_not_colour_the_exit_status() -> None:
+    """A queue of well-formed questions is not a broken run."""
+    from agent_harness.__main__ import _is_failure
+    from agent_harness.outcomes import ESCALATED, REFUSED
+
+    assert _is_failure(_outcome("R7", ok=False, disposition=ESCALATED)) is False
+    assert _is_failure(_outcome("R2", ok=False, disposition=REFUSED)) is True

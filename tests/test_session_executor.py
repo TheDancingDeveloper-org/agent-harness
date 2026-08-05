@@ -330,13 +330,18 @@ def test_a_nonzero_exit_fails_the_item_without_reviewing(repo: Path, tmp_path: P
 
 def test_an_agent_that_changed_nothing_is_reported_as_such(repo: Path, tmp_path: Path) -> None:
     """A CLI agent that decided the task was impossible leaves a clean tree.
-    That is a real answer, not a failure to paper over."""
+    That is a real answer, not a failure to paper over.
+
+    This test used to assert `FAILED`, which is what the docstring above spent
+    two lines saying it was not. It is `BLOCKED` now: a real answer nobody can
+    act on without a person is what `blocked` is for.
+    """
     devenv = FakeDevEnv(agent=None)
     executor, queue = build(repo, tmp_path, devenv)
     add_item(queue)
     outcome = executor.run_once()
     assert outcome is not None
-    assert outcome.state == FAILED
+    assert outcome.state == BLOCKED
     assert "no changes" in outcome.reason
 
 
@@ -844,3 +849,23 @@ def test_the_agent_is_told_where_to_put_a_refusal(repo: Path, tmp_path: Path) ->
     executor.run_once()
 
     assert REFUSAL_FILE in seen[0]
+
+
+def test_a_refusal_lands_in_blocked_not_failed(repo: Path, tmp_path: Path) -> None:
+    """Measured on rdpapp R7, and the reason the Stop carries a state at all.
+
+    Disposition, reason kind and attempt count were all correct and the item
+    still sat in `failed`, because only the checks path copied `stop.state`
+    across. An escalation filed under `failed` is invisible to exactly the
+    person it was raised for.
+    """
+    executor, queue = build(repo, tmp_path, FakeDevEnv(agent=refuse("needs a live database")))
+    add_item(queue)
+
+    outcome = executor.run_once()
+
+    assert outcome is not None
+    assert outcome.state == BLOCKED
+    item = queue.get("W1")
+    assert item is not None
+    assert item.state == BLOCKED

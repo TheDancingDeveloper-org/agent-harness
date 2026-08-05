@@ -1436,7 +1436,7 @@ stops being one.
 |---|---|---|
 | `pass` | exit 0 | On to the reviewer |
 | `fail` | exit non-zero | The item is refused. Costs an attempt. |
-| `fix_available` | exit non-zero, **and** you declared a fix for that command | The item is refused, and the fix is **recorded in the event stream and never run** |
+| `fix_available` | exit non-zero, **and** you declared a fix for that command | The fix is recorded in the event stream. With `apply_fixes` off (the default) the item is refused there; with it on, the fix is run once and the check re-run |
 | `retry` | the command did not finish in time | The item goes back to pending. **Costs no attempt** — the question was not answered, which is not the answer being no |
 | `escalate` | the program is not installed, or the disk is full | The item is **blocked**. No diff fixes that and no retry clears it |
 
@@ -1446,9 +1446,57 @@ Declaring a fix, per project:
 {"checks": ["ruff format --check ."], "fixes": {"ruff format --check .": ["ruff", "format", "."]}}
 ```
 
-It is recorded, not applied. A gate that silently repaired what it was meant to
-catch could not be trusted to have caught anything; applying it is a decision
-with its own consequences.
+It is recorded, not applied — unless you also say `"apply_fixes": true`.
+
+#### Running a declared fix (#155)
+
+A formatter in check mode is a gate no model reliably passes. It is not a
+judgement about the work: it is column arithmetic, the model cannot compute what
+`rustfmt` would have done, and a measured run of one item was refused four times
+out of seven for brace placement while being substantively correct every time.
+
+With `apply_fixes` on, a check that fails and has a declared fix has that fix run
+**once, in the item's own worktree**, and the check **re-run**. The re-run is the
+verdict:
+
+```json
+{
+  "checks": ["cargo fmt --all -- --check", "cargo test"],
+  "fixes": {"cargo fmt --all -- --check": ["cargo", "fmt", "--all"]},
+  "apply_fixes": true
+}
+```
+
+**This is allowed only because a formatter's fix is deterministic and
+mechanical.** It changes where a brace goes, never what the program does, and
+what it produces is the code that would have been merged anyway. **A failing
+test must never be "fixed" and re-run** — a test failure is a statement about
+behaviour, repairing it is a judgement, and re-running it after something edited
+it launders the failure rather than reporting it. Declaring a fix for a test
+suite, a type checker, or a linter whose autofix changes behaviour defeats every
+guard below.
+
+The gate is not weakened. What the harness enforces:
+
+- the fix runs **once**, and never provokes another fix. A gate cannot be ground
+  down to a pass;
+- **the whole suite must pass on the post-fix tree** — checks that had already
+  passed are re-run after a fix, so a fix cannot buy one gate by breaking
+  another;
+- the fix may only **rewrite files that already exist**. Adding, deleting or
+  renaming a path is not something a formatter does, and it escalates to a
+  person rather than passing the item;
+- the fix runs with the **item's worktree** as its working directory, and an
+  argv naming an absolute path or a `..` segment is refused before it runs;
+- **nothing is silent.** Each fix that runs emits a `check_fix_applied` event
+  naming the check, the fix and the exact paths it rewrote; those paths are in
+  the committed diff; and the reviewer is told, in its prompt, that the harness
+  modified the tree and which files it touched.
+
+What the harness **cannot** enforce is that the command you declared is a
+formatter. `apply_fixes` is off by default, is per project, and applies only to
+commands you personally paired with a fix. That last step is your assertion, and
+nothing checks it.
 
 `escalate` is an **additional** outcome and never a softer `fail`. A check
 cannot reach for it to avoid failing an item, and an escalating check still

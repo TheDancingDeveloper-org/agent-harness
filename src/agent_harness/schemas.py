@@ -498,10 +498,28 @@ class ProjectSpec(BaseModel):
         description=(
             "`check command -> argv believed to clear it`. When a check with a declared "
             "fix fails, the item's outcome is `fix_available` rather than plain `fail` "
-            "and the fix is recorded in the event stream. **It is never run.** A gate "
-            "that silently repaired what it was meant to catch could not be trusted to "
-            "have caught anything; applying it is a separate decision. The key must be "
-            "one of `checks`, verbatim."
+            "and the fix is recorded in the event stream. It is run only if "
+            "`apply_fixes` is true. The key must be one of `checks`, verbatim."
+        ),
+    )
+    apply_fixes: bool = Field(
+        False,
+        description=(
+            "Whether a declared fix may actually be RUN. False, the default, keeps the "
+            "old behaviour exactly: the fix is recorded and the item is refused. True "
+            "means a failing check with a declared fix has that fix run once in the "
+            "item's worktree and the check re-run — and **the re-run is the verdict**, "
+            "so a gate that still fails still refuses the item. "
+            "**Only ever turn this on for formatters.** It is allowed at all because a "
+            "formatter's fix is deterministic and mechanical: it changes where a brace "
+            "goes, never what the code does, and its effect lands in the reviewed diff. "
+            "A failing test must never be 'fixed' and re-run — that hides the failure "
+            "instead of reporting it, and no guard here can tell your test runner from "
+            "your formatter. The harness enforces what it can (the fix runs only in the "
+            "item's worktree, once, with no loop; it may only rewrite files that already "
+            "exist; every check must pass on the resulting tree; and every fix that runs "
+            "is announced in the event stream and to the reviewer). The rest is your "
+            "assertion about the commands you declared."
         ),
     )
     max_item_seconds: float = Field(
@@ -600,6 +618,12 @@ class ProjectSpec(BaseModel):
         for command, fix in self.fixes.items():
             if not fix or not all(part for part in fix):
                 raise ValueError(f"the fix for {command!r} must be a non-empty argv list")
+        if self.apply_fixes and not self.fixes:
+            raise ValueError(
+                "apply_fixes is on and no fixes are declared. It is a permission to run "
+                "the fixes you named, not a mode; with nothing named it does nothing, "
+                "and reading it as 'the harness will repair failures' would be wrong."
+            )
         return self
 
 

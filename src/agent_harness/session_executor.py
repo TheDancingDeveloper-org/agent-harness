@@ -64,6 +64,8 @@ from .outcomes import (
     REVIEW_REJECTED,
     WITHHELD,
     WORKER_ERROR,
+    AppliedFix,
+    CheckResult,
     Stop,
     stop_for,
 )
@@ -774,9 +776,11 @@ class SessionExecutor:
                         detail="`" + " ".join(checked.fix) + "` is declared to clear this",
                         session_id=session.id,
                     )
+                self._announce_fixes(record, checked, session.id)
                 outcome.stop = stop
                 outcome.state = stop.state
                 return outcome
+            self._announce_fixes(record, checked, session.id)
             self._emit(record, "checks_passed", session_id=session.id)
             self._keepalive(record)
 
@@ -832,7 +836,9 @@ class SessionExecutor:
                         record, "draft_pr_opened", detail=outcome.pr_url, session_id=session.id
                     )
 
-            verdict_text = self._review(record, tree, True, "", base=base)
+            verdict_text = self._review(
+                record, tree, True, "", base=base, applied_fixes=checked.applied
+            )
             outcome.stages.append("review")
             verdict = APPROVED if verdict_text.strip().upper().startswith("APPROVED") else REJECTED
             for proposal in record_follow_ups(
@@ -961,8 +967,33 @@ class SessionExecutor:
         error = (record.last_error or "").strip()
         return PRIOR_FAILURE_PROMPT.format(error=error[:4000]) if error else ""
 
+    def _announce_fixes(
+        self, record: WorkRecord, checked: CheckResult, session_id: str | None = None
+    ) -> None:
+        """What the harness itself changed in this worktree, said out loud.
+
+        The same event the headless executor emits, for the same reason: a
+        declared fix that ran modified the tree a reviewer and an operator are
+        about to read, and neither may have to infer that from a diff.
+        """
+        from .executor import fix_announcement
+
+        for one in checked.applied:
+            self._emit(
+                record,
+                "check_fix_applied",
+                detail=fix_announcement(one),
+                session_id=session_id,
+            )
+
     def _review(
-        self, record: WorkRecord, tree: Path, passed: bool, failure: str, base: str = ""
+        self,
+        record: WorkRecord,
+        tree: Path,
+        passed: bool,
+        failure: str,
+        base: str = "",
+        applied_fixes: Sequence[AppliedFix] = (),
     ) -> str:
         if self.reviewer is None:
             # Checked before the diff is computed: there is no point building
@@ -983,7 +1014,7 @@ class SessionExecutor:
             # The same helpers the headless reviewer uses, so a correction to
             # either cannot land in one executor and not the other (#167).
             context=review_context(tree, diff, self.context_budget),
-            checks=review_checks_prompt(self.checks.commands),
+            checks=review_checks_prompt(self.checks.commands, applied_fixes),
         )
         try:
             response = self.reviewer.call("reviewer", [{"role": "user", "content": prompt}])

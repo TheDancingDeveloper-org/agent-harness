@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +65,7 @@ from .outcomes import (
     ITEM_SPEND,
     ITEM_WALL_CLOCK,
     NO_TARGET,
+    PASS,
     PASSED,
     PATCH_REJECTED,
     PROVIDER_EXHAUSTED,
@@ -71,6 +74,7 @@ from .outcomes import (
     REVIEW_REJECTED,
     WITHHELD,
     WORKER_ERROR,
+    AppliedFix,
     CheckResult,
     Stop,
     stop_for,
@@ -1115,15 +1119,68 @@ class Checks:
     its failure meant. Guessing at another ecosystem's messages is precisely
     how a generic harness stops being one, and a misread failure here would
     turn a real defect into a retry.
+
+    ## Applying a declared fix (#155)
+
+    With `apply_fixes` on, a check that fails and has a declared fix has that
+    fix **run once, in the item's own worktree**, and is then **re-run**. The
+    re-run is the verdict. If the gate still says no, the item is refused
+    exactly as it always was.
+
+    **This is allowed only because a formatter's fix is deterministic and
+    mechanical.** `cargo fmt`, `ruff format` and `prettier --write` compute the
+    one canonical rendering of code that already says what it says; running one
+    changes where a brace goes, and cannot change what the program does. The
+    gate is not weakened by re-asking it about a tree that a canonical renderer
+    has rewritten — the answer to "is this file formatted?" is being *earned*,
+    not skipped, and the formatted code is the code that would have been merged
+    anyway.
+
+    **A test that fails must never be "fixed" and re-run.** That is a different
+    thing wearing the same shape: a failing test is a statement about
+    behaviour, its repair is a judgement, and re-running it after something
+    edited it would launder the failure instead of reporting it. Nothing in
+    this class may be used to do that, and the guards below narrow how far it
+    can be pushed:
+
+    - **One fix, one re-run, no loop.** A fix never provokes another fix, and
+      a check is never fixed twice. A gate cannot be ground down to a pass.
+    - **The whole suite must pass on the post-fix tree.** Checks that had
+      already passed before a fix ran are re-run afterwards, so a "fix" cannot
+      buy one gate by breaking another that was already green.
+    - **The fix may only rewrite files that already exist.** Adding, deleting
+      or renaming a path is not something a formatter does; it *is* something
+      a fix that deletes a failing test does. It escalates to a person rather
+      than passing the item.
+    - **Confined to the worktree.** The fix runs with the item's tree as its
+      working directory, and an argv naming an absolute path or a `..` segment
+      is refused before anything runs.
+    - **Never silent.** Every fix that runs is recorded on the result as an
+      `AppliedFix` naming the paths it rewrote, is emitted as an event, and is
+      stated to the reviewer. See `review_checks_prompt`.
+
+    **What is not enforceable, stated plainly:** the harness cannot tell a
+    formatter from a test runner. `apply_fixes` is off by default, is per
+    project, and applies only to commands the operator has *personally* paired
+    with a fix. Declaring a fix for a command whose failure is a judgement —
+    a test suite, a type checker, a linter with autofixes that change
+    behaviour — defeats every guard above, and is the operator asserting
+    something the harness has to take on trust. Do not do it.
     """
 
     commands: Sequence[Sequence[str]] = ()
     timeout: float = 900.0
     #: `command index or program name -> argv that is believed to clear it`.
     #: Declared by the caller, because only the caller knows that
-    #: `ruff format` fixes what `ruff format --check` reports. Recorded when
-    #: the check fails; **never run** — see `outcomes.CheckResult.fix`.
+    #: `ruff format` fixes what `ruff format --check` reports. Always recorded
+    #: on the result; run only when `apply_fixes` is on.
     fixes: Mapping[str, Sequence[str]] = field(default_factory=dict)
+    #: **Off by default, and deliberately.** On, a declared fix is run and its
+    #: check re-run, under every guard in this class's docstring. Turning it on
+    #: is the operator asserting that every command they have declared a fix
+    #: for is mechanically fixable — which is a promise about the tools, not a
+    #: property the harness can verify.
+    apply_fixes: bool = False
 
     def _fix_for(self, command: Sequence[str]) -> tuple[str, ...]:
         for key in (" ".join(command), command[0] if command else ""):
@@ -1132,49 +1189,284 @@ class Checks:
                 return tuple(found)
         return ()
 
-    def run(self, repo: Path) -> CheckResult:
-        for command in self.commands:
-            argv = list(command)
-            label = " ".join(argv)
-            try:
-                result = subprocess.run(  # noqa: S603 - caller-supplied argv, no shell
-                    argv,
-                    cwd=repo,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout,
-                )
-            except subprocess.TimeoutExpired:
-                # The question was not answered. That is not the same as the
-                # answer being no, and holding it against the item would fail
-                # sound work because a machine was busy.
-                return CheckResult(
-                    RETRY,
-                    f"`{label}` did not finish within {self.timeout:g}s",
-                    command=tuple(argv),
-                )
-            except OSError as exc:
-                # The program is missing or not executable. No diff fixes
-                # that and no retry clears it; it is a deployment fault
-                # wearing a check's clothes.
-                return CheckResult(
-                    ESCALATE,
-                    f"`{label}` could not be started: {exc}",
-                    command=tuple(argv),
-                )
-            if result.returncode != 0:
-                tail = (result.stdout + result.stderr).strip().splitlines()[-40:]
-                detail = f"`{label}` failed:\n" + "\n".join(tail)
-                if is_disk_exhaustion(detail):
-                    # The machine is out of room. Every subsequent item fails
-                    # the same way, and each one pays a planner and an
-                    # implementer first.
-                    return CheckResult(ESCALATE, detail, command=tuple(argv))
-                fix = self._fix_for(argv)
-                if fix:
-                    return CheckResult(FIX_AVAILABLE, detail, command=tuple(argv), fix=fix)
-                return CheckResult(FAIL, detail, command=tuple(argv))
+    def _run_one(self, repo: Path, command: Sequence[str]) -> CheckResult:
+        """One gate, asked once. The classification, and nothing else."""
+        argv = list(command)
+        label = " ".join(argv)
+        try:
+            result = subprocess.run(  # noqa: S603 - caller-supplied argv, no shell
+                argv,
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            # The question was not answered. That is not the same as the
+            # answer being no, and holding it against the item would fail
+            # sound work because a machine was busy.
+            return CheckResult(
+                RETRY,
+                f"`{label}` did not finish within {self.timeout:g}s",
+                command=tuple(argv),
+            )
+        except OSError as exc:
+            # The program is missing or not executable. No diff fixes
+            # that and no retry clears it; it is a deployment fault
+            # wearing a check's clothes.
+            return CheckResult(
+                ESCALATE,
+                f"`{label}` could not be started: {exc}",
+                command=tuple(argv),
+            )
+        if result.returncode != 0:
+            tail = (result.stdout + result.stderr).strip().splitlines()[-40:]
+            detail = f"`{label}` failed:\n" + "\n".join(tail)
+            if is_disk_exhaustion(detail):
+                # The machine is out of room. Every subsequent item fails
+                # the same way, and each one pays a planner and an
+                # implementer first.
+                return CheckResult(ESCALATE, detail, command=tuple(argv))
+            fix = self._fix_for(argv)
+            if fix:
+                return CheckResult(FIX_AVAILABLE, detail, command=tuple(argv), fix=fix)
+            return CheckResult(FAIL, detail, command=tuple(argv))
         return PASSED
+
+    def run(self, repo: Path) -> CheckResult:
+        applied: list[AppliedFix] = []
+        last_fixed: int | None = None
+        for index, command in enumerate(self.commands):
+            result = self._run_one(repo, command)
+            if result.ok:
+                continue
+            if result.outcome != FIX_AVAILABLE or not self.apply_fixes:
+                # Unchanged behaviour, and the default one: the fix is
+                # recorded and the item is refused.
+                return replace(result, applied=tuple(applied))
+            rechecked, record = self._fix_and_recheck(repo, command, result)
+            if record is not None:
+                applied.append(record)
+            if not rechecked.ok:
+                return replace(rechecked, applied=tuple(applied))
+            last_fixed = index
+        if last_fixed is not None:
+            # Every gate that ran BEFORE the last fix did so against a tree the
+            # fix has since rewritten, so its answer is about a tree that no
+            # longer exists. Re-asking them is what makes the guarantee "every
+            # declared check passes on the tree as it now stands" true rather
+            # than the much weaker "every check passed at some point". Nothing
+            # here can provoke another fix, so this terminates. Usually free: a
+            # formatter is conventionally the cheapest check and therefore the
+            # first, and there is then nothing before it to re-run.
+            for command in self.commands[:last_fixed]:
+                result = self._run_one(repo, command)
+                if not result.ok:
+                    return replace(result, applied=tuple(applied))
+        if applied:
+            # A pass the harness helped produce, and it says so.
+            return CheckResult(PASS, applied=tuple(applied))
+        return PASSED
+
+    def _fix_and_recheck(
+        self, repo: Path, command: Sequence[str], failure: CheckResult
+    ) -> tuple[CheckResult, AppliedFix | None]:
+        """Run one declared fix, bound its effect, and ask the gate again.
+
+        Returns the gate's *second* answer and the record of what the fix did.
+        The second answer is the only one that decides anything: this method
+        cannot turn a failure into a pass, it can only give the same command a
+        second look at a tree the operator's own fix rewrote.
+        """
+        argv = tuple(failure.fix)
+        label = " ".join(argv)
+        checked = tuple(command)
+        unconfined = unconfined_argument(argv)
+        if unconfined:
+            return (
+                CheckResult(
+                    ESCALATE,
+                    f"the declared fix `{label}` names {unconfined!r}, which may point "
+                    "outside the item's worktree. A fix may only rewrite files in the "
+                    "tree it is run in, so it was not run.",
+                    command=checked,
+                ),
+                None,
+            )
+        before = worktree_tree_id(repo)
+        if not before:
+            # Without git there is no way to say what the fix changed, and an
+            # unbounded, invisible edit to the tree a reviewer is about to read
+            # is precisely what must not happen.
+            return (
+                CheckResult(
+                    ESCALATE,
+                    f"the declared fix `{label}` was not run: {repo} is not a git worktree, "
+                    "so what the fix changed could be neither bounded nor shown to a reviewer.",
+                    command=checked,
+                ),
+                None,
+            )
+        try:
+            subprocess.run(  # noqa: S603 - caller-supplied argv, no shell
+                list(argv),
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return (
+                CheckResult(
+                    RETRY,
+                    f"the declared fix `{label}` did not finish within {self.timeout:g}s",
+                    command=checked,
+                ),
+                None,
+            )
+        except OSError as exc:
+            return (
+                CheckResult(
+                    ESCALATE,
+                    f"the declared fix `{label}` could not be started: {exc}",
+                    command=checked,
+                ),
+                None,
+            )
+        structural, rewritten = tree_delta(repo, before, worktree_tree_id(repo))
+        if structural:
+            # A formatter rewrites files; it does not invent or remove them.
+            # Something that does is not the mechanical repair this path is
+            # allowed to run, and a person has to look at the configuration.
+            return (
+                CheckResult(
+                    ESCALATE,
+                    f"the declared fix `{label}` added, removed or renamed "
+                    + ", ".join(structural[:10])
+                    + ". A fix is permitted to rewrite existing files and nothing else; "
+                    "this one is not a mechanical repair and must not be declared as one.",
+                    command=checked,
+                ),
+                AppliedFix(checked, argv, tuple(structural) + tuple(rewritten), cleared=False),
+            )
+        rerun = self._run_one(repo, command)
+        record = AppliedFix(checked, argv, tuple(rewritten), cleared=rerun.ok)
+        if rerun.ok:
+            return rerun, record
+        # The gate has now been asked twice and said no twice. It is a plain
+        # failure: the fix is spent, so the result must not offer it again and
+        # invite another round.
+        outcome = FAIL if rerun.outcome == FIX_AVAILABLE else rerun.outcome
+        detail = (
+            f"{rerun.detail}\n\n(the declared fix `{label}` was run first and did not clear this)"
+        )
+        return CheckResult(outcome, detail, command=checked), record
+
+
+def fix_announcement(one: AppliedFix) -> str:
+    """One sentence saying what the harness ran and what it did to the tree.
+
+    Shared by both executors on purpose: a correction to how a fix is announced
+    must not land in one and not the other (#167).
+    """
+    return (
+        f"`{' '.join(one.fix)}` was run after `{' '.join(one.check)}` failed, and "
+        + ("cleared it" if one.cleared else "did NOT clear it")
+        + "; it rewrote: "
+        + (", ".join(one.paths) or "nothing")
+    )
+
+
+def unconfined_argument(argv: Sequence[str]) -> str:
+    """The first argument that could reach outside the tree, or `""`.
+
+    Cheap and conservative, and checked *before* anything runs. A fix is a
+    command against the item's own worktree; an argument naming an absolute
+    path or climbing out through `..` is either a mistake or a fix doing
+    something a fix may not do, and both are worth refusing loudly.
+
+    The program itself (`argv[0]`) may be absolute — `/usr/bin/cargo` is a
+    normal way to name a tool — but may not climb.
+    """
+    for index, argument in enumerate(argv):
+        if index and (
+            argument.startswith(("/", "~")) or (argument.startswith("--") and "=/" in argument)
+        ):
+            return argument
+        if ".." in Path(argument).parts:
+            return argument
+    return ""
+
+
+def worktree_tree_id(repo: Path) -> str:
+    """A git tree object naming everything in `repo` right now, or `""`.
+
+    Written through a **throwaway index**, so the repository's real index is
+    untouched and an attempt that is later abandoned is abandoned exactly as it
+    would have been. Two of these, side by side, say precisely which files
+    something changed — which is how the harness can show a reviewer what a
+    formatter did rather than asserting it.
+
+    Ignored paths are excluded, because `git add` excludes them: a fix that
+    writes into `target/` or `node_modules/` is invisible here, and so is it to
+    the commit and the reviewer. That is the intended scope, not an oversight.
+    """
+    inside = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["git", "-C", str(repo), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+    )
+    if inside.returncode != 0:
+        return ""
+    with tempfile.TemporaryDirectory() as scratch:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+        staged = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["git", "-C", str(repo), "add", "-A"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if staged.returncode != 0:
+            return ""
+        written = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["git", "-C", str(repo), "write-tree"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if written.returncode != 0:
+            return ""
+        return written.stdout.strip()
+
+
+def tree_delta(repo: Path, before: str, after: str) -> tuple[list[str], list[str]]:
+    """`(paths added/removed/renamed, paths rewritten in place)`.
+
+    The first list is the one that matters: it is what a formatter never does
+    and what a fix is not allowed to do.
+    """
+    if not before or not after or before == after:
+        return [], []
+    output = run_git(repo, "diff", "--name-status", "-z", before, after, check=False)
+    fields = [field for field in output.split("\0") if field]
+    structural: list[str] = []
+    rewritten: list[str] = []
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        # A rename or copy is reported as `R100 old new` — two paths, so the
+        # cursor moves by three rather than two.
+        paths = (
+            fields[index + 1 : index + 3]
+            if status[:1] in ("R", "C")
+            else fields[index + 1 : index + 2]
+        )
+        index += 1 + len(paths)
+        if status.startswith("M") or status.startswith("T"):
+            rewritten.extend(paths)
+        else:
+            structural.extend(paths)
+    return structural, rewritten
 
 
 def is_disk_exhaustion(detail: str) -> bool:
@@ -1359,6 +1651,23 @@ This project has no checks configured, so nothing has been run against this
 change. You are the only gate it has.
 """
 
+#: The harness edited the tree. The reviewer is told, in the same breath as it
+#: is told which gates passed, because the alternative is a diff that contains
+#: lines no agent wrote and no note saying so. "Do not hold this against the
+#: change" is *not* said and must not be: the formatting is in the diff, it is
+#: reviewable, and if a fix did something a formatter should not do then
+#: noticing that is exactly the reviewer's job.
+REVIEW_FIXED_PROMPT = """
+**The harness itself modified this tree.** One or more checks failed, the
+project had declared a mechanical fix for them, and the harness ran it and
+re-ran the check. Every command below then exited zero on the tree as you now
+see it. What each fix rewrote:
+{fixes}
+Those lines are in the diff above and are not the agent's work. Review them as
+you would any other part of the change: a fix that changed more than
+formatting is a defect, whoever ran it.
+"""
+
 #: The files the diff touched, as they now stand. Without this the reviewer is
 #: asked whether a change is wired in correctly while holding only the change,
 #: and "the task cannot be judged from what you were given" — which the prompt
@@ -1524,12 +1833,33 @@ def review_context(repo: Path, diff: str, budget: int) -> str:
     return REVIEW_CONTEXT_PROMPT.format(files="\n".join(blocks), omitted=omitted)
 
 
-def review_checks_prompt(commands: Sequence[Sequence[str]]) -> str:
-    """Which commands passed, and that the harness ran them."""
-    commands = [" ".join(command) for command in commands if command]
-    if not commands:
-        return REVIEW_NO_CHECKS_PROMPT
-    return REVIEW_CHECKS_PROMPT.format(commands="\n".join(f"  {command}" for command in commands))
+def review_checks_prompt(
+    commands: Sequence[Sequence[str]], applied: Sequence[AppliedFix] = ()
+) -> str:
+    """Which commands passed, that the harness ran them, and what it rewrote.
+
+    `applied` is not optional information. A declared fix that ran changed the
+    diff the reviewer is about to read, and a reviewer who believes every line
+    in front of it was written by the agent is being misled by omission.
+    """
+    names = [" ".join(command) for command in commands if command]
+    said = (
+        REVIEW_NO_CHECKS_PROMPT
+        if not names
+        else REVIEW_CHECKS_PROMPT.format(commands="\n".join(f"  {command}" for command in names))
+    )
+    if not applied:
+        return said
+    return said + REVIEW_FIXED_PROMPT.format(
+        fixes="\n".join(
+            "  `{fix}` (after `{check}` failed), rewriting: {paths}".format(
+                fix=" ".join(one.fix),
+                check=" ".join(one.check),
+                paths=", ".join(one.paths) or "nothing",
+            )
+            for one in applied
+        )
+    )
 
 
 class Executor:
@@ -2362,11 +2692,19 @@ class Executor:
                     "fix_available",
                     detail="`" + " ".join(checked.fix) + "` is declared to clear this",
                 )
+            self._announce_fixes(record, checked)
             outcome.reason = failure
             outcome.stop = stop
             outcome.state = stop.state
             self._abandon_branch(branch)
             return outcome
+        self._announce_fixes(record, checked)
+        if checked.applied:
+            # The tree is not what it was when `applied_diff` was taken: the
+            # harness ran a declared fix over it. Re-reading it is what makes
+            # the reviewer's copy the truth — and what stops the commit below
+            # from containing lines the reviewer was never shown.
+            applied_diff = run_git(self.repo, "diff", "HEAD") or applied_diff
         self._emit(record, "checks_passed")
         # Recorded, though it makes resumption no cheaper: re-running a
         # project's checks is idempotent and costs no model call, so a resumed
@@ -2470,7 +2808,16 @@ class Executor:
                 )
 
         return self._review_stage(
-            record, outcome, applied_diff, branch, base, resume, log, attempt, mode
+            record,
+            outcome,
+            applied_diff,
+            branch,
+            base,
+            resume,
+            log,
+            attempt,
+            mode,
+            applied_fixes=checked.applied,
         )
 
     def _review_stage(
@@ -2484,6 +2831,7 @@ class Executor:
         log: A.AttemptLog,
         attempt: int,
         mode: str,
+        applied_fixes: Sequence[AppliedFix] = (),
     ) -> Outcome:
         """The expensive gate, and what approval buys.
 
@@ -2516,7 +2864,7 @@ class Executor:
                     # above. What the reviewer needs is *which* commands
                     # passed, and that the harness rather than the author ran
                     # them.
-                    checks=self._review_checks_prompt(),
+                    checks=self._review_checks_prompt(applied_fixes),
                 ),
             )
         outcome.stages.append("review")
@@ -2621,8 +2969,24 @@ class Executor:
     def _review_context(self, diff: str) -> str:
         return review_context(self.repo, diff, self.context_policy.budget)
 
-    def _review_checks_prompt(self) -> str:
-        return review_checks_prompt(self.checks.commands)
+    def _review_checks_prompt(self, applied: Sequence[AppliedFix] = ()) -> str:
+        return review_checks_prompt(self.checks.commands, applied)
+
+    def _announce_fixes(self, record: WorkRecord, checked: CheckResult) -> None:
+        """Say what the harness changed, whichever way the checks then went.
+
+        Emitted for a fix that cleared its gate *and* for one that did not: an
+        operator reading the stream has to be able to see that a command ran
+        against the tree even when the item was refused anyway, because the
+        tree it ran against is the one they will be looking at.
+        """
+        for one in checked.applied:
+            self._emit(
+                record,
+                "check_fix_applied",
+                detail=fix_announcement(one),
+                evidence={"fix": one.as_dict()},
+            )
 
     def _starved_prompt(self, starved: Sequence[str]) -> str:
         """Supporting targets that did not fit, named so they are not guessed at."""

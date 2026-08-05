@@ -10,7 +10,15 @@ against a real gateway, at real cost, one at a time:
 3. a hand-rolled transport sent the credential wrong, and every route came
    back `credential rejected`;
 4. the model returned only `content`, so the loop found no actions in
-   `extra` and executed **nothing** while appearing to run.
+   `extra` and executed **nothing** while appearing to run;
+5. no `Submitted` was raised on the finish marker, so a loop that should have
+   stopped after one turn ran to its step limit -- in a real run, forty model
+   calls to reach an outcome it had already decided;
+6. the loop's own bookkeeping (`extra`, an `exit` role) reached the wire, and
+   the gateway refused every route with `upstream_rejected`.
+
+The fifth and sixth were found here, in under a second each. The sixth had
+already cost a live run before this file existed.
 
 Every one of them is a wiring mistake findable in under a second without a
 network. That is what this file is for. The model is scripted, the repository
@@ -208,3 +216,27 @@ def test_a_malformed_reply_is_handed_back_to_the_model_not_raised(repo: Path) ->
 
     with pytest.raises(FormatError):
         model.query([{"role": "user", "content": "go"}])
+
+
+def test_what_reaches_the_wire_is_a_chat_message_and_nothing_else(repo: Path) -> None:
+    """The suspect behind a live `upstream_rejected` from the gateway.
+
+    The loop keeps its own bookkeeping on messages -- `extra` carrying parsed
+    actions, and an `exit` role when it finishes. Those are its business. A
+    chat-completions endpoint is entitled to reject a message object with
+    fields it does not define, and LiteLLM strips them where our transport
+    would pass them straight through.
+
+    So this asserts the shape we send, not the shape we hold: every message
+    reaching the transport must have exactly `role` and `content`, and a role
+    the API actually defines.
+    """
+    client, asked = scripted("cat answer.txt", "./check.sh", DONE)
+    build(client, repo).run("Look, check, finish.")
+
+    assert asked, "no call reached the transport"
+    for turn in asked:
+        for message in turn:
+            assert set(message) == {"role", "content"}, f"extra fields on the wire: {message}"
+            assert message["role"] in {"system", "user", "assistant"}, message["role"]
+            assert isinstance(message["content"], str)

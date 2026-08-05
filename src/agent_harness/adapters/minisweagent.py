@@ -44,6 +44,7 @@ says so plainly rather than failing somewhere later.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -127,6 +128,40 @@ def _segments(command: str) -> list[list[str]]:
     return out
 
 
+#: Roles a chat-completions endpoint defines. The loop uses `exit` for its own
+#: bookkeeping, which is its business and not a role any API knows.
+_WIRE_ROLES = frozenset({"system", "user", "assistant", "tool"})
+
+
+def _for_the_wire(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """The conversation as a chat API defines it, and nothing more.
+
+    The loop keeps bookkeeping on its messages -- `extra` carrying the parsed
+    actions, an `exit` role when it finishes. An endpoint is entitled to reject
+    a message object with fields it does not define, and one did: a live run
+    was refused on all three routes with `upstream_rejected`, which the
+    classifier correctly called a refusal and correctly did not retry.
+
+    LiteLLM strips these, which is why the spike never saw it and the first
+    integrated run did. Stripping here rather than in `ModelClient` because
+    this is the loop's shape, and core should not learn it.
+
+    An unknown role becomes `user`: dropping the message would silently lose a
+    turn of context, and inventing a role is how this failed in the first
+    place.
+    """
+    out: list[dict[str, str]] = []
+    for message in messages:
+        role = str(message.get("role", "user"))
+        out.append(
+            {
+                "role": role if role in _WIRE_ROLES else "user",
+                "content": str(message.get("content", "")),
+            }
+        )
+    return out
+
+
 @dataclass
 class HarnessModel:
     """`mini-swe-agent`'s `Model`, answered by this harness's client.
@@ -170,7 +205,7 @@ class HarnessModel:
 
         from ..executor import _text_of
 
-        reply = self.client.call(self.role, messages, **kwargs)
+        reply = self.client.call(self.role, _for_the_wire(messages), **kwargs)
         self.n_calls += 1
         content = _text_of(reply.body) or ""
         # A FormatError is not caught here: the loop handles it by telling the

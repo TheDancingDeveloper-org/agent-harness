@@ -23,6 +23,7 @@ from fastapi.templating import Jinja2Templates
 
 from .browser_session import BrowserSession, BrowserSessions
 from .events import WORK, Event
+from .inception import Inception
 from .query_service import HarnessQueries
 from .work import BLOCKED, CLAIMED, DONE, PENDING
 
@@ -85,6 +86,17 @@ def install_ui(app: FastAPI) -> BrowserSessions:
         )
         sink = request.app.state.audit or request.app.state.store
         sink.append([event])
+
+    def inception_for(request: Request) -> Inception:
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        return Inception(queue, model_client=request.app.state.model_client)
+
+    def project_redirect(request: Request, project_id: str) -> RedirectResponse:
+        return RedirectResponse(
+            url=str(request.url_for("plans")) + f"?project_id={project_id}", status_code=303
+        )
 
     @app.get("/", include_in_schema=False)
     def root(request: Request) -> RedirectResponse:
@@ -324,6 +336,113 @@ def install_ui(app: FastAPI) -> BrowserSessions:
         )
         return RedirectResponse(url=request.url_for("holds"), status_code=303)
 
+    @app.post("/ui/actions/inception/start", name="inception_start_action", include_in_schema=False)
+    async def inception_start_action(request: Request) -> RedirectResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        overview = body.get("overview", "").strip()
+        if not project_id or not overview:
+            raise HTTPException(status_code=422, detail="project id and overview are required")
+        try:
+            inception_for(request).start(project_id, overview)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        action_audit(
+            request,
+            action="inception_start",
+            outcome="operator_started_inception",
+            data={"project_id": project_id},
+        )
+        return project_redirect(request, project_id)
+
+    @app.post("/ui/actions/inception/scope", name="inception_scope_action", include_in_schema=False)
+    async def inception_scope_action(request: Request) -> RedirectResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        if not project_id:
+            raise HTTPException(status_code=422, detail="project id is required")
+        try:
+            inception_for(request).scope(project_id, body.get("feedback", "").strip() or None)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        action_audit(
+            request,
+            action="inception_scope",
+            outcome="operator_requested_scope",
+            data={"project_id": project_id},
+        )
+        return project_redirect(request, project_id)
+
+    @app.post(
+        "/ui/actions/inception/question",
+        name="inception_question_action",
+        include_in_schema=False,
+    )
+    async def inception_question_action(request: Request) -> RedirectResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        question_id = body.get("question_id", "").strip()
+        answer = body.get("answer", "").strip() or None
+        defer_reason = body.get("defer_reason", "").strip() or None
+        severity = body.get("severity", "").strip() or None
+        if not project_id or not question_id or not (answer or defer_reason or severity):
+            raise HTTPException(
+                status_code=422,
+                detail="project, question, and an answer, deferral, or severity are required",
+            )
+        try:
+            inception_for(request).resolve(
+                project_id,
+                question_id,
+                answer=answer,
+                defer_reason=defer_reason,
+                severity=severity,
+                who=session.operator,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        action_audit(
+            request,
+            action="inception_question",
+            outcome="operator_resolved_question",
+            data={"project_id": project_id, "question_id": question_id},
+        )
+        return project_redirect(request, project_id)
+
+    @app.post(
+        "/ui/actions/inception/approve",
+        name="inception_approve_action",
+        include_in_schema=False,
+    )
+    async def inception_approve_action(request: Request) -> RedirectResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        if not project_id:
+            raise HTTPException(status_code=422, detail="project id is required")
+        try:
+            inception_for(request).approve(project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        action_audit(
+            request,
+            action="inception_approve",
+            outcome="operator_approved_scope",
+            data={"project_id": project_id},
+        )
+        return project_redirect(request, project_id)
+
     @app.get("/holds", name="holds", response_class=HTMLResponse, include_in_schema=False)
     def holds_page(request: Request, project_id: str | None = None) -> HTMLResponse:
         require_session(request)
@@ -370,16 +489,43 @@ def install_ui(app: FastAPI) -> BrowserSessions:
         )
 
     @app.get("/plans", name="plans", response_class=HTMLResponse, include_in_schema=False)
-    def plans_page(request: Request) -> HTMLResponse:
+    def plans_page(request: Request, project_id: str | None = None) -> HTMLResponse:
         require_session(request)
+        query = queries(request)
+        projects = query.projects()
+        selected = project_id or (
+            projects.projects[0].project.project_id if projects.projects else None
+        )
+        proposal = query.inception(selected) if selected else None
+        selected_summary = query.project(selected) if selected else None
+        plan_path = selected_summary.project.plan_path if selected_summary else None
         return render(
             request,
-            "placeholder.html",
+            "plans.html",
             title="Plans",
-            message=(
-                "Plan review is available through the typed API while its review wizard "
-                "is being delivered."
-            ),
+            projects=projects,
+            project_id=selected,
+            proposal=proposal,
+            plan_markdown=query.inception_plan(selected, selected) if selected else None,
+            plan_path=plan_path,
+            parse_result=query.plan_parse(plan_path) if plan_path else None,
+        )
+
+    @app.get("/graph", name="graph", response_class=HTMLResponse, include_in_schema=False)
+    def graph_page(request: Request, project_id: str | None = None) -> HTMLResponse:
+        require_session(request)
+        query = queries(request)
+        projects = query.projects()
+        selected = project_id or (
+            projects.projects[0].project.project_id if projects.projects else None
+        )
+        return render(
+            request,
+            "graph.html",
+            title="Dependency graph",
+            projects=projects,
+            project_id=selected,
+            graph=query.graph(selected) if selected else None,
         )
 
     @app.get("/sessions", name="sessions", response_class=HTMLResponse, include_in_schema=False)

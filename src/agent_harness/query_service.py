@@ -10,19 +10,28 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 from .schemas import (
     AttemptStageEvidence,
+    DependencyEdgeModel,
+    DependencyGraphReport,
     Event,
     EventPage,
     FleetControl,
     HoldList,
     HoldView,
+    ItemReadiness,
     LatestEvent,
+    OpenQuestion,
+    PlanItem,
+    PlanParseResult,
     ProjectList,
     ProjectSpec,
     ProjectSummary,
+    ProposalModel,
+    ReadinessReasonModel,
     RoleRoute,
     WorkEvidence,
     WorkItem,
@@ -154,6 +163,135 @@ class HarnessQueries:
         now = queue.now()
         return HoldList(
             open=[HoldView(**hold.as_dict(now)) for hold in queue.holds.open_holds(project_id)]
+        )
+
+    def inception(self, project_id: str) -> ProposalModel | None:
+        """Return the current inception proposal through the typed read boundary."""
+        if self.queue is None:
+            return None
+        from .inception import Inception
+
+        proposal = Inception(self.queue).current(project_id)
+        if proposal is None:
+            return None
+        return ProposalModel(
+            revision=proposal.revision,
+            created_at=proposal.created_at,
+            goal=proposal.goal,
+            assumptions=proposal.assumptions,
+            non_goals=proposal.non_goals,
+            risks=proposal.risks,
+            phases=proposal.phases,
+            questions=[
+                OpenQuestion(
+                    id=question.id,
+                    question=question.question,
+                    severity=question.severity,
+                    why_it_matters=question.why_it_matters,
+                    answer=question.answer,
+                    deferred_reason=question.deferred_reason,
+                    resolved_by=question.resolved_by,
+                )
+                for question in proposal.questions
+            ],
+            feedback=proposal.feedback,
+            item_count=proposal.item_count(),
+            blocking_open=len(proposal.blocking_open()),
+        )
+
+    def inception_plan(self, project_id: str, name: str | None = None) -> str | None:
+        """Render the current proposal without creating queue rows or files."""
+        if self.queue is None:
+            return None
+        from .inception import Inception
+
+        try:
+            return Inception(self.queue).plan_markdown(project_id, name)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def plan_parse_markdown(markdown: str) -> PlanParseResult:
+        """Parse a document using the same loss-reporting parser as the API."""
+        from .plan import parse_plan
+
+        parsed = parse_plan(markdown)
+        report = parsed.dependency_report()
+        return PlanParseResult(
+            items=[
+                PlanItem(
+                    id=item.id,
+                    title=item.title,
+                    body=item.body,
+                    labels=item.labels,
+                    milestone=item.milestone,
+                    depends_on=item.depends_on,
+                    done=item.done,
+                    line=item.line,
+                )
+                for item in parsed.items
+            ],
+            skipped=[f"line {line}: {title}" for line, title in parsed.skipped],
+            duplicate_ids=parsed.duplicate_ids(),
+            unresolved_dependencies=report.unresolved,
+            external_dependencies=report.external,
+            decision_dependencies=report.decisions,
+            cross_project_dependencies=report.cross_project,
+            malformed_dependencies=report.malformed,
+            dependency_cycles=[list(cycle) for cycle in report.cycles],
+            unattached_arrows=[f"line {line}: {text}" for line, text in report.unattached_arrows],
+        )
+
+    def plan_parse(self, path: str) -> PlanParseResult | None:
+        """Read and parse a configured plan path, without writing anything."""
+        target = Path(path)
+        if not target.is_file():
+            return None
+        return self.plan_parse_markdown(target.read_text(encoding="utf-8"))
+
+    def graph(self, project_id: str) -> DependencyGraphReport | None:
+        if self.queue is None or self.queue.get_project(project_id) is None:
+            return None
+        report = self.queue.graph.report(project_id)
+        records = {record.item_id: record for record in self.queue.items(project_id=project_id)}
+        return DependencyGraphReport(
+            project_id=report.project_id,
+            revision=report.revision,
+            edges=[
+                DependencyEdgeModel(
+                    source_item=edge.source_item,
+                    target_kind=edge.target_kind,
+                    target_id=edge.target_id,
+                    required=edge.required,
+                    resolver=edge.resolver,
+                    state=edge.state,
+                    evidence=edge.evidence,
+                    provenance=edge.provenance,
+                    revision=edge.revision,
+                )
+                for edge in report.edges
+            ],
+            cycles=[list(cycle) for cycle in report.cycles],
+            ready=list(report.ready),
+            not_ready=[
+                self._readiness_model(state, records.get(state.item_id))
+                for state in report.not_ready
+            ],
+        )
+
+    @staticmethod
+    def _readiness_model(state: Any, record: WorkRecord | None) -> ItemReadiness:
+        return ItemReadiness(
+            project_id=state.project_id,
+            item_id=state.item_id,
+            ready=state.ready,
+            graph_revision=state.revision,
+            admitted_revision=record.admitted_revision if record is not None else None,
+            reasons=[ReadinessReasonModel(**reason.__dict__) for reason in state.reasons],
+            advisory=[ReadinessReasonModel(**reason.__dict__) for reason in state.advisory],
+            overridden=state.overridden,
+            override_reason=state.override_reason,
+            explanation=state.explain(),
         )
 
     def events(self, since_id: int = 0, limit: int = 200) -> EventPage:

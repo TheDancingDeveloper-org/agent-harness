@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Coordination plane</p><h1>Dependency graph</h1></div><span class="mode-badge">Revision {{ graph.revision if graph else '—' }}</span></div>
+  <section class="card"><form method="get" action="{{ url_for('graph') }}"><label for="graph-project">Project</label><select id="graph-project" name="project_id" onchange="this.form.submit()">{% for summary in projects.projects %}<option value="{{ summary.project.project_id }}"{% if summary.project.project_id == project_id %} selected{% endif %}>{{ summary.project.name }} ({{ summary.project.project_id }})</option>{% endfor %}</select></form></section>
+  {% if not graph %}<section class="empty"><h2>No graph available</h2><p>Choose a configured project.</p></section>{% else %}
+    <section class="card"><div class="card-heading"><div><p class="eyebrow">Admission</p><h2>Readiness</h2></div><span class="success">{{ graph.ready|length }} ready</span></div>
+      {% if graph.cycles %}<div class="alert danger"><strong>Cycles block work.</strong><ul>{% for cycle in graph.cycles %}<li>{{ cycle|join(' → ') }}</li>{% endfor %}</ul></div>{% endif %}
+      {% if graph.not_ready %}<div class="list">{% for item in graph.not_ready %}<article class="card"><h3><a href="{{ url_for('work_item_page', item_id=item.item_id) }}?project_id={{ item.project_id }}">{{ item.item_id }}</a></h3><p>{{ item.explanation }}</p>{% if item.advisory %}<p class="muted">Advisory: {{ item.advisory|length }} edge(s)</p>{% endif %}</article>{% endfor %}</div>{% else %}<p class="muted">Every item is ready at this revision.</p>{% endif %}
+    </section>
+    <section class="card"><h2>Edges</h2>{% if graph.edges %}<div class="table-wrap"><table><thead><tr><th>Waiting item</th><th>Target</th><th>Kind</th><th>State</th><th>Evidence</th></tr></thead><tbody>{% for edge in graph.edges %}<tr><td>{{ edge.source_item }}</td><td>{{ edge.target_id }}</td><td>{{ edge.target_kind }}</td><td>{{ edge.state }}{% if not edge.required %} (advisory){% endif %}</td><td>{{ edge.evidence }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="muted">No dependency edges are declared.</p>{% endif %}</section>
+  {% endif %}
+{% endblock %}

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
+from typing import Any
 
 from fastapi.testclient import TestClient
 
@@ -13,6 +15,27 @@ from agent_harness.store import EventStore
 from agent_harness.work import Project, WorkQueue, WorkRecord
 
 TOKEN = "browser-test-token"  # noqa: S105 - fixture value
+
+PROPOSAL = {
+    "goal": "A safe browser plan.",
+    "assumptions": ["The queue is durable"],
+    "non_goals": ["Automatic execution"],
+    "risks": ["Scope may change"],
+    "phases": [{"id": "P0", "title": "Foundation", "items": []}],
+    "open_questions": [
+        {
+            "id": "Q1",
+            "question": "Which branch?",
+            "severity": "blocking",
+            "why_it_matters": "It changes the checkout.",
+        }
+    ],
+}
+
+
+class FakeScoper:
+    def call(self, _role: str, _messages: list[dict[str, Any]]) -> str:
+        return json.dumps(PROPOSAL)
 
 
 def make_client(tmp_path: Path, *, token: str | None = TOKEN) -> TestClient:
@@ -221,3 +244,94 @@ def test_ui_named_urls_honor_root_path(tmp_path: Path) -> None:
         assert response.status_code == 200
         assert "/harness/login" in response.text
         assert "/harness/assets/app.css" in response.text
+
+
+def test_plans_surface_scoping_gate_and_plan_preview(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(Project(project_id="p", name="Project P"))
+    app = create_api(store, queue=queue, token=TOKEN, model_client=FakeScoper())
+    with TestClient(app) as client:
+        login(client)
+        csrf = (
+            client.get("/plans?project_id=p")
+            .text.split('name="csrf_token" value="', 1)[1]
+            .split('"', 1)[0]
+        )
+        assert "Describe a project" in client.get("/plans?project_id=p").text
+        started = client.post(
+            "/ui/actions/inception/start",
+            data={"csrf_token": csrf, "project_id": "p", "overview": "A browser plan"},
+            headers={"X-CSRF-Token": csrf},
+            follow_redirects=False,
+        )
+        assert started.status_code == 303
+        scoped = client.post(
+            "/ui/actions/inception/scope",
+            data={"csrf_token": csrf, "project_id": "p"},
+            headers={"X-CSRF-Token": csrf},
+            follow_redirects=False,
+        )
+        assert scoped.status_code == 303
+        html = client.get("/plans?project_id=p").text
+        assert "Which branch?" in html and "Approve scope" in html
+        assert "disabled" in html
+        question = client.post(
+            "/ui/actions/inception/question",
+            data={
+                "csrf_token": csrf,
+                "project_id": "p",
+                "question_id": "Q1",
+                "answer": "main",
+            },
+            headers={"X-CSRF-Token": csrf},
+            follow_redirects=False,
+        )
+        assert question.status_code == 303
+        approved = client.post(
+            "/ui/actions/inception/approve",
+            data={"csrf_token": csrf, "project_id": "p"},
+            headers={"X-CSRF-Token": csrf},
+            follow_redirects=False,
+        )
+        assert approved.status_code == 303
+        html = client.get("/plans?project_id=p").text
+        assert "PLAN.md preview" in html
+        assert "A safe browser plan." in html
+
+
+def test_plans_show_loss_report_for_configured_plan(tmp_path: Path) -> None:
+    plan_path = tmp_path / "PLAN.md"
+    plan_path.write_text(
+        "# Plan\n\n## Narrative\n\n### T1 — One\n\nDo one.\n\n"
+        "### T1 — Duplicate\n\nDo two.\n\n### T2 — Two\n\ndepends on: T9\n",
+        encoding="utf-8",
+    )
+    store = EventStore(tmp_path / "events.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(Project(project_id="p", name="Project P", plan_path=str(plan_path)))
+    with TestClient(create_api(store, queue=queue, token=TOKEN)) as client:
+        login(client)
+        html = client.get("/plans?project_id=p").text
+        assert "Parse review" in html
+        assert "Duplicate ids" in html
+        assert "unresolved" in html.lower()
+
+
+def test_graph_page_shows_typed_edges_and_readiness(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(Project(project_id="p", name="Project P"))
+    queue.add(
+        [
+            WorkRecord(item_id="T1", title="First", brief="first"),
+            WorkRecord(item_id="T2", title="Second", brief="second", depends_on=["T1"]),
+        ],
+        project_id="p",
+    )
+    with TestClient(create_api(store, queue=queue, token=TOKEN)) as client:
+        login(client)
+        html = client.get("/graph?project_id=p").text
+        assert "Dependency graph" in html
+        assert "T2" in html and "T1" in html
+        assert "blocked" in html.lower()

@@ -1,4 +1,4 @@
-# GUI Milestones 0–1 evidence and Milestone 2 control bridge
+# GUI Milestones 0–1 evidence and Milestones 2–3 slices
 
 Status: implementation slice complete; the full GUI program is not complete.
 
@@ -30,6 +30,15 @@ The same gates were run after the browser shell and guarded action bridge:
 | `uv run ruff format --check .` | passed, 116 files formatted |
 | `TMPDIR=/tmp/agent-harness-gui-baseline.HoeEBo uv run mypy` | passed, 111 source files |
 
+After the inception, plan-parse review and dependency-graph slices:
+
+| Command | Result |
+|---|---|
+| `TMPDIR=/tmp/agent-harness-gui-baseline.HoeEBo uv run pytest -q` | passed at 100%, 1 skipped (`/tmp/gui-pytest-m3-final.log`) |
+| `uv run ruff check .` | passed |
+| `uv run ruff format --check .` | passed |
+| `TMPDIR=/tmp/agent-harness-gui-baseline.HoeEBo uv run mypy` | passed, 111 source files |
+
 An earlier concurrent setup attempt and an earlier `/dev/shm` pytest attempt are
 not evidence: the former raced virtualenv creation and the latter filled the
 64 MiB tmpfs. They are retained here only to explain why the valid baseline uses
@@ -53,6 +62,15 @@ not evidence: the former raced virtualenv creation and the latter filled the
   supervised worker pool. The initial control bridge adds only explicit,
   CSRF-protected pause/drain/stop, retry, block and hold-answer actions; each
   delegates the existing queue validation and appends an operator audit event.
+- The Plans page now runs the typed inception draft, scope, question-resolution and
+  approval gates with CSRF and authenticated operator attribution. It renders a generated
+  `PLAN.md` preview/download without creating queue rows.
+- Configured plans have a read-only parser review listing recognized items, skipped
+  headings, duplicate IDs, malformed/unresolved/external/decision/cross-project
+  dependencies, cycles and unattached arrows.
+- The Dependency graph page renders the typed graph revision, edge state/evidence,
+  ready items, cycles and per-item readiness explanations from the same graph report
+  used by admission and the JSON API.
 - Typed item evidence exposes append-only events, durable attempt stages and
   retained holds without fabricating absent history or cost.
 - `/api/events/stream` resumes after a monotonic cursor and surfaces disconnects;
@@ -68,7 +86,9 @@ delivery, JSON/API isolation, evidence and cursor validation.
 
 This is not a release claim for the full `GUI_PLAN`: browser automation,
 screen-reader checks, forced reconnect with replayed events, and all additional
-accessibility/security/concurrency journeys remain to run. Milestones 2–8
-(remaining mutations, plan/adoption wizards, routing/operations panels, internal sessions,
-extensions, automation, RBAC and recovery) remain explicitly incomplete. No
+accessibility/security/concurrency journeys remain to run. Milestone 2 remains partial
+(preflight/configuration/bulk actions/notifications and dependency-override controls are
+not yet wired). Milestone 3 remains partial (adoption, plan dry-run/sync and richer graph
+interactions are not yet wired). Milestones 4–8 (routing/operations panels, internal
+sessions, extensions, automation, RBAC and recovery) remain explicitly incomplete. No
 real fleet or external deployment was used.

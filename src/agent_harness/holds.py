@@ -186,6 +186,7 @@ class Hold:
     def as_dict(self, now: float | None = None) -> dict[str, Any]:
         at = now if now is not None else time.time()
         return {
+            "project_id": self.project_id,
             "item_id": self.item_id,
             "attempt": self.attempt,
             "state": self.state,

@@ -227,6 +227,7 @@ CREATE TABLE IF NOT EXISTS control (
 -- same thing after a week.
 CREATE TABLE IF NOT EXISTS abandoned_sessions (
     session_id  TEXT PRIMARY KEY,
+    project_id  TEXT,
     item_id     TEXT NOT NULL,
     reason      TEXT,
     session_url TEXT,
@@ -647,6 +648,9 @@ class WorkQueue:
             # what it always did.
             "deliverable": "TEXT NOT NULL DEFAULT 'code'",
         },
+        "abandoned_sessions": {
+            "project_id": "TEXT",
+        },
     }
 
     def _add_missing_columns(self, conn: sqlite3.Connection) -> None:
@@ -794,6 +798,46 @@ class WorkQueue:
                 "INSERT OR IGNORE INTO control (project_id, state, changed_at) VALUES (?, ?, ?)",
                 (project.project_id, STOPPED, self.now()),
             )
+        finally:
+            conn.close()
+
+    def update_project(self, project: Project, *, expected_updated_at: float) -> bool:
+        """Replace an existing project only if it is still the reviewed version.
+
+        Browser review is a judgement about exact values. A compare followed
+        by an unconditional update leaves a race for another process between
+        those operations, so the version predicate belongs in the UPDATE.
+        """
+        conn = self._connect()
+        try:
+            changed = conn.execute(
+                "UPDATE projects SET name = ?, repo = ?, work_dir = ?, base_branch = ?, "
+                "checks = ?, fixes = ?, durability = ?, max_item_seconds = ?, "
+                "max_item_spend_usd = ?, max_hold_seconds = ?, plan_path = ?, roles = ?, "
+                "max_workers = ?, max_attempts = ?, min_free_disk_gb = ?, updated_at = ? "
+                "WHERE project_id = ? AND updated_at = ?",
+                (
+                    project.name,
+                    project.repo,
+                    project.work_dir,
+                    project.base_branch,
+                    json.dumps(project.checks),
+                    json.dumps(project.fixes),
+                    project.durability,
+                    project.max_item_seconds,
+                    project.max_item_spend_usd,
+                    project.max_hold_seconds,
+                    project.plan_path,
+                    json.dumps(project.roles) if project.roles else None,
+                    project.max_workers,
+                    project.max_attempts,
+                    project.min_free_disk_gb,
+                    self.now(),
+                    project.project_id,
+                    expected_updated_at,
+                ),
+            ).rowcount
+            return changed == 1
         finally:
             conn.close()
 
@@ -1026,6 +1070,37 @@ class WorkQueue:
                 "updated_at = excluded.updated_at",
                 (key, json.dumps(value), self.now()),
             )
+        finally:
+            conn.close()
+
+    def compare_and_set_setting(self, key: str, expected: Any | None, value: Any) -> bool:
+        """Replace a setting only when its complete stored value is unchanged.
+
+        Browser reviews use this instead of comparing a timestamp and then
+        writing in a second transaction.  The immediate transaction makes
+        the comparison and replacement one operation, so an API or CLI edit
+        cannot be overwritten between those two steps.  ``None`` means the
+        setting was absent when reviewed.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            current = json.loads(row["value"]) if row else None
+            if current != expected:
+                conn.rollback()
+                return False
+            conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (key, json.dumps(value), self.now()),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -1729,6 +1804,7 @@ class WorkQueue:
         session_id: str,
         item_id: str,
         *,
+        project_id: str | None = None,
         reason: str | None = None,
         session_url: str | None = None,
     ) -> None:
@@ -1742,8 +1818,9 @@ class WorkQueue:
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO abandoned_sessions "
-                "(session_id, item_id, reason, session_url, abandoned_at) VALUES (?, ?, ?, ?, ?)",
-                (session_id, item_id, reason, session_url, self.now()),
+                "(session_id, project_id, item_id, reason, session_url, abandoned_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, project_id, item_id, reason, session_url, self.now()),
             )
         finally:
             conn.close()

@@ -1,20 +1,14 @@
-"""The harness's HTTP API. Headless — no HTML, no templates, no GUI.
+"""The harness's JSON API and self-contained browser application.
 
-The GUI lives in the session host (AIDevEnv is the reference one), which
-already owns tabs, auth, push notifications, mobile and the terminal sessions
-the agents run in. A second web UI here would mean a second URL and a second
-login to do the same job worse.
+The public API remains typed and documented. Every JSON route names a response
+model, every field has a description, and OpenAPI is served alongside Swagger
+UI. The browser application is an additional first-party client in this same
+process and origin; it does not replace or weaken the JSON contract.
 
-What this DOES own is a documented API. Every route is typed, every field has
-a description, and the OpenAPI document is served alongside Swagger UI — so a
-person with `curl`, an agent with a shell, or a generated client can all drive
-the harness without reading its source.
-
-Auth is a bearer token. Deployed inside a session host it is the SAME token
-that reaches the GUI: one credential, one thing to rotate, and no second
-secret to keep track of. The service fails closed — with no token configured
-every authenticated route refuses, because coming up open is not an acceptable
-default for something reachable over a network.
+API clients authenticate with the configured bearer token. A browser exchanges
+that token once for a bounded opaque server-side session, so the credential is
+never placed in a URL, rendered page, script, browser storage or log. With no
+configured token, both surfaces fail closed.
 
     /docs          Swagger UI, with an Authorize button
     /redoc         ReDoc
@@ -35,15 +29,38 @@ from fastapi import Path as PathParam
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import __version__
+from .adoption_service import (
+    AdoptionConfigurationError,
+    AdoptionInspectionFailure,
+    AdoptionReconciliationFailure,
+    adoption_event_sink,
+    fresh_report,
+    inspect_project,
+    reconcile_project,
+    report_model,
+    resolve_adoption,
+)
 from .audit import AuditStore
+from .audit_service import maintain_audit, reconcile_repository
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
-from .maintenance import DEFAULT_RETENTION_DAYS, run_maintenance
+from .maintenance import DEFAULT_RETENTION_DAYS
+from .plan_service import PlanSyncConflict, PlanSyncFailure
+from .plan_service import execute as execute_plan_sync
+from .plan_service import parse_result as plan_parse_result
 from .preflight import BaseChecks
+from .process_metrics import ProcessMetricsSampler, ProcessMetricsSource
+from .project_service import configure_project, project_spec
 from .providers import MEANING
-from .reconcile import GitHubReconciler, items_by_pr
+from .routing_service import ROLE_MAP_KEY as ROLE_MAP_KEY
+from .routing_service import configure_roles, role_map_view
 from .schemas import (
     AddItemsRequest,
     AddItemsResult,
+    AdoptionDecisionRequest,
+    AdoptionInspectRequest,
+    AdoptionReconcileRequest,
+    AdoptionReportModel,
+    AnalyticsDashboard,
     AnswerRequest,
     AnswerResult,
     AuditCost,
@@ -63,9 +80,11 @@ from .schemas import (
     DependencyOverrideRequest,
     DependencyOverrideResult,
     Event,
+    EventFilters,
     EventPage,
     ExecutionReadiness,
     FleetControl,
+    GatewayLogPage,
     Health,
     HoldList,
     HoldView,
@@ -78,12 +97,12 @@ from .schemas import (
     NewBaseline,
     OpenQuestion,
     OverdueHold,
-    PlanItem,
     PlanParseResult,
     PlanSyncRequest,
     PlanSyncResult,
     PreflightCheck,
     PreflightResult,
+    ProcessMetrics,
     ProjectList,
     ProjectReadiness,
     ProjectSpec,
@@ -97,8 +116,6 @@ from .schemas import (
     RetryResult,
     RoleMap,
     RoleMapView,
-    RoleRoute,
-    RoutedRole,
     RouteReachability,
     RoutesHealthView,
     ScopeRequest,
@@ -106,10 +123,13 @@ from .schemas import (
     StopProjectRequest,
     Summary,
     WaitingItem,
+    WorkerInventory,
+    WorkEvidence,
     WorkItem,
     WorkList,
 )
 from .store import EventStore
+from .ui import install_ui
 from .work import (
     BLOCKED,
     CLAIMED,
@@ -126,10 +146,6 @@ from .work import (
 
 WINDOWS = {"1h": 3600, "24h": 86400, "72h": 3 * 86400, "7d": 7 * 86400, "all": None}
 
-#: Where the live role map is stored. Shared through the queue's database
-#: because the API and the worker are different processes.
-ROLE_MAP_KEY = "role_map"
-
 #: How long a healthy model has to answer preflight's one-token probe, and
 #: how long it has before it is treated as not answering at all. Anything in
 #: between is reported as slow and not refused — a late model is usable, and
@@ -142,9 +158,10 @@ DESCRIPTION = """\
 Plans work, claims it, runs it as an agent in a terminal session, and records
 what happened.
 
-**Auth** — every route except `/healthz` needs `Authorization: Bearer <token>`.
-Deployed inside a session host this is the same token that reaches the GUI.
-Use **Authorize** above to try these against a live instance.
+**Auth** — every JSON data route needs `Authorization: Bearer <token>`.
+`/healthz`, `/docs`, `/redoc` and `/openapi.json` remain public. Use
+**Authorize** above to try the API against a live instance. Browser sessions
+are separate opaque credentials established at `/login`.
 
 **Reading the numbers.** Two things this API is careful about, because both are
 easy to get wrong and expensive when you do:
@@ -182,6 +199,9 @@ def create_api(
     probes: Mapping[str, Any] | None = None,
     executor_roles: Any | None = None,
     default_preset: str = "",
+    github_factory: Any | None = None,
+    process_metrics: ProcessMetricsSource | None = None,
+    adoption_branches: Any | None = None,
 ) -> FastAPI:
     """Build the API.
 
@@ -230,6 +250,9 @@ def create_api(
     app.state.probes = dict(probes or {})
     app.state.executor_roles = executor_roles
     app.state.default_preset = default_preset
+    app.state.github_factory = github_factory
+    app.state.process_metrics = process_metrics or ProcessMetricsSampler()
+    app.state.adoption_branches = adoption_branches
     app.state.ask_model = _model_asker(model_client)
     app.state.base_checks = BaseChecks()
     app.state.token = token
@@ -336,6 +359,30 @@ def create_api(
             queue.holds.current(project_id, item_id) if record.state == HELD else None,
             queue.now(),
         )
+
+    @app.get(
+        "/api/work/{item_id}/evidence",
+        tags=["work"],
+        summary="Durable evidence for one item",
+        response_model=WorkEvidence,
+        responses={404: {"description": "No such item"}},
+    )
+    def work_evidence(
+        item_id: str = PathParam(description="Plan id, e.g. `T4`."),
+        project_id: str = Query("default", description="Which project the item is in."),
+        _: None = Depends(require_token),
+    ) -> WorkEvidence:
+        from .query_service import HarnessQueries
+
+        evidence = HarnessQueries(
+            store,
+            app.state.queue,
+            audit=app.state.audit,
+            fleet=app.state.fleet,
+        ).evidence(project_id, item_id)
+        if evidence is None:
+            raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
+        return evidence
 
     @app.post(
         "/api/work",
@@ -661,6 +708,140 @@ def create_api(
             readiness=_readiness_model(queue.readiness(item_id, project_id=project_id), record),
         )
 
+    # ------------------------------------------------------------- adoption
+
+    def adoption_context(project_id: str, *, inspect_remote: bool = True) -> Any:
+        queue = need_queue()
+        sink = app.state.audit or store
+        kwargs: dict[str, Any] = {
+            "github_factory": app.state.github_factory,
+            "inspect_remote": inspect_remote,
+            "on_event": adoption_event_sink(sink, source="api-adoption"),
+        }
+        if app.state.adoption_branches is not None:
+            kwargs["branches"] = app.state.adoption_branches
+        try:
+            return resolve_adoption(queue, project_id, **kwargs)
+        except AdoptionConfigurationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def current_adoption(project_id: str, *, inspect_remote: bool = False) -> tuple[Any, Any]:
+        context = adoption_context(project_id, inspect_remote=inspect_remote)
+        try:
+            report = context.adopter.load(project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return context, report
+
+    @app.post(
+        "/api/adoption/{project_id}/inspect",
+        tags=["plan"],
+        summary="Inspect an existing project without adopting it",
+        response_model=AdoptionReportModel,
+    )
+    def adoption_inspect(
+        request: AdoptionInspectRequest,
+        project_id: str = PathParam(description="Persisted project id."),
+        _: None = Depends(require_token),
+    ) -> AdoptionReportModel:
+        """Persist a proposal; create no queue row and make no remote write."""
+        context = adoption_context(project_id, inspect_remote=request.inspect_remote)
+        try:
+            report = inspect_project(context)
+        except AdoptionInspectionFailure as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return report_model(report, redact=(app.state.audit or store).redact, parsed=context.plan)
+
+    @app.get(
+        "/api/adoption/{project_id}",
+        tags=["plan"],
+        summary="Current adoption proposal",
+        response_model=AdoptionReportModel,
+        responses={404: {"description": "No inspection has been persisted"}},
+    )
+    def adoption_report(
+        project_id: str = PathParam(description="Persisted project id."),
+        _: None = Depends(require_token),
+    ) -> AdoptionReportModel:
+        context, report = current_adoption(project_id)
+        return report_model(report, redact=(app.state.audit or store).redact, parsed=context.plan)
+
+    @app.post(
+        "/api/adoption/{project_id}/decision",
+        tags=["plan"],
+        summary="Approve, reject or revise one adoption proposal",
+        response_model=AdoptionReportModel,
+    )
+    def adoption_decision(
+        request: AdoptionDecisionRequest,
+        project_id: str = PathParam(description="Persisted project id."),
+        _: None = Depends(require_token),
+    ) -> AdoptionReportModel:
+        context, report = current_adoption(project_id)
+        if not secrets.compare_digest(report.content_digest(), request.expected_digest):
+            raise HTTPException(status_code=409, detail="adoption findings changed after review")
+        try:
+            if request.decision == "approve":
+                report = context.adopter.approve(
+                    project_id,
+                    approved_drops=request.approved_drops,
+                    reason=request.reason,
+                )
+            else:
+                if request.approved_drops:
+                    raise ValueError("reject/revise cannot approve item drops")
+                report = context.adopter.reject(
+                    project_id,
+                    reason=request.reason,
+                    revise=request.decision == "revise",
+                )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return report_model(report, redact=(app.state.audit or store).redact, parsed=context.plan)
+
+    @app.post(
+        "/api/adoption/{project_id}/reconcile",
+        tags=["plan"],
+        summary="Preview or apply an approved adoption",
+        response_model=AdoptionReportModel,
+    )
+    def adoption_reconcile(
+        request: AdoptionReconcileRequest,
+        project_id: str = PathParam(description="Persisted project id."),
+        _: None = Depends(require_token),
+    ) -> AdoptionReportModel:
+        context, report = current_adoption(project_id)
+        if not request.dry_run:
+            if not request.expected_digest or not secrets.compare_digest(
+                report.content_digest(), request.expected_digest
+            ):
+                raise HTTPException(
+                    status_code=409, detail="adoption findings changed after review"
+                )
+            if request.expected_approved_drops is None or sorted(
+                request.expected_approved_drops
+            ) != sorted(report.approved_drops):
+                raise HTTPException(
+                    status_code=409, detail="approved drop list changed after review"
+                )
+            context = adoption_context(project_id, inspect_remote=report.inspect_remote)
+            try:
+                fresh = fresh_report(context)
+            except AdoptionInspectionFailure as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            if not secrets.compare_digest(fresh.content_digest(), report.content_digest()):
+                raise HTTPException(
+                    status_code=409,
+                    detail="adoption inputs or evidence changed after review; inspect again",
+                )
+        try:
+            report = reconcile_project(context, dry_run=request.dry_run)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except AdoptionReconciliationFailure as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return report_model(report, redact=(app.state.audit or store).redact, parsed=context.plan)
+
     # ------------------------------------------------------------- control
 
     @app.get(
@@ -922,6 +1103,7 @@ def create_api(
             rows=[AuditCostRow(**r) for r in rows],
             total_cost_usd=sum(priced) if priced else None,
             total_unpriced=sum(r["unpriced"] or 0 for r in rows),
+            denominator=sum(r["calls"] or 0 for r in rows),
             partial=partial,
         )
 
@@ -941,8 +1123,31 @@ def create_api(
         return AuditDelivery(
             window=window,
             rows=[AuditDeliveryRow(**r) for r in rows],
+            denominator=audit_store().delivery_denominator(since=since, project_id=project_id),
             partial=partial,
         )
+
+    @app.get(
+        "/api/analytics",
+        tags=["observability"],
+        summary="Complete typed analytics projection",
+        response_model=AnalyticsDashboard,
+    )
+    def analytics(
+        window: str = Query("7d", description=f"One of {sorted(WINDOWS)}."),
+        project_id: str | None = Query(
+            None, description="Limit spend, delivery and baselines to one project."
+        ),
+        _: None = Depends(require_token),
+    ) -> AnalyticsDashboard:
+        from .query_service import HarnessQueries
+
+        try:
+            return HarnessQueries(
+                store, app.state.queue, audit=app.state.audit, fleet=app.state.fleet
+            ).analytics(window=window, project_id=project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post(
         "/api/audit/reconcile",
@@ -964,16 +1169,7 @@ def create_api(
         produces two facts, in order, both true when recorded — not one fact
         that changes its mind.
         """
-        queue = app.state.queue
-        mapping = items_by_pr(queue) if queue is not None else {}
-        report = GitHubReconciler(repo, audit_store()).reconcile(mapping)
-        return ReconcileResult(
-            merged=report.merged,
-            closed_unmerged=report.closed_unmerged,
-            reverted=report.reverted,
-            skipped=report.skipped,
-            errors=report.errors,
-        )
+        return reconcile_repository(app.state.queue, audit_store(), repo)
 
     @app.post(
         "/api/audit/maintenance",
@@ -993,10 +1189,7 @@ def create_api(
         so an operator does not have to wait an hour to see whether retention
         is working, which is exactly when they are most likely to want to know.
         """
-        report = run_maintenance(audit_store(), retention_days=retention_days)
-        return MaintenanceResult(
-            rolled_up=report.rolled_up, thinned=report.thinned, errors=report.errors
-        )
+        return maintain_audit(audit_store(), retention_days)
 
     @app.get(
         "/api/audit/rollups",
@@ -1130,31 +1323,7 @@ def create_api(
         start does.
         """
         queue = need_queue()
-        queue.add_project(
-            Project(
-                project_id=spec.project_id,
-                name=spec.name,
-                repo=spec.repo,
-                work_dir=spec.work_dir,
-                base_branch=spec.base_branch,
-                checks=list(spec.checks),
-                fixes={k: list(v) for k, v in spec.fixes.items()},
-                apply_fixes=spec.apply_fixes,
-                durability=spec.durability,
-                max_item_seconds=spec.max_item_seconds,
-                max_item_spend_usd=spec.max_item_spend_usd,
-                plan_path=spec.plan_path,
-                roles={k: v.model_dump() for k, v in spec.roles.items()} if spec.roles else None,
-                max_workers=spec.max_workers,
-                max_attempts=spec.max_attempts,
-                min_free_disk_gb=spec.min_free_disk_gb,
-            )
-        )
-        fleet_ = app.state.fleet
-        if fleet_ is not None and hasattr(fleet_, "resize"):
-            # A no-op for a stopped project: there is no pool to reconcile,
-            # and the persisted budget is what the next start reads.
-            fleet_.resize(spec.project_id)
+        configure_project(queue, spec, fleet=app.state.fleet)
         return _project_summary(queue, spec.project_id, app.state.fleet)
 
     @app.get(
@@ -1467,6 +1636,42 @@ def create_api(
         return _project_summary(queue, project_id, app.state.fleet)
 
     @app.post(
+        "/api/projects/{project_id}/control",
+        tags=["control"],
+        summary="Pause or drain one project",
+        response_model=ProjectSummary,
+        responses={409: {"description": "Resume requires the explicit start contract"}},
+    )
+    def project_control(
+        request: SetFleetControl,
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> ProjectSummary:
+        """Change a project's claiming state without starting work implicitly.
+
+        `running` is intentionally not accepted here: continuing execution is
+        the expensive, preflight-gated start contract above. Pause, drain and
+        stop remain safe next-boundary controls and are also available to a
+        monitoring deployment, where they only change durable operator intent.
+        """
+        if request.state == "running":
+            raise HTTPException(
+                status_code=409,
+                detail="resume uses POST /api/projects/{project_id}/start so preflight is explicit",
+            )
+        queue = need_queue()
+        if queue.get_project(project_id) is None:
+            raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
+        fleet_ = app.state.fleet
+        if fleet_ is not None and request.state == STOPPED and hasattr(fleet_, "request_stop"):
+            fleet_.request_stop(project_id, reason=request.reason)
+        elif fleet_ is not None and request.state == STOPPED:
+            fleet_.stop(project_id, reason=request.reason)
+        else:
+            queue.set_control(request.state, request.reason, project_id=project_id)
+        return _project_summary(queue, project_id, app.state.fleet)
+
+    @app.post(
         "/api/control",
         tags=["control"],
         summary="Pause, drain or resume the fleet",
@@ -1569,16 +1774,7 @@ def create_api(
         it is your call, and it is worth making deliberately.
         """
         queue = need_queue()
-        queue.set_setting(
-            ROLE_MAP_KEY,
-            # Only the routing fields. `used` is computed from the deployment,
-            # not configured, and storing it would let a stale answer be read
-            # back later as though an operator had set it.
-            {
-                name: route.model_dump(include={"model", "endpoint", "provider"})
-                for name, route in request.roles.items()
-            },
-        )
+        configure_roles(queue, request)
         return _role_map_view(app.state, queue)
 
     # ---------------------------------------------------------------- plan
@@ -1607,31 +1803,7 @@ def create_api(
         if not target.is_file():
             raise HTTPException(status_code=404, detail=f"no plan at {path!r}")
         parsed = parse_plan_file(target)
-        report = parsed.dependency_report()
-        return PlanParseResult(
-            items=[
-                PlanItem(
-                    id=i.id,
-                    title=i.title,
-                    body=i.body,
-                    labels=i.labels,
-                    milestone=i.milestone,
-                    depends_on=i.depends_on,
-                    done=i.done,
-                    line=i.line,
-                )
-                for i in parsed.items
-            ],
-            skipped=[f"line {n}: {title}" for n, title in parsed.skipped],
-            duplicate_ids=parsed.duplicate_ids(),
-            unresolved_dependencies=report.unresolved,
-            external_dependencies=report.external,
-            decision_dependencies=report.decisions,
-            cross_project_dependencies=report.cross_project,
-            malformed_dependencies=report.malformed,
-            dependency_cycles=[list(cycle) for cycle in report.cycles],
-            unattached_arrows=[f"line {n}: {text}" for n, text in report.unattached_arrows],
-        )
+        return plan_parse_result(parsed)
 
     @app.post(
         "/api/plan/sync",
@@ -1655,37 +1827,76 @@ def create_api(
         usually an edit, sometimes a mistake, and never grounds for the
         harness to decide work stopped mattering.
         """
-        from .github import GitHub, GitHubError, sync
-        from .plan import parse_plan_file
+        factory = app.state.github_factory
+        if factory is None:
+            from .github import GitHub
 
-        target = Path(request.path)
-        if not target.is_file():
-            raise HTTPException(status_code=404, detail=f"no plan at {request.path!r}")
-        parsed = parse_plan_file(target)
-        duplicates = parsed.duplicate_ids()
-        if duplicates and not request.allow_duplicates:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "reason": "the plan states these ids more than once; each becomes one issue",
-                    "duplicate_ids": duplicates,
-                },
-            )
+            github = GitHub(request.repo)
+        else:
+            github = factory(request.repo)
         try:
-            report = sync(GitHub(request.repo), parsed.deduplicated(), dry_run=request.dry_run)
-        except GitHubError as exc:
+            return execute_plan_sync(
+                request.path,
+                github,
+                dry_run=request.dry_run,
+                allow_duplicates=request.allow_duplicates,
+            )
+        except PlanSyncConflict as exc:
+            status_code = 404 if exc.reason_kind == "plan_missing" else 409
+            detail: str | dict[str, Any]
+            detail = {"reason": str(exc), **exc.details} if exc.details else str(exc)
+            raise HTTPException(status_code=status_code, detail=detail) from exc
+        except PlanSyncFailure as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return PlanSyncResult(
-            created=report.created,
-            updated=report.updated,
-            unchanged=report.unchanged,
-            orphaned=report.orphaned,
-            labels_created=report.labels_created,
-            milestones_created=report.milestones_created,
-            dry_run=request.dry_run,
-        )
 
     # ------------------------------------------------------- observability
+
+    @app.get(
+        "/api/process",
+        tags=["observability"],
+        summary="Session-independent service-process metrics",
+        response_model=ProcessMetrics,
+    )
+    def process_metrics_api(_: None = Depends(require_token)) -> ProcessMetrics:
+        """Sample the process serving this API.
+
+        This does not query a session host or infer a process tree. The start
+        timestamp is the moment this API application began tracking itself.
+        """
+        from .query_service import HarnessQueries
+
+        return HarnessQueries(
+            store,
+            app.state.queue,
+            audit=app.state.audit,
+            fleet=app.state.fleet,
+            process_metrics=app.state.process_metrics,
+        ).process_metrics()
+
+    @app.get(
+        "/api/gateway-logs",
+        tags=["observability"],
+        summary="Redacted model gateway call log",
+        response_model=GatewayLogPage,
+    )
+    def gateway_logs(
+        since_id: int = Query(0, ge=0, description="Exclusive source-event cursor."),
+        limit: int = Query(200, ge=1, le=1000, description="Maximum model calls to return."),
+        project_id: str | None = Query(None, description="Limit to one recorded project id."),
+        _: None = Depends(require_token),
+    ) -> GatewayLogPage:
+        """Allowlisted `model_call` evidence from the active event source.
+
+        The live audit store is preferred and the ingest event store is the
+        monitoring-only fallback. Both redact before writing. Model answer
+        bodies and arbitrary payload fields are deliberately excluded, and
+        no filesystem log path is part of this contract.
+        """
+        from .query_service import HarnessQueries
+
+        return HarnessQueries(store, app.state.queue, audit=app.state.audit).gateway_logs(
+            since_id, limit, project_id=project_id
+        )
 
     @app.get(
         "/api/errors",
@@ -1710,6 +1921,7 @@ def create_api(
             meaning={c: MEANING[c] for c in RATE_LIMIT_CLASSES},
             unclassified=by_class.get(UNCLASSIFIED, 0),
             total=sum(classified.values()),
+            denominator=error_store.rate_limit_denominator(since),
             by_worker=error_store.group_counts("worker", since),
             by_endpoint=error_store.group_counts("endpoint", since),
             by_role=error_store.group_counts("role", since),
@@ -1724,6 +1936,21 @@ def create_api(
     def events(
         since_id: int = Query(0, description="Cursor from the previous page."),
         limit: int = Query(200, ge=1, le=1000),
+        project_id: str | None = Query(None, description="Limit to one project."),
+        item_id: str | None = Query(None, description="Limit to one work item."),
+        worker: str | None = Query(None, description="Limit to one worker identity."),
+        endpoint: str | None = Query(None, description="Limit to one endpoint."),
+        role: str | None = Query(None, description="Limit to one routed role."),
+        model: str | None = Query(None, description="Limit to one model identifier."),
+        outcome: str | None = Query(None, description="Limit to one outcome token."),
+        error_class: str | None = Query(None, description="Limit to one error class."),
+        reason_kind: str | None = Query(None, description="Limit to one reason kind."),
+        start_ts: float | None = Query(
+            None, description="Include events at or after this Unix time."
+        ),
+        end_ts: float | None = Query(
+            None, description="Include events at or before this Unix time."
+        ),
         _: None = Depends(require_token),
     ) -> EventPage:
         """Append-only history, oldest first.
@@ -1732,11 +1959,44 @@ def create_api(
         millisecond must still have a total order, or a poll silently drops
         one.
         """
-        rows = store.since_id(since_id, limit=limit)
-        return EventPage(
-            events=[Event(**row) for row in rows],
-            cursor=rows[-1]["id"] if rows else since_id,
-        )
+        from .query_service import HarnessQueries
+
+        try:
+            filters = EventFilters(
+                project_id=project_id,
+                item_id=item_id,
+                worker=worker,
+                endpoint=endpoint,
+                role=role,
+                model=model,
+                outcome=outcome,
+                error_class=error_class,
+                reason_kind=reason_kind,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return HarnessQueries(
+            store, app.state.queue, audit=app.state.audit, fleet=app.state.fleet
+        ).filtered_events(since_id, limit, filters)
+
+    @app.get(
+        "/api/workers",
+        tags=["control", "observability"],
+        summary="Worker-pool inventory",
+        response_model=WorkerInventory,
+    )
+    def workers(
+        project_id: str | None = Query(None, description="Limit to one project."),
+        _: None = Depends(require_token),
+    ) -> WorkerInventory:
+        """Read live workers alongside durable claims and failure evidence."""
+        from .query_service import HarnessQueries
+
+        return HarnessQueries(
+            store, app.state.queue, audit=app.state.audit, fleet=app.state.fleet
+        ).worker_inventory(project_id)
 
     @app.get(
         "/api/summary",
@@ -1787,6 +2047,27 @@ def create_api(
             ],
         )
 
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next: Any) -> Any:
+        response = await call_next(request)
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; "
+            "style-src 'self'; connect-src 'self'; img-src 'self' data:; "
+            "font-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; "
+            "form-action 'self'",
+        )
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault(
+            "Permissions-Policy", "camera=(), microphone=(), geolocation=()"
+        )
+        if request.url.path.startswith("/assets/"):
+            response.headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
+        return response
+
+    install_ui(app)
     return app
 
 
@@ -1920,26 +2201,7 @@ def _model_asker(client: Any) -> Any:
 
 def _role_map_view(state: Any, queue: WorkQueue) -> RoleMapView:
     """The global map, annotated with what this deployment will call."""
-    from .model_client import reviewer_independence
-
-    stored = queue.get_setting(ROLE_MAP_KEY) or {}
-    executor = _executor_roles(state)
-    independent, why = reviewer_independence(
-        _role_routes(queue, default_preset=getattr(state, "default_preset", "")),
-        implemented_by=executor.implemented_by,
-    )
-    return RoleMapView(
-        reviewer_independent=independent,
-        reviewer_note=why,
-        roles={
-            name: RoutedRole(
-                **RoleRoute(**route).model_dump(),
-                used=executor.calls_role(name),
-                unused_reason=executor.unused_reason(name),
-            )
-            for name, route in stored.items()
-        },
-    )
+    return role_map_view(state, queue)
 
 
 def _preflight(
@@ -2006,24 +2268,7 @@ def _preflight(
 
 
 def _project_spec(project: Project) -> ProjectSpec:
-    return ProjectSpec(
-        project_id=project.project_id,
-        name=project.name,
-        repo=project.repo,
-        work_dir=project.work_dir,
-        base_branch=project.base_branch,
-        checks=list(project.checks),
-        fixes={k: list(v) for k, v in (project.fixes or {}).items()},
-        apply_fixes=bool(project.apply_fixes),
-        durability=project.durability,
-        max_item_seconds=project.max_item_seconds,
-        max_item_spend_usd=project.max_item_spend_usd,
-        plan_path=project.plan_path,
-        roles={k: RoleRoute(**v) for k, v in project.roles.items()} if project.roles else None,
-        max_workers=project.max_workers,
-        max_attempts=project.max_attempts,
-        min_free_disk_gb=project.min_free_disk_gb,
-    )
+    return project_spec(project)
 
 
 def _project_summary(queue: WorkQueue, project_id: str, fleet: Any | None = None) -> ProjectSummary:
@@ -2094,6 +2339,7 @@ def _item_model(
 ) -> WorkItem:
     now = time.time() if now is None else now
     return WorkItem(
+        project_id=record.project_id,
         hold=HoldView(**hold.as_dict(now)) if hold is not None else None,
         item_id=record.item_id,
         title=record.title,

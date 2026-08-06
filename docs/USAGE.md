@@ -16,8 +16,8 @@ pip install git+https://github.com/TheDancingDeveloper-org/agent-harness
 agent-harness --help
 ```
 
-Inside [AIDevEnv](https://github.com/TheDancingDeveloper-org/aidevenv) it is
-already there, already running, and already behind the Work tab.
+When `agent-harness serve` is running, open its own URL for the packaged GUI.
+No MyDevEnv, AIDevEnv or other host process is required for browser access.
 
 ---
 
@@ -837,7 +837,7 @@ claim ──▶ git worktree on the item's base
 `AIDEVENV_TOKEN` authenticates to the session host; `HARNESS_API_KEY`
 authenticates the reviewer's model calls.
 
-### Without one — headless
+### Without one — direct execution
 
 Omit `--session-host` and the harness calls the model API directly, doing the
 implementing itself. Fully deterministic, and there is nothing to attach to:
@@ -933,7 +933,7 @@ Commit or stash it, or pass --allow-dirty if it is genuinely disposable.
 overrides it — loudly, and recorded in the preflight report, because the whole
 point is that the loss is silent and irreversible.
 
-One consequence of working in place: **one worker per checkout**. Two headless
+One consequence of working in place: **one worker per checkout**. Two direct
 workers on one directory would check branches out over each other.
 
 ### The role flags are a seed, not a setting
@@ -1227,8 +1227,9 @@ environment must hold and a non-destructive post-deploy smoke test, is in
 
 ## 5. Drive it from the API
 
-The harness serves a full OpenAPI document with Swagger UI. Inside a session
-host, the token that reaches the GUI reaches this too.
+The harness serves a full OpenAPI document with Swagger UI and its browser
+control plane. API clients use the bearer token; browsers exchange it at
+`/login` for an opaque HttpOnly session.
 
 ```bash
 # Directly

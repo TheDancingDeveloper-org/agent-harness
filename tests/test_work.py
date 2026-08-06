@@ -333,6 +333,20 @@ def test_an_unset_setting_is_none_not_an_error(queue: WorkQueue) -> None:
     assert queue.get_setting("nope") is None
 
 
+def test_a_reviewed_setting_replacement_is_atomic(tmp_path: Path) -> None:
+    queue = make_queue(str(tmp_path / "w.sqlite"))
+    original = {"reviewer": {"model": "old"}}
+    queue.set_setting("role_map", original)
+
+    assert queue.compare_and_set_setting("role_map", original, {"reviewer": {"model": "reviewed"}})
+    queue.set_setting("role_map", {"reviewer": {"model": "concurrent"}})
+
+    assert not queue.compare_and_set_setting(
+        "role_map", {"reviewer": {"model": "reviewed"}}, {"reviewer": {"model": "stale"}}
+    )
+    assert queue.get_setting("role_map") == {"reviewer": {"model": "concurrent"}}
+
+
 # ------------------------------- a rewritten brief revives a stalled item
 
 

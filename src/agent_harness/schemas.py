@@ -43,6 +43,7 @@ class LatestEvent(BaseModel):
 
 
 class WorkItem(BaseModel):
+    project_id: str = Field(description="Project scope of this item.")
     item_id: str = Field(description="Stable id from the plan, e.g. `T4`.")
     title: str
     brief: str = Field(description="The full specification given to the agent.")
@@ -158,8 +159,11 @@ class WorkList(BaseModel):
 class HoldView(BaseModel):
     """A question an item is waiting on, and how long it has been waiting."""
 
+    project_id: str = Field(
+        description="Project containing the held item. Together with `item_id`, this "
+        "is the stable identity used by detail and answer routes."
+    )
     item_id: str = Field(
-        "",
         description="Which item is asking. `GET /api/holds` is an inbox, and an "
         "inbox entry that does not say what it is about cannot be acted on — "
         "`POST /api/work/{item_id}/answer` needs exactly this id.",
@@ -496,11 +500,11 @@ class ProjectSpec(BaseModel):
     supplied again after a restart -- every field was previously a CLI flag
     with nowhere to be written down."""
 
-    project_id: str = Field(description="Stable id, used to scope every other call.")
-    name: str
+    project_id: str = Field(min_length=1, description="Stable id, used to scope every other call.")
+    name: str = Field(min_length=1)
     repo: str | None = Field(None, description="GitHub repo as `owner/name`.")
     work_dir: str | None = Field(None, description="Checkout the worktrees branch from.")
-    base_branch: str = "main"
+    base_branch: str = Field("main", min_length=1)
     checks: list[str] = Field(
         default_factory=list,
         description=(
@@ -563,6 +567,13 @@ class ProjectSpec(BaseModel):
             "reported as unenforceable — unknown cost is never treated as zero."
         ),
     )
+    max_hold_seconds: float = Field(
+        6 * 60 * 60,
+        ge=0,
+        description="Maximum time a held question keeps its claim. Zero means no expiry; "
+        "the safe default is six hours so one unanswered question cannot occupy a worker "
+        "forever.",
+    )
     durability: str = Field(
         "",
         description=(
@@ -581,6 +592,7 @@ class ProjectSpec(BaseModel):
     )
     max_workers: int = Field(
         1,
+        ge=1,
         description="Concurrency budget. Its purpose is that one project cannot "
         "starve another, so it is per project rather than per fleet. Each worker owns "
         "a worktree and its build output, so raising this also multiplies peak disk use.",
@@ -1079,6 +1091,131 @@ class DependencyOverrideResult(BaseModel):
     readiness: ItemReadiness = Field(description="The item's readiness after the override.")
 
 
+# ---------------------------------------------------------------- adoption
+
+
+class AdoptionInspectRequest(BaseModel):
+    """Read-only evidence sources to include in a persisted adoption proposal."""
+
+    inspect_remote: bool = Field(
+        True,
+        description="Inspect the persisted GitHub repository when configured. Read-only; "
+        "the caller cannot supply a different repository.",
+    )
+
+
+class AdoptionEvidenceModel(BaseModel):
+    kind: str = Field(description="Evidence rung: explicit, runnable, judged or prior attempt.")
+    outcome: str = Field(description="What that evidence source reported.")
+    detail: str = Field(description="Redacted explanation retained whether decisive or not.")
+    citations: list[str] = Field(
+        default_factory=list, description="Paths, symbols or commits cited by the evidence."
+    )
+
+
+class AdoptionCandidateModel(BaseModel):
+    kind: str = Field(description="Existing issue, pull request or branch candidate kind.")
+    identity: str = Field(description="Candidate identity within its kind.")
+    state: str = Field(description="Observed external or branch state.")
+    confidence: str = Field(description="Why this is a lead rather than automatically a fact.")
+    evidence: str = Field(description="Redacted reason the candidate was associated.")
+    marker_present: bool = Field(description="Whether the candidate already carries the marker.")
+    harness_created: bool = Field(
+        description="Whether explicit evidence says the harness created the candidate."
+    )
+    title: str = Field(description="Redacted candidate title, when one was observed.")
+    branch: str = Field(description="Redacted branch identity, when one was observed.")
+    url: str = Field(description="Redacted candidate URL, when one was observed.")
+    repository: str | None = Field(None, description="Repository attributed to the candidate.")
+    same_repository: bool = Field(
+        description="Whether a pull-request head belongs to the persisted repository."
+    )
+
+
+class AdoptionMutationModel(BaseModel):
+    kind: str = Field(description="Kind of queue or external change reconciliation proposes.")
+    target: str = Field(description="Redacted target of the proposed change.")
+    detail: str = Field(description="Exact redacted effect described before it is applied.")
+    requires_approval: bool = Field(
+        description="Whether this mutation needs the item in the human-named drop list."
+    )
+
+
+class AdoptionItemModel(BaseModel):
+    item_id: str = Field(description="Plan item identity.")
+    title: str = Field(description="Redacted plan title.")
+    brief: str = Field(description="Redacted plan brief.")
+    depends_on: list[str] = Field(description="Dependencies retained from the parsed plan.")
+    queue_state: str | None = Field(None, description="Existing queue state, if already known.")
+    queue_brief: str | None = Field(None, description="Existing redacted queue brief.")
+    deliverable: str = Field(description="Whether the plan expects code or findings.")
+    proposed_state: str = Field(description="State reconciliation proposes for the item.")
+    evidence: list[AdoptionEvidenceModel] = Field(description="Ranked retained evidence.")
+    candidates: list[AdoptionCandidateModel] = Field(description="External and branch leads.")
+    mutations: list[AdoptionMutationModel] = Field(description="Proposed changes for this item.")
+    ambiguity: str | None = Field(None, description="Why a human must inspect competing facts.")
+    prior_failure: str | None = Field(None, description="Redacted prior harness failure.")
+    requires_drop_approval: bool = Field(
+        description="Whether treating this item as done requires it to be named explicitly."
+    )
+
+
+class AdoptionReportModel(BaseModel):
+    project_id: str = Field(description="Persisted project being adopted.")
+    state: str = Field(description="Current adoption lifecycle state.")
+    repository: str = Field(description="Redacted resolved local checkout path.")
+    created_at: float = Field(description="Unix time at which these findings were created.")
+    dry_run: bool = Field(description="Whether reconciliation was previewed without mutation.")
+    items: list[AdoptionItemModel] = Field(description="Every parsed item; none silently dropped.")
+    plan_path: str = Field(description="Persisted plan path used for this inspection.")
+    configured_repo: str | None = Field(
+        None, description="Persisted remote repository inspected, when enabled/configured."
+    )
+    input_digest: str = Field(
+        description="Digest of persisted paths, remote scope, plan bytes and inspection mode."
+    )
+    inspect_remote: bool = Field(
+        description="Whether the persisted remote repository contributed evidence."
+    )
+    approved_drops: list[str] = Field(description="Exact item ids the human allowed as done.")
+    history: list[str] = Field(description="Ordered lifecycle states for this proposal.")
+    decision_reason: str = Field(description="Redacted human reason for the decision, if any.")
+    digest: str = Field(description="Stable identity of findings, excluding clock and decision.")
+    proposed_drops: list[str] = Field(description="Items evidence proposes as already delivered.")
+    unconfirmed_drops: list[str] = Field(
+        description="Droppable candidates that evidence does not itself assert are done."
+    )
+    parse: PlanParseResult | None = Field(
+        None, description="Current loss-reporting parse evidence when available."
+    )
+
+
+class AdoptionDecisionRequest(BaseModel):
+    decision: Literal["approve", "reject", "revise"] = Field(
+        description="Human decision. Approval still drops only explicitly named item ids."
+    )
+    approved_drops: list[str] = Field(
+        default_factory=list, description="Exact proposed item ids allowed to land as done."
+    )
+    reason: str = Field(min_length=1, description="Why this decision is being made.")
+    expected_digest: str = Field(
+        min_length=1, description="Findings digest this human decision was made against."
+    )
+
+
+class AdoptionReconcileRequest(BaseModel):
+    dry_run: bool = Field(
+        True,
+        description="Safe default. False is the first operation that changes queue/remote state.",
+    )
+    expected_digest: str | None = Field(
+        None, description="Required for apply; findings digest the human reviewed."
+    )
+    expected_approved_drops: list[str] | None = Field(
+        None, description="Required for apply; exact approved drop list the human reviewed."
+    )
+
+
 # ------------------------------------------------------------------- errors
 
 
@@ -1095,6 +1232,12 @@ class RateLimits(BaseModel):
         "these and cannot be recovered."
     )
     total: int = Field(description="Classified rate limits only. Excludes `unclassified`.")
+    denominator: int = Field(
+        0,
+        description="All observed rate-limit events in the window, including the "
+        "separately reported unclassified rows. This is the denominator for any "
+        "rate-limit comparison.",
+    )
     by_worker: list[dict[str, Any]] = Field(default_factory=list)
     by_endpoint: list[dict[str, Any]] = Field(default_factory=list)
     by_role: list[dict[str, Any]] = Field(default_factory=list)
@@ -1148,6 +1291,11 @@ class AuditCost(BaseModel):
     rows: list[AuditCostRow] = Field(default_factory=list)
     total_cost_usd: float | None = None
     total_unpriced: int = 0
+    denominator: int = Field(
+        0,
+        description="Model-call rows observed in the requested window, including "
+        "calls whose price was unknown.",
+    )
     partial: bool = Field(
         False,
         description="True when the requested window starts before the earliest "
@@ -1165,6 +1313,11 @@ class AuditDeliveryRow(BaseModel):
 class AuditDelivery(BaseModel):
     window: str
     rows: list[AuditDeliveryRow] = Field(default_factory=list)
+    denominator: int = Field(
+        0,
+        description="Distinct work items observed in the requested window. Outcome "
+        "rows can overlap because one item may emit more than one outcome.",
+    )
     partial: bool = False
 
 
@@ -1303,6 +1456,21 @@ class BaselineList(BaseModel):
     baselines: list[Baseline] = Field(default_factory=list)
 
 
+class AnalyticsDashboard(BaseModel):
+    """The typed, read-only projection rendered by the analytics page."""
+
+    window: str = Field(description="The requested audit window token.")
+    project_id: str | None = Field(None, description="Optional project scope.")
+    rate_limits: RateLimits = Field(description="Classified and unclassified rate limits.")
+    cost: AuditCost = Field(description="Known and unpriced model-call spend.")
+    delivery: AuditDelivery = Field(description="Outcome counts and item denominator.")
+    audit_health: AuditHealth = Field(
+        description="Whether the history is complete enough to trust."
+    )
+    baselines: BaselineList = Field(description="Immutable supplied comparison baselines.")
+    rollups: AuditRollups = Field(description="Daily retained history for long windows.")
+
+
 class NewBaseline(BaseModel):
     baseline_id: str = Field(description="Stable id. Recording twice under one id is refused.")
     project_id: str
@@ -1337,6 +1505,203 @@ class Event(BaseModel):
 class EventPage(BaseModel):
     events: list[Event]
     cursor: int = Field(description="Pass as `since_id` next time. Unchanged when empty.")
+
+
+class ProcessMetrics(BaseModel):
+    """A session-independent observation of the serving process."""
+
+    sampled_at: float = Field(description="Unix time at which this snapshot was sampled.")
+    started_at: float = Field(
+        description="Unix time at which this API application began tracking its process."
+    )
+    uptime_seconds: float = Field(
+        description="Monotonic seconds since this API application began tracking its process."
+    )
+    pid: int = Field(description="Operating-system id of the process serving this API.")
+    thread_count: int = Field(description="Live Python threads in the serving process.")
+    cpu_seconds: float = Field(description="CPU seconds consumed by the serving process.")
+    mode: Literal["supervised", "monitoring-only"] = Field(
+        description="Whether an in-process worker fleet is attached; no session host is queried."
+    )
+    active_workers: int = Field(
+        description="Live workers reported by the attached fleet, or zero in monitoring-only mode."
+    )
+
+
+class GatewayLog(BaseModel):
+    """Allowlisted fields from one redacted model gateway call."""
+
+    id: int = Field(description="Monotonic source-event id used for cursor paging.")
+    ts: float = Field(description="Unix time at which the gateway outcome was recorded.")
+    project_id: str | None = Field(None, description="Project attributed to the call, if recorded.")
+    item_id: str | None = Field(None, description="Work item attributed to the call, if recorded.")
+    worker: str | None = Field(None, description="Worker identity attributed to the call.")
+    role: str | None = Field(None, description="Routed model role used by the call.")
+    model: str | None = Field(None, description="Model identifier recorded for the call.")
+    endpoint: str | None = Field(
+        None,
+        description="Credential-safe endpoint identity with URL userinfo, query and fragment "
+        "removed.",
+    )
+    outcome: str | None = Field(None, description="Recorded gateway outcome token.")
+    error_class: str | None = Field(None, description="Classified failure kind, when one occurred.")
+    latency_s: float | None = Field(None, description="Recorded call latency in seconds.")
+    attempt: int | None = Field(None, description="Attempt number within the model call ladder.")
+    detail: str | None = Field(
+        None,
+        description="Bounded redacted gateway detail; model answer payloads are never exposed "
+        "here.",
+    )
+
+
+class GatewayLogPage(BaseModel):
+    """Cursor-paged model gateway evidence from the active event source."""
+
+    configured: bool = Field(description="Whether the selected event source is readable.")
+    degraded: bool = Field(
+        description="Whether the selected live audit source reports degraded persistence."
+    )
+    source: Literal["live_audit", "ingested_events"] = Field(
+        description="The append-only source projected; never a local filesystem log path."
+    )
+    logs: list[GatewayLog] = Field(
+        default_factory=list,
+        description="Allowlisted, already-redacted model-call records in source cursor order.",
+    )
+    cursor: int = Field(
+        description="Pass as `since_id` next time; advances across scanned non-model events."
+    )
+
+
+class EventFilters(BaseModel):
+    """Typed, URL-safe filters for the append-only event explorer.
+
+    The fields mirror the evidence dimensions recorded by the audit store. A
+    reason kind lives in event data because older event rows predate the
+    classified field; readers therefore treat its absence as no match rather
+    than inventing a classification.
+    """
+
+    project_id: str | None = Field(None, description="Limit events to one project.")
+    item_id: str | None = Field(None, description="Limit events to one work item.")
+    worker: str | None = Field(None, description="Limit events to one worker identity.")
+    endpoint: str | None = Field(None, description="Limit events to one endpoint.")
+    role: str | None = Field(None, description="Limit events to one routed role.")
+    model: str | None = Field(None, description="Limit events to one model identifier.")
+    outcome: str | None = Field(None, description="Limit events to one outcome token.")
+    error_class: str | None = Field(None, description="Limit events to one error class.")
+    reason_kind: str | None = Field(None, description="Limit events to a recorded reason kind.")
+    start_ts: float | None = Field(None, description="Include events at or after this Unix time.")
+    end_ts: float | None = Field(None, description="Include events at or before this Unix time.")
+
+    @field_validator(
+        "project_id",
+        "item_id",
+        "worker",
+        "endpoint",
+        "role",
+        "model",
+        "outcome",
+        "error_class",
+        "reason_kind",
+        "start_ts",
+        "end_ts",
+        mode="before",
+    )
+    @classmethod
+    def blank_strings_are_not_filters(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @model_validator(mode="after")
+    def valid_time_window(self) -> EventFilters:
+        if self.start_ts is not None and self.end_ts is not None and self.start_ts > self.end_ts:
+            raise ValueError("start_ts must not be after end_ts")
+        return self
+
+
+class AbandonedSessionEvidence(BaseModel):
+    """A terminal session deliberately retained after an agent timeout."""
+
+    session_id: str = Field(description="Session retained for human recovery.")
+    project_id: str | None = Field(
+        None, description="Project scope, when recorded by a project-aware executor."
+    )
+    item_id: str = Field(description="Item whose context the session still owns.")
+    reason: str | None = Field(None, description="Why the session was abandoned.")
+    session_url: str | None = Field(None, description="Optional deep link to the session.")
+    abandoned_at: float = Field(description="Unix time when the session was retained.")
+
+
+class WorkerInventoryItem(BaseModel):
+    """One live worker, a durable claim, or a recorded worker failure."""
+
+    worker_id: str = Field(description="Runtime worker identity, normally its thread name.")
+    project_id: str | None = Field(None, description="Project served by this worker, if known.")
+    state: str = Field(description="`running`, `idle`, `failed`, or `stale_claim`.")
+    claim_owner: str | None = Field(None, description="Durable queue owner on a claimed item.")
+    item_id: str | None = Field(None, description="Work item currently held by the worker.")
+    lease_until: float | None = Field(None, description="Claim lease expiry, when an item is held.")
+    heartbeat_at: float | None = Field(
+        None, description="Most recent durable claim update, used as the heartbeat evidence."
+    )
+    stage: str | None = Field(None, description="Most recent recorded stage or event outcome.")
+    started_at: float | None = Field(None, description="Runtime worker start time, when attached.")
+    item_started_at: float | None = Field(None, description="When the current item first started.")
+    failure: str | None = Field(None, description="Most recent recorded worker failure.")
+    failed_at: float | None = Field(None, description="Unix time of the worker failure.")
+    abandoned_sessions: list[AbandonedSessionEvidence] = Field(
+        default_factory=list, description="Retained session evidence associated with this item."
+    )
+
+
+class WorkerInventory(BaseModel):
+    """The read-only worker-pool projection used by the GUI and API."""
+
+    configured: bool = Field(description="Whether a supervised worker pool is attached.")
+    mode: Literal["supervised", "monitoring-only"] = Field(
+        description="Monitoring-only deployments have no worker identities to report."
+    )
+    reason: str | None = Field(None, description="Why the inventory is unavailable, when absent.")
+    workers: list[WorkerInventoryItem] = Field(default_factory=list)
+
+
+class AttemptStageEvidence(BaseModel):
+    """One durable boundary reached by one attempt."""
+
+    attempt: int = Field(description="One-based attempt number.")
+    stage: str = Field(description="A member of the executor's fixed stage list.")
+    admitted_revision: int = Field(
+        description="Dependency-graph revision against which the attempt was admitted."
+    )
+    mode: str = Field(description="Durability mode that recorded this boundary.")
+    recorded_at: float = Field(description="Unix timestamp when this boundary was recorded.")
+    artefact: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Retained typed stage data. Missing keys mean the evidence was not "
+        "recorded; clients must not infer them.",
+    )
+
+
+class WorkEvidence(BaseModel):
+    """Item-scoped history without fabricated gaps."""
+
+    project_id: str = Field(description="Project containing the item.")
+    item_id: str = Field(description="Stable plan id.")
+    events: list[Event] = Field(
+        default_factory=list,
+        description="Recorded events for this item, oldest first. Empty means no retained "
+        "event evidence is available, not that nothing happened.",
+    )
+    stages: list[AttemptStageEvidence] = Field(
+        default_factory=list,
+        description="Durable attempt stages, oldest first.",
+    )
+    holds: list[HoldView] = Field(
+        default_factory=list,
+        description="Every retained question for the item, including closed questions.",
+    )
 
 
 # ------------------------------------------------------------------ summary

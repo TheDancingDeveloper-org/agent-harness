@@ -243,6 +243,10 @@ class AdoptionReport:
     created_at: float
     dry_run: bool
     items: list[AdoptionItem]
+    plan_path: str = ""
+    configured_repo: str | None = None
+    input_digest: str = ""
+    inspect_remote: bool = False
     approved_drops: list[str] = field(default_factory=list)
     history: list[str] = field(default_factory=lambda: [DRAFT, INSPECTING, PROPOSED])
     #: Why a human rejected or asked for a revision. Never inferred.
@@ -575,6 +579,11 @@ class Adoption:
         *,
         dry_run: bool = False,
         persist: bool = True,
+        plan_path: str = "",
+        configured_repo: str | None = None,
+        input_digest: str = "",
+        inspect_remote: bool = False,
+        emit: bool = True,
     ) -> AdoptionReport:
         """Build a proposal. Reads everything; changes nothing outside the report.
 
@@ -603,6 +612,10 @@ class Adoption:
             created_at=self.now(),
             dry_run=dry_run,
             items=proposed,
+            plan_path=plan_path,
+            configured_repo=configured_repo,
+            input_digest=input_digest,
+            inspect_remote=inspect_remote,
             history=[DRAFT, INSPECTING, PROPOSED],
         )
         previous = self.queue.get_setting(self._key(project_id))
@@ -616,7 +629,7 @@ class Adoption:
                 report.created_at = earlier.created_at
         if persist:
             self._save(report)
-        for item in report.items:
+        for item in report.items if emit else []:
             outcome = (
                 "adoption_ambiguous"
                 if item.ambiguity
@@ -872,7 +885,13 @@ class Adoption:
 
     # ------------------------------------------------------------ decision
 
-    def approve(self, project_id: str, *, approved_drops: Sequence[str] = ()) -> AdoptionReport:
+    def approve(
+        self,
+        project_id: str,
+        *,
+        approved_drops: Sequence[str] = (),
+        reason: str = "",
+    ) -> AdoptionReport:
         """Record the human's exact permission. Absence is never approval."""
         report = self.load(project_id)
         if report.state not in (PROPOSED, APPROVED):
@@ -887,6 +906,7 @@ class Adoption:
             raise ValueError(f"cannot approve unproposed drops: {', '.join(unknown)}")
         report.state = APPROVED
         report.approved_drops = sorted(set(approved_drops))
+        report.decision_reason = reason.strip()
         report.history = [*report.history, APPROVED]
         self._save(report)
         self._emit(
@@ -896,6 +916,7 @@ class Adoption:
             detail=(
                 f"approved drops: {', '.join(report.approved_drops) or 'none'}; "
                 f"proposed: {', '.join(sorted(proposed)) or 'none'}"
+                + (f"; reason: {report.decision_reason}" if report.decision_reason else "")
             ),
         )
         return report
@@ -929,14 +950,21 @@ class Adoption:
             report.dry_run = True
             return report
 
-        self.queue.add_project(
-            Project(
-                project_id=project_id,
-                name=project_id,
-                work_dir=str(self.repository),
-                created_at=self.now(),
+        # Adoption can start a project from nothing, but the HTTP/browser
+        # workflow normally targets a project that is already configured.
+        # Re-registering a minimal row in that case would erase its checks,
+        # budgets, routes, repository and plan path at the moment a human
+        # confirms adoption. Existing configuration is authoritative and is
+        # therefore left byte-for-byte alone.
+        if self.queue.get_project(project_id) is None:
+            self.queue.add_project(
+                Project(
+                    project_id=project_id,
+                    name=project_id,
+                    work_dir=str(self.repository),
+                    created_at=self.now(),
+                )
             )
-        )
         approved = set(report.approved_drops)
         self.queue.add(
             [
@@ -1182,6 +1210,10 @@ def report_from_dict(raw: Mapping[str, Any]) -> AdoptionReport:
         created_at=float(raw["created_at"]),
         dry_run=bool(raw.get("dry_run", False)),
         items=items,
+        plan_path=str(raw.get("plan_path") or ""),
+        configured_repo=(str(raw["configured_repo"]) if raw.get("configured_repo") else None),
+        input_digest=str(raw.get("input_digest") or ""),
+        inspect_remote=bool(raw.get("inspect_remote", False)),
         approved_drops=[str(value) for value in raw.get("approved_drops") or []],
         history=[str(value) for value in raw.get("history") or []]
         or [DRAFT, INSPECTING, str(raw["state"])],

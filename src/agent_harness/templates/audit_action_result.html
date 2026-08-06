@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Operator action result</p><h1>{{ title }}</h1></div><span class="mode-badge">Recorded</span></div>
+  <section class="card">
+    {% if action_kind == "reconcile" %}
+      <p>GitHub reconciliation completed for <code>{{ repo }}</code>.</p>
+      <dl class="detail-facts"><dt>Merged</dt><dd>{{ result.merged }}</dd><dt>Closed unmerged</dt><dd>{{ result.closed_unmerged }}</dd><dt>Reverted</dt><dd>{{ result.reverted }}</dd><dt>Skipped</dt><dd>{{ result.skipped }}</dd><dt>Reason</dt><dd>{{ reason }}</dd></dl>
+    {% else %}
+      <p>Audit maintenance completed.</p>
+      <dl class="detail-facts"><dt>Rollup rows written</dt><dd>{{ result.rolled_up }}</dd><dt>Raw rows thinned</dt><dd>{{ result.thinned }}</dd><dt>Reason</dt><dd>{{ reason }}</dd></dl>
+    {% endif %}
+    {% if result.errors %}<div class="alert error" role="alert"><strong>Returned errors</strong><ul>{% for error in result.errors %}<li>{{ error }}</li>{% endfor %}</ul></div>{% else %}<p class="alert success">The operation returned no errors.</p>{% endif %}
+    <p><a class="button secondary" href="{{ url_for('analytics') }}">Back to analytics</a></p>
+  </section>
+{% endblock %}

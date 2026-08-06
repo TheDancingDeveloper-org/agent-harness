@@ -495,8 +495,10 @@ wrapper- and heredoc-aware — and screens each. Its `execute` is one method, an
 one method is the entire attack surface.
 
 **It is not a sandbox**, and nothing here should be described as one. The
-session host owns process isolation, and a second worse copy of it does not
-belong here. It cannot see inside an inline program — `sh -c '…'` and
+current direct runner still needs the OS-enforced item boundary specified in
+`STATUS.md` Stage 2; an optional session host may provide its own isolation,
+but that does not satisfy the harness-owned execution target. The guard cannot
+see inside an inline program — `sh -c '…'` and
 `python -c '…'` are one argv token — so a deployment that runs a shell as a
 check has an unscreened shell. Pattern matching bounds the obvious reaches, not
 the clever ones: it converts a class of catastrophic outcomes into a legible
@@ -1107,16 +1109,22 @@ than setting a flag no worker acts on. With one, the same API gains a worker
 pool its start action can use — and still nothing runs until someone starts a
 project.
 
-### Why there is no GUI here
+### The browser control plane is another client
 
-The GUI belongs to the session host. It already owns tabs, token
-authentication, push notifications, a mobile story and the PTY sessions the
-agents run in. A web UI in this repository would mean a second URL, a second
-login, no notifications and no phone — worse, for the same work.
+The browser application is packaged and served by `agent-harness` from the
+same process and origin as the JSON API. It uses server-rendered templates,
+vendored static assets and bounded opaque browser sessions established by a
+one-time exchange of the configured bearer token. The token is not rendered,
+stored in frontend code or placed in a URL. Browser mutations require CSRF
+validation and explicit review; HTML controllers delegate to the same typed
+application services and gate checks as JSON routes.
 
-This is not an aesthetic position; it is the same reasoning as everywhere else
-in this document. The harness owns the decisions and the record. It serves JSON,
-and the host renders it.
+This does not make the GUI part of execution. A monitoring-only service renders
+the same views while refusing start actions it cannot fulfil, and execution
+continues when the GUI is offline. A session host remains an optional executor
+adapter for PTY-backed agents, not the owner of browser authentication, routes,
+assets or deployment. The later in-repository chat/terminal subsystem described
+in `GUI_PLAN.md` is not implemented.
 
 ---
 

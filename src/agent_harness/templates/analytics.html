@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading">
+    <div><p class="eyebrow">Operational telemetry</p><h1>Analytics</h1></div>
+    {% if dashboard.audit_health.degraded %}<span class="state state-failed">Audit degraded</span>{% else %}<span class="state state-done">Audit recording</span>{% endif %}
+  </div>
+
+  <form class="card filterbar" method="get" action="{{ url_for('analytics') }}">
+    <label>Window
+      <select name="window">
+        {% for option in ["1h", "24h", "72h", "7d", "all"] %}<option value="{{ option }}" {% if dashboard.window == option %}selected{% endif %}>{{ option }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Project (optional)<input name="project_id" value="{{ dashboard.project_id or '' }}" placeholder="all projects"></label>
+    <button type="submit">Refresh</button>
+  </form>
+
+  {% if dashboard.audit_health.degraded %}
+    <p class="alert error">History is missing, degraded, or unavailable. Counts below are not evidence of complete history.</p>
+  {% endif %}
+  {% if dashboard.cost.partial or dashboard.delivery.partial %}
+    <p class="alert error">The selected {{ dashboard.window }} window begins before retained history (oldest event: {{ dashboard.audit_health.oldest|datetime if dashboard.audit_health.oldest else 'unknown' }}). Results are partial.</p>
+  {% endif %}
+
+  <div class="analytics-grid">
+    <section class="card">
+      <h2>Service process</h2>
+      <p class="muted">Sampled independently of session-host state. Tracking begins when this API application starts.</p>
+      <dl class="facts">
+        <div><dt>Mode</dt><dd>{{ process.mode }}</dd></div>
+        <div><dt>Uptime</dt><dd>{{ '%.1f'|format(process.uptime_seconds) }}s</dd></div>
+        <div><dt>CPU</dt><dd>{{ '%.3f'|format(process.cpu_seconds) }}s</dd></div>
+        <div><dt>Threads</dt><dd>{{ process.thread_count }}</dd></div>
+        <div><dt>Active workers</dt><dd>{{ process.active_workers }}</dd></div>
+        <div><dt>Process id</dt><dd>{{ process.pid }}</dd></div>
+      </dl>
+      <p class="small">Typed JSON evidence: <span class="mono">GET {{ root_path }}/api/process</span></p>
+    </section>
+
+    <section class="card">
+      <h2>Gateway calls</h2>
+      <p class="muted">Allowlisted <span class="mono">model_call</span> fields from {{ gateway_logs.source }}. Arbitrary model payloads are excluded.</p>
+      {% if gateway_logs.degraded %}<p class="alert error">The live audit source is degraded; gateway history is unavailable.</p>{% endif %}
+      <div class="table-scroll"><table><thead><tr><th>Time</th><th>Route</th><th>Outcome</th><th>Latency</th></tr></thead><tbody>
+        {% for row in gateway_logs.logs %}<tr><td>{{ row.ts|datetime }}</td><td>{{ row.role or '—' }} / {{ row.model or '—' }}<br><span class="mono">{{ row.endpoint or '—' }}</span></td><td>{{ row.outcome or '—' }}{% if row.error_class %} / {{ row.error_class }}{% endif %}</td><td>{{ row.latency_s if row.latency_s is not none else '—' }}</td></tr>{% else %}<tr><td colspan="4">No gateway-call evidence</td></tr>{% endfor %}
+      </tbody></table></div>
+      <p class="small">Typed JSON evidence: <span class="mono">GET {{ root_path }}/api/gateway-logs</span></p>
+    </section>
+
+    <section class="card">
+      <h2>Rate limits</h2>
+      <p class="muted">Denominator: {{ dashboard.rate_limits.denominator }} observed rate-limit rows. Unclassified remains separate.</p>
+      <table><thead><tr><th>Class</th><th>Count</th><th>Meaning</th></tr></thead><tbody>
+        {% for key in ["rpm", "window_cap", "terminal_cap"] %}<tr><td>{{ key }}</td><td>{{ dashboard.rate_limits.classified[key] }}</td><td>{{ dashboard.rate_limits.meaning[key] }}</td></tr>{% endfor %}
+        <tr><td>unclassified</td><td>{{ dashboard.rate_limits.unclassified }}</td><td>Recorded before classification; excluded from known classes.</td></tr>
+      </tbody></table>
+      {% if dashboard.baselines.baselines %}<p class="small muted">Supplied baselines: {{ dashboard.baselines.baselines|length }}. Compare only with the matching workload and window.</p>{% else %}<p class="small muted">No supplied baseline is recorded.</p>{% endif %}
+    </section>
+
+    <section class="card">
+      <h2>Cost</h2>
+      <p class="muted">Denominator: {{ dashboard.cost.denominator }} model calls. Known spend excludes {{ dashboard.cost.total_unpriced }} unpriced calls.</p>
+      <p><strong>Known total:</strong> {% if dashboard.cost.total_cost_usd is none %}unknown{% else %}${{ '%.4f'|format(dashboard.cost.total_cost_usd) }}{% endif %}</p>
+      <table><thead><tr><th>Project / role / model</th><th>Known USD</th><th>Calls</th><th>Unpriced</th></tr></thead><tbody>
+        {% for row in dashboard.cost.rows %}<tr><td>{{ row.project_id or '—' }} / {{ row.role or '—' }} / {{ row.model or '—' }}</td><td>{{ row.cost_usd if row.cost_usd is not none else 'unknown' }}</td><td>{{ row.calls }}</td><td>{{ row.unpriced }}</td></tr>{% else %}<tr><td colspan="4">No cost evidence</td></tr>{% endfor %}
+      </tbody></table>
+    </section>
+
+    <section class="card">
+      <h2>Delivery</h2>
+      <p class="muted">Denominator: {{ dashboard.delivery.denominator }} distinct work items. Outcome event counts may overlap.</p>
+      <table><thead><tr><th>Project / outcome</th><th>Events</th><th>Items</th></tr></thead><tbody>
+        {% for row in dashboard.delivery.rows %}<tr><td>{{ row.project_id or '—' }} / {{ row.outcome or '—' }}</td><td>{{ row.n }}</td><td>{{ row.items }}</td></tr>{% else %}<tr><td colspan="3">No delivery evidence</td></tr>{% endfor %}
+      </tbody></table>
+      <p class="small muted">Merged, closed-unmerged, and reverted outcomes appear only after reconciliation records them.</p>
+    </section>
+
+    <section class="card">
+      <h2>Audit history</h2>
+      <dl class="facts"><div><dt>Stored events</dt><dd>{{ dashboard.audit_health.events }}</dd></div><div><dt>Schema</dt><dd>{{ dashboard.audit_health.schema_version or '—' }}</dd></div><div><dt>Oldest</dt><dd>{{ dashboard.audit_health.oldest|datetime if dashboard.audit_health.oldest else '—' }}</dd></div><div><dt>Newest</dt><dd>{{ dashboard.audit_health.newest|datetime if dashboard.audit_health.newest else '—' }}</dd></div></dl>
+      <p class="muted">Daily rollups through {{ dashboard.rollups.rolled_up_through or 'no published day' }}. {{ dashboard.rollups.rows|length }} retained rollup rows.</p>
+      {% if dashboard.baselines.baselines %}<table><thead><tr><th>Baseline</th><th>Window</th><th>Items done</th><th>Cost</th></tr></thead><tbody>{% for baseline in dashboard.baselines.baselines %}<tr><td>{{ baseline.label }} <span class="mono">({{ baseline.baseline_id }})</span></td><td>{{ baseline.window_days }}d</td><td>{{ baseline.items_done if baseline.items_done is not none else 'unknown' }}</td><td>{{ baseline.cost_usd if baseline.cost_usd is not none else 'unknown' }}</td></tr>{% endfor %}</tbody></table>{% endif %}
+    </section>
+  </div>
+
+  <section class="card">
+    <div class="card-heading"><div><p class="eyebrow">Guarded operations</p><h2>Reconciliation and maintenance</h2></div><span class="mode-badge">Explicit review</span></div>
+    <p class="muted">Each operation has a separate non-mutating review, a one-time confirmation, authenticated operator attribution, and a required reason.</p>
+    <div class="analytics-grid">
+      <form method="post" action="{{ url_for('audit_reconcile_review') }}" data-csrf-form>
+        <h3>GitHub reconciliation</h3>
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label>Project<select name="project_id" required><option value="">Select a configured repository</option>{% for summary in projects.projects %}{% if summary.project.repo %}<option value="{{ summary.project.project_id }}">{{ summary.project.name }} — {{ summary.project.repo }}</option>{% endif %}{% endfor %}</select></label>
+        <label>Reason<input name="reason" required placeholder="Why reconcile now?"></label>
+        <button type="submit">Review reconciliation</button>
+      </form>
+      <form method="post" action="{{ url_for('audit_maintenance_review') }}" data-csrf-form>
+        <h3>Audit maintenance</h3>
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label>Raw-event retention days<input name="retention_days" type="number" min="0" value="{{ retention_days }}" required></label>
+        <label>Reason<input name="reason" required placeholder="Why run maintenance now?"></label>
+        <button type="submit">Review maintenance</button>
+      </form>
+    </div>
+  </section>
+{% endblock %}

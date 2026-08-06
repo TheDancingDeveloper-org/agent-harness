@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Control plane</p><h1>Projects</h1></div><span class="mode-badge">{{ mode }}</span></div>
+  <p class="muted">A project starts stopped after restart. This view exposes queue state, leases, workers, readiness and audit health without starting work.</p>
+  {% if not projects.projects %}
+    <section class="empty"><h2>No projects configured</h2><p>Create a project through the typed API, then return here to inspect it.</p></section>
+  {% else %}
+    <section class="project-grid" aria-label="Projects" id="project-cards" hx-get="{{ url_for('projects_fragment') }}" hx-trigger="every 15s" hx-swap="innerHTML">
+      {% include "fragments/project_cards.html" %}
+    </section>
+  {% endif %}
+{% endblock %}

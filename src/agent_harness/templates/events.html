@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Append-only history</p><h1>Events</h1></div><span class="mode-badge" id="stream-state">Cursor {{ events.cursor }}</span></div>
+  <p class="muted">The stream resumes after the last monotonic cursor. A reconnect is visible and never silently replaces the event store.</p>
+  <form class="filterbar event-filters" method="get" action="{{ url_for('events') }}">
+    <label for="event-project">Project<input id="event-project" name="project_id" value="{{ filters.project_id or '' }}"></label>
+    <label for="event-item">Item<input id="event-item" name="item_id" value="{{ filters.item_id or '' }}"></label>
+    <label for="event-worker">Worker<input id="event-worker" name="worker" value="{{ filters.worker or '' }}"></label>
+    <label for="event-endpoint">Endpoint<input id="event-endpoint" name="endpoint" value="{{ filters.endpoint or '' }}"></label>
+    <label for="event-role">Role<input id="event-role" name="role" value="{{ filters.role or '' }}"></label>
+    <label for="event-model">Model<input id="event-model" name="model" value="{{ filters.model or '' }}"></label>
+    <label for="event-outcome">Outcome<input id="event-outcome" name="outcome" value="{{ filters.outcome or '' }}"></label>
+    <label for="event-error">Error class<input id="event-error" name="error_class" value="{{ filters.error_class or '' }}"></label>
+    <label for="event-reason">Reason kind<input id="event-reason" name="reason_kind" value="{{ filters.reason_kind or '' }}"></label>
+    <label for="event-start">From Unix time<input id="event-start" name="start_ts" inputmode="decimal" value="{{ filters.start_ts if filters.start_ts is not none else '' }}"></label>
+    <label for="event-end">Through Unix time<input id="event-end" name="end_ts" inputmode="decimal" value="{{ filters.end_ts if filters.end_ts is not none else '' }}"></label>
+    <button class="secondary" type="submit">Filter</button>
+  </form>
+  <ol class="timeline" id="event-timeline" hx-ext="sse" sse-connect="{{ stream_url }}" sse-swap="harness" hx-swap="afterbegin">{% for event in events.events %}<li><strong>{{ event.outcome or event.kind }}</strong><span class="muted">{{ event.ts|datetime }}</span><p>{{ event.data.detail or event.source }}</p></li>{% else %}<li class="muted">No events have been recorded.</li>{% endfor %}</ol>
+{% endblock %}

@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Runtime inventory</p><h1>Workers</h1></div><span class="mode-badge">{{ inventory.mode }}</span></div>
+  {% if not inventory.configured %}
+    <section class="empty"><h2>Monitoring-only deployment</h2><p>{{ inventory.reason }}</p><p>No worker identity is inferred from durable claims; the service is not supervising execution.</p></section>
+  {% elif inventory.reason %}
+    <section class="alert warning" role="status">{{ inventory.reason }}</section>
+  {% elif not inventory.workers %}
+    <section class="empty"><h2>No worker evidence</h2><p>The supervised pool is attached, but no live worker, claim, or failure is currently recorded.</p></section>
+  {% else %}
+    <section class="card table-scroll" aria-labelledby="worker-inventory-heading">
+      <h2 id="worker-inventory-heading">Worker and claim evidence</h2>
+      <p class="muted">Live identities come from the attached fleet. Claims, leases, stages, failures, and abandoned sessions come from durable state and are never fabricated.</p>
+      <table><thead><tr><th>Worker</th><th>Project / item</th><th>State</th><th>Lease / heartbeat</th><th>Stage</th><th>Failure / retained session</th></tr></thead><tbody>
+      {% for worker in inventory.workers %}<tr>
+        <th><code>{{ worker.worker_id }}</code></th>
+        <td>{{ worker.project_id or '—' }}{% if worker.item_id %} / <a href="{{ url_for('work_item_page', item_id=worker.item_id) }}?project_id={{ worker.project_id|urlencode }}">{{ worker.item_id }}</a>{% endif %}</td>
+        <td><span class="state state-{{ worker.state }}">{{ worker.state }}</span></td>
+        <td>{% if worker.lease_until %}{{ worker.lease_until|datetime }}{% else %}—{% endif %}<br><span class="muted">{{ worker.heartbeat_at|datetime if worker.heartbeat_at else 'no durable heartbeat' }}</span></td>
+        <td>{{ worker.stage or '—' }}</td>
+        <td>{% if worker.failure %}<span class="warning">{{ worker.failure }}</span>{% endif %}{% for session in worker.abandoned_sessions %}<div><a href="{{ session.session_url or '#' }}">retained {{ session.session_id }}</a></div>{% endfor %}{% if not worker.failure and not worker.abandoned_sessions %}—{% endif %}</td>
+      </tr>{% endfor %}</tbody></table>
+    </section>
+  {% endif %}
+{% endblock %}

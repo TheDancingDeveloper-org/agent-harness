@@ -748,7 +748,7 @@ def _run(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # Before anything claims, and before the first model call: a headless run
+    # Before anything claims, and before the first model call: a direct run
     # works in place and begins each attempt by discarding the working tree, so
     # a dirty checkout is uncommitted work about to be destroyed. Refusing is
     # the only safe default; --allow-dirty is how you say it is disposable.
@@ -1613,7 +1613,7 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-dirty",
         action="store_true",
         help="run against a checkout that has uncommitted or untracked files. A "
-        "headless run works IN PLACE and discards the working tree before each "
+        "direct run works IN PLACE and discards the working tree before each "
         "attempt — tracked changes are reverted and untracked files are deleted, "
         "neither recoverably — so a dirty checkout is refused by default. Pass "
         "this only when the tree is genuinely disposable.",
@@ -1664,7 +1664,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     p_serve = sub.add_parser(
-        "serve", help="serve the JSON API (headless — the GUI is the session host's)"
+        "serve", help="serve the JSON API and self-contained browser control plane"
     )
     p_serve.add_argument(
         "--audit-db",
@@ -1679,11 +1679,9 @@ def main(argv: list[str] | None = None) -> int:
         "--session-host",
         default=os.environ.get("AIDEVENV_URL", ""),
         metavar="URL",
-        help="base URL of a session host. WITH this, the API can start work: a "
-        "worker pool is attached and each agent runs as a terminal session you can "
-        "attach to. WITHOUT it the service is monitoring-only — every read works "
-        "and starting a project is refused, because starting would mark it running "
-        "with nothing able to claim.",
+        help="optional execution adapter for terminal sessions. WITH this, the "
+        "service can start work. WITHOUT it the packaged GUI and every read work "
+        "in monitoring-only mode, while starting is refused because nothing can claim.",
     )
     p_serve.add_argument(
         "--agent",
@@ -1745,7 +1743,8 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("HARNESS_ROOT_PATH", ""),
         metavar="PREFIX",
         help="prefix this service is reached under when behind a proxy, e.g. "
-        "/api/harness. Without it, Swagger UI tells clients to call URLs that 404.",
+        "/harness. Without it, browser links and OpenAPI advertise URLs clients "
+        "cannot call.",
     )
 
     args = parser.parse_args(argv)

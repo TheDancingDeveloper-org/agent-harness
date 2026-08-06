@@ -63,6 +63,8 @@ class Worker:
 
     thread: threading.Thread
     stop: threading.Event
+    started_at: float = 0.0
+    owner: str | None = None
 
 
 @dataclass
@@ -100,6 +102,16 @@ class ProjectPool:
         self.stop.set()
         for worker in self.workers:
             worker.stop.set()
+
+
+@dataclass(frozen=True)
+class WorkerSnapshot:
+    """A read-only runtime identity exposed to control-plane projections."""
+
+    project_id: str
+    worker_id: str
+    claim_owner: str | None
+    started_at: float
 
 
 class Fleet:
@@ -165,9 +177,9 @@ class Fleet:
             # the project still reads `stopped` claims nothing and sleeps a
             # full poll for no reason.
             self.queue.set_control(RUNNING, project_id=project_id)
-            for _ in range(max(1, project.max_workers)):
-                pool.workers.append(self._spawn(pool))
             self._pools[project_id] = pool
+            for _ in range(max(1, project.max_workers)):
+                self._spawn(pool)
             log.info("started %d worker(s) for project %s", len(pool.workers), project_id)
             return len(pool.workers)
 
@@ -216,7 +228,7 @@ class Fleet:
             shortfall = target - pool.wanted
             for _ in range(max(0, shortfall)):
                 try:
-                    pool.workers.append(self._spawn(pool))
+                    self._spawn(pool)
                 except RuntimeError as exc:  # the OS refused another thread
                     # Reported after the lock: a sibling that started fine is
                     # working, and must not be torn down over this.
@@ -253,8 +265,13 @@ class Fleet:
             name=f"harness-{pool.project_id}-{pool.launched}",
             daemon=True,
         )
+        worker = Worker(thread=thread, stop=stop, started_at=self.now())
+        # Register before starting the thread. The executor may fail during
+        # construction immediately, and inventory should still be able to
+        # explain which runtime identity disappeared.
+        pool.workers.append(worker)
         thread.start()
-        return Worker(thread=thread, stop=stop)
+        return worker
 
     def _join_retired(self, project_id: str, pool: ProjectPool, retired: list[Worker]) -> None:
         """Wait for shrunk-away workers off the caller's thread.
@@ -354,11 +371,44 @@ class Fleet:
         with self._lock:
             return [f for f in self._failures if project_id is None or f.project_id == project_id]
 
+    def workers(self, project_id: str | None = None) -> list[WorkerSnapshot]:
+        """Live worker identities and their process claim owner.
+
+        This is deliberately a snapshot, not a registry. The fleet remains
+        the owner of runtime threads; callers receive enough evidence to
+        correlate a live thread with durable queue claims without mutating or
+        scheduling anything.
+        """
+        with self._lock:
+            snapshots: list[WorkerSnapshot] = []
+            for pid, pool in self._pools.items():
+                if project_id is not None and pid != project_id:
+                    continue
+                for worker in pool.workers:
+                    if worker.thread.is_alive():
+                        snapshots.append(
+                            WorkerSnapshot(
+                                project_id=pid,
+                                worker_id=worker.thread.name,
+                                claim_owner=worker.owner,
+                                started_at=worker.started_at,
+                            )
+                        )
+            return snapshots
+
     # ------------------------------------------------------------ internals
 
     def _worker(self, project_id: str, stop: threading.Event) -> None:
         try:
             executor = self.executor_factory(project_id)
+            with self._lock:
+                pool = self._pools.get(project_id)
+                if pool is not None:
+                    current = threading.current_thread()
+                    for worker in pool.workers:
+                        if worker.thread is current:
+                            worker.owner = getattr(executor, "owner", None)
+                            break
         except Exception as exc:  # noqa: BLE001 - one project must not kill the fleet
             self._died(project_id, None, f"could not build an executor: {exc}")
             return

@@ -20,7 +20,7 @@ Status: written 2026-08-02. **Partly implemented — updated 2026-08-04.**
 | §2 Phase 0 — correctness, unattended running | **Largely built.** Leases, per-project control, preflight, the reaper and the audit layer are live. Unattended running itself is **unproven** — no long run has happened. |
 | §3 Phase 1 — project as a scope | **Built.** Projects are first-class, with their own checkout, checks, roles, budgets and control state. |
 | §4 Phase 2 — separate streams, explicitly resumed | **Built.** One worker pool per project; a project starts `stopped` and only a human starts it. |
-| §5 Phase 3 — the GUI worth having | **Not built**, and not built *here* — the GUI belongs to the session host, per `AGENTS.md`. |
+| §5 Phase 3 — the GUI worth having | **Superseded by `GUI_PLAN.md`.** The GUI is built and packaged here; delivery is in progress. |
 | §6 Phase 4 — project inception | **Built**, over the API only: `src/agent_harness/inception.py`, worked example in [`USAGE.md`](USAGE.md) §0b. There is no `agent-harness inception` subcommand. |
 | §7 Phase 5 — operational depth | **Partly built.** Per-item budgets, resumable attempts, a typed outcome taxonomy and durable holds landed in 2026-08; telemetry export is opt-in and has never reached a collector. |
 
@@ -452,5 +452,6 @@ Per-project attempt and cost metrics, baseline comparison, failure triage.
   project the scoper has just finished initialising.
 - **No unattended repo creation.** Inception proposes; a human approves before
   anything is created.
-- **No second web UI.** The session host keeps owning tabs, auth and
-  terminals. The harness serves JSON.
+- **One deployable UI.** The harness owns its browser application and JSON API
+  in one process. A session host may own execution terminals but is not a GUI,
+  authentication, routing or deployment dependency.

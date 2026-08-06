@@ -77,6 +77,24 @@ several items safely to one plan branch, surface exceptions, and attribute its
 calls and outcomes to the item that caused them. None of that end-to-end path
 has run.
 
+The first-party browser control plane from `codex/gui-plan` is now imported on
+this tree and **tested** at the in-process application boundary. It includes the
+packaged authenticated shell, project/work/hold/event views, guarded single-item
+actions, inception and plan review, adoption, dependency exploration, routing,
+worker and analytics views, audit operations, process/gateway projections, and
+the typed/shared services those paths use. Importing it did not replace the
+Stage 1 role-runner path: `role_runners.py`, the metadata-selected adapter and
+their end-to-end fixture tests remain present.
+
+That is an implementation statement, not release evidence. No browser runtime,
+phone viewport, screen reader, real deployment, forced SSE reconnect, real
+GitHub concurrency or real fleet has exercised the imported GUI on this tree.
+It remains an execution-independent client: monitoring works without an
+executor, and a start action is still refused when the deployment cannot claim
+work. The GUI's remaining work is recorded in §2.8 and in the consolidated
+pending tables below; `GUI_PLAN.md` is design/history, while this file remains
+the status authority.
+
 ---
 
 ## 2. Settled product direction and development plan
@@ -132,7 +150,7 @@ target branch.
 | **P10 — human involvement is exceptional** | Before publication, people are involved only for questions, holds and failures. The single final PR review and merge is the normal human approval point. | There is no approval ceremony per item and no need to watch agents work. A held item keeps its claim under D12; unrelated workers continue. The GUI/API must make the exception and the evidence needed to answer it visible. |
 | **P11 — calls are not the optimisation target** | Use generous configurable loop bounds. Keep time, spend and call ceilings as emergency controls and continue measuring them, but do not shorten the loop to minimise request count. | The useful run took 31 turns; the failed design used one. Number of calls is not currently a material product concern. A limit still must stop a pathological loop, and a provider cost cap is still terminal and never retried. |
 | **P12 — local development cadence** | Develop, commit, gate and integrate locally. Do not push, open a PR, wait for hosted CI, or deploy each implementation slice. | Those remote steps are materially delaying the feedback loop. GitHub support is retained and tested with local fakes; GitHub issues remain the state record required by D1, but issues stay open while implementation exists only locally. Publication happens once at the explicit milestone in §2.4. |
-| **P13 — GUI is a client, not an execution dependency** | The GUI workstream consumes typed API state and event/notification contracts. Its assumed webhook support must be verified; it is not an input to executor design. | The current GUI plan describes authenticated webhook support as later work, not a landed facility. Execution must continue with the GUI offline. Holds, failures, completion and review events live in the harness's durable stores/API; a GUI or external channel presents and notifies. This section does not decide the GUI's repository placement, which is governed separately. |
+| **P13 — GUI is a client, not an execution dependency** | The GUI consumes typed API state and event/notification contracts. It is owned and served by `agent-harness`, but is not an input to executor design. | The imported browser control plane is a first-party client over shared services. Authenticated webhook/notification delivery is still unbuilt. Execution must continue with the GUI offline. Holds, failures, completion and review events live in durable harness stores/API; the GUI or a later external channel presents and notifies. |
 
 ### 2.3 Plan-branch and dependency semantics
 
@@ -173,7 +191,7 @@ denominator. Safety defects discovered in an earlier stage pre-empt the order.
 |---|---|---|
 | **0. Preserve the baseline** | Keep the direct and session executors while building the new path. Record these decisions and align affected tracker issues at the publication milestone. | The current four repository gates pass. No existing gate or historical evidence is removed to simplify the runner. |
 | **1. Put the loop behind a generic runner** | Define the core role-runner protocol and installed-metadata lookup; adapt the existing mini-SWE loop to it; pass role, item, project and whole-loop bounds explicitly. Let the loop use checks for feedback, then feed its resulting tree into the existing checks/review/attempt/audit pipeline. | In local fixture repositories, a multi-turn implementer can inspect, edit and test; the harness reruns the declared gates; all calls are attributable to one project/item/attempt; no AIDevEnv or CLI-agent process is involved. A real workload is not run yet. |
-| **2. Enforce the execution boundary** | Replace inherited shell execution with an OS-enforced local sandbox, a minimal allow-listed environment, an item worktree, and declared dependency mounts. Keep outbound internet available. Treat `CommandGuard` as an earlier explanatory refusal, not the security boundary. | Tests prove an agent can work throughout its repository, cannot read or write an undeclared sibling/host path, cannot read controller credentials from its environment, can use an allowed dependency root according to its mode, and can reach an allowed network fixture. Do not run rdpapp before this passes. |
+| **2. Enforce the execution boundary** | Replace inherited shell execution with an OS-enforced local sandbox, a minimal allow-listed environment, an item worktree, and declared dependency mounts. The recommended first backend is Docker/OCI, behind a generic execution-environment contract and selected through deployment metadata; keep outbound internet available. Treat `CommandGuard` as an earlier explanatory refusal, not the security boundary. | Tests prove an agent can work throughout its repository, cannot read or write an undeclared sibling/host path, cannot read controller credentials from its environment, can use an allowed dependency root according to its mode, and can reach an allowed network fixture. The tests must exercise the actual backend and its configured security options, not only a mocked subprocess. Do not run rdpapp before this passes. |
 | **3. Make `serve` own a local fleet** | Add an AIDevEnv-independent executor factory and worker pool to `serve`; make executor capability—not presence of `--session-host`—drive readiness and preflight. Allocate one worktree and runner per claimed item, with item-scoped telemetry and failure isolation. | With no AIDevEnv variables or session host, the API starts a project and two fixture items are observed running concurrently. Killing or failing one does not stop, park or corrupt the other; restart/reaping leaves claims and worktrees consistent. |
 | **4. Build local plan integration** | Create and durably record the plan branch/base SHA; serialise promotion; rebase/replay and regate work produced from an older plan head; release dependants only after every prerequisite is promoted. Preserve item commits and promotion events. | A local fixture plan with two independent items and one item depending on both completes into one branch. The dependent item demonstrably sees both promoted changes. A conflicting promotion is returned for repair, and no remote is contacted. |
 | **5. Complete exception and feedback control** | Expose item-scoped runner progress, questions, holds, gate evidence and promotion state through typed API/events. Add a deduplicated remote-review event contract and automatic correction-item/resume path, exercised against a local fake. Connect the GUI/notification workstream only through those contracts. | A question pauses only its item and can be answered through the API; an injected actionable review comment resumes work once; duplicates do nothing; ambiguous feedback opens a hold; the fleet continues throughout. The test does not require a GUI or GitHub. |
@@ -215,6 +233,159 @@ the currently measured delivery failure.
   the controller environment. `CommandGuard` explains and terminates known
   refusals, but it is not confinement. No real workload run is authorised by
   the Stage 1 result.
+
+### 2.7 Execution backend recommendation — Docker/OCI, selectively adopted
+
+The target state needs a real operating-system boundary before a real workload
+is run. The recommended first backend for that boundary is **Docker/OCI**,
+behind a generic execution-environment contract and selected through deployment
+metadata. This recommendation follows a review of
+[`desplega-ai/agent-swarm`](https://github.com/desplega-ai/agent-swarm/tree/30f79a927bb6c95b53da8797629cf13b67360159)
+at commit `30f79a9` (2026-08-05). It is an execution-backend recommendation,
+not a decision to adopt that project's control plane or task model.
+
+#### What to borrow
+
+- Use multi-stage OCI builds so stable, expensive toolchain layers are kept
+  separate from frequently changing harness code.
+- Publish deliberately different image targets (for example, a small base and
+  a fuller development image), and measure uncompressed size and layer changes
+  in CI. A single universal image containing every language and browser is not
+  the default; it becomes too large and makes the toolchain contract unclear.
+- Pin base images, operating-system packages, CLIs and toolchains. Record the
+  resolved image digest in preflight and item evidence so a result can be
+  explained after an image tag moves.
+- Run the agent's commands as a non-root user and make writable locations
+  explicit. The container still needs a deliberate security profile:
+  `no-new-privileges`, dropped capabilities, a read-only root filesystem where
+  practical, resource limits, and no Docker socket or privileged host mount.
+- Keep project toolchains in image/configuration metadata. The first real
+  workload is Rust, so the first acceptance image must contain the required
+  Rust/Cargo toolchain; the reviewed upstream image is not itself sufficient
+  because its published worker image focuses on Ubuntu, Node/Bun, Python,
+  browser tooling and supporting services rather than Rust.
+
+#### What remains harness-owned
+
+The harness remains the control plane and source of truth:
+
+- `serve` owns claiming, leases, attempts, budgets, holds, events, audit and
+  failure isolation;
+- `ModelClient` owns every model call, route, retry ladder, endpoint parking,
+  pricing and terminal cost-cap policy;
+- the selected role runner remains a generic metadata-resolved adapter;
+- each item gets a disposable worktree and execution container;
+- the plan branch, promotion lock, replay/rebase and authoritative gates stay
+  in the harness; and
+- provider, GitHub and harness credentials remain in the controller. They are
+  not placed in the agent-readable environment merely because a container is
+  being used.
+
+The container is therefore a tool-command environment, not a long-lived model
+worker. The model loop stays in the harness process and asks the backend to
+inspect, edit and test the item's mounted worktree.
+
+#### What not to adopt from agent-swarm
+
+Do not copy its lead/worker task topology, persistent worker-owned repository
+clones, or shared source volume as the coordination mechanism. Those are useful
+for a different product, but they do not provide the target semantics here:
+
+- isolation is per worker there, while this target requires isolation per item;
+- a reused clone can carry branches, stashes or uncommitted changes between
+  tasks, which recreates the stale-worktree failure already found here;
+- model-provider CLIs and their credentials run inside the worker image, which
+  conflicts with P2/P3; and
+- shared volumes cannot replace the exact plan-head and serialized promotion
+  rules in P7.
+
+E2B or another remote sandbox may later implement the same generic backend
+  contract, but it is not a reason to add a second orchestration plane now.
+
+#### Required backend contract before Stage 2 can exit
+
+The Docker implementation must be tested as deployed, not only through a fake
+subprocess. For one item it must specify and durably report:
+
+```text
+image reference and resolved digest
+item worktree mount (read/write)
+declared dependency and toolchain mounts (read-only by default)
+ephemeral or declared writable caches
+minimal allow-listed environment
+network policy (outbound internet remains available)
+resource and command limits
+container identity and security profile
+```
+
+Stage 2 is complete only when tests demonstrate repository-wide work, refusal
+of undeclared host/sibling reads and writes, absence of controller credentials,
+declared mount modes, allowed network access, and clean teardown. Stages 3 and
+4 then prove that one such container/worktree is allocated per claimed item,
+that killing one item does not affect another, and that Docker execution does
+not weaken plan-branch promotion or the authoritative gates.
+
+### 2.8 GUI import and remaining work
+
+The browser implementation from `codex/gui-plan` at `deed5a1` has been
+reconciled onto the current Stage 1 tree. The import is deliberately additive:
+the current `DESIGN.md`/`STATUS.md` authority, generic role-runner contract,
+metadata lookup and adapter tests remain. `agent-harness serve` now packages
+and serves HTML, static assets and the typed JSON API from one origin, with no
+session-host dependency for browser access.
+
+Implemented and covered by in-process tests:
+
+- bounded opaque browser sessions, token-rotation revocation, login throttling,
+  CSRF/origin checks and authenticated operator attribution;
+- project, work, hold, event, dependency, worker and analytics views, plus an
+  SSE stream over the existing monotonic cursor;
+- guarded project/work/hold controls and one-time reviewed project, routing,
+  plan-sync, adoption, audit-maintenance and reconciliation actions;
+- typed shared services for queries, configuration, routing, plan sync,
+  adoption and audit operations rather than browser-only business rules;
+- item evidence, worker inventory, process metrics, narrowed/redacted gateway
+  event projections, and an accessible no-script dependency table with an
+  optional packaged graph enhancement; and
+- clean-wheel coverage for the templates and vendored assets. Normal operation
+  has no CDN or separate frontend build/service.
+
+Remaining work, in dependency order:
+
+1. **Finish the execution-facing contracts in Stage 5.** Expose item-scoped
+   runner progress, questions, authoritative gate evidence and plan-promotion
+   state through typed API/events. Add deduplicated remote-review events and the
+   correction/resume path before adding UI for them. The GUI must consume those
+   contracts and remain optional to execution.
+2. **Complete existing operator controls.** Add exact-state reviewed bulk
+   transitions, complete continue/force-start and refusal parity, preserve hold
+   answers across expiry/version conflicts, and add any missing item filters or
+   artifact/diff links. No visual gesture is authority for a transition.
+3. **Build notification delivery as a subsystem.** Holds, failures, completion
+   and remote review need a durable generic notification contract and an
+   authenticated webhook/channel adapter. The current GUI has no proven push or
+   phone-notification path; do not infer one from the optional session host.
+4. **Prove the browser boundary.** Add browser-runtime journeys for forced SSE
+   disconnect/replay and polling fallback, keyboard-only use, focus handling,
+   reduced motion, desktop/phone layouts and screen-reader semantics. Add the
+   planned XSS/CSP, cookie, root-path/proxy and simultaneous-operator security
+   exercises. In-process ASGI coverage is not a substitute for these.
+5. **Exercise real integrations and packaging.** Run monitoring-only and
+   supervised deployment smoke tests from a built wheel/container; exercise
+   plan sync, adoption and reconciliation against an authorised non-critical
+   remote, including concurrent remote changes and partial-write recovery.
+   Retain release evidence and unmet criteria; the imported branch's historical
+   evidence does not prove the reconciled tree.
+6. **Later product subsystems remain unbuilt.** Agent-harness-owned persistent
+   sessions/chat/terminal; memory, knowledge, skills and tools; scheduling and
+   external channels; multi-user identity/RBAC; and WAL-aware backup/restore
+   retain the sequencing in `GUI_PLAN.md` Milestones 5–8. They must use generic
+   protocols and may not create a gate registry while D8 remains open.
+
+GUI work outside item exceptions and evidence remains behind Stages 2–6 of the
+delivery programme. A polished control plane cannot authorize the next real
+workload before confinement, fleet ownership and plan integration pass their
+own exits.
 
 ---
 

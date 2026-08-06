@@ -16,12 +16,13 @@ that decision to the permanent coordination ledger.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from enum import IntEnum, StrEnum
 from types import MappingProxyType
@@ -318,7 +319,7 @@ class SQLiteCommandJournal:
 
     def __init__(self, path: str | object) -> None:
         self.path = str(path)
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.executescript(self._SCHEMA)
 
     def _connect(self) -> sqlite3.Connection:
@@ -326,6 +327,24 @@ class SQLiteCommandJournal:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
+
+    @contextlib.contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """One connection, committed like `with conn:` and then **closed**.
+
+        `with self._connect() as conn` was the whole of it, and a sqlite3
+        connection's context manager manages a transaction rather than the
+        connection: every call left an open handle for the collector to find,
+        in a process that is meant to run for weeks (#206). The `with conn`
+        is kept inside, because the reservation path opens an explicit
+        `BEGIN IMMEDIATE` and depends on it to commit.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     @staticmethod
     def _result(row: sqlite3.Row) -> CommandResult | None:
@@ -350,7 +369,7 @@ class SQLiteCommandJournal:
         now: float,
         processing_seconds: float,
     ) -> _Reservation:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """SELECT * FROM command_journal
@@ -391,7 +410,7 @@ class SQLiteCommandJournal:
             return _Reservation(acquired=True)
 
     def finish(self, result: CommandResult, *, token: str) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             cursor = conn.execute(
                 """UPDATE command_journal
                    SET status = ?, code = ?, detail = ?, decided_at = ?,
@@ -412,7 +431,7 @@ class SQLiteCommandJournal:
                 raise RuntimeError("command journal processing lease was lost")
 
     def delivered(self, project_id: str, idempotency_key: str) -> bool:
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 """SELECT delivered FROM command_journal
                    WHERE project_id = ? AND idempotency_key = ?""",
@@ -421,7 +440,7 @@ class SQLiteCommandJournal:
         return bool(row and row["delivered"])
 
     def mark_delivered(self, project_id: str, idempotency_key: str) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """UPDATE command_journal SET delivered = 1
                    WHERE project_id = ? AND idempotency_key = ? AND status IS NOT NULL""",

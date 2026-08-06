@@ -41,7 +41,7 @@ from typing import Any
 
 from .events import Event
 from .pricing import cost_of
-from .redaction import Redact, from_environment, redact_event, redact_payload
+from .redaction import Redact, from_environment, redact_event, redact_payload, redact_text
 
 log = logging.getLogger(__name__)
 
@@ -320,9 +320,17 @@ class AuditStore:
         notes: str | None = None,
     ) -> bool:
         """Record a dated measurement to compare against. Immutable once set:
-        re-recording under the same id is refused, not overwritten."""
+        re-recording under the same id is refused, not overwritten.
+
+        `label` and `notes` are free text a human typed, so they go through
+        the same filter `append` does. This is the second way into a store
+        that has no way to remove anything, and a credential pasted into a
+        baseline note would otherwise outlive every other copy of it.
+        """
         if self.degraded:
             return False
+        label = redact_text(label, self.redact)
+        notes = redact_text(notes, self.redact)
         conn = self._connect()
         cursor = conn.execute(
             "INSERT OR IGNORE INTO baselines (baseline_id, project_id, recorded_at, label, "

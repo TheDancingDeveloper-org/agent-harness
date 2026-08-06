@@ -2583,6 +2583,7 @@ class Executor:
         # no usable diff leaves no branch behind.
         base, stacked_on = self._base_for(record)
         self._base = base
+        self._sync_worktree(base)
 
         # 1. Plan. Cheap, once per item, and the highest-leverage call.
         planner = _planner_from(resume.artefact(A.PLANNED)) if resume.skips(A.PLANNED) else None
@@ -3324,6 +3325,30 @@ class Executor:
             return f"{(self.repo / path).stat().st_size} bytes"
         except OSError:
             return "size unknown"
+
+    def _sync_worktree(self, base: str) -> None:
+        """Put the tree at `base` before anything reads it.
+
+        `select_repo_context` already refuses to read the working tree, for a
+        reason it states plainly: at this point the tree still holds the
+        *previous* item's branch, so a model shown it writes about a file its
+        patch will never meet. It reads through `git show base:path` instead.
+
+        `edits.to_diff` reads the tree. Those two disagreeing is not a
+        cosmetic inconsistency — it is the second item to touch any file being
+        told that text it was shown, and that is present on the base its
+        branch will be cut from, "does not occur in the file". The model is
+        right and the harness blames it, and the better the previous item did
+        the more certain the next one is to fail.
+
+        So the tree is moved to the base *before* the implementer is asked,
+        rather than in `_prepare_branch` after it has answered. No branch is
+        created here: an item that produces no usable diff still leaves none
+        behind, which is why the branch is cut late.
+        """
+        run_git(self.repo, "checkout", "--", ".", check=False)
+        run_git(self.repo, "clean", "-fd", check=False)
+        run_git(self.repo, "checkout", base)
 
     def _prepare_branch(self, branch: str, base: str | None = None) -> None:
         """A clean tree at `base`, on a branch of this item's own.

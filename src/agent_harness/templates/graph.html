@@ -1,20 +1,87 @@
 {% extends "base.html" %}
 {% block content %}
-  <div class="page-heading"><div><p class="eyebrow">Coordination plane</p><h1>Dependency graph</h1></div><span class="mode-badge">Revision {{ graph.revision if graph else '—' }}</span></div>
-  <section class="card"><form method="get" action="{{ url_for('graph') }}"><label for="graph-project">Project</label><select id="graph-project" name="project_id" onchange="this.form.submit()">{% for summary in projects.projects %}<option value="{{ summary.project.project_id }}"{% if summary.project.project_id == project_id %} selected{% endif %}>{{ summary.project.name }} ({{ summary.project.project_id }})</option>{% endfor %}</select></form></section>
-  {% if not graph %}<section class="empty"><h2>No graph available</h2><p>Choose a configured project.</p></section>{% else %}
-    <section class="card"><div class="card-heading"><div><p class="eyebrow">Admission</p><h2>Readiness</h2></div><span class="success">{{ graph.ready|length }} ready</span></div>
-      {% if graph.cycles %}<div class="alert danger"><strong>Cycles block work.</strong><ul>{% for cycle in graph.cycles %}<li>{{ cycle|join(' → ') }}</li>{% endfor %}</ul></div>{% endif %}
-      {% if graph.ready %}<h3>Ready at revision {{ graph.revision }}</h3><ul>{% for item_id in graph.ready %}<li><a href="{{ url_for('work_item_page', item_id=item_id) }}?project_id={{ project_id }}">{{ item_id }}</a></li>{% endfor %}</ul>{% endif %}
-      {% if graph.not_ready %}<div class="list">{% for item in graph.not_ready %}<article class="card"><h3><a href="{{ url_for('work_item_page', item_id=item.item_id) }}?project_id={{ item.project_id }}">{{ item.item_id }}</a></h3><p>{{ item.explanation }}</p>{% if item.advisory %}<p class="muted">Advisory: {{ item.advisory|length }} edge(s)</p>{% endif %}
-        <form method="post" action="{{ url_for('dependency_override_action') }}" data-csrf-form>
-          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}"><input type="hidden" name="item_id" value="{{ item.item_id }}">
-          <label for="override-{{ item.item_id }}">Reason for admitting this blocked item</label><input id="override-{{ item.item_id }}" name="reason" required>
-          <button class="secondary" type="submit">Override at revision {{ graph.revision }}</button>
-        </form>
-      </article>{% endfor %}</div>{% else %}<p class="muted">Every item is ready at this revision.</p>{% endif %}
-      {% if overrides %}<h3>Recorded overrides</h3><div class="table-wrap"><table><thead><tr><th>Item</th><th>Revision</th><th>Operator</th><th>Reason</th></tr></thead><tbody>{% for override in overrides %}<tr><td>{{ override.item_id }}</td><td>{{ override.revision }}</td><td>{{ override.who or '—' }}</td><td>{{ override.reason }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}
+  <div class="page-heading">
+    <div><p class="eyebrow">Coordination plane</p><h1>Dependency graph</h1></div>
+    <span class="mode-badge">Revision {{ graph.revision if graph else '—' }}</span>
+  </div>
+  <section class="card">
+    <form method="get" action="{{ url_for('graph') }}">
+      <label for="graph-project">Project</label>
+      <select id="graph-project" name="project_id">
+        {% for summary in projects.projects %}
+          <option value="{{ summary.project.project_id }}"{% if summary.project.project_id == project_id %} selected{% endif %}>{{ summary.project.name }} ({{ summary.project.project_id }})</option>
+        {% endfor %}
+      </select>
+      <button class="secondary" type="submit">Show project graph</button>
+    </form>
+  </section>
+  {% if not graph %}
+    <section class="empty"><h2>No graph available</h2><p>Choose a configured project.</p></section>
+  {% else %}
+    <section class="card graph-explorer" data-dependency-graph data-graph-revision="{{ graph.revision }}" hidden>
+      <div class="card-heading">
+        <div><p class="eyebrow">Read-only visual</p><h2>Explore relationships</h2></div>
+        <span class="mode-badge">Progressive enhancement</span>
+      </div>
+      <p class="muted">The diagram uses the exact typed edge rows below. Search and focus change only this view; they never change readiness, edge state, or approval.</p>
+      <div class="graph-toolbar">
+        <label for="graph-search">Search items, targets, kinds, states, or evidence
+          <input id="graph-search" type="search" autocomplete="off" data-graph-search aria-controls="dependency-diagram graph-edge-table" placeholder="For example T7, human decision, unresolved">
+        </label>
+        <div class="graph-view-controls" role="group" aria-label="Dependency diagram view controls">
+          <button class="secondary" type="button" data-graph-zoom-out aria-label="Zoom out">−</button>
+          <button class="secondary" type="button" data-graph-zoom-in aria-label="Zoom in">+</button>
+          <button class="secondary" type="button" data-graph-pan-left aria-label="Pan left">←</button>
+          <button class="secondary" type="button" data-graph-pan-up aria-label="Pan up">↑</button>
+          <button class="secondary" type="button" data-graph-pan-down aria-label="Pan down">↓</button>
+          <button class="secondary" type="button" data-graph-pan-right aria-label="Pan right">→</button>
+          <button class="secondary" type="button" data-graph-reset>Reset view</button>
+        </div>
+      </div>
+      <p class="small muted" id="graph-search-status" data-graph-search-status role="status" aria-live="polite">All graph rows shown.</p>
+      <div class="graph-legend" aria-label="Dependency diagram legend">
+        <span><i class="graph-swatch kind-local_work" aria-hidden="true"></i>Local work</span>
+        <span><i class="graph-swatch kind-external_reference" aria-hidden="true"></i>External reference</span>
+        <span><i class="graph-swatch kind-human_decision" aria-hidden="true"></i>Human decision</span>
+        <span><i class="graph-swatch kind-cross_project_work" aria-hidden="true"></i>Cross-project work</span>
+        <span><i class="graph-line state-satisfied" aria-hidden="true"></i>Satisfied</span>
+        <span><i class="graph-line state-blocked" aria-hidden="true"></i>Blocked</span>
+        <span><i class="graph-line state-unresolved" aria-hidden="true"></i>Unresolved</span>
+        <span><i class="graph-line edge-advisory" aria-hidden="true"></i>Advisory</span>
+        <span><i class="graph-swatch node-cycle" aria-hidden="true"></i>Cycle member</span>
+      </div>
+      <div id="dependency-diagram" class="dependency-diagram" data-graph-canvas tabindex="0" role="region" aria-label="Interactive dependency diagram. Use the controls, arrow keys to pan, plus or minus to zoom, or tab to focus a node.">
+        <p class="muted graph-fallback">Enable first-party JavaScript for the visual diagram. The complete readiness and edge evidence remains available below.</p>
+      </div>
+      <aside class="graph-focus" data-graph-focus role="status" aria-live="polite" aria-labelledby="graph-focus-title">
+        <h3 id="graph-focus-title">Item focus</h3>
+        <p data-graph-focus-summary>Choose a diagram node, or search and press Enter, to focus its matching readiness and edge rows.</p>
+      </aside>
     </section>
-    <section class="card"><h2>Edges</h2>{% if graph.edges %}<div class="table-wrap"><table><thead><tr><th>Waiting item</th><th>Target</th><th>Kind</th><th>State</th><th>Evidence</th></tr></thead><tbody>{% for edge in graph.edges %}<tr><td>{{ edge.source_item }}</td><td>{{ edge.target_id }}</td><td>{{ edge.target_kind }}</td><td>{{ edge.state }}{% if not edge.required %} (advisory){% endif %}</td><td>{{ edge.evidence }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="muted">No dependency edges are declared.</p>{% endif %}</section>
+    <section class="card">
+      <div class="card-heading"><div><p class="eyebrow">Admission</p><h2>Readiness</h2></div><span class="success">{{ graph.ready|length }} ready</span></div>
+      {% if graph.cycles %}
+        <div class="alert danger"><strong>Cycles block work.</strong><ul>{% for cycle in graph.cycles %}<li data-graph-cycle='{{ cycle|tojson }}'>{{ cycle|join(' → ') }}</li>{% endfor %}</ul></div>
+      {% endif %}
+      {% if graph.ready %}
+        <h3>Ready at revision {{ graph.revision }}</h3>
+        <ul>{% for item_id in graph.ready %}<li data-graph-item="{{ item_id }}" data-graph-ready="true" data-graph-explanation="ready at graph revision {{ graph.revision }}"><a href="{{ url_for('work_item_page', item_id=item_id) }}?project_id={{ project_id|urlencode }}">{{ item_id }}</a></li>{% endfor %}</ul>
+      {% endif %}
+      {% if graph.not_ready %}
+        <div class="list">{% for item in graph.not_ready %}<article class="card" data-graph-item="{{ item.item_id }}" data-graph-ready="false" data-graph-explanation="{{ item.explanation }}"><h3><a href="{{ url_for('work_item_page', item_id=item.item_id) }}?project_id={{ item.project_id|urlencode }}">{{ item.item_id }}</a></h3><p>{{ item.explanation }}</p>{% if item.advisory %}<p class="muted">Advisory: {{ item.advisory|length }} edge(s)</p>{% endif %}
+          <form method="post" action="{{ url_for('dependency_override_action') }}" data-csrf-form>
+            <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}"><input type="hidden" name="item_id" value="{{ item.item_id }}">
+            <label for="override-{{ item.item_id }}">Reason for admitting this blocked item</label><input id="override-{{ item.item_id }}" name="reason" required>
+            <button class="secondary" type="submit">Override at revision {{ graph.revision }}</button>
+          </form>
+        </article>{% endfor %}</div>
+      {% else %}<p class="muted">Every item is ready at this revision.</p>{% endif %}
+      {% if overrides %}<h3>Recorded overrides</h3><div class="table-scroll"><table><thead><tr><th>Item</th><th>Revision</th><th>Operator</th><th>Reason</th></tr></thead><tbody>{% for override in overrides %}<tr><td>{{ override.item_id }}</td><td>{{ override.revision }}</td><td>{{ override.who or '—' }}</td><td>{{ override.reason }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}
+    </section>
+    <section class="card">
+      <h2>Complete edge list</h2>
+      <p class="muted">This table is the accessible, no-script equivalent of the diagram and remains complete while search highlights matches.</p>
+      {% if graph.edges %}<div class="table-scroll"><table id="graph-edge-table"><thead><tr><th>Waiting item</th><th>Target</th><th>Kind</th><th>Requirement</th><th>State</th><th>Resolver</th><th>Evidence</th></tr></thead><tbody>{% for edge in graph.edges %}<tr data-graph-edge data-source="{{ edge.source_item }}" data-target="{{ edge.target_id }}" data-kind="{{ edge.target_kind }}" data-state="{{ edge.state }}" data-required="{{ 'true' if edge.required else 'false' }}" data-resolver="{{ edge.resolver or '' }}" data-evidence="{{ edge.evidence }}"><td>{{ edge.source_item }}</td><td>{{ edge.target_id }}</td><td>{{ edge.target_kind|replace('_', ' ') }}</td><td>{{ 'required' if edge.required else 'advisory' }}</td><td>{{ edge.state }}</td><td>{{ edge.resolver or '—' }}</td><td>{{ edge.evidence }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="muted">No dependency edges are declared.</p>{% endif %}
+    </section>
   {% endif %}
 {% endblock %}

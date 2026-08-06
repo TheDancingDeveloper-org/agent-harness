@@ -218,7 +218,8 @@ This is not a release claim for the full `GUI_PLAN`: browser automation,
 screen-reader checks, forced reconnect with replayed events, and all additional
 accessibility/security/concurrency journeys remain to run. Milestone 2 remains partial
 (bulk-action review, notifications and other controls are not yet wired). Milestone 3
-remains partial (adoption is wired; richer graph interactions are not yet wired). Milestone 4's
+is implemented in-process, including adoption and graph interaction, but its real-browser
+accessibility journeys remain unexercised. Milestone 4's
 substantially owned control-plane surface is implemented: global routing, worker inventory,
 filtered events, typed analytics, confirmed reconciliation and maintenance, portable
 process metrics and structured gateway-call evidence. This is not a claim that core reads
@@ -228,9 +229,10 @@ GitHub repository or external deployment was used.
 
 The post-Milestone-4 audit found adoption was CLI-only despite a mature engine; that gap is
 now implemented and exercised. The engine correction prevents reconciliation from
-replacing an existing project with a minimal row. The next Milestone 3 gap is accessible
-dependency-graph search/focus and visual zoom/pan while keeping the current complete list
-equivalent authoritative for edge and readiness evidence.
+replacing an existing project with a minimal row. The graph interaction gap is also
+implemented as a read-only progressive enhancement while keeping the complete list
+equivalent authoritative for edge and readiness evidence. The next implementation gap is
+Milestone 2's reviewed bulk-action contract.
 
 ## Current slice verification
 
@@ -247,3 +249,29 @@ The full suite includes the adoption engine/API/browser journeys, generic-core g
 API isolation, write-boundary redaction and wheel packaging tests. No real remote
 repository was contacted: remote reads, drift and partial-write failure use an in-process
 stateful transport double, so this is not evidence of atomicity or real GitHub behavior.
+
+Milestone 3.7 now preserves the complete server-rendered readiness/cycle/edge evidence as
+the no-script and assistive-technology equivalent, then progressively adds an SVG laid out
+from those same escaped rows. Search and item focus cover typed identities, target kinds,
+states, resolver/evidence text, advisory status and cycles; buttons and canvas keys provide
+zoom, pan and reset. The enhancement is initially hidden, makes no HTTP request, and appears
+only after initialization. Focused fixtures exercise every target kind, all three edge
+states, advisory edges, cycles, hostile data-attribute text, CSP-compatible markup, package
+contents and the unchanged revision-scoped override path. `node --check` passes for the
+packaged script. No executable Chromium is installed—the available launcher is an
+uninstalled snap stub—so actual keyboard, screen-reader and visual browser behavior remains
+unexercised and is not claimed.
+
+After the Milestone 3.7 graph interaction slice:
+
+| Check | Result |
+|---|---|
+| `TMPDIR=/tmp/agent-harness-gui-graph-full.7qCVp2 uv run pytest -q` | passed at 100%, 1 skipped |
+| `uv run ruff check .` | passed |
+| `uv run ruff format --check .` | passed, 135 files already formatted |
+| `TMPDIR=/tmp/agent-harness-gui-graph-mypy.j3dXUJ uv run mypy` | passed, 130 source files |
+| `node --check src/agent_harness/static/app.js` | passed |
+
+The pytest result is the complete repository suite, including the fresh-wheel packaging
+test. The Node result is syntax validation only and does not replace the explicitly unmet
+real-browser journey.

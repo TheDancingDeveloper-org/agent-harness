@@ -13,7 +13,9 @@ def test_ui_resources_are_in_the_installed_package() -> None:
 
     package = importlib.resources.files("agent_harness")
     assert package.joinpath("templates", "base.html").is_file()
+    assert package.joinpath("templates", "graph.html").is_file()
     assert package.joinpath("static", "app.css").is_file()
+    assert package.joinpath("static", "app.js").is_file()
     assert package.joinpath("static", "htmx.min.js").is_file()
 
 
@@ -34,5 +36,7 @@ def test_wheel_contains_templates_and_static_assets(tmp_path: Path) -> None:
     with zipfile.ZipFile(wheels[0]) as archive:
         names = set(archive.namelist())
     assert "agent_harness/templates/base.html" in names
+    assert "agent_harness/templates/graph.html" in names
     assert "agent_harness/static/app.css" in names
+    assert "agent_harness/static/app.js" in names
     assert "agent_harness/static/htmx.min.js" in names

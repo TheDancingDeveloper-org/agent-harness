@@ -1026,6 +1026,106 @@ def test_graph_page_shows_typed_edges_and_readiness(tmp_path: Path) -> None:
         assert "blocked" in html.lower()
 
 
+def test_graph_explorer_preserves_every_typed_distinction_and_list_equivalent(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(tmp_path / "events.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    for project_id in ("p", "other"):
+        queue.add_project(Project(project_id=project_id, name=project_id))
+    queue.add([WorkRecord(item_id="REMOTE", title="Remote work")], project_id="other")
+    queue.add(
+        [
+            WorkRecord(item_id="T1", title="First", state="done"),
+            WorkRecord(item_id="D9", title="Human choice"),
+            WorkRecord(
+                item_id="T2",
+                title="Everything waits here",
+                depends_on=[
+                    "T1",
+                    "?external:tracker:TICKET-9",
+                    "decision:D9",
+                    "project:other/REMOTE",
+                ],
+            ),
+            WorkRecord(item_id="C1", title="Cycle one", depends_on=["C2"]),
+            WorkRecord(item_id="C2", title="Cycle two", depends_on=["C1"]),
+        ],
+        project_id="p",
+    )
+    with TestClient(create_api(store, queue=queue, token=TOKEN)) as client:
+        login(client)
+        response = client.get("/graph?project_id=p")
+    assert response.status_code == 200
+    html = response.text
+    assert 'data-dependency-graph data-graph-revision="' in html
+    assert 'data-graph-revision="' in html and " hidden>" in html
+    assert 'data-graph-search aria-controls="dependency-diagram graph-edge-table"' in html
+    assert 'data-graph-canvas tabindex="0" role="region"' in html
+    assert "Search items, targets, kinds, states, or evidence" in html
+    assert "Zoom in" in html and "Pan left" in html and "Reset view" in html
+    assert "Complete edge list" in html
+    assert "accessible, no-script equivalent" in html
+    for kind in (
+        "local_work",
+        "external_reference",
+        "human_decision",
+        "cross_project_work",
+    ):
+        assert f'data-kind="{kind}"' in html
+    for state in ("satisfied", "blocked", "unresolved"):
+        assert f'data-state="{state}"' in html
+    assert 'data-required="false"' in html
+    assert "advisory" in html.lower()
+    assert "data-graph-cycle=" in html
+    assert "Cycles block work" in html
+    assert "TICKET-9" in html and "tracker" in html
+    assert "other/REMOTE" in html
+
+
+def test_packaged_graph_script_is_keyboard_accessible_and_read_only() -> None:
+    script = Path(__file__).parents[1] / "src" / "agent_harness" / "static" / "app.js"
+    source = script.read_text(encoding="utf-8")
+    for key in ("ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Enter", "Escape"):
+        assert key in source
+    assert "focusSummary.textContent" in source
+    assert 'aria-live="polite"' in (
+        Path(__file__).parents[1] / "src" / "agent_harness" / "templates" / "graph.html"
+    ).read_text(encoding="utf-8")
+    assert "aria-label" in source
+    assert "data-graph-edge" in source and "data-graph-item" in source
+    assert "root.hidden = false" in source
+    assert (
+        "fetch("
+        not in source[
+            source.index("const initializeDependencyGraph") : source.index(
+                "document.addEventListener('DOMContentLoaded'"
+            )
+        ]
+    )
+
+
+def test_graph_data_attributes_escape_untrusted_evidence(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(Project(project_id="p", name="p"))
+    hostile = '"><img src=x onerror=alert(1)>'
+    queue.add(
+        [
+            WorkRecord(item_id=hostile, title="Hostile target"),
+            WorkRecord(item_id="T2", title="Waiting", depends_on=[hostile]),
+        ],
+        project_id="p",
+    )
+    with TestClient(create_api(store, queue=queue, token=TOKEN)) as client:
+        login(client)
+        response = client.get("/graph?project_id=p")
+    assert response.status_code == 200
+    assert hostile not in response.text
+    assert "&gt;&lt;img" in response.text
+    assert "<img src=x onerror=alert(1)>" not in response.text
+
+
 def test_dependency_override_is_explicit_revision_scoped_and_audited(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "events.sqlite")
     queue = WorkQueue(str(tmp_path / "queue.sqlite"))

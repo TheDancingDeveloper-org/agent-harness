@@ -88,10 +88,10 @@ The complete implementation tree has the following evidence:
 
 | Check | Most recent result |
 |---|---|
-| `TMPDIR=/tmp/agent-harness-gui-adoption-full.V0396Z uv run pytest -q` | Passed at 100%, 1 skipped |
+| `TMPDIR=/tmp/agent-harness-gui-graph-full.7qCVp2 uv run pytest -q` | Passed at 100%, 1 skipped |
 | `uv run ruff check .` | Passed |
 | `uv run ruff format --check .` | Passed, 135 files checked |
-| `TMPDIR=/tmp/agent-harness-gui-adoption-mypy.foKNPD uv run mypy` | Passed, 130 source files |
+| `TMPDIR=/tmp/agent-harness-gui-graph-mypy.j3dXUJ uv run mypy` | Passed, 130 source files |
 
 The full suite includes the wheel packaging and in-process browser journeys. Browser
 automation, accessibility tooling, a forced browser SSE reconnect, real GitHub concurrency,
@@ -125,11 +125,11 @@ meaning, allowlist fields, re-redact displayed text, remove URL userinfo/query/f
 bound detail, and report degraded history. Focused tests prove both reads avoid session-host
 state, omit arbitrary model output, scope projects, and fail closed for malformed endpoints.
 
-Milestone 4's substantially owned control-plane surface is implemented. Continue with the
-remaining earlier acceptance gaps rather than starting Milestone 5: first reconcile the
-Milestone 2 bulk-action review/notification requirements and Milestone 3 typed adoption and
-interactive-graph requirements against current code, then implement the smallest complete
-missing contract and update this state section before and after it.
+Milestone 4's substantially owned control-plane surface is implemented. The subsequent
+audit found and closed the Milestone 3 typed-adoption and interactive-graph gaps described
+below. Continue with the remaining Milestone 2 bulk-action review/notification requirements
+rather than starting Milestone 5; implement the smallest complete missing contract and
+update this state section before and after it.
 
 Milestone 3.6 is now implemented. `POST /api/adoption/{project_id}/inspect`,
 `GET /api/adoption/{project_id}`, and the decision/reconcile routes are typed. They resolve
@@ -143,10 +143,21 @@ project configuration is preserved during reconciliation. A failed remote write 
 that earlier queue/remote changes may be partial and records that fact instead of claiming
 atomicity.
 
-The next remaining Milestone 3 contract is 3.7: add accessible search and item focus to the
-dependency view while retaining its complete list equivalent and the typed graph's exact
-edge/readiness semantics. Zoom and pan should enhance the visual representation, never
-replace keyboard-readable evidence or become an authorization gesture.
+Milestone 3.7 is now implemented as progressive enhancement over the existing typed report,
+not a new graph model. Server-rendered readiness cards, cycle warnings, override controls
+and the complete edge table remain authoritative and usable without script. Packaged,
+repository-owned JavaScript lays those same escaped rows out as an SVG; search covers items,
+targets, kinds, states, resolvers and evidence; keyboard/pointer focus highlights exact
+nodes and adjacent table rows; and explicit keyboard-accessible controls zoom, pan and
+reset. Styling retains target kind, resolution state, advisory status and cycle membership.
+The explorer initializes hidden and appears only after successful enhancement. It makes no
+request, derives no readiness answer, persists nothing, and cannot authorize an override.
+
+The next implementation slice returns to the remaining Milestone 2 gaps: audit current
+work controls against the bulk-action review requirement, choose the smallest safe batch
+whose members share one existing queue transition, and bind its preview/apply to exact
+project, item identities, current states and operator reason. Notification delivery remains
+a separate subsystem rather than an incidental side effect of that control.
 
 ## 1. Product decision
 
@@ -288,7 +299,7 @@ services rather than growing a second interpretation in HTML controllers.
 | Holds | Authenticated inbox and structured answer form exist | Draft preservation on expiry/mismatch and notifications |
 | Events | SSE over the monotonic cursor and event views exist | Forced reconnect/replay proof, richer filtering and polling fallback evidence |
 | Audit | Health, events, cost, delivery, rollups, baselines, maintenance, and reconcile APIs exist | Dashboards, confirmations, reason/operator audit for actions, missing breakdowns |
-| Plans | Inception, question gates, generated preview, parse-loss report, reviewed plan sync, and typed/reviewed adoption lifecycle exist | Richer accessible dependency-graph interaction |
+| Plans | Inception, question gates, generated preview, parse-loss report, reviewed plan sync, and typed/reviewed adoption lifecycle exist | Additional end-to-end browser/accessibility journeys |
 | Routing | Role map and route-health APIs exist | Editor, used/unused explanation, independence warnings, secret-safe validation |
 | Workers | Project summaries expose counts and failures | Worker/claim/lease/heartbeat/session inventory API |
 | Attempts and artifacts | Durable data exists in internal modules | Typed item-scoped API for attempts, stages, patches, diffs, and evidence links |
@@ -554,6 +565,10 @@ write is reported and audited as potentially partial rather than represented as 
 3.7. Build an accessible dependency graph with zoom, pan, search, item focus, and a list
 equivalent. Distinguish local work, external references, human decisions, cross-project
 dependencies, advisory edges, satisfied edges, blocked edges, unresolved edges, and cycles.
+Implemented: the server-rendered complete list remains the authoritative no-script
+equivalent. A packaged read-only SVG enhancement uses the same typed rows, exposes semantic
+legends and live focus/search summaries, supports keyboard and button zoom/pan/reset, and
+styles every target kind, edge state, advisory edge and cycle member distinctly.
 
 3.8. Show resolver status/evidence and the exact item-readiness explanation. Overrides are
 revision-scoped and require authenticated identity and reason.

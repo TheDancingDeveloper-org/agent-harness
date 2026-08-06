@@ -1091,6 +1091,131 @@ class DependencyOverrideResult(BaseModel):
     readiness: ItemReadiness = Field(description="The item's readiness after the override.")
 
 
+# ---------------------------------------------------------------- adoption
+
+
+class AdoptionInspectRequest(BaseModel):
+    """Read-only evidence sources to include in a persisted adoption proposal."""
+
+    inspect_remote: bool = Field(
+        True,
+        description="Inspect the persisted GitHub repository when configured. Read-only; "
+        "the caller cannot supply a different repository.",
+    )
+
+
+class AdoptionEvidenceModel(BaseModel):
+    kind: str = Field(description="Evidence rung: explicit, runnable, judged or prior attempt.")
+    outcome: str = Field(description="What that evidence source reported.")
+    detail: str = Field(description="Redacted explanation retained whether decisive or not.")
+    citations: list[str] = Field(
+        default_factory=list, description="Paths, symbols or commits cited by the evidence."
+    )
+
+
+class AdoptionCandidateModel(BaseModel):
+    kind: str = Field(description="Existing issue, pull request or branch candidate kind.")
+    identity: str = Field(description="Candidate identity within its kind.")
+    state: str = Field(description="Observed external or branch state.")
+    confidence: str = Field(description="Why this is a lead rather than automatically a fact.")
+    evidence: str = Field(description="Redacted reason the candidate was associated.")
+    marker_present: bool = Field(description="Whether the candidate already carries the marker.")
+    harness_created: bool = Field(
+        description="Whether explicit evidence says the harness created the candidate."
+    )
+    title: str = Field(description="Redacted candidate title, when one was observed.")
+    branch: str = Field(description="Redacted branch identity, when one was observed.")
+    url: str = Field(description="Redacted candidate URL, when one was observed.")
+    repository: str | None = Field(None, description="Repository attributed to the candidate.")
+    same_repository: bool = Field(
+        description="Whether a pull-request head belongs to the persisted repository."
+    )
+
+
+class AdoptionMutationModel(BaseModel):
+    kind: str = Field(description="Kind of queue or external change reconciliation proposes.")
+    target: str = Field(description="Redacted target of the proposed change.")
+    detail: str = Field(description="Exact redacted effect described before it is applied.")
+    requires_approval: bool = Field(
+        description="Whether this mutation needs the item in the human-named drop list."
+    )
+
+
+class AdoptionItemModel(BaseModel):
+    item_id: str = Field(description="Plan item identity.")
+    title: str = Field(description="Redacted plan title.")
+    brief: str = Field(description="Redacted plan brief.")
+    depends_on: list[str] = Field(description="Dependencies retained from the parsed plan.")
+    queue_state: str | None = Field(None, description="Existing queue state, if already known.")
+    queue_brief: str | None = Field(None, description="Existing redacted queue brief.")
+    deliverable: str = Field(description="Whether the plan expects code or findings.")
+    proposed_state: str = Field(description="State reconciliation proposes for the item.")
+    evidence: list[AdoptionEvidenceModel] = Field(description="Ranked retained evidence.")
+    candidates: list[AdoptionCandidateModel] = Field(description="External and branch leads.")
+    mutations: list[AdoptionMutationModel] = Field(description="Proposed changes for this item.")
+    ambiguity: str | None = Field(None, description="Why a human must inspect competing facts.")
+    prior_failure: str | None = Field(None, description="Redacted prior harness failure.")
+    requires_drop_approval: bool = Field(
+        description="Whether treating this item as done requires it to be named explicitly."
+    )
+
+
+class AdoptionReportModel(BaseModel):
+    project_id: str = Field(description="Persisted project being adopted.")
+    state: str = Field(description="Current adoption lifecycle state.")
+    repository: str = Field(description="Redacted resolved local checkout path.")
+    created_at: float = Field(description="Unix time at which these findings were created.")
+    dry_run: bool = Field(description="Whether reconciliation was previewed without mutation.")
+    items: list[AdoptionItemModel] = Field(description="Every parsed item; none silently dropped.")
+    plan_path: str = Field(description="Persisted plan path used for this inspection.")
+    configured_repo: str | None = Field(
+        None, description="Persisted remote repository inspected, when enabled/configured."
+    )
+    input_digest: str = Field(
+        description="Digest of persisted paths, remote scope, plan bytes and inspection mode."
+    )
+    inspect_remote: bool = Field(
+        description="Whether the persisted remote repository contributed evidence."
+    )
+    approved_drops: list[str] = Field(description="Exact item ids the human allowed as done.")
+    history: list[str] = Field(description="Ordered lifecycle states for this proposal.")
+    decision_reason: str = Field(description="Redacted human reason for the decision, if any.")
+    digest: str = Field(description="Stable identity of findings, excluding clock and decision.")
+    proposed_drops: list[str] = Field(description="Items evidence proposes as already delivered.")
+    unconfirmed_drops: list[str] = Field(
+        description="Droppable candidates that evidence does not itself assert are done."
+    )
+    parse: PlanParseResult | None = Field(
+        None, description="Current loss-reporting parse evidence when available."
+    )
+
+
+class AdoptionDecisionRequest(BaseModel):
+    decision: Literal["approve", "reject", "revise"] = Field(
+        description="Human decision. Approval still drops only explicitly named item ids."
+    )
+    approved_drops: list[str] = Field(
+        default_factory=list, description="Exact proposed item ids allowed to land as done."
+    )
+    reason: str = Field(min_length=1, description="Why this decision is being made.")
+    expected_digest: str = Field(
+        min_length=1, description="Findings digest this human decision was made against."
+    )
+
+
+class AdoptionReconcileRequest(BaseModel):
+    dry_run: bool = Field(
+        True,
+        description="Safe default. False is the first operation that changes queue/remote state.",
+    )
+    expected_digest: str | None = Field(
+        None, description="Required for apply; findings digest the human reviewed."
+    )
+    expected_approved_drops: list[str] | None = Field(
+        None, description="Required for apply; exact approved drop list the human reviewed."
+    )
+
+
 # ------------------------------------------------------------------- errors
 
 

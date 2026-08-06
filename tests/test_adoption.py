@@ -34,7 +34,7 @@ from agent_harness.adoption import (
 from agent_harness.audit import AuditStore
 from agent_harness.github import MARKER, GitHub
 from agent_harness.plan import parse_plan
-from agent_harness.work import DONE, FAILED, PENDING, WorkQueue, WorkRecord
+from agent_harness.work import DONE, FAILED, PENDING, Project, WorkQueue, WorkRecord
 from stage_a_support import event_sink
 
 PLAN = """\
@@ -320,6 +320,41 @@ def test_dry_run_reconciliation_performs_no_mutation(queue: WorkQueue, repo: Pat
     assert queue.items() == []
     assert queue.projects() == []
     assert gh.mutations() == []
+
+
+def test_reconciliation_preserves_an_existing_project_configuration(
+    queue: WorkQueue, repo: Path
+) -> None:
+    configured = Project(
+        project_id="existing",
+        name="Existing project",
+        repo="owner/repository",
+        work_dir=str(repo),
+        base_branch="develop",
+        checks=["pytest -q"],
+        fixes={"ruff format --check .": ["ruff", "format", "."]},
+        apply_fixes=True,
+        durability="sync",
+        max_item_seconds=60,
+        max_item_spend_usd=2.5,
+        max_hold_seconds=120,
+        plan_path=str(repo / "PLAN.md"),
+        roles={"reviewer": {"model": "reviewer-a"}},
+        max_workers=3,
+        max_attempts=4,
+        min_free_disk_gb=1.5,
+    )
+    queue.add_project(configured)
+    before = queue.get_project("existing")
+    assert before is not None
+    adopter = adoption(queue, repo, gh=default_gh())
+    adopter.inspect("existing", parse_plan(PLAN))
+    adopter.approve("existing", approved_drops=[])
+
+    adopter.reconcile("existing")
+
+    after = queue.get_project("existing")
+    assert after == before
 
 
 # ------------------------------------------------------- §5.2 the ladder

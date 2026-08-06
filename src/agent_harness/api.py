@@ -29,6 +29,17 @@ from fastapi import Path as PathParam
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import __version__
+from .adoption_service import (
+    AdoptionConfigurationError,
+    AdoptionInspectionFailure,
+    AdoptionReconciliationFailure,
+    adoption_event_sink,
+    fresh_report,
+    inspect_project,
+    reconcile_project,
+    report_model,
+    resolve_adoption,
+)
 from .audit import AuditStore
 from .audit_service import maintain_audit, reconcile_repository
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
@@ -45,6 +56,10 @@ from .routing_service import configure_roles, role_map_view
 from .schemas import (
     AddItemsRequest,
     AddItemsResult,
+    AdoptionDecisionRequest,
+    AdoptionInspectRequest,
+    AdoptionReconcileRequest,
+    AdoptionReportModel,
     AnalyticsDashboard,
     AnswerRequest,
     AnswerResult,
@@ -186,6 +201,7 @@ def create_api(
     default_preset: str = "",
     github_factory: Any | None = None,
     process_metrics: ProcessMetricsSource | None = None,
+    adoption_branches: Any | None = None,
 ) -> FastAPI:
     """Build the API.
 
@@ -236,6 +252,7 @@ def create_api(
     app.state.default_preset = default_preset
     app.state.github_factory = github_factory
     app.state.process_metrics = process_metrics or ProcessMetricsSampler()
+    app.state.adoption_branches = adoption_branches
     app.state.ask_model = _model_asker(model_client)
     app.state.base_checks = BaseChecks()
     app.state.token = token
@@ -690,6 +707,140 @@ def create_api(
             revision=revision,
             readiness=_readiness_model(queue.readiness(item_id, project_id=project_id), record),
         )
+
+    # ------------------------------------------------------------- adoption
+
+    def adoption_context(project_id: str, *, inspect_remote: bool = True) -> Any:
+        queue = need_queue()
+        sink = app.state.audit or store
+        kwargs: dict[str, Any] = {
+            "github_factory": app.state.github_factory,
+            "inspect_remote": inspect_remote,
+            "on_event": adoption_event_sink(sink, source="api-adoption"),
+        }
+        if app.state.adoption_branches is not None:
+            kwargs["branches"] = app.state.adoption_branches
+        try:
+            return resolve_adoption(queue, project_id, **kwargs)
+        except AdoptionConfigurationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def current_adoption(project_id: str, *, inspect_remote: bool = False) -> tuple[Any, Any]:
+        context = adoption_context(project_id, inspect_remote=inspect_remote)
+        try:
+            report = context.adopter.load(project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return context, report
+
+    @app.post(
+        "/api/adoption/{project_id}/inspect",
+        tags=["plan"],
+        summary="Inspect an existing project without adopting it",
+        response_model=AdoptionReportModel,
+    )
+    def adoption_inspect(
+        request: AdoptionInspectRequest,
+        project_id: str = PathParam(description="Persisted project id."),
+        _: None = Depends(require_token),
+    ) -> AdoptionReportModel:
+        """Persist a proposal; create no queue row and make no remote write."""
+        context = adoption_context(project_id, inspect_remote=request.inspect_remote)
+        try:
+            report = inspect_project(context)
+        except AdoptionInspectionFailure as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return report_model(report, redact=(app.state.audit or store).redact, parsed=context.plan)
+
+    @app.get(
+        "/api/adoption/{project_id}",
+        tags=["plan"],
+        summary="Current adoption proposal",
+        response_model=AdoptionReportModel,
+        responses={404: {"description": "No inspection has been persisted"}},
+    )
+    def adoption_report(
+        project_id: str = PathParam(description="Persisted project id."),
+        _: None = Depends(require_token),
+    ) -> AdoptionReportModel:
+        context, report = current_adoption(project_id)
+        return report_model(report, redact=(app.state.audit or store).redact, parsed=context.plan)
+
+    @app.post(
+        "/api/adoption/{project_id}/decision",
+        tags=["plan"],
+        summary="Approve, reject or revise one adoption proposal",
+        response_model=AdoptionReportModel,
+    )
+    def adoption_decision(
+        request: AdoptionDecisionRequest,
+        project_id: str = PathParam(description="Persisted project id."),
+        _: None = Depends(require_token),
+    ) -> AdoptionReportModel:
+        context, report = current_adoption(project_id)
+        if not secrets.compare_digest(report.content_digest(), request.expected_digest):
+            raise HTTPException(status_code=409, detail="adoption findings changed after review")
+        try:
+            if request.decision == "approve":
+                report = context.adopter.approve(
+                    project_id,
+                    approved_drops=request.approved_drops,
+                    reason=request.reason,
+                )
+            else:
+                if request.approved_drops:
+                    raise ValueError("reject/revise cannot approve item drops")
+                report = context.adopter.reject(
+                    project_id,
+                    reason=request.reason,
+                    revise=request.decision == "revise",
+                )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return report_model(report, redact=(app.state.audit or store).redact, parsed=context.plan)
+
+    @app.post(
+        "/api/adoption/{project_id}/reconcile",
+        tags=["plan"],
+        summary="Preview or apply an approved adoption",
+        response_model=AdoptionReportModel,
+    )
+    def adoption_reconcile(
+        request: AdoptionReconcileRequest,
+        project_id: str = PathParam(description="Persisted project id."),
+        _: None = Depends(require_token),
+    ) -> AdoptionReportModel:
+        context, report = current_adoption(project_id)
+        if not request.dry_run:
+            if not request.expected_digest or not secrets.compare_digest(
+                report.content_digest(), request.expected_digest
+            ):
+                raise HTTPException(
+                    status_code=409, detail="adoption findings changed after review"
+                )
+            if request.expected_approved_drops is None or sorted(
+                request.expected_approved_drops
+            ) != sorted(report.approved_drops):
+                raise HTTPException(
+                    status_code=409, detail="approved drop list changed after review"
+                )
+            context = adoption_context(project_id, inspect_remote=report.inspect_remote)
+            try:
+                fresh = fresh_report(context)
+            except AdoptionInspectionFailure as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            if not secrets.compare_digest(fresh.content_digest(), report.content_digest()):
+                raise HTTPException(
+                    status_code=409,
+                    detail="adoption inputs or evidence changed after review; inspect again",
+                )
+        try:
+            report = reconcile_project(context, dry_run=request.dry_run)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except AdoptionReconciliationFailure as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return report_model(report, redact=(app.state.audit or store).redact, parsed=context.plan)
 
     # ------------------------------------------------------------- control
 

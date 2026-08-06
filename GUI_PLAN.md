@@ -1,9 +1,9 @@
 # Agent Harness GUI Implementation Plan
 
-**Status:** Accepted product direction; implementation in progress. Milestones 0–1 and
-substantial Milestones 2–3 slices are implemented, as are the Milestone 4 routing,
-worker-inventory, event-explorer and typed-analytics slices. Milestones 2–4 remain
-partial and Milestones 5–8 remain incomplete.
+**Status:** Accepted product direction; implementation in progress. Milestones 0–1,
+substantial Milestone 2, and the Milestone 3 inception, plan, adoption and dependency
+contracts are implemented, as are the substantially owned Milestone 4 control-plane
+slices. Milestones 2–3 remain partial and Milestones 5–8 remain incomplete.
 **Plan date:** 2026-08-05  
 **Product boundary:** The GUI is built, packaged, served, tested, and documented entirely
 inside `agent-harness`.
@@ -13,8 +13,9 @@ inside `agent-harness`.
 plane is implemented in `src/agent_harness/ui.py`, `query_service.py`,
 `browser_session.py`, `templates/`, and `static/`; its in-process journeys are in
 `tests/test_ui.py` and `tests/test_ui_packaging.py`. The current tree includes the GUI
-foundation commits `264294d` through `a245679` plus an uncommitted continuation containing
-the subsequent slices described below. Build and gate results are recorded in
+foundation commits `264294d` through `a245679`, the merged continuation through `b18e4c9`,
+and the current Milestone 3.6 adoption slice described below. Build and gate results are
+recorded in
 [`docs/evidence/2026-08-05-gui-milestone-0-1.md`](docs/evidence/2026-08-05-gui-milestone-0-1.md).
 
 This worktree is the implementation source of truth for this plan. The repository's
@@ -35,7 +36,7 @@ pytest attempt was invalid because this older worktree had not installed the new
 
 ### 0.1 Landed foundation
 
-The branch currently points at `a245679` and contains these GUI commits:
+The original GUI foundation consists of these commits:
 
 1. `264294d feat: add self-contained browser control plane`
 2. `8b202a9 feat: add guarded browser control actions`
@@ -73,8 +74,12 @@ The implementation now includes:
 10. Milestone 4.9 portable service-process sampling and a
    narrowed projection of already-redacted `model_call` events from the live append-only
    event source. This uses no session-host state, exposes no arbitrary model payload, and
-   introduces no filesystem log-path convention; and
-11. focused in-process journeys for replay, stale project/routing configuration, CSRF,
+   introduces no filesystem log-path convention;
+11. a typed adoption lifecycle and reviewed browser wizard that resolve only persisted
+   project paths and repository scope, retain parse-loss and ranked evidence, require exact
+   named drop approval, re-inspect before apply, default JSON reconciliation to dry-run,
+   and preserve the existing project configuration; and
+12. focused in-process journeys for replay, stale project/routing/adoption configuration, CSRF,
    preview-without-write, plan mutation, remote preview drift and refused external writes.
 
 ### 0.3 Current verification
@@ -83,10 +88,10 @@ The complete implementation tree has the following evidence:
 
 | Check | Most recent result |
 |---|---|
-| `TMPDIR=/tmp/agent-harness-gui-4-9-full.7JtLkQ uv run pytest -q` | Passed at 100%, 1 skipped |
+| `TMPDIR=/tmp/agent-harness-gui-adoption-full.V0396Z uv run pytest -q` | Passed at 100%, 1 skipped |
 | `uv run ruff check .` | Passed |
-| `uv run ruff format --check .` | Passed, 134 files checked |
-| `TMPDIR=/tmp/agent-harness-gui-4-9-mypy.Ce6jNh uv run mypy` | Passed, 129 source files |
+| `uv run ruff format --check .` | Passed, 135 files checked |
+| `TMPDIR=/tmp/agent-harness-gui-adoption-mypy.foKNPD uv run mypy` | Passed, 130 source files |
 
 The full suite includes the wheel packaging and in-process browser journeys. Browser
 automation, accessibility tooling, a forced browser SSE reconnect, real GitHub concurrency,
@@ -101,7 +106,8 @@ not prove a transaction across remote preview and writes.
 2. The role editor is global. Per-project route overrides remain available through project
    configuration but do not yet have a specialized routing comparison view.
 3. Milestone 2 still lacks bulk-action review and notification delivery. Milestone 3 still
-   lacks the typed adoption HTTP/wizard flow and richer interactive graph controls.
+   lacks richer interactive graph controls; the typed adoption HTTP/browser lifecycle is
+   implemented.
 4. Milestone 4 rate-limit, cost, delivery, audit-health, worker inventory and filtered
    event exploration are implemented as read-only typed views. GitHub reconciliation and
    audit maintenance have explicit reviewed browser actions. Process metrics and gateway
@@ -124,6 +130,23 @@ remaining earlier acceptance gaps rather than starting Milestone 5: first reconc
 Milestone 2 bulk-action review/notification requirements and Milestone 3 typed adoption and
 interactive-graph requirements against current code, then implement the smallest complete
 missing contract and update this state section before and after it.
+
+Milestone 3.6 is now implemented. `POST /api/adoption/{project_id}/inspect`,
+`GET /api/adoption/{project_id}`, and the decision/reconcile routes are typed. They resolve
+the checkout, plan and optional remote repository only from persisted project
+configuration, return the parse-loss report and ranked evidence, omit arbitrary remote
+bodies, and redact/safely render candidate fields. Inspection creates no queue rows;
+approval names exact drops but still creates no queue rows; JSON reconciliation defaults
+to dry-run; real apply re-inspects the same plan/remote scope and refuses digest or drop-list
+drift. The browser uses separate one-time decision and first-mutation reviews. Existing
+project configuration is preserved during reconciliation. A failed remote write reports
+that earlier queue/remote changes may be partial and records that fact instead of claiming
+atomicity.
+
+The next remaining Milestone 3 contract is 3.7: add accessible search and item focus to the
+dependency view while retaining its complete list equivalent and the typed graph's exact
+edge/readiness semantics. Zoom and pan should enhance the visual representation, never
+replace keyboard-readable evidence or become an authorization gesture.
 
 ## 1. Product decision
 
@@ -265,7 +288,7 @@ services rather than growing a second interpretation in HTML controllers.
 | Holds | Authenticated inbox and structured answer form exist | Draft preservation on expiry/mismatch and notifications |
 | Events | SSE over the monotonic cursor and event views exist | Forced reconnect/replay proof, richer filtering and polling fallback evidence |
 | Audit | Health, events, cost, delivery, rollups, baselines, maintenance, and reconcile APIs exist | Dashboards, confirmations, reason/operator audit for actions, missing breakdowns |
-| Plans | Inception, question gates, generated preview, parse-loss report and uncommitted reviewed plan sync exist | Finish plan-sync review items above; adoption HTTP API and wizard |
+| Plans | Inception, question gates, generated preview, parse-loss report, reviewed plan sync, and typed/reviewed adoption lifecycle exist | Richer accessible dependency-graph interaction |
 | Routing | Role map and route-health APIs exist | Editor, used/unused explanation, independence warnings, secret-safe validation |
 | Workers | Project summaries expose counts and failures | Worker/claim/lease/heartbeat/session inventory API |
 | Attempts and artifacts | Durable data exists in internal modules | Typed item-scoped API for attempts, stages, patches, diffs, and evidence links |
@@ -522,6 +545,11 @@ shows repository and exact create/update/orphan counts.
 
 3.6. Add a typed HTTP adoption proposal API around `adoption.py`, then build the adoption
 wizard. A proposal is never a decision: nothing is dropped unless the operator names it.
+Implemented: inspect/report/decision/reconcile resolve persisted inputs, expose redacted
+typed evidence, default reconciliation to dry-run, and bind browser apply to one-time exact
+report/drop-list review plus apply-time reinspection. Inspection and approval create no
+queue rows. Reconciliation preserves existing project configuration; a failed external
+write is reported and audited as potentially partial rather than represented as atomic.
 
 3.7. Build an accessible dependency graph with zoom, pan, search, item focus, and a list
 equivalent. Distinguish local work, external references, human decisions, cross-project

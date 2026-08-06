@@ -190,6 +190,17 @@ not evidence: the former raced virtualenv creation and the latter filled the
   convention. It re-redacts allowlisted display fields, strips endpoint userinfo/query/
   fragment, bounds detail, filters by project without breaking sparse cursor paging, and
   reports degraded live history instead of silently falling back to stale ingest data.
+- Milestone 3.6 now has typed inspect, current-report, decision and reconciliation API
+  contracts plus a reviewed browser wizard. Every path resolves its checkout, plan and
+  optional remote evidence source from persisted project configuration. Inspection and
+  approval create no queue rows; real reconciliation is dry-run by default in JSON and is
+  bound to the exact findings digest and human-named drop list. Apply re-inspects the same
+  input scope, preserves the existing project row, and refuses drift. The public report
+  includes parse-loss and ranked evidence but excludes arbitrary remote issue/PR bodies,
+  re-redacts free text and removes candidate-URL credentials, query strings and fragments.
+  A regression journey demonstrates the non-transactional failure boundary honestly: if a
+  confirmed marker write fails after queue insertion, the 502 and audit both say the result
+  may be partial, and the landed queue row remains observable.
 - Typed item evidence exposes append-only events, durable attempt stages and
   retained holds without fabricating absent history or cost.
 - `/api/events/stream` resumes after a monotonic cursor and surfaces disconnects;
@@ -207,7 +218,7 @@ This is not a release claim for the full `GUI_PLAN`: browser automation,
 screen-reader checks, forced reconnect with replayed events, and all additional
 accessibility/security/concurrency journeys remain to run. Milestone 2 remains partial
 (bulk-action review, notifications and other controls are not yet wired). Milestone 3
-remains partial (adoption and richer graph interactions are not yet wired). Milestone 4's
+remains partial (adoption is wired; richer graph interactions are not yet wired). Milestone 4's
 substantially owned control-plane surface is implemented: global routing, worker inventory,
 filtered events, typed analytics, confirmed reconciliation and maintenance, portable
 process metrics and structured gateway-call evidence. This is not a claim that core reads
@@ -215,8 +226,24 @@ an arbitrary gateway daemon's local log files. Milestones 5–8 (internal sessio
 extensions, automation, RBAC and recovery) remain explicitly incomplete. No real fleet,
 GitHub repository or external deployment was used.
 
+The post-Milestone-4 audit found adoption was CLI-only despite a mature engine; that gap is
+now implemented and exercised. The engine correction prevents reconciliation from
+replacing an existing project with a minimal row. The next Milestone 3 gap is accessible
+dependency-graph search/focus and visual zoom/pan while keeping the current complete list
+equivalent authoritative for edge and readiness evidence.
+
 ## Current slice verification
 
-The Milestone 4.9 four-gate table above is the latest complete implementation evidence.
-Earlier transient or partial runs are historical context only and are not substituted for
-that complete pass.
+After the typed and reviewed Milestone 3.6 adoption slice:
+
+| Check | Result |
+|---|---|
+| `TMPDIR=/tmp/agent-harness-gui-adoption-full.V0396Z uv run pytest -q` | passed at 100%, 1 skipped |
+| `uv run ruff check .` | passed |
+| `uv run ruff format --check .` | passed, 135 files already formatted |
+| `TMPDIR=/tmp/agent-harness-gui-adoption-mypy.foKNPD uv run mypy` | passed, 130 source files |
+
+The full suite includes the adoption engine/API/browser journeys, generic-core guard,
+API isolation, write-boundary redaction and wheel packaging tests. No real remote
+repository was contacted: remote reads, drift and partial-write failure use an in-process
+stateful transport double, so this is not evidence of atomicity or real GitHub behavior.

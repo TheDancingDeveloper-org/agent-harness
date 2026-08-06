@@ -15,6 +15,7 @@ from agent_harness.api import create_api
 from agent_harness.audit import AuditStore
 from agent_harness.events import MODEL_CALL, UNCLASSIFIED, WORK, Event
 from agent_harness.fleet import WorkerSnapshot
+from agent_harness.github import GitHub
 from agent_harness.process_metrics import ProcessSample
 from agent_harness.redaction import Redactor
 from agent_harness.store import EventStore
@@ -629,6 +630,205 @@ def test_gateway_logs_strip_userinfo_from_endpoints_without_a_scheme(
     assert "secret" not in response.text
 
 
+def test_adoption_http_lifecycle_is_typed_dry_run_first_and_drop_exact(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    plan = repository / "PLAN.md"
+    plan.write_text(
+        "# Existing project\n\n"
+        "- [x] T1: Already delivered\n\nbrief\n\n"
+        "- [ ] T2: Still needed\n\nanother brief\n"
+    )
+    store = EventStore(tmp_path / "events.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(
+        Project(
+            project_id="existing",
+            name="Existing project",
+            work_dir=str(repository),
+            plan_path=str(plan),
+            checks=["pytest -q"],
+            max_workers=2,
+        )
+    )
+
+    def branches(_repo: Path) -> list[str]:
+        return ["harness/T1"]
+
+    with TestClient(
+        create_api(store, queue=queue, token=TOKEN, adoption_branches=branches)
+    ) as client:
+        inspected = client.post(
+            "/api/adoption/existing/inspect", headers=auth(), json={"inspect_remote": False}
+        )
+        assert inspected.status_code == 200
+        proposal = inspected.json()
+        assert proposal["state"] == "proposed"
+        assert proposal["proposed_drops"] == ["T1"]
+        assert proposal["parse"]["items"][0]["id"] == "T1"
+        assert queue.items(project_id="existing") == []
+
+        unknown = client.post(
+            "/api/adoption/existing/decision",
+            headers=auth(),
+            json={
+                "decision": "approve",
+                "approved_drops": ["T2"],
+                "reason": "reviewed",
+                "expected_digest": proposal["digest"],
+            },
+        )
+        assert unknown.status_code == 409
+        assert queue.items(project_id="existing") == []
+
+        approved = client.post(
+            "/api/adoption/existing/decision",
+            headers=auth(),
+            json={
+                "decision": "approve",
+                "approved_drops": ["T1"],
+                "reason": "reviewed",
+                "expected_digest": proposal["digest"],
+            },
+        )
+        assert approved.status_code == 200
+        preview = client.post("/api/adoption/existing/reconcile", headers=auth(), json={})
+        assert preview.status_code == 200
+        assert preview.json()["dry_run"] is True
+        assert queue.items(project_id="existing") == []
+
+        applied = client.post(
+            "/api/adoption/existing/reconcile",
+            headers=auth(),
+            json={
+                "dry_run": False,
+                "expected_digest": proposal["digest"],
+                "expected_approved_drops": ["T1"],
+            },
+        )
+        assert applied.status_code == 200
+    assert {row.item_id: row.state for row in queue.items(project_id="existing")} == {
+        "T1": DONE,
+        "T2": PENDING,
+    }
+    configured = queue.get_project("existing")
+    assert configured is not None
+    assert configured.name == "Existing project"
+    assert configured.checks == ["pytest -q"]
+    assert configured.max_workers == 2
+
+
+def test_adoption_inspection_refuses_missing_persisted_paths(client: TestClient) -> None:
+    response = client.post(
+        "/api/adoption/default/inspect", headers=auth(), json={"inspect_remote": False}
+    )
+    assert response.status_code == 409
+    assert "work_dir" in response.json()["detail"] or "plan_path" in response.json()["detail"]
+
+
+def test_adoption_report_omits_remote_body_and_safely_renders_candidate_url(
+    tmp_path: Path,
+) -> None:
+    secret = "remote-secret-value"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    plan = repository / "PLAN.md"
+    plan.write_text("# Existing\n\n- [ ] T1: First\n\nbrief\n")
+    store = EventStore(tmp_path / "events.sqlite", redact=Redactor([secret]))
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(
+        Project(
+            project_id="existing",
+            name="Existing",
+            repo="owner/repository",
+            work_dir=str(repository),
+            plan_path=str(plan),
+        )
+    )
+
+    def runner(args: Any, stdin: str | None = None) -> str:
+        del stdin
+        if args[1:3] == ["issue", "list"]:
+            return (
+                '[{"number":7,"title":"T1 remote-secret-value",'
+                '"body":"T1 arbitrary remote prose must stay private remote-secret-value",'
+                '"state":"OPEN","url":"https://alice:remote-secret-value@github.example/'
+                'owner/repository/issues/7?token=remote-secret-value"}]'
+            )
+        if args[1:3] == ["pr", "list"]:
+            return "[]"
+        raise AssertionError(args)
+
+    with TestClient(
+        create_api(
+            store,
+            queue=queue,
+            token=TOKEN,
+            github_factory=lambda repo: GitHub(repo, runner),
+            adoption_branches=lambda _repo: [],
+        )
+    ) as client:
+        response = client.post(
+            "/api/adoption/existing/inspect",
+            headers=auth(),
+            json={"inspect_remote": True},
+        )
+    assert response.status_code == 200
+    candidate = response.json()["items"][0]["candidates"][0]
+    assert "body" not in candidate
+    assert candidate["title"] == "T1 [redacted]"
+    assert candidate["url"] == "https://github.example/owner/repository/issues/7"
+    assert secret not in response.text
+    assert "arbitrary remote prose" not in response.text
+
+
+def test_adoption_remote_inspection_failure_is_generic_and_saves_no_proposal(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    plan = repository / "PLAN.md"
+    plan.write_text("# Existing\n\n- [ ] T1: First\n\nbrief\n")
+    store = EventStore(tmp_path / "events.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(
+        Project(
+            project_id="existing",
+            name="Existing",
+            repo="owner/repository",
+            work_dir=str(repository),
+            plan_path=str(plan),
+        )
+    )
+
+    def runner(args: Any, stdin: str | None = None) -> str:
+        del args, stdin
+        raise RuntimeError("transport exposed remote-secret-value")
+
+    with TestClient(
+        create_api(
+            store,
+            queue=queue,
+            token=TOKEN,
+            github_factory=lambda repo: GitHub(repo, runner),
+            adoption_branches=lambda _repo: [],
+        )
+    ) as client:
+        failed = client.post(
+            "/api/adoption/existing/inspect",
+            headers=auth(),
+            json={"inspect_remote": True},
+        )
+        missing = client.get("/api/adoption/existing", headers=auth())
+    assert failed.status_code == 502
+    assert "could not be inspected" in failed.json()["detail"]
+    assert "remote-secret-value" not in failed.text
+    assert missing.status_code == 404
+    assert queue.items(project_id="existing") == []
+
+
 def test_worker_inventory_is_explicitly_monitoring_only_without_fleet(
     client: TestClient,
 ) -> None:
@@ -723,6 +923,10 @@ def test_the_schema_documents_response_shapes_not_empty_objects(
         ("/api/process", "get"),
         ("/api/workers", "get"),
         ("/api/analytics", "get"),
+        ("/api/adoption/{project_id}/inspect", "post"),
+        ("/api/adoption/{project_id}", "get"),
+        ("/api/adoption/{project_id}/decision", "post"),
+        ("/api/adoption/{project_id}/reconcile", "post"),
         ("/healthz", "get"),
     ]:
         content = schema["paths"][path][method]["responses"]["200"]["content"]
@@ -853,6 +1057,13 @@ def test_sync_defaults_to_a_dry_run(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     prop = schema["components"]["schemas"]["PlanSyncRequest"]["properties"]["dry_run"]
     assert prop["default"] is True
+
+
+def test_adoption_reconciliation_defaults_to_a_dry_run(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    prop = schema["components"]["schemas"]["AdoptionReconcileRequest"]["properties"]["dry_run"]
+    assert prop["default"] is True
+    assert "first operation" in prop["description"]
 
 
 # --------------------------------------------------------------- control

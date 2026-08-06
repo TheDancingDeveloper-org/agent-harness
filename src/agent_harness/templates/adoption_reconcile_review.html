@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">First real mutation</p><h1>Review adoption reconciliation</h1></div><span class="mode-badge">One-time confirmation</span></div>
+  <section class="card">
+    <p><strong>Project:</strong> {{ project_id }}<br><strong>Resolved checkout:</strong> <span class="mono">{{ report.repository }}</span><br><strong>Reason:</strong> {{ reason }}</p>
+    <p class="alert warning">This confirmation is the first step that creates or refreshes queue rows and may apply explicitly approved remote marker changes. The engine preview below made no mutation.</p>
+    <table><thead><tr><th>Item</th><th>State after reconcile</th><th>Exact proposed changes</th></tr></thead><tbody>{% for item in report.items %}<tr><td>{{ item.item_id }} — {{ item.title }}</td><td>{{ 'done' if item.item_id in report.approved_drops else item.proposed_state }}</td><td><ul>{% for mutation in item.mutations %}<li>{{ mutation.kind }} — {{ mutation.target }}: {{ mutation.detail }}{% if mutation.requires_approval and item.item_id not in report.approved_drops %} (will not apply; not approved){% endif %}</li>{% endfor %}</ul></td></tr>{% endfor %}</tbody></table>
+    <form method="post" action="{{ url_for('adoption_reconcile_apply') }}" data-csrf-form><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}"><input type="hidden" name="review_id" value="{{ review.review_id }}"><button type="submit">Apply reviewed adoption</button></form>
+  </section>
+{% endblock %}

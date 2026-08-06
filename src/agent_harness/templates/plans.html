@@ -53,6 +53,44 @@
         {% if sync_error %}<p class="alert error" role="alert">{{ sync_error }}</p>{% endif %}
       </section>
     {% endif %}
+    <section class="card">
+      <div class="card-heading"><div><p class="eyebrow">Existing work</p><h2>Adoption</h2></div><span class="mode-badge">Proposal, never decision</span></div>
+      {% if adoption_available %}
+        <p class="muted">Inspect the persisted checkout and plan. Inspection may read the configured remote repository, but creates no queue rows and edits nothing outside the harness.</p>
+        <form method="post" action="{{ url_for('adoption_inspect_action') }}" data-csrf-form>
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}">
+          {% if repo %}<label class="choice"><input type="checkbox" name="inspect_remote" value="yes" checked> Inspect configured remote repository {{ repo }} read-only</label>{% endif %}
+          <button type="submit">{{ 'Inspect again' if adoption else 'Inspect existing work' }}</button>
+        </form>
+      {% else %}
+        <p class="alert warning">Configure both a checkout and plan path before adoption can inspect existing work.</p>
+      {% endif %}
+      {% if adoption %}
+        <div class="card-heading"><div><p class="eyebrow">{{ adoption.state }}</p><h3>Adoption proposal</h3></div><span class="attention">{{ adoption.items|length }} items</span></div>
+        <p><strong>Resolved checkout:</strong> <span class="mono">{{ adoption.repository }}</span><br><strong>Plan:</strong> <span class="mono">{{ adoption.plan_path }}</span>{% if adoption.inspect_remote %}<br><strong>Remote evidence:</strong> {{ adoption.configured_repo }}{% endif %}</p>
+        {% if adoption.parse and (adoption.parse.skipped or adoption.parse.duplicate_ids or adoption.parse.unresolved_dependencies or adoption.parse.malformed_dependencies or adoption.parse.dependency_cycles or adoption.parse.unattached_arrows) %}<p class="alert warning">The plan has parse findings. They remain visible in the parse review above; adoption did not silently discard them.</p>{% endif %}
+        <p class="alert warning">Nothing has been dropped and no queue row has been created by this proposal.</p>
+        <div class="table-scroll"><table><thead><tr><th>Item</th><th>Proposal</th><th>Evidence / ambiguity</th><th>Proposed changes</th></tr></thead><tbody>
+          {% for item in adoption.items %}<tr><td><strong>{{ item.item_id }}</strong><br>{{ item.title }}</td><td>{{ item.proposed_state }}{% if item.requires_drop_approval %}<br><span class="attention">Needs named drop approval</span>{% endif %}</td><td>{% if item.ambiguity %}<span class="warning">{{ item.ambiguity }}</span>{% endif %}<ul>{% for evidence in item.evidence %}<li>{{ evidence.kind }} / {{ evidence.outcome }}: {{ evidence.detail }}{% if evidence.citations %} ({{ evidence.citations|join(', ') }}){% endif %}</li>{% else %}<li>No affirmative evidence</li>{% endfor %}</ul></td><td><ul>{% for mutation in item.mutations %}<li>{{ mutation.kind }} — {{ mutation.target }}: {{ mutation.detail }}{% if mutation.requires_approval %} (approval required){% endif %}</li>{% endfor %}</ul></td></tr>{% endfor %}
+        </tbody></table></div>
+        {% if adoption.state == 'proposed' %}
+          <form method="post" action="{{ url_for('adoption_decision_review') }}" data-csrf-form>
+            <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}">
+            {% if adoption.proposed_drops %}<fieldset><legend>Items allowed to enter as done</legend>{% for item_id in adoption.proposed_drops %}<label class="choice"><input type="checkbox" name="approve_drop:{{ item_id }}" value="yes"> {{ item_id }} — explicitly approve this drop</label>{% endfor %}</fieldset>{% endif %}
+            <label>Decision<select name="decision"><option value="approve">Approve proposal</option><option value="revise">Request a new inspection</option><option value="reject">Reject proposal</option></select></label>
+            <label>Reason<input name="reason" required placeholder="Why this exact decision?"></label>
+            <button type="submit">Review decision</button>
+          </form>
+        {% elif adoption.state == 'approved' %}
+          <p class="success">Approved drops: {{ adoption.approved_drops|join(', ') if adoption.approved_drops else 'none' }}. Approval alone still created no queue rows.</p>
+          <form method="post" action="{{ url_for('adoption_reconcile_review') }}" data-csrf-form><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}"><label>Reconciliation reason<input name="reason" required placeholder="Why apply this adoption now?"></label><button type="submit">Review first mutation</button></form>
+        {% elif adoption.state in ['rejected', 'revise'] %}
+          <p class="warning">Decision: {{ adoption.decision_reason }}. Inspect again to create a fresh proposal.</p>
+        {% elif adoption.state == 'stopped' %}
+          <p class="success">Reconciled. Earlier queue progress and project configuration were preserved.</p>
+        {% endif %}
+      {% endif %}
+    </section>
     {% if proposal %}
       <section class="card">
         <div class="card-heading"><div><p class="eyebrow">Revision {{ proposal.revision }}</p><h2>{{ proposal.goal or 'Proposal' }}</h2></div><span class="attention">{{ proposal.item_count }} items</span></div>

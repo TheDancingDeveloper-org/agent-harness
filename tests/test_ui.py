@@ -61,6 +61,14 @@ class FakeGitHubRunner:
         return "https://github.com/o/r/issues/1\n"
 
 
+class AdoptionGitHubRunner(FakeGitHubRunner):
+    def __call__(self, args: Sequence[str], stdin: str | None = None) -> str:
+        if args[1:3] in (["issue", "list"], ["pr", "list"]):
+            self.calls.append([*args])
+            return "[]"
+        return super().__call__(args, stdin)
+
+
 class StatefulGitHubRunner(FakeGitHubRunner):
     """A remote backlog that can drift or refuse the confirmed write."""
 
@@ -73,6 +81,9 @@ class StatefulGitHubRunner(FakeGitHubRunner):
         if args[1:3] == ["issue", "list"]:
             self.calls.append([*args])
             return self.issues
+        if args[1:3] == ["pr", "list"]:
+            self.calls.append([*args])
+            return "[]"
         if self.fail_writes and args[1:3] in (["issue", "create"], ["issue", "edit"]):
             self.calls.append([*args])
             raise GitHubError("the remote rejected the write")
@@ -165,6 +176,321 @@ def test_analytics_shows_session_independent_process_and_gateway_evidence(
     assert "secret123" not in html
     assert "/api/process" in html
     assert "/api/gateway-logs" in html
+
+
+def test_adoption_wizard_keeps_inspection_and_reviews_non_mutating_then_applies_once(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "existing-repo"
+    repository.mkdir()
+    plan = repository / "PLAN.md"
+    plan.write_text(
+        "# Existing project\n\n"
+        "- [x] T1: Already delivered\n\nbrief\n\n"
+        "- [ ] T2: Still needed\n\nanother brief\n"
+    )
+    store = EventStore(tmp_path / "events.sqlite")
+    audit = AuditStore(tmp_path / "audit.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(
+        Project(
+            project_id="existing",
+            name="Existing project",
+            repo="owner/repository",
+            work_dir=str(repository),
+            plan_path=str(plan),
+            checks=["pytest -q"],
+            max_workers=3,
+        )
+    )
+    github_calls: list[str] = []
+
+    def github_factory(repo: str) -> GitHub:
+        github_calls.append(repo)
+        return GitHub(repo, AdoptionGitHubRunner())
+
+    with TestClient(
+        create_api(
+            store,
+            queue=queue,
+            audit=audit,
+            token=TOKEN,
+            github_factory=github_factory,
+            adoption_branches=lambda _repo: [],
+        )
+    ) as client:
+        login(client)
+        page = client.get("/plans?project_id=existing")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        inspected = client.post(
+            "/ui/actions/adoption/inspect",
+            data={"csrf_token": csrf, "project_id": "existing", "inspect_remote": "yes"},
+            headers={"X-CSRF-Token": csrf},
+            follow_redirects=False,
+        )
+        assert inspected.status_code == 303
+        assert queue.items(project_id="existing") == []
+        assert github_calls == ["owner/repository"]
+
+        proposal = client.get("/plans?project_id=existing")
+        assert "Adoption proposal" in proposal.text
+        assert "Already delivered" in proposal.text
+        assert "Nothing has been dropped" in proposal.text
+        decision_review = client.post(
+            "/ui/actions/adoption/decision/review",
+            data={
+                "csrf_token": csrf,
+                "project_id": "existing",
+                "decision": "approve",
+                "reason": "checked the existing delivery",
+                "approve_drop:T1": "yes",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert decision_review.status_code == 200
+        assert "T1" in decision_review.text
+        assert "T2" in decision_review.text
+        assert "No queue row or remote resource has changed" in decision_review.text
+        decision_review_id = decision_review.text.split('name="review_id" value="', 1)[1].split(
+            '"', 1
+        )[0]
+        assert queue.items(project_id="existing") == []
+
+        decided = client.post(
+            "/ui/actions/adoption/decision/apply",
+            data={"csrf_token": csrf, "project_id": "existing", "review_id": decision_review_id},
+            headers={"X-CSRF-Token": csrf},
+            follow_redirects=False,
+        )
+        assert decided.status_code == 303
+        assert queue.items(project_id="existing") == []
+
+        assert (
+            "Approval alone still created no queue rows"
+            in client.get("/plans?project_id=existing").text
+        )
+        reconcile_review = client.post(
+            "/ui/actions/adoption/reconcile/review",
+            data={
+                "csrf_token": csrf,
+                "project_id": "existing",
+                "reason": "bring pending work into the queue",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert reconcile_review.status_code == 200
+        assert "First real mutation" in reconcile_review.text
+        assert "T1" in reconcile_review.text and "done" in reconcile_review.text
+        assert "T2" in reconcile_review.text and "pending" in reconcile_review.text
+        reconcile_review_id = reconcile_review.text.split('name="review_id" value="', 1)[1].split(
+            '"', 1
+        )[0]
+        assert queue.items(project_id="existing") == []
+
+        applied = client.post(
+            "/ui/actions/adoption/reconcile/apply",
+            data={
+                "csrf_token": csrf,
+                "project_id": "existing",
+                "review_id": reconcile_review_id,
+            },
+            headers={"X-CSRF-Token": csrf},
+            follow_redirects=False,
+        )
+        assert applied.status_code == 303
+        assert {row.item_id: row.state for row in queue.items(project_id="existing")} == {
+            "T1": "done",
+            "T2": "pending",
+        }
+        project = queue.get_project("existing")
+        assert project is not None
+        assert project.repo == "owner/repository"
+        assert project.checks == ["pytest -q"]
+        assert project.max_workers == 3
+
+        replay = client.post(
+            "/ui/actions/adoption/reconcile/apply",
+            data={
+                "csrf_token": csrf,
+                "project_id": "existing",
+                "review_id": reconcile_review_id,
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert replay.status_code == 409
+        assert len(queue.items(project_id="existing")) == 2
+        events = [json.loads(row["data"]) for row in audit.recent(limit=50)]
+        assert any(
+            row.get("action") == "adoption_reconcile"
+            and row.get("operator") == "operator"
+            and row.get("reason") == "bring pending work into the queue"
+            for row in events
+        )
+        assert any(
+            row.get("action") == "adoption_reconcile"
+            and row.get("reason_kind") == "invalid_or_expired_review"
+            for row in events
+        )
+
+
+def test_adoption_reconciliation_refuses_plan_drift_before_mutation(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    plan = repository / "PLAN.md"
+    plan.write_text("# Existing\n\n- [ ] T1: First\n\nbrief\n")
+    store = EventStore(tmp_path / "events.sqlite")
+    audit = AuditStore(tmp_path / "audit.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(
+        Project(
+            project_id="existing",
+            name="Existing",
+            work_dir=str(repository),
+            plan_path=str(plan),
+        )
+    )
+    with TestClient(
+        create_api(
+            store,
+            queue=queue,
+            audit=audit,
+            token=TOKEN,
+            adoption_branches=lambda _repo: [],
+        )
+    ) as client:
+        login(client)
+        page = client.get("/plans?project_id=existing")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        client.post(
+            "/ui/actions/adoption/inspect",
+            data={"csrf_token": csrf, "project_id": "existing"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        report = client.get("/api/adoption/existing", headers={"Authorization": f"Bearer {TOKEN}"})
+        digest = report.json()["digest"]
+        client.post(
+            "/api/adoption/existing/decision",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            json={
+                "decision": "approve",
+                "approved_drops": [],
+                "reason": "reviewed",
+                "expected_digest": digest,
+            },
+        )
+        reviewed = client.post(
+            "/ui/actions/adoption/reconcile/review",
+            data={"csrf_token": csrf, "project_id": "existing", "reason": "adopt it"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        review_id = reviewed.text.split('name="review_id" value="', 1)[1].split('"', 1)[0]
+        plan.write_text("# Existing\n\n- [ ] T1: Changed\n\na different brief\n")
+        refused = client.post(
+            "/ui/actions/adoption/reconcile/apply",
+            data={"csrf_token": csrf, "project_id": "existing", "review_id": review_id},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert refused.status_code == 409
+        assert queue.items(project_id="existing") == []
+        events = [json.loads(row["data"]) for row in audit.recent(limit=50)]
+        assert any(
+            row.get("action") == "adoption_reconcile"
+            and row.get("reason_kind") == "adoption_inputs_changed"
+            for row in events
+        )
+
+
+def test_adoption_reconciliation_reports_a_partial_external_failure(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    plan = repository / "PLAN.md"
+    plan.write_text("# Existing\n\n- [ ] T1: First\n\nbrief\n")
+    store = EventStore(tmp_path / "events.sqlite")
+    audit = AuditStore(tmp_path / "audit.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(
+        Project(
+            project_id="existing",
+            name="Existing",
+            repo="owner/repository",
+            work_dir=str(repository),
+            plan_path=str(plan),
+        )
+    )
+    runner = StatefulGitHubRunner()
+    runner.issues = json.dumps(
+        [
+            {
+                "number": 7,
+                "title": "First",
+                "body": "This is T1 and deliberately has no harness marker.",
+                "state": "CLOSED",
+                "url": "https://github.example/owner/repository/issues/7",
+            }
+        ]
+    )
+    with TestClient(
+        create_api(
+            store,
+            queue=queue,
+            audit=audit,
+            token=TOKEN,
+            github_factory=lambda repo: GitHub(repo, runner),
+            adoption_branches=lambda _repo: [],
+        )
+    ) as client:
+        login(client)
+        page = client.get("/plans?project_id=existing")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        inspected = client.post(
+            "/ui/actions/adoption/inspect",
+            data={"csrf_token": csrf, "project_id": "existing", "inspect_remote": "yes"},
+            headers={"X-CSRF-Token": csrf},
+            follow_redirects=False,
+        )
+        assert inspected.status_code == 303
+        proposal = client.get(
+            "/api/adoption/existing", headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+        payload = proposal.json()
+        assert payload["proposed_drops"] == ["T1"]
+        approved = client.post(
+            "/api/adoption/existing/decision",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            json={
+                "decision": "approve",
+                "approved_drops": ["T1"],
+                "reason": "confirmed closed issue",
+                "expected_digest": payload["digest"],
+            },
+        )
+        assert approved.status_code == 200
+        reviewed = client.post(
+            "/ui/actions/adoption/reconcile/review",
+            data={"csrf_token": csrf, "project_id": "existing", "reason": "adopt it"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert reviewed.status_code == 200
+        review_id = reviewed.text.split('name="review_id" value="', 1)[1].split('"', 1)[0]
+        runner.fail_writes = True
+        failed = client.post(
+            "/ui/actions/adoption/reconcile/apply",
+            data={"csrf_token": csrf, "project_id": "existing", "review_id": review_id},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert failed.status_code == 502
+        assert "may already have landed" in failed.text
+        assert "remote rejected" not in failed.text
+        landed = queue.get("T1", project_id="existing")
+        assert landed is not None and landed.state == "done"
+        current = client.get("/api/adoption/existing", headers={"Authorization": f"Bearer {TOKEN}"})
+        assert current.json()["state"] == "approved"
+        events = [json.loads(row["data"]) for row in audit.recent(limit=50)]
+        assert any(
+            row.get("action") == "adoption_reconcile"
+            and row.get("reason_kind") == "external_reconcile_failed_may_be_partial"
+            for row in events
+        )
 
 
 def test_login_cookie_is_opaque_and_pages_are_read_only(tmp_path: Path) -> None:

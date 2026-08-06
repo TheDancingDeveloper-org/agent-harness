@@ -23,6 +23,17 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
+from .adoption_service import (
+    AdoptionConfigurationError,
+    AdoptionInspectionFailure,
+    AdoptionReconciliationFailure,
+    adoption_event_sink,
+    fresh_report,
+    inspect_project,
+    reconcile_project,
+    report_model,
+    resolve_adoption,
+)
 from .audit import AuditStore
 from .audit_service import maintain_audit, reconcile_repository
 from .browser_session import BrowserSession, BrowserSessions
@@ -50,6 +61,7 @@ from .routing_service import (
     stored_role_map,
 )
 from .schemas import (
+    AdoptionReportModel,
     BaseCheckStatus,
     PlanSyncResult,
     PreflightCheck,
@@ -203,6 +215,39 @@ def install_ui(app: FastAPI) -> BrowserSessions:
 
         return GitHub(repo)
 
+    def adoption_context(request: Request, project_id: str, *, inspect_remote: bool) -> Any:
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        sink = request.app.state.audit or request.app.state.store
+        kwargs: dict[str, Any] = {
+            "github_factory": request.app.state.github_factory,
+            "inspect_remote": inspect_remote,
+            "on_event": adoption_event_sink(sink, source="browser-adoption"),
+        }
+        if request.app.state.adoption_branches is not None:
+            kwargs["branches"] = request.app.state.adoption_branches
+        try:
+            return resolve_adoption(queue, project_id, **kwargs)
+        except AdoptionConfigurationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def adoption_report(
+        request: Request, project_id: str, *, required: bool = False
+    ) -> AdoptionReportModel | None:
+        context = adoption_context(request, project_id, inspect_remote=False)
+        try:
+            report = context.adopter.load(project_id)
+        except ValueError as exc:
+            if required:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            return None
+        return report_model(
+            report,
+            redact=(request.app.state.audit or request.app.state.store).redact,
+            parsed=context.plan,
+        )
+
     def plans_context(
         request: Request,
         project_id: str | None,
@@ -219,6 +264,11 @@ def install_ui(app: FastAPI) -> BrowserSessions:
         selected_summary = query.project(selected) if selected else None
         plan_path = selected_summary.project.plan_path if selected_summary else None
         repo = selected_summary.project.repo if selected_summary else None
+        adoption_available = bool(
+            selected_summary
+            and selected_summary.project.plan_path
+            and selected_summary.project.work_dir
+        )
         return {
             "projects": projects,
             "project_id": selected,
@@ -226,9 +276,13 @@ def install_ui(app: FastAPI) -> BrowserSessions:
             "plan_markdown": query.inception_plan(selected, selected) if selected else None,
             "plan_path": plan_path,
             "repo": repo,
+            "adoption_available": adoption_available,
             "parse_result": query.plan_parse(plan_path) if plan_path else None,
             "sync_preview": sync_preview,
             "sync_error": sync_error,
+            "adoption": (
+                adoption_report(request, selected) if selected and adoption_available else None
+            ),
         }
 
     def optional(value: str) -> str | None:
@@ -1357,6 +1411,317 @@ def install_ui(app: FastAPI) -> BrowserSessions:
         return RedirectResponse(
             url=str(request.url_for("plans")) + f"?project_id={project_id}", status_code=303
         )
+
+    @app.post(
+        "/ui/actions/adoption/inspect",
+        name="adoption_inspect_action",
+        include_in_schema=False,
+    )
+    async def adoption_inspect_action(request: Request) -> RedirectResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        context = adoption_context(
+            request, project_id, inspect_remote=body.get("inspect_remote") == "yes"
+        )
+        try:
+            report = inspect_project(context)
+        except AdoptionInspectionFailure as exc:
+            refusal_audit(
+                request,
+                action="adoption_inspect",
+                reason_kind="remote_inspection_failed",
+                data={"project_id": project_id},
+            )
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        action_audit(
+            request,
+            action="adoption_inspect",
+            outcome="operator_inspected_adoption",
+            data={
+                "project_id": project_id,
+                "digest": report.content_digest(),
+                "inspect_remote": context.inspect_remote,
+                "proposed_drops": report.proposed_drops(),
+            },
+        )
+        return project_redirect(request, project_id)
+
+    @app.post(
+        "/ui/actions/adoption/decision/review",
+        name="adoption_decision_review",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    async def adoption_decision_review(request: Request) -> HTMLResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        decision = body.get("decision", "").strip()
+        reason = body.get("reason", "").strip()
+        if decision not in {"approve", "reject", "revise"}:
+            raise HTTPException(status_code=422, detail="choose approve, reject or revise")
+        if not reason:
+            raise HTTPException(status_code=422, detail="an adoption decision reason is required")
+        report = adoption_report(request, project_id, required=True)
+        assert report is not None
+        approved_drops = sorted(
+            key.removeprefix("approve_drop:")
+            for key, value in body.items()
+            if key.startswith("approve_drop:") and value == "yes"
+        )
+        if decision != "approve" and approved_drops:
+            raise HTTPException(status_code=422, detail="reject/revise cannot approve item drops")
+        unknown = sorted(set(approved_drops) - set(report.proposed_drops))
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail=f"cannot approve unproposed drops: {', '.join(unknown)}",
+            )
+        review = sessions.create_review(
+            session,
+            kind="adoption_decision",
+            target_id=project_id,
+            baseline_digest=report.digest,
+            baseline_version=0.0,
+            payload={
+                "decision": decision,
+                "reason": reason,
+                "approved_drops": approved_drops,
+            },
+        )
+        return render(
+            request,
+            "adoption_decision_review.html",
+            title="Review adoption decision",
+            project_id=project_id,
+            report=report,
+            review=review,
+            decision=decision,
+            reason=reason,
+            approved_drops=approved_drops,
+        )
+
+    @app.post(
+        "/ui/actions/adoption/decision/apply",
+        name="adoption_decision_apply",
+        include_in_schema=False,
+    )
+    async def adoption_decision_apply(request: Request) -> RedirectResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        try:
+            review = sessions.consume_review(
+                session,
+                body.get("review_id", ""),
+                kind="adoption_decision",
+                target_id=project_id,
+            )
+        except HTTPException:
+            refusal_audit(
+                request,
+                action="adoption_decision",
+                reason_kind="invalid_or_expired_review",
+                data={"project_id": project_id},
+            )
+            raise
+        context = adoption_context(request, project_id, inspect_remote=False)
+        report = context.adopter.load(project_id)
+        if not secrets.compare_digest(report.content_digest(), review.baseline_digest):
+            refusal_audit(
+                request,
+                action="adoption_decision",
+                reason_kind="adoption_findings_changed",
+                data={"project_id": project_id},
+            )
+            raise HTTPException(status_code=409, detail="adoption findings changed after review")
+        decision = review.payload.get("decision")
+        reason = review.payload.get("reason")
+        approved_drops = review.payload.get("approved_drops")
+        if (
+            decision not in {"approve", "reject", "revise"}
+            or not isinstance(reason, str)
+            or not reason
+            or not isinstance(approved_drops, list)
+            or not all(isinstance(value, str) for value in approved_drops)
+        ):
+            raise HTTPException(status_code=409, detail="adoption decision review is invalid")
+        try:
+            if decision == "approve":
+                report = context.adopter.approve(
+                    project_id, approved_drops=approved_drops, reason=reason
+                )
+            else:
+                report = context.adopter.reject(
+                    project_id, reason=reason, revise=decision == "revise"
+                )
+        except ValueError as exc:
+            refusal_audit(
+                request,
+                action="adoption_decision",
+                reason_kind="adoption_decision_refused",
+                data={"project_id": project_id, "detail": str(exc)},
+            )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        action_audit(
+            request,
+            action="adoption_decision",
+            outcome=f"operator_adoption_{decision}",
+            data={
+                "project_id": project_id,
+                "reason": reason,
+                "approved_drops": report.approved_drops,
+                "digest": report.content_digest(),
+            },
+        )
+        return project_redirect(request, project_id)
+
+    @app.post(
+        "/ui/actions/adoption/reconcile/review",
+        name="adoption_reconcile_review",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    async def adoption_reconcile_review(request: Request) -> HTMLResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        reason = body.get("reason", "").strip()
+        if not reason:
+            raise HTTPException(status_code=422, detail="a reconciliation reason is required")
+        context = adoption_context(request, project_id, inspect_remote=False)
+        report = context.adopter.load(project_id)
+        if report.state != "approved":
+            raise HTTPException(status_code=409, detail="adoption proposal is not approved")
+        public = report_model(
+            report,
+            redact=(request.app.state.audit or request.app.state.store).redact,
+            parsed=context.plan,
+        )
+        preview = reconcile_project(context, dry_run=True)
+        review = sessions.create_review(
+            session,
+            kind="adoption_reconcile",
+            target_id=project_id,
+            baseline_digest=report.content_digest(),
+            baseline_version=0.0,
+            payload={
+                "reason": reason,
+                "approved_drops": list(report.approved_drops),
+                "inspect_remote": report.inspect_remote,
+                "input_digest": report.input_digest,
+            },
+        )
+        return render(
+            request,
+            "adoption_reconcile_review.html",
+            title="Review adoption reconciliation",
+            project_id=project_id,
+            report=public,
+            preview=preview,
+            review=review,
+            reason=reason,
+        )
+
+    @app.post(
+        "/ui/actions/adoption/reconcile/apply",
+        name="adoption_reconcile_apply",
+        include_in_schema=False,
+    )
+    async def adoption_reconcile_apply(request: Request) -> RedirectResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        try:
+            review = sessions.consume_review(
+                session,
+                body.get("review_id", ""),
+                kind="adoption_reconcile",
+                target_id=project_id,
+            )
+        except HTTPException:
+            refusal_audit(
+                request,
+                action="adoption_reconcile",
+                reason_kind="invalid_or_expired_review",
+                data={"project_id": project_id},
+            )
+            raise
+        reason = review.payload.get("reason")
+        approved_drops = review.payload.get("approved_drops")
+        inspect_remote = review.payload.get("inspect_remote")
+        if (
+            not isinstance(reason, str)
+            or not reason
+            or not isinstance(approved_drops, list)
+            or not all(isinstance(value, str) for value in approved_drops)
+            or not isinstance(inspect_remote, bool)
+        ):
+            raise HTTPException(status_code=409, detail="adoption reconciliation review is invalid")
+        context = adoption_context(request, project_id, inspect_remote=inspect_remote)
+        report = context.adopter.load(project_id)
+        try:
+            fresh = fresh_report(context)
+        except AdoptionInspectionFailure as exc:
+            refusal_audit(
+                request,
+                action="adoption_reconcile",
+                reason_kind="remote_reinspection_failed",
+                data={"project_id": project_id},
+            )
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if (
+            report.state != "approved"
+            or not secrets.compare_digest(report.content_digest(), review.baseline_digest)
+            or not secrets.compare_digest(fresh.content_digest(), review.baseline_digest)
+            or sorted(report.approved_drops) != sorted(approved_drops)
+        ):
+            refusal_audit(
+                request,
+                action="adoption_reconcile",
+                reason_kind="adoption_inputs_changed",
+                data={"project_id": project_id},
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="adoption inputs, evidence or approved drops changed after review",
+            )
+        try:
+            report = reconcile_project(context)
+        except ValueError as exc:
+            refusal_audit(
+                request,
+                action="adoption_reconcile",
+                reason_kind="adoption_reconcile_refused",
+                data={"project_id": project_id, "detail": str(exc)},
+            )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except AdoptionReconciliationFailure as exc:
+            refusal_audit(
+                request,
+                action="adoption_reconcile",
+                reason_kind="external_reconcile_failed_may_be_partial",
+                data={"project_id": project_id},
+            )
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        action_audit(
+            request,
+            action="adoption_reconcile",
+            outcome="operator_reconciled_adoption",
+            data={
+                "project_id": project_id,
+                "reason": reason,
+                "approved_drops": report.approved_drops,
+                "items": len(report.items),
+            },
+        )
+        return project_redirect(request, project_id)
 
     @app.get("/graph", name="graph", response_class=HTMLResponse, include_in_schema=False)
     def graph_page(request: Request, project_id: str | None = None) -> HTMLResponse:

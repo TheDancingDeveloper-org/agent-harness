@@ -4,6 +4,9 @@
 **Scope:** local fixture repositories only; no provider, GitHub, AIDevEnv,
 session-host or CLI-agent process was contacted.
 
+**Implementation commit:** `aabdfdb` (`Add metadata-selected implementer role
+runner`). This is a local commit only; nothing was pushed or published.
+
 This package records the exit evidence for Stage 1 in
 [`docs/STATUS.md`](../STATUS.md). It is deliberately not a real-workload
 acceptance record. Stage 2 (OS-enforced confinement) is still required before a

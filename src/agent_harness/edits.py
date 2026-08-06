@@ -324,13 +324,41 @@ def plan_edits(root: Path, edits: list[Edit]) -> dict[str, tuple[str, str]]:
     return by_path
 
 
+#: What a unified diff says about a file whose last line has no newline.
+NO_NEWLINE = "\\ No newline at end of file\n"
+
+
+def _line_ending(target: Path) -> str:
+    r"""How this file separates its lines, as it is stored on disk.
+
+    Everything above works in `\n`, because `read_text` translates on the way
+    in and a model writes `\n` whatever the file does. That normalisation is
+    what lets a SEARCH block match a CRLF file at all — but the *diff* goes to
+    `git apply`, which compares bytes. A CRLF file edited through an LF diff
+    is refused with `patch does not apply`, on an edit that had already
+    matched: an item lost to a line ending, with nothing the model could have
+    done differently and no rung of the ladder able to rescue it.
+    """
+    try:
+        with target.open(encoding="utf-8", newline="") as handle:
+            return "\r\n" if "\r\n" in handle.read() else "\n"
+    except (OSError, UnicodeDecodeError):
+        return "\n"
+
+
+def _as_stored(text: str, ending: str) -> str:
+    return text if ending == "\n" else text.replace("\n", ending)
+
+
 def apply_edits(root: Path, edits: list[Edit]) -> list[str]:
     """Apply every edit, or none of them. Returns the paths changed."""
     planned = plan_edits(root, edits)
     for path, (_, after) in planned.items():
         target = _resolve(root, path)
+        ending = _line_ending(target)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(after)
+        with target.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(_as_stored(after, ending))
     return list(planned)
 
 
@@ -345,6 +373,13 @@ def to_diff(root: Path, edits: list[Edit]) -> str:
     exactly as it was -- the patch validator, the apply ladder, the checks, the
     reviewer and the commit all still see a diff, and none of them needs to
     learn a second way for changes to arrive.
+
+    Which puts the whole weight on the rendering being exactly right, because
+    `git apply` compares bytes and no rung of the ladder can rescue a patch
+    that is wrong about the file. Three things are therefore read off the file
+    on disk rather than assumed: how it ends its lines, whether it exists at
+    all, and whether it ends in a newline. Each of those, got wrong, refused a
+    valid edit and cost the item.
     """
     import difflib
 
@@ -352,15 +387,30 @@ def to_diff(root: Path, edits: list[Edit]) -> str:
     for path, (before, after) in plan_edits(root, edits).items():
         if before == after:
             continue
-        out.extend(
-            difflib.unified_diff(
-                before.splitlines(keepends=True),
-                after.splitlines(keepends=True),
-                fromfile=f"a/{path}" if before else "/dev/null",
-                tofile=f"b/{path}",
-                n=3,
-            )
+        target = _resolve(root, path)
+        exists = target.exists()
+        ending = _line_ending(target) if exists else "\n"
+        rendered = difflib.unified_diff(
+            _as_stored(before, ending).splitlines(keepends=True),
+            _as_stored(after, ending).splitlines(keepends=True),
+            # Whether the file EXISTS, not whether it has anything in it. An
+            # empty `__init__.py` is a file, and a patch calling it
+            # `/dev/null` is refused with `already exists in working
+            # directory` -- while `plan_edits` above deliberately allows an
+            # empty SEARCH against exactly that file.
+            fromfile=f"a/{path}" if exists else "/dev/null",
+            tofile=f"b/{path}",
+            n=3,
         )
-        if out and not out[-1].endswith("\n"):
-            out.append("\n")
+        for line in rendered:
+            if line.endswith(("\n", "\r")):
+                out.append(line)
+                continue
+            # A last line with no newline. `difflib` says so by emitting a
+            # line that does not end in one, which runs together with whatever
+            # follows: `-beta` and `+gamma` arrive as `-beta+gamma`, and git
+            # reports `corrupt patch`. The marker below is how a diff says it
+            # properly.
+            out.append(line + "\n")
+            out.append(NO_NEWLINE)
     return "".join(out)

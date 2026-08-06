@@ -1,6 +1,61 @@
 {% extends "base.html" %}
 {% block content %}
-  <div class="page-heading"><div><p class="eyebrow">Operational telemetry</p><h1>Analytics</h1></div>{% if audit_health.degraded %}<span class="state state-failed">Audit degraded</span>{% else %}<span class="state state-done">Audit recording</span>{% endif %}</div>
-  {% if audit_health.degraded %}<p class="alert error">History is degraded or unavailable. Counts below are not evidence of complete history.</p>{% endif %}
-  <div class="analytics-grid"><section class="card"><h2>Rate limits</h2><p class="muted">Known classes only; historical unclassified limits remain separate.</p><table><thead><tr><th>Class</th><th>Count</th></tr></thead><tbody>{% for key, count in rate_limits.items() %}<tr><td>{{ key }}</td><td>{{ count }}</td></tr>{% else %}<tr><td colspan="2">No classified rate limits</td></tr>{% endfor %}</tbody></table></section><section class="card"><h2>Cost</h2><table><thead><tr><th>Project / role / model</th><th>Known USD</th><th>Unpriced</th></tr></thead><tbody>{% for row in costs %}<tr><td>{{ row.project_id or '—' }} / {{ row.role or '—' }} / {{ row.model or '—' }}</td><td>{{ row.cost_usd if row.cost_usd is not none else 'unknown' }}</td><td>{{ row.unpriced }}</td></tr>{% else %}<tr><td colspan="3">No cost evidence</td></tr>{% endfor %}</tbody></table></section><section class="card"><h2>Delivery</h2><table><thead><tr><th>Project / outcome</th><th>Events</th><th>Items</th></tr></thead><tbody>{% for row in delivery %}<tr><td>{{ row.project_id or '—' }} / {{ row.outcome or '—' }}</td><td>{{ row.n }}</td><td>{{ row.items }}</td></tr>{% else %}<tr><td colspan="3">No delivery evidence</td></tr>{% endfor %}</tbody></table></section></div>
+  <div class="page-heading">
+    <div><p class="eyebrow">Operational telemetry</p><h1>Analytics</h1></div>
+    {% if dashboard.audit_health.degraded %}<span class="state state-failed">Audit degraded</span>{% else %}<span class="state state-done">Audit recording</span>{% endif %}
+  </div>
+
+  <form class="card filterbar" method="get" action="{{ url_for('analytics') }}">
+    <label>Window
+      <select name="window">
+        {% for option in ["1h", "24h", "72h", "7d", "all"] %}<option value="{{ option }}" {% if dashboard.window == option %}selected{% endif %}>{{ option }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Project (optional)<input name="project_id" value="{{ dashboard.project_id or '' }}" placeholder="all projects"></label>
+    <button type="submit">Refresh</button>
+  </form>
+
+  {% if dashboard.audit_health.degraded %}
+    <p class="alert error">History is missing, degraded, or unavailable. Counts below are not evidence of complete history.</p>
+  {% endif %}
+  {% if dashboard.cost.partial or dashboard.delivery.partial %}
+    <p class="alert error">The selected {{ dashboard.window }} window begins before retained history (oldest event: {{ dashboard.audit_health.oldest|datetime if dashboard.audit_health.oldest else 'unknown' }}). Results are partial.</p>
+  {% endif %}
+
+  <div class="analytics-grid">
+    <section class="card">
+      <h2>Rate limits</h2>
+      <p class="muted">Denominator: {{ dashboard.rate_limits.denominator }} observed rate-limit rows. Unclassified remains separate.</p>
+      <table><thead><tr><th>Class</th><th>Count</th><th>Meaning</th></tr></thead><tbody>
+        {% for key in ["rpm", "window_cap", "terminal_cap"] %}<tr><td>{{ key }}</td><td>{{ dashboard.rate_limits.classified[key] }}</td><td>{{ dashboard.rate_limits.meaning[key] }}</td></tr>{% endfor %}
+        <tr><td>unclassified</td><td>{{ dashboard.rate_limits.unclassified }}</td><td>Recorded before classification; excluded from known classes.</td></tr>
+      </tbody></table>
+      {% if dashboard.baselines.baselines %}<p class="small muted">Supplied baselines: {{ dashboard.baselines.baselines|length }}. Compare only with the matching workload and window.</p>{% else %}<p class="small muted">No supplied baseline is recorded.</p>{% endif %}
+    </section>
+
+    <section class="card">
+      <h2>Cost</h2>
+      <p class="muted">Denominator: {{ dashboard.cost.denominator }} model calls. Known spend excludes {{ dashboard.cost.total_unpriced }} unpriced calls.</p>
+      <p><strong>Known total:</strong> {% if dashboard.cost.total_cost_usd is none %}unknown{% else %}${{ '%.4f'|format(dashboard.cost.total_cost_usd) }}{% endif %}</p>
+      <table><thead><tr><th>Project / role / model</th><th>Known USD</th><th>Calls</th><th>Unpriced</th></tr></thead><tbody>
+        {% for row in dashboard.cost.rows %}<tr><td>{{ row.project_id or '—' }} / {{ row.role or '—' }} / {{ row.model or '—' }}</td><td>{{ row.cost_usd if row.cost_usd is not none else 'unknown' }}</td><td>{{ row.calls }}</td><td>{{ row.unpriced }}</td></tr>{% else %}<tr><td colspan="4">No cost evidence</td></tr>{% endfor %}
+      </tbody></table>
+    </section>
+
+    <section class="card">
+      <h2>Delivery</h2>
+      <p class="muted">Denominator: {{ dashboard.delivery.denominator }} distinct work items. Outcome event counts may overlap.</p>
+      <table><thead><tr><th>Project / outcome</th><th>Events</th><th>Items</th></tr></thead><tbody>
+        {% for row in dashboard.delivery.rows %}<tr><td>{{ row.project_id or '—' }} / {{ row.outcome or '—' }}</td><td>{{ row.n }}</td><td>{{ row.items }}</td></tr>{% else %}<tr><td colspan="3">No delivery evidence</td></tr>{% endfor %}
+      </tbody></table>
+      <p class="small muted">Merged, closed-unmerged, and reverted outcomes appear only after reconciliation records them.</p>
+    </section>
+
+    <section class="card">
+      <h2>Audit history</h2>
+      <dl class="facts"><div><dt>Stored events</dt><dd>{{ dashboard.audit_health.events }}</dd></div><div><dt>Schema</dt><dd>{{ dashboard.audit_health.schema_version or '—' }}</dd></div><div><dt>Oldest</dt><dd>{{ dashboard.audit_health.oldest|datetime if dashboard.audit_health.oldest else '—' }}</dd></div><div><dt>Newest</dt><dd>{{ dashboard.audit_health.newest|datetime if dashboard.audit_health.newest else '—' }}</dd></div></dl>
+      <p class="muted">Daily rollups through {{ dashboard.rollups.rolled_up_through or 'no published day' }}. {{ dashboard.rollups.rows|length }} retained rollup rows.</p>
+      {% if dashboard.baselines.baselines %}<table><thead><tr><th>Baseline</th><th>Window</th><th>Items done</th><th>Cost</th></tr></thead><tbody>{% for baseline in dashboard.baselines.baselines %}<tr><td>{{ baseline.label }} <span class="mono">({{ baseline.baseline_id }})</span></td><td>{{ baseline.window_days }}d</td><td>{{ baseline.items_done if baseline.items_done is not none else 'unknown' }}</td><td>{{ baseline.cost_usd if baseline.cost_usd is not none else 'unknown' }}</td></tr>{% endfor %}</tbody></table>{% endif %}
+    </section>
+  </div>
 {% endblock %}

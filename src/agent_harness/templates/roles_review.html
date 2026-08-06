@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+  <p class="breadcrumb"><a href="{{ url_for('settings') }}">Settings</a> / Review role routing</p>
+  <div class="page-heading"><div><p class="eyebrow">Explicit confirmation</p><h1>Review role routing</h1></div><span class="mode-badge">No changes applied</span></div>
+  <section class="alert warning" role="status"><strong>This changes live routing.</strong> The replacement takes effect on the next model call. It does not pause workers or rewrite project overrides.</section>
+  <section class="card">
+    <h2>Resolved replacement</h2>
+    <p class="alert {{ 'warning' if not routes.reviewer_independent else 'success' }}"><strong>Reviewer independence:</strong> {{ routes.reviewer_note }}</p>
+    {% if role_rows %}<div class="table-scroll"><table><thead><tr><th>Role</th><th>Fallback order</th><th>Endpoint</th><th>Preset / classifier</th><th>Price reference</th><th>Executor use</th></tr></thead><tbody>{% for route in role_rows %}<tr><th>{{ route.name }}</th><td>{{ route.models|join(' → ') }}</td><td><code>{{ route.endpoint }}</code></td><td>{{ route.preset or 'deployment default' }} / {{ route.provider }}</td><td>{{ route.price_ref or 'model id' }}</td><td>{% if route.used %}Used{% else %}<span class="warning">Unused: {{ route.unused_reason }}</span>{% endif %}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p>This replacement removes every global role route.</p>{% endif %}
+  </section>
+  <section class="card">
+    <form method="post" action="{{ url_for('roles_apply') }}" data-csrf-form><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="review_id" value="{{ review.review_id }}"><button type="submit">Apply reviewed routing</button> <a class="button secondary" href="{{ url_for('settings') }}">Cancel</a></form>
+    <p class="muted small">This review is one-time and expires. A concurrent API or CLI routing change makes it stale instead of being overwritten.</p>
+  </section>
+{% endblock %}

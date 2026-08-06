@@ -7,6 +7,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request
@@ -21,6 +22,20 @@ class BrowserSession:
     token_fingerprint: str
 
 
+@dataclass(frozen=True)
+class BrowserReview:
+    """One exact, short-lived browser action awaiting explicit confirmation."""
+
+    review_id: str
+    session_id: str
+    kind: str
+    target_id: str
+    baseline_digest: str
+    baseline_version: float
+    payload: dict[str, Any]
+    expires_at: float
+
+
 class BrowserSessions:
     """Process-local bounded sessions.
 
@@ -30,12 +45,22 @@ class BrowserSessions:
     store later without changing the browser contract.
     """
 
-    def __init__(self, *, ttl_seconds: int = 8 * 60 * 60, max_sessions: int = 256) -> None:
-        if ttl_seconds <= 0 or max_sessions <= 0:
+    def __init__(
+        self,
+        *,
+        ttl_seconds: int = 8 * 60 * 60,
+        max_sessions: int = 256,
+        review_ttl_seconds: int = 10 * 60,
+        max_reviews: int = 512,
+    ) -> None:
+        if ttl_seconds <= 0 or max_sessions <= 0 or review_ttl_seconds <= 0 or max_reviews <= 0:
             raise ValueError("session limits must be positive")
         self.ttl_seconds = ttl_seconds
         self.max_sessions = max_sessions
+        self.review_ttl_seconds = review_ttl_seconds
+        self.max_reviews = max_reviews
         self._sessions: dict[str, BrowserSession] = {}
+        self._reviews: dict[str, BrowserReview] = {}
         self._login_failures: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
 
@@ -90,6 +115,66 @@ class BrowserSessions:
         if session_id:
             with self._lock:
                 self._sessions.pop(session_id, None)
+                for review_id in [
+                    key for key, review in self._reviews.items() if review.session_id == session_id
+                ]:
+                    self._reviews.pop(review_id, None)
+
+    def create_review(
+        self,
+        session: BrowserSession,
+        *,
+        kind: str,
+        target_id: str,
+        baseline_digest: str,
+        baseline_version: float,
+        payload: dict[str, Any],
+        now: float | None = None,
+    ) -> BrowserReview:
+        moment = time.time() if now is None else now
+        review = BrowserReview(
+            review_id=secrets.token_urlsafe(32),
+            session_id=session.session_id,
+            kind=kind,
+            target_id=target_id,
+            baseline_digest=baseline_digest,
+            baseline_version=baseline_version,
+            payload=payload,
+            expires_at=moment + self.review_ttl_seconds,
+        )
+        with self._lock:
+            self._purge(moment)
+            if len(self._reviews) >= self.max_reviews:
+                oldest = min(self._reviews.values(), key=lambda item: item.expires_at)
+                self._reviews.pop(oldest.review_id, None)
+            self._reviews[review.review_id] = review
+        return review
+
+    def consume_review(
+        self,
+        session: BrowserSession,
+        review_id: str,
+        *,
+        kind: str,
+        target_id: str,
+        now: float | None = None,
+    ) -> BrowserReview:
+        """Consume one matching review; replay and cross-session use are refused."""
+        moment = time.time() if now is None else now
+        with self._lock:
+            self._purge(moment)
+            review = self._reviews.get(review_id)
+            if (
+                review is None
+                or review.session_id != session.session_id
+                or review.kind != kind
+                or review.target_id != target_id
+            ):
+                raise HTTPException(
+                    status_code=409, detail="configuration review is invalid or expired"
+                )
+            self._reviews.pop(review_id, None)
+        return review
 
     def require(self, request: Request) -> BrowserSession:
         session = self.get(request.cookies.get("harness_session"))
@@ -130,3 +215,6 @@ class BrowserSessions:
         expired = [key for key, value in self._sessions.items() if value.expires_at <= now]
         for key in expired:
             self._sessions.pop(key, None)
+        expired_reviews = [key for key, value in self._reviews.items() if value.expires_at <= now]
+        for key in expired_reviews:
+            self._reviews.pop(key, None)

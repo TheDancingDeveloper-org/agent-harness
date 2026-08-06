@@ -7,7 +7,7 @@
     <p class="muted">{{ entry.workers }} worker(s) active · {{ entry.stale }} stale lease(s) · {{ entry.worker_failures }} worker failure(s)</p>
     {% if entry.control.reason %}<p class="reason">{{ entry.control.reason }}</p>{% endif %}
     {% if entry.last_worker_error %}<p class="alert error">Latest worker failure: {{ entry.last_worker_error }}</p>{% endif %}
-    <p><a class="button secondary" href="{{ url_for('work_page') }}?project_id={{ entry.project.project_id|urlencode }}">Inspect work</a></p>
+    <p><a class="button secondary" href="{{ url_for('work_page') }}?project_id={{ entry.project.project_id|urlencode }}">Inspect work</a> <a class="button secondary" href="{{ url_for('preflight', project_id=entry.project.project_id) }}">Review preflight</a> <a class="button secondary" href="{{ url_for('project_configuration', project_id=entry.project.project_id) }}">Configure</a></p>
     <div class="action-row" aria-label="Project controls">
       {% for target in ['paused', 'draining', 'stopped'] %}
         <form method="post" action="{{ url_for('project_control_action') }}" data-csrf-form>

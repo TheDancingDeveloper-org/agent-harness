@@ -196,6 +196,15 @@ class EventStore:
         sql += f" GROUP BY {field}, error_class ORDER BY n DESC"
         return [dict(r) for r in self._connect().execute(sql, args)]
 
+    def rate_limit_denominator(self, since: float | None = None) -> int:
+        """All observed classified and unclassified rate-limit rows."""
+        sql = "SELECT COUNT(*) FROM events WHERE error_class IS NOT NULL"
+        args: list[Any] = []
+        if since is not None:
+            sql += " AND ts >= ?"
+            args.append(since)
+        return int(self._connect().execute(sql, args).fetchone()[0])
+
     def outcome_counts(self, kind: str | None = None, since: float | None = None) -> dict[str, int]:
         sql = "SELECT outcome, COUNT(*) AS n FROM events WHERE outcome IS NOT NULL"
         args: list[Any] = []

@@ -45,6 +45,12 @@
           {% if parse_result.dependency_cycles %}<h3>Cycles</h3><ul>{% for cycle in parse_result.dependency_cycles %}<li>{{ cycle|join(' → ') }}</li>{% endfor %}</ul>{% endif %}
           {% if parse_result.unattached_arrows %}<h3>Unattached dependency arrows</h3><ul>{% for finding in parse_result.unattached_arrows %}<li>{{ finding }}</li>{% endfor %}</ul>{% endif %}
         {% else %}<p class="alert warning">The configured plan file is missing or unreadable. Nothing was silently dropped.</p>{% endif %}
+        {% if repo and plan_path and project_id and parse_result and not parse_result.duplicate_ids and not parse_result.unresolved_dependencies and not parse_result.malformed_dependencies and not parse_result.dependency_cycles and not parse_result.unattached_arrows %}
+          <form method="post" action="{{ url_for('plan_sync_review') }}" data-csrf-form><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}"><button type="submit">Preview GitHub sync</button></form>
+        {% elif plan_path and not repo %}
+          <p class="alert warning">Configure a repository before previewing an external plan sync.</p>
+        {% endif %}
+        {% if sync_error %}<p class="alert error" role="alert">{{ sync_error }}</p>{% endif %}
       </section>
     {% endif %}
     {% if proposal %}

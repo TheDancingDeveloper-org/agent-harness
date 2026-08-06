@@ -5,7 +5,15 @@
   {% if not graph %}<section class="empty"><h2>No graph available</h2><p>Choose a configured project.</p></section>{% else %}
     <section class="card"><div class="card-heading"><div><p class="eyebrow">Admission</p><h2>Readiness</h2></div><span class="success">{{ graph.ready|length }} ready</span></div>
       {% if graph.cycles %}<div class="alert danger"><strong>Cycles block work.</strong><ul>{% for cycle in graph.cycles %}<li>{{ cycle|join(' → ') }}</li>{% endfor %}</ul></div>{% endif %}
-      {% if graph.not_ready %}<div class="list">{% for item in graph.not_ready %}<article class="card"><h3><a href="{{ url_for('work_item_page', item_id=item.item_id) }}?project_id={{ item.project_id }}">{{ item.item_id }}</a></h3><p>{{ item.explanation }}</p>{% if item.advisory %}<p class="muted">Advisory: {{ item.advisory|length }} edge(s)</p>{% endif %}</article>{% endfor %}</div>{% else %}<p class="muted">Every item is ready at this revision.</p>{% endif %}
+      {% if graph.ready %}<h3>Ready at revision {{ graph.revision }}</h3><ul>{% for item_id in graph.ready %}<li><a href="{{ url_for('work_item_page', item_id=item_id) }}?project_id={{ project_id }}">{{ item_id }}</a></li>{% endfor %}</ul>{% endif %}
+      {% if graph.not_ready %}<div class="list">{% for item in graph.not_ready %}<article class="card"><h3><a href="{{ url_for('work_item_page', item_id=item.item_id) }}?project_id={{ item.project_id }}">{{ item.item_id }}</a></h3><p>{{ item.explanation }}</p>{% if item.advisory %}<p class="muted">Advisory: {{ item.advisory|length }} edge(s)</p>{% endif %}
+        <form method="post" action="{{ url_for('dependency_override_action') }}" data-csrf-form>
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}"><input type="hidden" name="item_id" value="{{ item.item_id }}">
+          <label for="override-{{ item.item_id }}">Reason for admitting this blocked item</label><input id="override-{{ item.item_id }}" name="reason" required>
+          <button class="secondary" type="submit">Override at revision {{ graph.revision }}</button>
+        </form>
+      </article>{% endfor %}</div>{% else %}<p class="muted">Every item is ready at this revision.</p>{% endif %}
+      {% if overrides %}<h3>Recorded overrides</h3><div class="table-wrap"><table><thead><tr><th>Item</th><th>Revision</th><th>Operator</th><th>Reason</th></tr></thead><tbody>{% for override in overrides %}<tr><td>{{ override.item_id }}</td><td>{{ override.revision }}</td><td>{{ override.who or '—' }}</td><td>{{ override.reason }}</td></tr>{% endfor %}</tbody></table></div>{% endif %}
     </section>
     <section class="card"><h2>Edges</h2>{% if graph.edges %}<div class="table-wrap"><table><thead><tr><th>Waiting item</th><th>Target</th><th>Kind</th><th>State</th><th>Evidence</th></tr></thead><tbody>{% for edge in graph.edges %}<tr><td>{{ edge.source_item }}</td><td>{{ edge.target_id }}</td><td>{{ edge.target_kind }}</td><td>{{ edge.state }}{% if not edge.required %} (advisory){% endif %}</td><td>{{ edge.evidence }}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="muted">No dependency edges are declared.</p>{% endif %}</section>
   {% endif %}

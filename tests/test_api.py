@@ -13,8 +13,9 @@ from fastapi.testclient import TestClient
 
 from agent_harness.api import create_api
 from agent_harness.events import MODEL_CALL, UNCLASSIFIED, WORK, Event
+from agent_harness.fleet import WorkerSnapshot
 from agent_harness.store import EventStore
-from agent_harness.work import CLAIMED, DONE, PENDING, WorkQueue, WorkRecord
+from agent_harness.work import CLAIMED, DONE, PENDING, Project, WorkQueue, WorkRecord
 from conftest import make_queue
 
 TOKEN = "test-token"  # noqa: S105 - a fixture, not a credential
@@ -404,6 +405,65 @@ def test_an_empty_poll_keeps_the_cursor(client: TestClient) -> None:
     assert payload["cursor"] == 99
 
 
+def test_event_filters_scan_past_non_matching_rows_and_keep_stream_cursor(
+    client: TestClient, store: EventStore
+) -> None:
+    now = time.time()
+    store.append(
+        [
+            Event(ts=now, kind=WORK, source="s", outcome="other", data={"project_id": "p"}),
+            Event(
+                ts=now,
+                kind=WORK,
+                source="s",
+                outcome="wanted",
+                data={"project_id": "p", "reason_kind": "checks_failed"},
+            ),
+            Event(ts=now, kind=WORK, source="s", outcome="later", data={"project_id": "q"}),
+        ]
+    )
+    payload = client.get(
+        "/api/events?since_id=0&limit=1&project_id=p&reason_kind=checks_failed",
+        headers=auth(),
+    ).json()
+    assert [event["outcome"] for event in payload["events"]] == ["wanted"]
+    assert payload["cursor"] == 2
+
+
+def test_worker_inventory_is_explicitly_monitoring_only_without_fleet(
+    client: TestClient,
+) -> None:
+    payload = client.get("/api/workers", headers=auth()).json()
+    assert payload["configured"] is False
+    assert payload["mode"] == "monitoring-only"
+    assert payload["workers"] == []
+
+
+def test_worker_inventory_joins_live_identity_with_durable_claim(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "e.sqlite")
+    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    queue.add_project(Project(project_id="p", name="P"))
+    queue.add([WorkRecord(item_id="W1", title="First")], project_id="p")
+    queue.set_control("running", project_id="p")
+    assert queue.claim("owner", project_id="p") is not None
+
+    class FakeFleet:
+        def workers(self, project_id: str | None = None) -> list[WorkerSnapshot]:
+            assert project_id in (None, "p")
+            return [WorkerSnapshot("p", "harness-p-1", "owner", 100.0)]
+
+        def failures(self, project_id: str | None = None) -> list[Any]:
+            return []
+
+    with TestClient(create_api(store, queue=queue, token=TOKEN, fleet=FakeFleet())) as client:
+        payload = client.get("/api/workers?project_id=p", headers=auth()).json()
+    assert payload["configured"] is True
+    assert payload["mode"] == "supervised"
+    assert payload["workers"][0]["worker_id"] == "harness-p-1"
+    assert payload["workers"][0]["item_id"] == "W1"
+    assert payload["workers"][0]["claim_owner"] == "owner"
+
+
 # ---------------------------------------------------------------- summary
 
 
@@ -460,6 +520,8 @@ def test_the_schema_documents_response_shapes_not_empty_objects(
         ("/api/summary", "get"),
         ("/api/errors", "get"),
         ("/api/events", "get"),
+        ("/api/workers", "get"),
+        ("/api/analytics", "get"),
         ("/healthz", "get"),
     ]:
         content = schema["paths"][path][method]["responses"]["200"]["content"]
@@ -649,6 +711,59 @@ def test_the_role_map_can_be_read_and_changed(client: TestClient) -> None:
     stored = client.get("/api/roles", headers=auth()).json()["roles"]
     assert stored["implementer"]["model"] == "cheap"
     assert stored["reviewer"]["model"] == "other-vendor"
+
+
+def test_the_role_map_preserves_fallback_preset_and_pricing_fields(client: TestClient) -> None:
+    route = {
+        "models": ["preferred", "fallback"],
+        "endpoint": "https://models.example/v1",
+        "provider": "generic",
+        "preset": "chat-completions",
+        "price_ref": "priced-as-this",
+    }
+    response = client.put("/api/roles", headers=auth(), json={"roles": {"reviewer": route}})
+    assert response.status_code == 200
+    stored = client.get("/api/roles", headers=auth()).json()["roles"]["reviewer"]
+    assert stored["model"] == "preferred"
+    assert stored["models"] == ["preferred", "fallback"]
+    assert stored["preset"] == "chat-completions"
+    assert stored["price_ref"] == "priced-as-this"
+
+
+def test_json_and_browser_plan_sync_share_dependency_refusals(
+    tmp_path: Path, store: EventStore
+) -> None:
+    plan = tmp_path / "PLAN.md"
+    plan.write_text(
+        "# Plan\n\n### T1 — Cannot start\n\ndepends on: T404\n",
+        encoding="utf-8",
+    )
+    queue = WorkQueue(str(tmp_path / "sync.sqlite"))
+    queue.add_project(Project(project_id="p", name="P", repo="o/r", plan_path=str(plan)))
+    with TestClient(create_api(store, queue=queue, token=TOKEN)) as app_client:
+        response = app_client.post(
+            "/api/plan/sync",
+            headers=auth(),
+            json={"path": str(plan), "repo": "o/r", "dry_run": True},
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["unresolved_dependencies"] == {"T1": ["T404"]}
+
+        login = app_client.post(
+            "/login",
+            data={"token": TOKEN},
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        assert login.status_code == 200
+        page = app_client.get("/plans?project_id=p")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        browser = app_client.post(
+            "/ui/actions/plan-sync/review",
+            data={"csrf_token": csrf, "project_id": "p"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert browser.status_code == 409
+        assert "unresolved" in browser.text.lower()
 
 
 def test_the_role_map_persists_for_a_worker_in_another_process(

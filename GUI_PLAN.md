@@ -1,9 +1,115 @@
 # Agent Harness GUI Implementation Plan
 
-**Status:** Accepted product direction; implementation not started  
+**Status:** Accepted product direction; implementation in progress. Milestones 0–1 and
+substantial Milestones 2–3 slices are implemented, as are the Milestone 4 routing,
+worker-inventory, event-explorer and typed-analytics slices. Milestones 2–4 remain
+partial and Milestones 5–8 remain incomplete.
 **Plan date:** 2026-08-05  
 **Product boundary:** The GUI is built, packaged, served, tested, and documented entirely
 inside `agent-harness`.
+
+**Implementation tree:** branch `codex/gui-plan` at
+`/home/sprooty/Working/Active/apps/agent-harness-worktrees/gui-plan`. The browser control
+plane is implemented in `src/agent_harness/ui.py`, `query_service.py`,
+`browser_session.py`, `templates/`, and `static/`; its in-process journeys are in
+`tests/test_ui.py` and `tests/test_ui_packaging.py`. The current tree includes the GUI
+foundation commits `264294d` through `a245679` plus an uncommitted continuation containing
+the subsequent slices described below. Build and gate results are recorded in
+[`docs/evidence/2026-08-05-gui-milestone-0-1.md`](docs/evidence/2026-08-05-gui-milestone-0-1.md).
+
+This worktree is the implementation source of truth for this plan. The repository's
+default `main` checkout is not the GUI implementation tree.
+
+## 0. Current implementation status
+
+This section is the resume point as of 2026-08-06. Continue in this worktree; the default
+`main` checkout is not the implementation source of truth.
+
+At the start of this continuation, the branch head is `a245679`: four GUI commits ahead of
+the merge base and 18 commits behind `main` at `be7abe1`. The Milestone 2–4 continuation is
+still a dirty worktree, not a commit. Preserve and verify that continuation, checkpoint it,
+then integrate current `main` before treating later implementation or gate results as
+release evidence.
+
+### 0.1 Landed foundation
+
+The branch currently points at `a245679` and contains these GUI commits:
+
+1. `264294d feat: add self-contained browser control plane`
+2. `8b202a9 feat: add guarded browser control actions`
+3. `b759325 docs: record GUI gate evidence`
+4. `a245679 feat: add browser inception and graph reviews`
+
+Together they establish the in-repository GUI policy, packaged/authenticated shell,
+monitoring views, browser action bridge, item evidence, SSE stream, inception flow, plan
+parse review, and typed dependency graph.
+
+### 0.2 Implemented Milestones 2–4 slices
+
+The implementation now includes:
+
+1. project preflight and explicit base-check views;
+2. a project configuration editor using the public `ProjectSpec`, secret-safe rendering,
+   a server-held one-time review, and an atomic `updated_at` compare-and-set on apply;
+3. explicit, revision-scoped dependency overrides with authenticated reason and audit;
+4. shared project, plan and routing application services instead of duplicate HTML/API
+   behavior;
+5. a two-step plan-sync flow: parse and read-only GitHub preview, followed by a separate
+   apply bound to the exact plan bytes, persisted project target, and reviewed remote
+   counts, with refusal audit for local, project, remote-preview and GitHub failures;
+6. shared plan-sync finding gates for JSON and browser clients, including unresolved,
+   malformed, cyclic and unattached dependencies;
+7. a generic global role-routing editor using a one-time review and atomic setting
+   compare-and-set, complete `RoleRoute` field persistence, credential-safe endpoint
+   rendering, used/unused explanations and reviewer-independence warnings;
+8. a typed worker-pool inventory joining live runtime identities to durable claims,
+   leases, heartbeats, stage evidence, failures and project-scoped abandoned sessions,
+   while reporting monitoring-only deployments without inventing a registry;
+9. URL-backed event filters for project, item, worker, endpoint, role, model, outcome,
+   error class, reason kind and time, including filtered SSE resume on the same monotonic
+   cursor; and
+10. focused in-process journeys for replay, stale project/routing configuration, CSRF,
+   preview-without-write, plan mutation, remote preview drift and refused external writes.
+
+### 0.3 Current verification
+
+The complete implementation tree has the following evidence:
+
+| Check | Most recent result |
+|---|---|
+| `TMPDIR=/tmp/agent-harness-gui-resume.vVPDQ5 uv run pytest -q` | Passed at 100%, 1 skipped |
+| `uv run ruff check .` | Passed |
+| `uv run ruff format --check .` | Passed, 119 files checked |
+| `TMPDIR=/tmp/agent-harness-gui-resume-mypy.KCzFMT uv run mypy` | Passed, 114 source files |
+
+The full suite includes the wheel packaging and in-process browser journeys. Browser
+automation, accessibility tooling, a forced browser SSE reconnect, real GitHub concurrency,
+and real fleet/deployment journeys remain open; the in-process stateful GitHub double does
+not prove a transaction across remote preview and writes.
+
+### 0.4 Known limits
+
+1. GitHub has no transaction spanning the second preview and subsequent issue writes. The
+   service re-previews immediately before applying and refuses visible drift, but a remote
+   actor can still change the backlog between those operations.
+2. The role editor is global. Per-project route overrides remain available through project
+   configuration but do not yet have a specialized routing comparison view.
+3. Milestone 2 still lacks bulk-action review and notification delivery. Milestone 3 still
+   lacks the typed adoption HTTP/wizard flow and richer interactive graph controls.
+4. Milestone 4 rate-limit, cost, delivery, audit-health, worker inventory and filtered
+   event exploration are implemented as read-only typed views. Confirmed GitHub
+   reconciliation, audit-maintenance controls and process-log metrics remain incomplete.
+
+### 0.5 Exact next work
+
+First revalidate and checkpoint the uncommitted Milestone 2–4 continuation, then integrate
+the 18 newer `main` commits and rerun proportionate regression gates. Continue with
+Milestone 4.8–4.9 only from that reconciled base: add confirmed GitHub reconciliation and
+audit-maintenance reviews/actions, then expose session-independent process and gateway-log
+metrics through typed, redacted APIs. The analytics views now keep `rpm`, `window_cap`,
+`terminal_cap` and `unclassified` separate; show supplied baselines and denominators; keep
+known spend distinct from unpriced calls; and retain table evidence behind every summary.
+Do not mark Milestone 4 complete until every 4.1–4.9 acceptance requirement is evidenced.
 
 ## 1. Product decision
 
@@ -27,14 +133,16 @@ invariants, append-only event history, honest reporting, or settled decisions D1
 
 ### 1.2 Consequence for the repository
 
-The current tree still enforces the old ruling in `AGENTS.md`, `README.md`,
-`docs/ARCHITECTURE.md`, `docs/MULTI-PROJECT-PLAN.md`, `docs/USAGE.md`, CLI help, the
-`api.py` module documentation, and `tests/test_api.py`. Implementation must begin by
-changing those statements and replacing the test that asserts `/` is a 404.
+The policy-alignment work described here has landed in the implementation tree. The old
+host-owned GUI statements were replaced in `AGENTS.md`, `README.md`,
+`docs/ARCHITECTURE.md`, `docs/MULTI-PROJECT-PLAN.md`, `docs/USAGE.md`, deployment guidance,
+CLI help, the `api.py` module documentation, and API tests. The existing JSON API remains
+public and typed; the browser routes are an additional first-party client over the same
+FastAPI process and shared services.
 
-Until that policy-alignment change lands, GUI implementation is blocked by contradictory
-repository instructions. The first milestone resolves the contradiction explicitly rather
-than allowing code and policy to drift.
+The remaining milestones below are implementation work, not a prerequisite policy
+rewrite. Acceptance claims must continue to follow the evidence document and must not
+promote an unexercised slice to proven behavior.
 
 ### 1.3 Reference products
 
@@ -131,28 +239,28 @@ Each expensive or externally visible operation must have:
 
 ## 4. Current baseline and gaps
 
-The repository already contains most of the control-plane JSON contracts, but no browser
-application. The implementation should reuse these contracts and add only the missing
-capabilities.
+The implementation branch now contains the browser foundation and several guarded control
+slices. The remaining work must continue to reuse the typed JSON contracts and shared
+services rather than growing a second interpretation in HTML controllers.
 
 | Capability | Current state | Required work |
 |---|---|---|
-| Application shell | `/` deliberately returns 404 | Templates, packaged assets, navigation, login, error and reconnect states |
-| Work | List, detail, retry, block, answer, readiness, graph, and dependency override APIs exist | Board/detail views, filters, action forms, item-scoped event and attempt evidence |
-| Projects | List, create/update, detail, start, stop, preflight, base checks, readiness, and control APIs exist | Overview/configuration views; explicit per-project pause and drain contracts |
-| Holds | List and answer APIs exist | Inbox, structured answer form, expiry handling, notifications, verified operator attribution |
-| Events | Monotonic cursor APIs exist | SSE transport preserving cursor semantics, filtering, reconnect and polling fallback |
+| Application shell | Packaged templates/assets, browser sessions, CSRF, navigation and security headers are implemented | Rich error states, reconnect proof, browser/accessibility journeys |
+| Work | Board/detail, retry, block, hold answer, typed evidence, readiness, graph and dependency override paths exist | URL-backed filters/sorting, bulk review and remaining refusal journeys |
+| Projects | Overview, control actions, preflight/base-check view and reviewed configuration editor exist | Continue/force-start review and complete mutation/refusal parity |
+| Holds | Authenticated inbox and structured answer form exist | Draft preservation on expiry/mismatch and notifications |
+| Events | SSE over the monotonic cursor and event views exist | Forced reconnect/replay proof, richer filtering and polling fallback evidence |
 | Audit | Health, events, cost, delivery, rollups, baselines, maintenance, and reconcile APIs exist | Dashboards, confirmations, reason/operator audit for actions, missing breakdowns |
-| Plans | Inception and plan parse/sync APIs exist | Wizards, revision UI, dry-run review, adoption HTTP API |
+| Plans | Inception, question gates, generated preview, parse-loss report and uncommitted reviewed plan sync exist | Finish plan-sync review items above; adoption HTTP API and wizard |
 | Routing | Role map and route-health APIs exist | Editor, used/unused explanation, independence warnings, secret-safe validation |
 | Workers | Project summaries expose counts and failures | Worker/claim/lease/heartbeat/session inventory API |
 | Attempts and artifacts | Durable data exists in internal modules | Typed item-scoped API for attempts, stages, patches, diffs, and evidence links |
 | Sessions/chat/terminal | Agent-harness can use an optional external session-host protocol | New in-repository generic session subsystem; external-host behavior does not satisfy this plan |
 | Memory/skills/tools | No generic product APIs | New extension contracts and installed-metadata boundaries |
 | Scheduling/channels | No generic product APIs | New scheduler, trigger, notification, and channel contracts |
-| Identity/RBAC | Bearer token only; several actions accept caller-supplied `who` | Browser session auth, CSRF defense, authenticated operator identity, later RBAC |
+| Identity/RBAC | Bearer API plus bounded opaque browser sessions, CSRF and authenticated operator attribution | Later multi-user identity and RBAC |
 | Backup/restore | Operational documentation only | WAL-aware snapshot, validation, restore plan, and guarded UI workflow |
-| Policy | Repository forbids local HTML | Explicit policy and test reversal in Milestone 0 |
+| Policy | In-repository GUI ruling and route/test reversal landed | Keep generic-core, gate and append-only invariants enforced |
 
 ## 5. Technical architecture
 
@@ -334,7 +442,8 @@ must distinguish stale displayed data from current state.
 **Acceptance:** From a wheel-installed `agent-harness serve`, an authenticated operator can
 inspect every project and item, find every open hold, follow live events through a forced
 disconnect/reconnect, and diagnose fixture failures without MyDevEnv, a CDN, or direct
-database access. No GUI route can yet change harness state.
+database access. The current implementation has exercised these read paths; later browser,
+screen-reader, reconnect, and release journeys remain open.
 
 ### Milestone 2 — Explicit controls and human-in-the-loop actions
 
@@ -348,7 +457,10 @@ overrides require a review dialog that shows every blocker and warning.
 
 2.3. Build the project configuration editor for repository, checkout, base branch, checks,
 fixes, role routes, worker limit, attempt limit, wall-clock budget, spend ceiling, disk
-floor, plan path, and durability. Secret values are never echoed.
+floor, plan path, hold expiry, and durability. Secret values are never echoed. The current
+slice validates the public `ProjectSpec`, holds a one-time review server-side, audits the
+apply, and refuses replay or stale persisted versions; bulk editing and richer route review
+remain open.
 
 2.4. Implement Retry, Block, Answer, and revision-scoped Dependency override forms. Add any
 missing reason/operator fields to typed API requests and record their audit outcomes.

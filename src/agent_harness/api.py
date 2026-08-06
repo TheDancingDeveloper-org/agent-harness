@@ -32,12 +32,19 @@ from . import __version__
 from .audit import AuditStore
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
 from .maintenance import DEFAULT_RETENTION_DAYS, run_maintenance
+from .plan_service import PlanSyncConflict, PlanSyncFailure
+from .plan_service import execute as execute_plan_sync
+from .plan_service import parse_result as plan_parse_result
 from .preflight import BaseChecks
+from .project_service import configure_project, project_spec
 from .providers import MEANING
 from .reconcile import GitHubReconciler, items_by_pr
+from .routing_service import ROLE_MAP_KEY as ROLE_MAP_KEY
+from .routing_service import configure_roles, role_map_view
 from .schemas import (
     AddItemsRequest,
     AddItemsResult,
+    AnalyticsDashboard,
     AnswerRequest,
     AnswerResult,
     AuditCost,
@@ -57,6 +64,7 @@ from .schemas import (
     DependencyOverrideRequest,
     DependencyOverrideResult,
     Event,
+    EventFilters,
     EventPage,
     ExecutionReadiness,
     FleetControl,
@@ -71,7 +79,6 @@ from .schemas import (
     MaintenanceResult,
     NewBaseline,
     OpenQuestion,
-    PlanItem,
     PlanParseResult,
     PlanSyncRequest,
     PlanSyncResult,
@@ -90,8 +97,6 @@ from .schemas import (
     RetryResult,
     RoleMap,
     RoleMapView,
-    RoleRoute,
-    RoutedRole,
     RouteReachability,
     RoutesHealthView,
     ScopeRequest,
@@ -99,6 +104,7 @@ from .schemas import (
     StopProjectRequest,
     Summary,
     WaitingItem,
+    WorkerInventory,
     WorkEvidence,
     WorkItem,
     WorkList,
@@ -120,10 +126,6 @@ from .work import (
 )
 
 WINDOWS = {"1h": 3600, "24h": 86400, "72h": 3 * 86400, "7d": 7 * 86400, "all": None}
-
-#: Where the live role map is stored. Shared through the queue's database
-#: because the API and the worker are different processes.
-ROLE_MAP_KEY = "role_map"
 
 #: How long a healthy model has to answer preflight's one-token probe, and
 #: how long it has before it is treated as not answering at all. Anything in
@@ -178,6 +180,7 @@ def create_api(
     probes: Mapping[str, Any] | None = None,
     executor_roles: Any | None = None,
     default_preset: str = "",
+    github_factory: Any | None = None,
 ) -> FastAPI:
     """Build the API.
 
@@ -226,6 +229,7 @@ def create_api(
     app.state.probes = dict(probes or {})
     app.state.executor_roles = executor_roles
     app.state.default_preset = default_preset
+    app.state.github_factory = github_factory
     app.state.ask_model = _model_asker(model_client)
     app.state.base_checks = BaseChecks()
     app.state.token = token
@@ -933,6 +937,7 @@ def create_api(
             rows=[AuditCostRow(**r) for r in rows],
             total_cost_usd=sum(priced) if priced else None,
             total_unpriced=sum(r["unpriced"] or 0 for r in rows),
+            denominator=sum(r["calls"] or 0 for r in rows),
             partial=partial,
         )
 
@@ -952,8 +957,31 @@ def create_api(
         return AuditDelivery(
             window=window,
             rows=[AuditDeliveryRow(**r) for r in rows],
+            denominator=audit_store().delivery_denominator(since=since, project_id=project_id),
             partial=partial,
         )
+
+    @app.get(
+        "/api/analytics",
+        tags=["observability"],
+        summary="Complete typed analytics projection",
+        response_model=AnalyticsDashboard,
+    )
+    def analytics(
+        window: str = Query("7d", description=f"One of {sorted(WINDOWS)}."),
+        project_id: str | None = Query(
+            None, description="Limit spend, delivery and baselines to one project."
+        ),
+        _: None = Depends(require_token),
+    ) -> AnalyticsDashboard:
+        from .query_service import HarnessQueries
+
+        try:
+            return HarnessQueries(
+                store, app.state.queue, audit=app.state.audit, fleet=app.state.fleet
+            ).analytics(window=window, project_id=project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post(
         "/api/audit/reconcile",
@@ -1141,30 +1169,7 @@ def create_api(
         start does.
         """
         queue = need_queue()
-        queue.add_project(
-            Project(
-                project_id=spec.project_id,
-                name=spec.name,
-                repo=spec.repo,
-                work_dir=spec.work_dir,
-                base_branch=spec.base_branch,
-                checks=list(spec.checks),
-                fixes={k: list(v) for k, v in spec.fixes.items()},
-                durability=spec.durability,
-                max_item_seconds=spec.max_item_seconds,
-                max_item_spend_usd=spec.max_item_spend_usd,
-                plan_path=spec.plan_path,
-                roles={k: v.model_dump() for k, v in spec.roles.items()} if spec.roles else None,
-                max_workers=spec.max_workers,
-                max_attempts=spec.max_attempts,
-                min_free_disk_gb=spec.min_free_disk_gb,
-            )
-        )
-        fleet_ = app.state.fleet
-        if fleet_ is not None and hasattr(fleet_, "resize"):
-            # A no-op for a stopped project: there is no pool to reconcile,
-            # and the persisted budget is what the next start reads.
-            fleet_.resize(spec.project_id)
+        configure_project(queue, spec, fleet=app.state.fleet)
         return _project_summary(queue, spec.project_id, app.state.fleet)
 
     @app.get(
@@ -1615,16 +1620,7 @@ def create_api(
         it is your call, and it is worth making deliberately.
         """
         queue = need_queue()
-        queue.set_setting(
-            ROLE_MAP_KEY,
-            # Only the routing fields. `used` is computed from the deployment,
-            # not configured, and storing it would let a stale answer be read
-            # back later as though an operator had set it.
-            {
-                name: route.model_dump(include={"model", "endpoint", "provider"})
-                for name, route in request.roles.items()
-            },
-        )
+        configure_roles(queue, request)
         return _role_map_view(app.state, queue)
 
     # ---------------------------------------------------------------- plan
@@ -1653,31 +1649,7 @@ def create_api(
         if not target.is_file():
             raise HTTPException(status_code=404, detail=f"no plan at {path!r}")
         parsed = parse_plan_file(target)
-        report = parsed.dependency_report()
-        return PlanParseResult(
-            items=[
-                PlanItem(
-                    id=i.id,
-                    title=i.title,
-                    body=i.body,
-                    labels=i.labels,
-                    milestone=i.milestone,
-                    depends_on=i.depends_on,
-                    done=i.done,
-                    line=i.line,
-                )
-                for i in parsed.items
-            ],
-            skipped=[f"line {n}: {title}" for n, title in parsed.skipped],
-            duplicate_ids=parsed.duplicate_ids(),
-            unresolved_dependencies=report.unresolved,
-            external_dependencies=report.external,
-            decision_dependencies=report.decisions,
-            cross_project_dependencies=report.cross_project,
-            malformed_dependencies=report.malformed,
-            dependency_cycles=[list(cycle) for cycle in report.cycles],
-            unattached_arrows=[f"line {n}: {text}" for n, text in report.unattached_arrows],
-        )
+        return plan_parse_result(parsed)
 
     @app.post(
         "/api/plan/sync",
@@ -1701,35 +1673,27 @@ def create_api(
         usually an edit, sometimes a mistake, and never grounds for the
         harness to decide work stopped mattering.
         """
-        from .github import GitHub, GitHubError, sync
-        from .plan import parse_plan_file
+        factory = app.state.github_factory
+        if factory is None:
+            from .github import GitHub
 
-        target = Path(request.path)
-        if not target.is_file():
-            raise HTTPException(status_code=404, detail=f"no plan at {request.path!r}")
-        parsed = parse_plan_file(target)
-        duplicates = parsed.duplicate_ids()
-        if duplicates and not request.allow_duplicates:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "reason": "the plan states these ids more than once; each becomes one issue",
-                    "duplicate_ids": duplicates,
-                },
-            )
+            github = GitHub(request.repo)
+        else:
+            github = factory(request.repo)
         try:
-            report = sync(GitHub(request.repo), parsed.deduplicated(), dry_run=request.dry_run)
-        except GitHubError as exc:
+            return execute_plan_sync(
+                request.path,
+                github,
+                dry_run=request.dry_run,
+                allow_duplicates=request.allow_duplicates,
+            )
+        except PlanSyncConflict as exc:
+            status_code = 404 if exc.reason_kind == "plan_missing" else 409
+            detail: str | dict[str, Any]
+            detail = {"reason": str(exc), **exc.details} if exc.details else str(exc)
+            raise HTTPException(status_code=status_code, detail=detail) from exc
+        except PlanSyncFailure as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return PlanSyncResult(
-            created=report.created,
-            updated=report.updated,
-            unchanged=report.unchanged,
-            orphaned=report.orphaned,
-            labels_created=report.labels_created,
-            milestones_created=report.milestones_created,
-            dry_run=request.dry_run,
-        )
 
     # ------------------------------------------------------- observability
 
@@ -1756,6 +1720,7 @@ def create_api(
             meaning={c: MEANING[c] for c in RATE_LIMIT_CLASSES},
             unclassified=by_class.get(UNCLASSIFIED, 0),
             total=sum(classified.values()),
+            denominator=error_store.rate_limit_denominator(since),
             by_worker=error_store.group_counts("worker", since),
             by_endpoint=error_store.group_counts("endpoint", since),
             by_role=error_store.group_counts("role", since),
@@ -1770,6 +1735,21 @@ def create_api(
     def events(
         since_id: int = Query(0, description="Cursor from the previous page."),
         limit: int = Query(200, ge=1, le=1000),
+        project_id: str | None = Query(None, description="Limit to one project."),
+        item_id: str | None = Query(None, description="Limit to one work item."),
+        worker: str | None = Query(None, description="Limit to one worker identity."),
+        endpoint: str | None = Query(None, description="Limit to one endpoint."),
+        role: str | None = Query(None, description="Limit to one routed role."),
+        model: str | None = Query(None, description="Limit to one model identifier."),
+        outcome: str | None = Query(None, description="Limit to one outcome token."),
+        error_class: str | None = Query(None, description="Limit to one error class."),
+        reason_kind: str | None = Query(None, description="Limit to one reason kind."),
+        start_ts: float | None = Query(
+            None, description="Include events at or after this Unix time."
+        ),
+        end_ts: float | None = Query(
+            None, description="Include events at or before this Unix time."
+        ),
         _: None = Depends(require_token),
     ) -> EventPage:
         """Append-only history, oldest first.
@@ -1778,11 +1758,44 @@ def create_api(
         millisecond must still have a total order, or a poll silently drops
         one.
         """
-        rows = store.since_id(since_id, limit=limit)
-        return EventPage(
-            events=[Event(**row) for row in rows],
-            cursor=rows[-1]["id"] if rows else since_id,
-        )
+        from .query_service import HarnessQueries
+
+        try:
+            filters = EventFilters(
+                project_id=project_id,
+                item_id=item_id,
+                worker=worker,
+                endpoint=endpoint,
+                role=role,
+                model=model,
+                outcome=outcome,
+                error_class=error_class,
+                reason_kind=reason_kind,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return HarnessQueries(
+            store, app.state.queue, audit=app.state.audit, fleet=app.state.fleet
+        ).filtered_events(since_id, limit, filters)
+
+    @app.get(
+        "/api/workers",
+        tags=["control", "observability"],
+        summary="Worker-pool inventory",
+        response_model=WorkerInventory,
+    )
+    def workers(
+        project_id: str | None = Query(None, description="Limit to one project."),
+        _: None = Depends(require_token),
+    ) -> WorkerInventory:
+        """Read live workers alongside durable claims and failure evidence."""
+        from .query_service import HarnessQueries
+
+        return HarnessQueries(
+            store, app.state.queue, audit=app.state.audit, fleet=app.state.fleet
+        ).worker_inventory(project_id)
 
     @app.get(
         "/api/summary",
@@ -1969,26 +1982,7 @@ def _model_asker(client: Any) -> Any:
 
 def _role_map_view(state: Any, queue: WorkQueue) -> RoleMapView:
     """The global map, annotated with what this deployment will call."""
-    from .model_client import reviewer_independence
-
-    stored = queue.get_setting(ROLE_MAP_KEY) or {}
-    executor = _executor_roles(state)
-    independent, why = reviewer_independence(
-        _role_routes(queue, default_preset=getattr(state, "default_preset", "")),
-        implemented_by=executor.implemented_by,
-    )
-    return RoleMapView(
-        reviewer_independent=independent,
-        reviewer_note=why,
-        roles={
-            name: RoutedRole(
-                **RoleRoute(**route).model_dump(),
-                used=executor.calls_role(name),
-                unused_reason=executor.unused_reason(name),
-            )
-            for name, route in stored.items()
-        },
-    )
+    return role_map_view(state, queue)
 
 
 def _preflight(
@@ -2050,23 +2044,7 @@ def _preflight(
 
 
 def _project_spec(project: Project) -> ProjectSpec:
-    return ProjectSpec(
-        project_id=project.project_id,
-        name=project.name,
-        repo=project.repo,
-        work_dir=project.work_dir,
-        base_branch=project.base_branch,
-        checks=list(project.checks),
-        fixes={k: list(v) for k, v in (project.fixes or {}).items()},
-        durability=project.durability,
-        max_item_seconds=project.max_item_seconds,
-        max_item_spend_usd=project.max_item_spend_usd,
-        plan_path=project.plan_path,
-        roles={k: RoleRoute(**v) for k, v in project.roles.items()} if project.roles else None,
-        max_workers=project.max_workers,
-        max_attempts=project.max_attempts,
-        min_free_disk_gb=project.min_free_disk_gb,
-    )
+    return project_spec(project)
 
 
 def _project_summary(queue: WorkQueue, project_id: str, fleet: Any | None = None) -> ProjectSummary:

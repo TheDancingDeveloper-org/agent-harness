@@ -1,4 +1,4 @@
-# GUI Milestones 0–1 evidence and Milestones 2–3 slices
+# GUI Milestones 0–1 evidence and Milestones 2–4 slices
 
 Status: implementation slice complete; the full GUI program is not complete.
 
@@ -6,9 +6,20 @@ Status: implementation slice complete; the full GUI program is not complete.
 
 - Branch: `codex/gui-plan`
 - Worktree: `/home/sprooty/Working/Active/apps/agent-harness-worktrees/gui-plan`
-- Plan: `GUI_PLAN.md`, SHA-256 `b8a5aa97c79dafdcb90502903df82445d7bdc274eb8c81a0deb6bccd7a68bb3d`
+- Committed branch head: `a245679`; the slices after that commit are currently an
+  uncommitted continuation and therefore are not yet commit-addressable evidence
+- Branch relationship at the 2026-08-06 resume check: four commits ahead of the merge base
+  and 18 commits behind `main` at `be7abe1`
+- Plan: `GUI_PLAN.md`; its exact post-checkpoint blob/commit identifier must replace the
+  transient working-tree hash when this continuation is checkpointed
 - Python: CPython 3.14.4; package installed with `uv sync --all-extras`
 - Temporary test volume: `/tmp` (separate ext4 filesystem, 361 GiB free at baseline)
+
+This evidence file was refreshed on 2026-08-06 after the worker-inventory, filtered-event
+and typed-analytics slices. The complete four-gate result below predates this
+documentation-only resume edit. It verifies the implementation continuation as it then
+stood, but does not remove the need to rerun the gates after checkpointing and integrating
+current `main`.
 
 ## Commands and results
 
@@ -38,6 +49,43 @@ After the inception, plan-parse review and dependency-graph slices:
 | `uv run ruff check .` | passed |
 | `uv run ruff format --check .` | passed |
 | `TMPDIR=/tmp/agent-harness-gui-baseline.HoeEBo uv run mypy` | passed, 111 source files |
+
+After the project configuration, plan synchronization and global role-routing slices:
+
+| Command | Result |
+|---|---|
+| `TMPDIR=/tmp/agent-harness-gui-full.zPtjTH uv run pytest -q` | passed at 100%, 1 skipped |
+| `uv run ruff check .` | passed |
+| `uv run ruff format --check .` | passed, 119 files checked |
+| `TMPDIR=/tmp/agent-harness-gui-full.zPtjTH uv run mypy` | passed, 114 source files |
+
+After the worker-pool inventory and URL-backed event-filter slices:
+
+| Check | Result |
+|---|---|
+| `TMPDIR=/tmp/agent-harness-gui-workers.XXXXXX uv run pytest -q` | passed at 100%, 1 skipped |
+| `uv run ruff check .` | passed |
+| `uv run ruff format --check .` | passed, 119 files already formatted |
+| `TMPDIR=/tmp/agent-harness-gui-workers-mypy.XXXXXX uv run mypy` | passed, 114 source files |
+
+After the typed analytics projection and browser panels:
+
+| Check | Result |
+|---|---|
+| `TMPDIR=<fast-temp> uv run pytest -q` | passed at 100%, 1 skipped |
+| `uv run ruff check .` | passed |
+| `uv run ruff format --check .` | passed, 119 files already formatted |
+| `TMPDIR=<fast-temp> uv run mypy` | passed, 114 source files |
+
+At the 2026-08-06 documentation-first resume checkpoint, against the complete dirty
+continuation:
+
+| Check | Result |
+|---|---|
+| `TMPDIR=/tmp/agent-harness-gui-resume.vVPDQ5 uv run pytest -q` | passed at 100%, 1 skipped |
+| `uv run ruff check .` | passed |
+| `uv run ruff format --check .` | passed, 119 files already formatted |
+| `TMPDIR=/tmp/agent-harness-gui-resume-mypy.KCzFMT uv run mypy` | passed, 114 source files |
 
 An earlier concurrent setup attempt and an earlier `/dev/shm` pytest attempt are
 not evidence: the former raced virtualenv creation and the latter filled the
@@ -71,6 +119,41 @@ not evidence: the former raced virtualenv creation and the latter filled the
 - The Dependency graph page renders the typed graph revision, edge state/evidence,
   ready items, cycles and per-item readiness explanations from the same graph report
   used by admission and the JSON API.
+- Dependency overrides now have an explicit browser review/action path. The form
+  requires a reason, records the authenticated operator and graph revision, delegates
+  to the same revision-scoped graph override as the JSON API, and displays the
+  resulting audit row without hiding the real edge state.
+- Project configuration now has a typed, secret-safe editor. Review renders the changed
+  fields and consequences without applying them; apply consumes a one-time server-held
+  payload, records the authenticated operator, and uses an atomic `updated_at` predicate so
+  a concurrent API/operator edit cannot be overwritten by a stale browser page.
+- Plan sync now has a separate read-only remote preview and explicit apply. The apply is
+  bound to the reviewed plan bytes, project repository/path/version and remote counts;
+  local, project, remote-preview and GitHub refusals are audited without credentials.
+  A stateful remote-drift journey proves a changed second preview performs zero writes.
+  GitHub does not provide a transaction across the second preview and later issue writes,
+  so the residual remote race remains explicit.
+- JSON and browser plan sync use the same finding gate for duplicate, unresolved,
+  malformed, cyclic and unattached dependencies. The browser control appears only when
+  both the plan path and repository are configured.
+- Settings now includes a generic global role-routing editor. It preserves fallback order,
+  route preset and price reference as well as the original route fields, renders endpoints
+  without URL credentials/query strings, identifies routes unused by the active executor,
+  reports reviewer independence, and applies through a one-time atomic compare-and-set.
+- `/api/workers` and the Workers page expose a typed read-only inventory. Live identities
+  come from the attached fleet; project/item claims, leases, heartbeat timestamps and stage
+  evidence come from durable queue/audit state; failures and project-scoped abandoned
+  sessions remain distinct evidence. Monitoring-only mode returns no invented workers.
+- The event explorer now accepts URL-backed project, item, worker, endpoint, role, model,
+  outcome, error-class, reason-kind and Unix-time filters. Sparse filters scan ordered rows
+  without skipping a later match, and filtered SSE reconnect uses the same exclusive
+  monotonic cursor.
+- `/api/analytics` and `/analytics` now share a typed read projection. Rate-limit panels
+  retain the three classified classes plus `unclassified` and an explicit denominator;
+  cost panels count model calls and keep known spend separate from unpriced calls; delivery
+  panels show event and distinct-item denominators; baselines and daily rollups remain
+  visible; and missing, degraded or partial audit history is called out rather than inferred
+  away. Focused API/audit/browser journeys cover these caveats.
 - Typed item evidence exposes append-only events, durable attempt stages and
   retained holds without fabricating absent history or cost.
 - `/api/events/stream` resumes after a monotonic cursor and surfaces disconnects;
@@ -87,8 +170,17 @@ delivery, JSON/API isolation, evidence and cursor validation.
 This is not a release claim for the full `GUI_PLAN`: browser automation,
 screen-reader checks, forced reconnect with replayed events, and all additional
 accessibility/security/concurrency journeys remain to run. Milestone 2 remains partial
-(preflight/configuration/bulk actions/notifications and dependency-override controls are
-not yet wired). Milestone 3 remains partial (adoption, plan dry-run/sync and richer graph
-interactions are not yet wired). Milestones 4–8 (routing/operations panels, internal
-sessions, extensions, automation, RBAC and recovery) remain explicitly incomplete. No
-real fleet or external deployment was used.
+(bulk-action review, notifications and other controls are not yet wired). Milestone 3
+remains partial (adoption and richer graph interactions are not yet wired). Milestone 4 is
+partial: global routing, worker inventory, filtered events and typed analytics are
+implemented, while confirmed reconciliation, audit-maintenance controls and process-log
+metrics are not. Milestones 5–8 (internal sessions,
+extensions, automation, RBAC and recovery) remain explicitly incomplete. No real fleet,
+GitHub repository or external deployment was used.
+
+## Current slice verification
+
+The resume-checkpoint four-gate table above is the latest complete implementation evidence. Earlier
+transient or partial runs are historical context only and are not substituted for that
+complete pass. Because the branch is still dirty and behind `main`, this is not yet a
+commit-addressable or integration-current release result.

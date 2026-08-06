@@ -14,17 +14,47 @@ import secrets
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from urllib.parse import parse_qs
+from typing import Any
+from urllib.parse import parse_qs, urlencode
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import ValidationError
 
 from .browser_session import BrowserSession, BrowserSessions
 from .events import WORK, Event
 from .inception import Inception
+from .plan_service import PlanSyncConflict, PlanSyncFailure
+from .plan_service import apply as apply_plan_sync
+from .plan_service import preview as preview_plan_sync
+from .project_service import (
+    ProjectConfigurationConflict,
+    configure_project,
+    project_spec,
+    project_spec_digest,
+)
 from .query_service import HarnessQueries
+from .routing_service import (
+    RoleConfigurationConflict,
+    configure_roles,
+    role_map_digest,
+    role_map_payload,
+    role_map_view,
+    role_map_view_for,
+    safe_endpoint,
+    stored_role_map,
+)
+from .schemas import (
+    BaseCheckStatus,
+    PlanSyncResult,
+    PreflightCheck,
+    PreflightResult,
+    ProjectSpec,
+    RoleMap,
+    RoleMapView,
+)
 from .work import BLOCKED, CLAIMED, DONE, PENDING
 
 TEMPLATE_DIR = Path(__file__).with_name("templates")
@@ -49,7 +79,9 @@ def install_ui(app: FastAPI) -> BrowserSessions:
             fleet=request.app.state.fleet,
         )
 
-    def render(request: Request, template: str, **context: object) -> HTMLResponse:
+    def render(
+        request: Request, template: str, *, status_code: int = 200, **context: object
+    ) -> HTMLResponse:
         session = sessions.get(request.cookies.get("harness_session"))
         if session is not None and not secrets.compare_digest(
             session.token_fingerprint, sessions.fingerprint(request.app.state.token or "")
@@ -59,6 +91,7 @@ def install_ui(app: FastAPI) -> BrowserSessions:
         return templates.TemplateResponse(
             request=request,
             name=template,
+            status_code=status_code,
             context={
                 "session": session,
                 "root_path": request.scope.get("root_path", ""),
@@ -87,6 +120,20 @@ def install_ui(app: FastAPI) -> BrowserSessions:
         sink = request.app.state.audit or request.app.state.store
         sink.append([event])
 
+    def refusal_audit(
+        request: Request,
+        *,
+        action: str,
+        reason_kind: str,
+        data: dict[str, object],
+    ) -> None:
+        action_audit(
+            request,
+            action=action,
+            outcome="operator_action_refused",
+            data={"reason_kind": reason_kind, **data},
+        )
+
     def inception_for(request: Request) -> Inception:
         queue = request.app.state.queue
         if queue is None:
@@ -97,6 +144,133 @@ def install_ui(app: FastAPI) -> BrowserSessions:
         return RedirectResponse(
             url=str(request.url_for("plans")) + f"?project_id={project_id}", status_code=303
         )
+
+    def preflight_model(request: Request, project_id: str, *, check_base: bool) -> PreflightResult:
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        project = queue.get_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        from .api import _preflight
+
+        report = _preflight(request.app.state, queue, project, check_base=check_base)
+        return PreflightResult(
+            project_id=report.project_id,
+            ready=report.ready,
+            summary=report.summary(),
+            checks=[PreflightCheck(**check.as_dict()) for check in report.checks],
+        )
+
+    def configured_project(request: Request, project_id: str) -> ProjectSpec:
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        project = queue.get_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return project_spec(project)
+
+    def configured_project_version(request: Request, project_id: str) -> float:
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        project = queue.get_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return float(project.updated_at)
+
+    def github_for(request: Request, repo: str) -> Any:
+        factory = getattr(request.app.state, "github_factory", None)
+        if factory is not None:
+            return factory(repo)
+        from .github import GitHub
+
+        return GitHub(repo)
+
+    def plans_context(
+        request: Request,
+        project_id: str | None,
+        *,
+        sync_preview: PlanSyncResult | None = None,
+        sync_error: str | None = None,
+    ) -> dict[str, Any]:
+        query = queries(request)
+        projects = query.projects()
+        selected = project_id or (
+            projects.projects[0].project.project_id if projects.projects else None
+        )
+        proposal = query.inception(selected) if selected else None
+        selected_summary = query.project(selected) if selected else None
+        plan_path = selected_summary.project.plan_path if selected_summary else None
+        repo = selected_summary.project.repo if selected_summary else None
+        return {
+            "projects": projects,
+            "project_id": selected,
+            "proposal": proposal,
+            "plan_markdown": query.inception_plan(selected, selected) if selected else None,
+            "plan_path": plan_path,
+            "repo": repo,
+            "parse_result": query.plan_parse(plan_path) if plan_path else None,
+            "sync_preview": sync_preview,
+            "sync_error": sync_error,
+        }
+
+    def optional(value: str) -> str | None:
+        return value.strip() or None
+
+    def project_spec_from_form(current: ProjectSpec, body: dict[str, str]) -> ProjectSpec:
+        """Validate browser input through the public API's exact contract."""
+        data = current.model_dump(mode="json")
+        data.update(
+            {
+                "project_id": current.project_id,
+                "name": body.get("name", "").strip(),
+                "repo": optional(body.get("repo", "")),
+                "work_dir": optional(body.get("work_dir", "")),
+                "base_branch": body.get("base_branch", "").strip(),
+                "durability": body.get("durability", "").strip(),
+                "plan_path": optional(body.get("plan_path", "")),
+                "max_workers": body.get("max_workers", ""),
+                "max_attempts": body.get("max_attempts", ""),
+                "max_item_seconds": body.get("max_item_seconds", ""),
+                "max_item_spend_usd": body.get("max_item_spend_usd", ""),
+                "max_hold_seconds": body.get("max_hold_seconds", ""),
+                "min_free_disk_gb": body.get("min_free_disk_gb", ""),
+            }
+        )
+        if body.get("replace_checks") == "yes":
+            data["checks"] = [
+                line.strip() for line in body.get("checks", "").splitlines() if line.strip()
+            ]
+        if body.get("replace_fixes") == "yes":
+            data["fixes"] = json.loads(body.get("fixes", "{}") or "{}")
+        if body.get("replace_roles") == "yes":
+            data["roles"] = json.loads(body.get("roles", "{}") or "{}") or None
+        return ProjectSpec.model_validate(data)
+
+    def changed_project_fields(before: ProjectSpec, after: ProjectSpec) -> list[str]:
+        previous = before.model_dump(mode="json")
+        proposed = after.model_dump(mode="json")
+        return sorted(key for key, value in proposed.items() if previous.get(key) != value)
+
+    def validation_message(exc: ValidationError | json.JSONDecodeError) -> str:
+        """Describe invalid input without reflecting submitted values or secrets."""
+        if isinstance(exc, json.JSONDecodeError):
+            return "Replacement checks, fixes, and routes must use valid JSON where requested."
+        return "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+            for error in exc.errors(include_input=False, include_url=False)
+        )
+
+    def role_rows(view: RoleMapView) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for name, route in sorted(view.roles.items()):
+            data = route.model_dump(mode="json")
+            data["name"] = name
+            data["endpoint"] = safe_endpoint(route.endpoint)
+            rows.append(data)
+        return rows
 
     @app.get("/", include_in_schema=False)
     def root(request: Request) -> RedirectResponse:
@@ -179,6 +353,149 @@ def install_ui(app: FastAPI) -> BrowserSessions:
             title="Projects",
             projects=queries(request).projects(),
             mode=("supervised" if request.app.state.fleet is not None else "monitoring-only"),
+        )
+
+    @app.get(
+        "/projects/{project_id}/configuration",
+        name="project_configuration",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def project_configuration_page(request: Request, project_id: str) -> HTMLResponse:
+        require_session(request)
+        return render(
+            request,
+            "project_configuration.html",
+            title="Project configuration",
+            project=configured_project(request, project_id),
+            error=None,
+        )
+
+    @app.post(
+        "/ui/actions/project-configuration/review",
+        name="project_configuration_review",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    async def project_configuration_review(request: Request) -> HTMLResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        current = configured_project(request, project_id)
+        try:
+            proposed = project_spec_from_form(current, body)
+        except (ValidationError, json.JSONDecodeError) as exc:
+            return render(
+                request,
+                "project_configuration.html",
+                title="Project configuration",
+                project=current,
+                error=validation_message(exc),
+                status_code=422,
+            )
+        changed = changed_project_fields(current, proposed)
+        if not changed:
+            raise HTTPException(status_code=409, detail="configuration is unchanged")
+        review = sessions.create_review(
+            session,
+            kind="project_configuration",
+            target_id=project_id,
+            baseline_digest=project_spec_digest(current),
+            baseline_version=configured_project_version(request, project_id),
+            payload=proposed.model_dump(mode="json"),
+        )
+        return render(
+            request,
+            "project_configuration_review.html",
+            title="Review project configuration",
+            project_id=project_id,
+            changed=changed,
+            proposed=proposed,
+            review=review,
+        )
+
+    @app.post(
+        "/ui/actions/project-configuration/apply",
+        name="project_configuration_apply",
+        include_in_schema=False,
+    )
+    async def project_configuration_apply(request: Request) -> RedirectResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        review = sessions.consume_review(
+            session,
+            body.get("review_id", ""),
+            kind="project_configuration",
+            target_id=project_id,
+        )
+        current = configured_project(request, project_id)
+        if not secrets.compare_digest(review.baseline_digest, project_spec_digest(current)):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "project configuration changed after review; review the current values again"
+                ),
+            )
+        proposed = ProjectSpec.model_validate(review.payload)
+        queue = request.app.state.queue
+        assert queue is not None
+        changed = changed_project_fields(current, proposed)
+        try:
+            configure_project(
+                queue,
+                proposed,
+                fleet=request.app.state.fleet,
+                expected_updated_at=review.baseline_version,
+            )
+        except ProjectConfigurationConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "project configuration changed after review; review the current values again"
+                ),
+            ) from exc
+        action_audit(
+            request,
+            action="project_configuration",
+            outcome="operator_configured_project",
+            data={"project_id": project_id, "changed_fields": changed},
+        )
+        return RedirectResponse(
+            url=request.url_for("project_configuration", project_id=project_id), status_code=303
+        )
+
+    @app.get(
+        "/projects/{project_id}/preflight",
+        name="preflight",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    def preflight_page(request: Request, project_id: str, check_base: bool = False) -> HTMLResponse:
+        require_session(request)
+        status = request.app.state.base_checks.status(project_id)
+        base = (
+            BaseCheckStatus(
+                project_id=project_id,
+                state=status.state,
+                ok=status.ok,
+                detail=status.detail,
+                started_at=status.started_at,
+                finished_at=status.finished_at,
+            )
+            if status is not None
+            else BaseCheckStatus(project_id=project_id, state="not_run", ok=None, detail="")
+        )
+        return render(
+            request,
+            "preflight.html",
+            title="Preflight",
+            project_id=project_id,
+            result=preflight_model(request, project_id, check_base=check_base),
+            base=base,
+            check_base=check_base,
         )
 
     @app.get("/work", name="work_page", response_class=HTMLResponse, include_in_schema=False)
@@ -357,6 +674,75 @@ def install_ui(app: FastAPI) -> BrowserSessions:
         )
         return project_redirect(request, project_id)
 
+    @app.post("/ui/actions/preflight/base", name="base_check_action", include_in_schema=False)
+    async def base_check_action(request: Request) -> RedirectResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        project = queue.get_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        run = request.app.state.base_checks.start(project)
+        action_audit(
+            request,
+            action="base_checks",
+            outcome="operator_started_or_joined_base_checks",
+            data={"project_id": project_id, "state": run.state},
+        )
+        return RedirectResponse(
+            url=str(request.url_for("preflight", project_id=project_id)) + "?check_base=true",
+            status_code=303,
+        )
+
+    @app.post(
+        "/ui/actions/work/dependency-override",
+        name="dependency_override_action",
+        include_in_schema=False,
+    )
+    async def dependency_override_action(request: Request) -> RedirectResponse:
+        """Record the same revision-scoped admission decision as the JSON API.
+
+        The browser supplies no free-text identity: the authenticated session is
+        the operator recorded in the graph. The reason remains mandatory, and
+        the graph keeps its real blocked edge state after the override.
+        """
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        item_id = body.get("item_id", "").strip()
+        reason = body.get("reason", "").strip()
+        if not project_id or not item_id:
+            raise HTTPException(status_code=422, detail="project and item are required")
+        if not reason:
+            raise HTTPException(status_code=422, detail="an override reason is required")
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        if queue.get(item_id, project_id=project_id) is None:
+            raise HTTPException(status_code=404, detail="work item not found")
+        revision = queue.graph.record_override(
+            project_id, item_id, reason=reason, who=session.operator
+        )
+        action_audit(
+            request,
+            action="dependency_override",
+            outcome="operator_overrode_dependency_gate",
+            data={
+                "project_id": project_id,
+                "item_id": item_id,
+                "revision": revision,
+                "reason": reason,
+            },
+        )
+        return RedirectResponse(
+            url=str(request.url_for("graph")) + f"?project_id={project_id}", status_code=303
+        )
+
     @app.post("/ui/actions/inception/scope", name="inception_scope_action", include_in_schema=False)
     async def inception_scope_action(request: Request) -> RedirectResponse:
         session = require_session(request)
@@ -461,54 +847,255 @@ def install_ui(app: FastAPI) -> BrowserSessions:
         )
 
     @app.get("/events", name="events", response_class=HTMLResponse, include_in_schema=False)
-    def events_page(request: Request) -> HTMLResponse:
+    def events_page(
+        request: Request,
+        since_id: int = 0,
+        limit: int = 100,
+        project_id: str | None = None,
+        item_id: str | None = None,
+        worker: str | None = None,
+        endpoint: str | None = None,
+        role: str | None = None,
+        model: str | None = None,
+        outcome: str | None = None,
+        error_class: str | None = None,
+        reason_kind: str | None = None,
+        start_ts: str | None = None,
+        end_ts: str | None = None,
+    ) -> HTMLResponse:
         require_session(request)
+        from .schemas import EventFilters
+
+        try:
+            filters = EventFilters(
+                project_id=project_id,
+                item_id=item_id,
+                worker=worker,
+                endpoint=endpoint,
+                role=role,
+                model=model,
+                outcome=outcome,
+                error_class=error_class,
+                reason_kind=reason_kind,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        event_page = queries(request).filtered_events(
+            since_id=since_id, limit=min(max(limit, 1), 1000), filters=filters, live=True
+        )
+        stream_params = {
+            key: value for key, value in filters.model_dump().items() if value is not None
+        }
+        stream_params["since_id"] = event_page.cursor
         return render(
             request,
             "events.html",
             title="Events",
-            events=queries(request).live_events(),
+            events=event_page,
+            filters=filters,
+            stream_url=str(request.url_for("event_stream")) + "?" + urlencode(stream_params),
+        )
+
+    @app.get("/workers", name="workers", response_class=HTMLResponse, include_in_schema=False)
+    def workers_page(request: Request, project_id: str | None = None) -> HTMLResponse:
+        require_session(request)
+        return render(
+            request,
+            "workers.html",
+            title="Workers",
+            project_id=project_id,
+            inventory=queries(request).worker_inventory(project_id),
         )
 
     @app.get("/analytics", name="analytics", response_class=HTMLResponse, include_in_schema=False)
-    def analytics_page(request: Request) -> HTMLResponse:
+    def analytics_page(
+        request: Request,
+        window: str = "7d",
+        project_id: str | None = None,
+    ) -> HTMLResponse:
         require_session(request)
-        audit = request.app.state.audit
+        try:
+            dashboard = queries(request).analytics(window=window, project_id=project_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return render(
             request,
             "analytics.html",
             title="Analytics",
-            rate_limits=(audit.rate_limits_by_class() if audit is not None else {}),
-            costs=(audit.cost() if audit is not None else []),
-            delivery=(audit.delivery() if audit is not None else []),
-            audit_health=(
-                {"configured": True, "degraded": audit.degraded, "events": audit.count()}
-                if audit is not None
-                else {"configured": False, "degraded": True, "events": 0}
-            ),
+            dashboard=dashboard,
         )
 
     @app.get("/plans", name="plans", response_class=HTMLResponse, include_in_schema=False)
     def plans_page(request: Request, project_id: str | None = None) -> HTMLResponse:
         require_session(request)
-        query = queries(request)
-        projects = query.projects()
-        selected = project_id or (
-            projects.projects[0].project.project_id if projects.projects else None
-        )
-        proposal = query.inception(selected) if selected else None
-        selected_summary = query.project(selected) if selected else None
-        plan_path = selected_summary.project.plan_path if selected_summary else None
         return render(
             request,
             "plans.html",
             title="Plans",
-            projects=projects,
-            project_id=selected,
-            proposal=proposal,
-            plan_markdown=query.inception_plan(selected, selected) if selected else None,
-            plan_path=plan_path,
-            parse_result=query.plan_parse(plan_path) if plan_path else None,
+            **plans_context(request, project_id),
+        )
+
+    @app.post(
+        "/ui/actions/plan-sync/review",
+        name="plan_sync_review",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    async def plan_sync_review(request: Request) -> HTMLResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        project = queue.get_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        if not project.repo or not project.plan_path:
+            raise HTTPException(
+                status_code=422,
+                detail="configure both a repository and a plan path before syncing",
+            )
+        try:
+            digest, parsed, preview = preview_plan_sync(
+                project.plan_path, github_for(request, project.repo)
+            )
+        except PlanSyncConflict as exc:
+            return render(
+                request,
+                "plans.html",
+                title="Plans",
+                status_code=409,
+                **plans_context(request, project_id, sync_error=str(exc)),
+            )
+        except PlanSyncFailure as exc:
+            return render(
+                request,
+                "plans.html",
+                title="Plans",
+                status_code=502,
+                **plans_context(
+                    request, project_id, sync_error=f"GitHub refused the preview: {exc}"
+                ),
+            )
+        review = sessions.create_review(
+            session,
+            kind="plan_sync",
+            target_id=project_id,
+            baseline_digest=digest,
+            baseline_version=float(project.updated_at),
+            payload={
+                "repo": project.repo,
+                "plan_path": project.plan_path,
+                "parsed": parsed.model_dump(mode="json"),
+                "preview": preview.model_dump(mode="json"),
+            },
+        )
+        return render(
+            request,
+            "plan_sync_review.html",
+            title="Review plan sync",
+            project_id=project_id,
+            plan_path=project.plan_path,
+            repo=project.repo,
+            parsed=parsed,
+            preview=preview,
+            review=review,
+        )
+
+    @app.post(
+        "/ui/actions/plan-sync/apply",
+        name="plan_sync_apply",
+        include_in_schema=False,
+    )
+    async def plan_sync_apply(request: Request) -> RedirectResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        review = sessions.consume_review(
+            session,
+            body.get("review_id", ""),
+            kind="plan_sync",
+            target_id=project_id,
+        )
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        project = queue.get_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        payload = review.payload
+        repo = payload.get("repo")
+        plan_path = payload.get("plan_path")
+        preview_payload = payload.get("preview")
+        if (
+            not isinstance(repo, str)
+            or not isinstance(plan_path, str)
+            or not isinstance(preview_payload, dict)
+        ):
+            refusal_audit(
+                request,
+                action="plan_sync",
+                reason_kind="invalid_review",
+                data={"project_id": project_id},
+            )
+            raise HTTPException(status_code=409, detail="plan review payload is invalid")
+        if (
+            project.updated_at != review.baseline_version
+            or project.repo != repo
+            or project.plan_path != plan_path
+        ):
+            refusal_audit(
+                request,
+                action="plan_sync",
+                reason_kind="project_configuration_changed",
+                data={"project_id": project_id},
+            )
+            raise HTTPException(status_code=409, detail="project changed after plan review")
+        expected_preview = PlanSyncResult.model_validate(preview_payload)
+        try:
+            result = apply_plan_sync(
+                plan_path,
+                repo,
+                github_for(request, repo),
+                expected_digest=review.baseline_digest,
+                expected_preview=expected_preview,
+            )
+        except PlanSyncConflict as exc:
+            refusal_audit(
+                request,
+                action="plan_sync",
+                reason_kind=exc.reason_kind,
+                data={"project_id": project_id, "repo": repo, "plan_path": plan_path},
+            )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PlanSyncFailure as exc:
+            refusal_audit(
+                request,
+                action="plan_sync",
+                reason_kind=exc.reason_kind,
+                data={"project_id": project_id, "repo": repo, "plan_path": plan_path},
+            )
+            raise HTTPException(status_code=502, detail=f"GitHub refused the sync: {exc}") from exc
+        action_audit(
+            request,
+            action="plan_sync",
+            outcome="operator_synced_plan",
+            data={
+                "project_id": project_id,
+                "repo": repo,
+                "plan_path": plan_path,
+                "created": result.created,
+                "updated": result.updated,
+                "orphaned": result.orphaned,
+            },
+        )
+        return RedirectResponse(
+            url=str(request.url_for("plans")) + f"?project_id={project_id}", status_code=303
         )
 
     @app.get("/graph", name="graph", response_class=HTMLResponse, include_in_schema=False)
@@ -526,6 +1113,7 @@ def install_ui(app: FastAPI) -> BrowserSessions:
             projects=projects,
             project_id=selected,
             graph=query.graph(selected) if selected else None,
+            overrides=(query.overrides(selected) if selected else []),
         )
 
     @app.get("/sessions", name="sessions", response_class=HTMLResponse, include_in_schema=False)
@@ -544,6 +1132,7 @@ def install_ui(app: FastAPI) -> BrowserSessions:
         readiness = None
         queue = request.app.state.queue
         configured = queue is not None
+        routes = role_map_view(request.app.state, queue) if queue is not None else None
         return render(
             request,
             "settings.html",
@@ -551,7 +1140,107 @@ def install_ui(app: FastAPI) -> BrowserSessions:
             readiness=readiness,
             mode=("supervised" if request.app.state.fleet is not None else "monitoring-only"),
             queue_configured=configured,
+            routes=routes,
+            role_rows=(role_rows(routes) if routes is not None else []),
         )
+
+    @app.post(
+        "/ui/actions/roles/review",
+        name="roles_review",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    async def roles_review(request: Request) -> HTMLResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        try:
+            submitted = json.loads(body.get("roles", "{}") or "{}")
+            proposed = RoleMap.model_validate({"roles": submitted})
+        except (ValidationError, json.JSONDecodeError) as exc:
+            return render(
+                request,
+                "settings.html",
+                title="Settings",
+                status_code=422,
+                readiness=None,
+                mode=("supervised" if request.app.state.fleet is not None else "monitoring-only"),
+                queue_configured=True,
+                routes=role_map_view(request.app.state, queue),
+                role_rows=role_rows(role_map_view(request.app.state, queue)),
+                route_error=validation_message(exc),
+            )
+        current = stored_role_map(queue)
+        payload = role_map_payload(proposed)
+        review = sessions.create_review(
+            session,
+            kind="role_map",
+            target_id="global",
+            baseline_digest=role_map_digest(current),
+            baseline_version=0,
+            payload={"expected": current, "proposed": payload},
+        )
+        proposed_view = role_map_view_for(request.app.state, payload)
+        return render(
+            request,
+            "roles_review.html",
+            title="Review role routing",
+            review=review,
+            routes=proposed_view,
+            role_rows=role_rows(proposed_view),
+        )
+
+    @app.post(
+        "/ui/actions/roles/apply",
+        name="roles_apply",
+        include_in_schema=False,
+    )
+    async def roles_apply(request: Request) -> RedirectResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        review = sessions.consume_review(
+            session,
+            body.get("review_id", ""),
+            kind="role_map",
+            target_id="global",
+        )
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        expected = review.payload.get("expected")
+        proposed_payload = review.payload.get("proposed")
+        if (expected is not None and not isinstance(expected, dict)) or not isinstance(
+            proposed_payload, dict
+        ):
+            refusal_audit(
+                request,
+                action="role_configuration",
+                reason_kind="invalid_review",
+                data={"scope": "global"},
+            )
+            raise HTTPException(status_code=409, detail="role review payload is invalid")
+        proposed = RoleMap.model_validate({"roles": proposed_payload})
+        try:
+            configure_roles(queue, proposed, expected=expected)
+        except RoleConfigurationConflict as exc:
+            refusal_audit(
+                request,
+                action="role_configuration",
+                reason_kind="role_map_changed",
+                data={"scope": "global"},
+            )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        action_audit(
+            request,
+            action="role_configuration",
+            outcome="operator_configured_roles",
+            data={"scope": "global", "roles": sorted(proposed.roles)},
+        )
+        return RedirectResponse(url=request.url_for("settings"), status_code=303)
 
     @app.get("/ui/fragments/projects", response_class=HTMLResponse, include_in_schema=False)
     def projects_fragment(request: Request) -> HTMLResponse:
@@ -586,16 +1275,42 @@ def install_ui(app: FastAPI) -> BrowserSessions:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="event cursor must be an integer") from exc
+        from .schemas import EventFilters
+
+        try:
+            filters = EventFilters(
+                **{
+                    key: request.query_params.get(key)
+                    for key in (
+                        "project_id",
+                        "item_id",
+                        "worker",
+                        "endpoint",
+                        "role",
+                        "model",
+                        "outcome",
+                        "error_class",
+                        "reason_kind",
+                        "start_ts",
+                        "end_ts",
+                    )
+                    if request.query_params.get(key) is not None
+                }
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         async def stream() -> AsyncIterator[str]:
             nonlocal last_id
             while True:
                 if await request.is_disconnected():
                     return
-                page = queries(request).live_events(last_id, limit=200)
+                page = queries(request).filtered_events(
+                    last_id, limit=200, filters=filters, live=True
+                )
+                last_id = page.cursor
                 if page.events:
                     for event in page.events:
-                        last_id = event.id
                         yield f"id: {event.id}\nevent: harness\ndata: {event.model_dump_json()}\n\n"
                 else:
                     yield ": heartbeat\n\n"

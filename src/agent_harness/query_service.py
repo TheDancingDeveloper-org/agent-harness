@@ -13,11 +13,26 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
+from .project_service import project_spec
+from .providers import MEANING
 from .schemas import (
+    AbandonedSessionEvidence,
+    AnalyticsDashboard,
     AttemptStageEvidence,
+    AuditCost,
+    AuditCostRow,
+    AuditDelivery,
+    AuditDeliveryRow,
+    AuditHealth,
+    AuditRollupRow,
+    AuditRollups,
+    Baseline,
+    BaselineList,
     DependencyEdgeModel,
     DependencyGraphReport,
     Event,
+    EventFilters,
     EventPage,
     FleetControl,
     HoldList,
@@ -25,20 +40,28 @@ from .schemas import (
     ItemReadiness,
     LatestEvent,
     OpenQuestion,
-    PlanItem,
     PlanParseResult,
     ProjectList,
-    ProjectSpec,
     ProjectSummary,
     ProposalModel,
+    RateLimits,
     ReadinessReasonModel,
-    RoleRoute,
+    WorkerInventory,
+    WorkerInventoryItem,
     WorkEvidence,
     WorkItem,
     WorkList,
 )
 from .store import EventStore
 from .work import BLOCKED, CLAIMED, DRAINING, HELD, WorkQueue, WorkRecord
+
+ANALYTICS_WINDOWS: dict[str, float | None] = {
+    "1h": 3600,
+    "24h": 86400,
+    "72h": 3 * 86400,
+    "7d": 7 * 86400,
+    "all": None,
+}
 
 
 class HarnessQueries:
@@ -78,27 +101,7 @@ class HarnessQueries:
         state, reason, previous = queue.control_detail(project_id)
         worker_health = self._worker_health(project_id)
         return ProjectSummary(
-            project=ProjectSpec(
-                project_id=project.project_id,
-                name=project.name,
-                repo=project.repo,
-                work_dir=project.work_dir,
-                base_branch=project.base_branch,
-                checks=list(project.checks),
-                fixes={k: list(v) for k, v in (project.fixes or {}).items()},
-                durability=project.durability,
-                max_item_seconds=project.max_item_seconds,
-                max_item_spend_usd=project.max_item_spend_usd,
-                plan_path=project.plan_path,
-                roles=(
-                    {name: RoleRoute(**route) for name, route in project.roles.items()}
-                    if project.roles
-                    else None
-                ),
-                max_workers=project.max_workers,
-                max_attempts=project.max_attempts,
-                min_free_disk_gb=project.min_free_disk_gb,
-            ),
+            project=project_spec(project),
             counts=queue.counts(project_id=project_id),
             control=FleetControl(state=state, reason=reason),
             previous_state=previous,
@@ -214,33 +217,9 @@ class HarnessQueries:
     def plan_parse_markdown(markdown: str) -> PlanParseResult:
         """Parse a document using the same loss-reporting parser as the API."""
         from .plan import parse_plan
+        from .plan_service import parse_result
 
-        parsed = parse_plan(markdown)
-        report = parsed.dependency_report()
-        return PlanParseResult(
-            items=[
-                PlanItem(
-                    id=item.id,
-                    title=item.title,
-                    body=item.body,
-                    labels=item.labels,
-                    milestone=item.milestone,
-                    depends_on=item.depends_on,
-                    done=item.done,
-                    line=item.line,
-                )
-                for item in parsed.items
-            ],
-            skipped=[f"line {line}: {title}" for line, title in parsed.skipped],
-            duplicate_ids=parsed.duplicate_ids(),
-            unresolved_dependencies=report.unresolved,
-            external_dependencies=report.external,
-            decision_dependencies=report.decisions,
-            cross_project_dependencies=report.cross_project,
-            malformed_dependencies=report.malformed,
-            dependency_cycles=[list(cycle) for cycle in report.cycles],
-            unattached_arrows=[f"line {line}: {text}" for line, text in report.unattached_arrows],
-        )
+        return parse_result(parse_plan(markdown))
 
     def plan_parse(self, path: str) -> PlanParseResult | None:
         """Read and parse a configured plan path, without writing anything."""
@@ -279,6 +258,12 @@ class HarnessQueries:
             ],
         )
 
+    def overrides(self, project_id: str) -> list[dict[str, Any]]:
+        """Revision-scoped dependency decisions for the graph audit panel."""
+        if self.queue is None or self.queue.get_project(project_id) is None:
+            return []
+        return self.queue.graph.overrides(project_id)
+
     @staticmethod
     def _readiness_model(state: Any, record: WorkRecord | None) -> ItemReadiness:
         return ItemReadiness(
@@ -295,10 +280,44 @@ class HarnessQueries:
         )
 
     def events(self, since_id: int = 0, limit: int = 200) -> EventPage:
-        rows = self.store.since_id(since_id, limit=limit)
+        return self.filtered_events(since_id=since_id, limit=limit)
+
+    def filtered_events(
+        self,
+        since_id: int = 0,
+        limit: int = 200,
+        filters: EventFilters | None = None,
+        *,
+        live: bool = False,
+    ) -> EventPage:
+        """Read filtered history without changing monotonic cursor meaning.
+
+        Filtering happens after the exclusive id cursor. The reader keeps
+        scanning ordered chunks until it has enough matches, so a sparse
+        filter cannot cause matching events to disappear at a page boundary.
+        """
+        filters = filters or EventFilters()
+        source = self.audit if live and self.audit is not None else self.store
+        cursor = since_id
+        matched: list[dict[str, Any]] = []
+        while len(matched) < limit:
+            rows = source.since_id(cursor, limit=min(1000, max(limit, 200)))
+            if not rows:
+                break
+            for row in rows:
+                cursor = int(row["id"])
+                event = self._audit_event_fields(row) if source is self.audit else row
+                if self._event_matches(event, filters):
+                    matched.append(event)
+                    if len(matched) >= limit:
+                        break
+            if len(rows) < min(1000, max(limit, 200)):
+                break
         return EventPage(
-            events=[Event(**row) for row in rows],
-            cursor=rows[-1]["id"] if rows else since_id,
+            events=[Event(**row) for row in matched],
+            # Advance over scanned non-matches. A cursor is a position in the
+            # append-only stream, not the id of the last displayed row.
+            cursor=cursor,
         )
 
     def live_events(self, since_id: int = 0, limit: int = 200) -> EventPage:
@@ -308,12 +327,225 @@ class HarnessQueries:
         ingest-and-serve deployment has only the legacy event store. The
         fallback is explicit and preserves each store's monotonic cursor.
         """
-        if self.audit is None:
-            return self.events(since_id, limit)
-        rows = self.audit.since_id(since_id, limit=limit)
-        return EventPage(
-            events=[Event(**self._audit_event_fields(row)) for row in rows],
-            cursor=rows[-1]["id"] if rows else since_id,
+        return self.filtered_events(since_id, limit, live=True)
+
+    @staticmethod
+    def _event_matches(event: dict[str, Any], filters: EventFilters) -> bool:
+        data = event.get("data") or {}
+
+        def value(name: str) -> Any:
+            return event.get(name) if event.get(name) is not None else data.get(name)
+
+        for name in (
+            "project_id",
+            "item_id",
+            "worker",
+            "endpoint",
+            "role",
+            "model",
+            "outcome",
+            "error_class",
+            "reason_kind",
+        ):
+            expected = getattr(filters, name)
+            if expected is not None and str(value(name) or "") != expected:
+                return False
+        ts = float(event.get("ts", 0.0))
+        if filters.start_ts is not None and ts < filters.start_ts:
+            return False
+        return not (filters.end_ts is not None and ts > filters.end_ts)
+
+    def worker_inventory(self, project_id: str | None = None) -> WorkerInventory:
+        """Project runtime, durable claims, failures and session evidence.
+
+        The queue remains authoritative for claims and the fleet remains
+        authoritative for live threads. This method only joins their read
+        projections; it never creates a worker record or infers supervision
+        from a claimed row in a monitoring-only deployment.
+        """
+        fleet = self.fleet
+        if fleet is None:
+            return WorkerInventory(
+                configured=False,
+                mode="monitoring-only",
+                reason="no worker pool is attached; this deployment is monitoring-only",
+            )
+        queue = self.queue
+        if queue is None:
+            return WorkerInventory(
+                configured=True,
+                mode="supervised",
+                reason="worker pool is attached but no work queue is configured",
+            )
+        snapshots = list(fleet.workers(project_id)) if hasattr(fleet, "workers") else []
+        claims = queue.claimed(project_id=project_id)
+        sessions = queue.abandoned_sessions()
+        by_item: dict[str, list[AbandonedSessionEvidence]] = {}
+        for row in sessions:
+            row_project = row.get("project_id")
+            if project_id is not None and row_project != project_id:
+                continue
+            by_item.setdefault(str(row["item_id"]), []).append(AbandonedSessionEvidence(**row))
+        latest = self._latest_by_item(project_id)
+        used_claims: set[int] = set()
+        items: list[WorkerInventoryItem] = []
+        now = queue.now()
+
+        def row_for_claim(
+            record: WorkRecord, worker_id: str, started_at: float | None
+        ) -> WorkerInventoryItem:
+            event = latest.get(record.item_id) or {}
+            data = event.get("data") or {}
+            return WorkerInventoryItem(
+                worker_id=worker_id,
+                project_id=record.project_id,
+                state="stale_claim" if record.lease_until < now else "running",
+                claim_owner=record.owner,
+                item_id=record.item_id,
+                lease_until=record.lease_until,
+                heartbeat_at=record.updated_at,
+                stage=event.get("outcome") or data.get("stage"),
+                started_at=started_at,
+                item_started_at=record.first_started_at or None,
+                abandoned_sessions=by_item.get(record.item_id, []),
+            )
+
+        for snapshot in snapshots:
+            match = next(
+                (
+                    (index, record)
+                    for index, record in enumerate(claims)
+                    if index not in used_claims and record.owner == snapshot.claim_owner
+                ),
+                None,
+            )
+            if match is None:
+                items.append(
+                    WorkerInventoryItem(
+                        worker_id=snapshot.worker_id,
+                        project_id=snapshot.project_id,
+                        state="running",
+                        claim_owner=snapshot.claim_owner,
+                        started_at=snapshot.started_at,
+                    )
+                )
+                continue
+            index, record = match
+            used_claims.add(index)
+            items.append(row_for_claim(record, snapshot.worker_id, snapshot.started_at))
+
+        for index, record in enumerate(claims):
+            if index in used_claims:
+                continue
+            items.append(row_for_claim(record, record.owner or "unknown", None))
+
+        failures = fleet.failures(project_id)
+        for failure in failures:
+            items.append(
+                WorkerInventoryItem(
+                    worker_id=failure.worker or "unknown",
+                    project_id=failure.project_id,
+                    state="failed",
+                    claim_owner=failure.worker,
+                    failure=failure.error,
+                    failed_at=failure.at,
+                    abandoned_sessions=[
+                        session
+                        for item_id in failure.released
+                        for session in by_item.get(item_id, [])
+                    ],
+                )
+            )
+        return WorkerInventory(configured=True, mode="supervised", workers=items)
+
+    def analytics(self, window: str = "7d", project_id: str | None = None) -> AnalyticsDashboard:
+        """Build the complete analytics projection for the browser client.
+
+        Audit is optional by design. When it is absent, rate limits can still
+        use the live event store, while spend, delivery, baselines and rollups
+        remain explicitly empty and the health model tells the operator why.
+        """
+        if window not in ANALYTICS_WINDOWS:
+            raise ValueError(
+                f"unknown window {window!r}; expected one of {sorted(ANALYTICS_WINDOWS)}"
+            )
+        span = ANALYTICS_WINDOWS[window]
+        since = None if span is None else time.time() - span
+        audit = self.audit
+        source = audit if audit is not None else self.store
+        oldest, newest = source.span()
+        partial = bool(since is not None and oldest is not None and oldest > since)
+        by_class = source.rate_limits_by_class(since)
+        classified = {name: by_class.get(name, 0) for name in RATE_LIMIT_CLASSES}
+        rate_limits = RateLimits(
+            window=window,
+            classified=classified,
+            meaning={name: MEANING[name] for name in RATE_LIMIT_CLASSES},
+            unclassified=by_class.get(UNCLASSIFIED, 0),
+            total=sum(classified.values()),
+            denominator=(
+                source.rate_limit_denominator(since)
+                if hasattr(source, "rate_limit_denominator")
+                else sum(by_class.values())
+            ),
+            by_worker=source.group_counts("worker", since),
+            by_endpoint=source.group_counts("endpoint", since),
+            by_role=source.group_counts("role", since),
+        )
+        if audit is None:
+            cost = AuditCost(window=window, partial=partial)
+            delivery = AuditDelivery(window=window, partial=partial)
+            baselines = BaselineList()
+            rollups = AuditRollups()
+            health = AuditHealth(configured=False, degraded=True, events=0)
+        else:
+            cost_rows = [
+                AuditCostRow(**row) for row in audit.cost(since=since, project_id=project_id)
+            ]
+            priced = [row.cost_usd for row in cost_rows if row.cost_usd is not None]
+            cost = AuditCost(
+                window=window,
+                rows=cost_rows,
+                total_cost_usd=sum(priced) if priced else None,
+                total_unpriced=sum(row.unpriced for row in cost_rows),
+                denominator=sum(row.calls for row in cost_rows),
+                partial=partial,
+            )
+            delivery_rows = [
+                AuditDeliveryRow(**row)
+                for row in audit.delivery(since=since, project_id=project_id)
+            ]
+            delivery = AuditDelivery(
+                window=window,
+                rows=delivery_rows,
+                denominator=audit.delivery_denominator(since=since, project_id=project_id),
+                partial=partial,
+            )
+            baselines = BaselineList(
+                baselines=[Baseline(**row) for row in audit.baselines(project_id=project_id)]
+            )
+            rollups = AuditRollups(
+                rows=[AuditRollupRow(**row) for row in audit.rollups(project_id=project_id)],
+                rolled_up_through=audit.rolled_up_through(),
+            )
+            health = AuditHealth(
+                configured=True,
+                degraded=audit.degraded,
+                path=str(audit.path),
+                events=audit.count(),
+                oldest=oldest,
+                newest=newest,
+                schema_version=getattr(audit, "SCHEMA_VERSION", None),
+            )
+        return AnalyticsDashboard(
+            window=window,
+            project_id=project_id,
+            rate_limits=rate_limits,
+            cost=cost,
+            delivery=delivery,
+            audit_health=health,
+            baselines=baselines,
+            rollups=rollups,
         )
 
     def evidence(self, project_id: str, item_id: str) -> WorkEvidence | None:

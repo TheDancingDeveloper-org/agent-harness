@@ -6,7 +6,9 @@
       event.preventDefault();
       const csrf = form.querySelector('input[name="csrf_token"]');
       fetch(form.action, {method: 'POST', headers: {'X-CSRF-Token': csrf ? csrf.value : '', 'Content-Type': 'application/x-www-form-urlencoded'}, body: new URLSearchParams(new FormData(form))}).then((response) => {
-        window.location.assign(response.redirected ? response.url : '/login');
+        if (response.redirected) window.location.assign(response.url);
+        else if (response.ok) response.text().then((html) => { document.open(); document.write(html); document.close(); });
+        else status('Action refused (' + response.status + ') — review the server response');
       }).catch(() => status('Disconnected — action was not submitted'));
     }));
     document.querySelectorAll('[sse-connect]').forEach((node) => {

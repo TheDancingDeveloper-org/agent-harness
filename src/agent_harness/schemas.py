@@ -488,11 +488,11 @@ class ProjectSpec(BaseModel):
     supplied again after a restart -- every field was previously a CLI flag
     with nowhere to be written down."""
 
-    project_id: str = Field(description="Stable id, used to scope every other call.")
-    name: str
+    project_id: str = Field(min_length=1, description="Stable id, used to scope every other call.")
+    name: str = Field(min_length=1)
     repo: str | None = Field(None, description="GitHub repo as `owner/name`.")
     work_dir: str | None = Field(None, description="Checkout the worktrees branch from.")
-    base_branch: str = "main"
+    base_branch: str = Field("main", min_length=1)
     checks: list[str] = Field(
         default_factory=list,
         description=(
@@ -537,6 +537,13 @@ class ProjectSpec(BaseModel):
             "reported as unenforceable — unknown cost is never treated as zero."
         ),
     )
+    max_hold_seconds: float = Field(
+        6 * 60 * 60,
+        ge=0,
+        description="Maximum time a held question keeps its claim. Zero means no expiry; "
+        "the safe default is six hours so one unanswered question cannot occupy a worker "
+        "forever.",
+    )
     durability: str = Field(
         "",
         description=(
@@ -555,6 +562,7 @@ class ProjectSpec(BaseModel):
     )
     max_workers: int = Field(
         1,
+        ge=1,
         description="Concurrency budget. Its purpose is that one project cannot "
         "starve another, so it is per project rather than per fleet. Each worker owns "
         "a worktree and its build output, so raising this also multiplies peak disk use.",
@@ -1063,6 +1071,12 @@ class RateLimits(BaseModel):
         "these and cannot be recovered."
     )
     total: int = Field(description="Classified rate limits only. Excludes `unclassified`.")
+    denominator: int = Field(
+        0,
+        description="All observed rate-limit events in the window, including the "
+        "separately reported unclassified rows. This is the denominator for any "
+        "rate-limit comparison.",
+    )
     by_worker: list[dict[str, Any]] = Field(default_factory=list)
     by_endpoint: list[dict[str, Any]] = Field(default_factory=list)
     by_role: list[dict[str, Any]] = Field(default_factory=list)
@@ -1116,6 +1130,11 @@ class AuditCost(BaseModel):
     rows: list[AuditCostRow] = Field(default_factory=list)
     total_cost_usd: float | None = None
     total_unpriced: int = 0
+    denominator: int = Field(
+        0,
+        description="Model-call rows observed in the requested window, including "
+        "calls whose price was unknown.",
+    )
     partial: bool = Field(
         False,
         description="True when the requested window starts before the earliest "
@@ -1133,6 +1152,11 @@ class AuditDeliveryRow(BaseModel):
 class AuditDelivery(BaseModel):
     window: str
     rows: list[AuditDeliveryRow] = Field(default_factory=list)
+    denominator: int = Field(
+        0,
+        description="Distinct work items observed in the requested window. Outcome "
+        "rows can overlap because one item may emit more than one outcome.",
+    )
     partial: bool = False
 
 
@@ -1271,6 +1295,21 @@ class BaselineList(BaseModel):
     baselines: list[Baseline] = Field(default_factory=list)
 
 
+class AnalyticsDashboard(BaseModel):
+    """The typed, read-only projection rendered by the analytics page."""
+
+    window: str = Field(description="The requested audit window token.")
+    project_id: str | None = Field(None, description="Optional project scope.")
+    rate_limits: RateLimits = Field(description="Classified and unclassified rate limits.")
+    cost: AuditCost = Field(description="Known and unpriced model-call spend.")
+    delivery: AuditDelivery = Field(description="Outcome counts and item denominator.")
+    audit_health: AuditHealth = Field(
+        description="Whether the history is complete enough to trust."
+    )
+    baselines: BaselineList = Field(description="Immutable supplied comparison baselines.")
+    rollups: AuditRollups = Field(description="Daily retained history for long windows.")
+
+
 class NewBaseline(BaseModel):
     baseline_id: str = Field(description="Stable id. Recording twice under one id is refused.")
     project_id: str
@@ -1305,6 +1344,100 @@ class Event(BaseModel):
 class EventPage(BaseModel):
     events: list[Event]
     cursor: int = Field(description="Pass as `since_id` next time. Unchanged when empty.")
+
+
+class EventFilters(BaseModel):
+    """Typed, URL-safe filters for the append-only event explorer.
+
+    The fields mirror the evidence dimensions recorded by the audit store. A
+    reason kind lives in event data because older event rows predate the
+    classified field; readers therefore treat its absence as no match rather
+    than inventing a classification.
+    """
+
+    project_id: str | None = Field(None, description="Limit events to one project.")
+    item_id: str | None = Field(None, description="Limit events to one work item.")
+    worker: str | None = Field(None, description="Limit events to one worker identity.")
+    endpoint: str | None = Field(None, description="Limit events to one endpoint.")
+    role: str | None = Field(None, description="Limit events to one routed role.")
+    model: str | None = Field(None, description="Limit events to one model identifier.")
+    outcome: str | None = Field(None, description="Limit events to one outcome token.")
+    error_class: str | None = Field(None, description="Limit events to one error class.")
+    reason_kind: str | None = Field(None, description="Limit events to a recorded reason kind.")
+    start_ts: float | None = Field(None, description="Include events at or after this Unix time.")
+    end_ts: float | None = Field(None, description="Include events at or before this Unix time.")
+
+    @field_validator(
+        "project_id",
+        "item_id",
+        "worker",
+        "endpoint",
+        "role",
+        "model",
+        "outcome",
+        "error_class",
+        "reason_kind",
+        "start_ts",
+        "end_ts",
+        mode="before",
+    )
+    @classmethod
+    def blank_strings_are_not_filters(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @model_validator(mode="after")
+    def valid_time_window(self) -> EventFilters:
+        if self.start_ts is not None and self.end_ts is not None and self.start_ts > self.end_ts:
+            raise ValueError("start_ts must not be after end_ts")
+        return self
+
+
+class AbandonedSessionEvidence(BaseModel):
+    """A terminal session deliberately retained after an agent timeout."""
+
+    session_id: str = Field(description="Session retained for human recovery.")
+    project_id: str | None = Field(
+        None, description="Project scope, when recorded by a project-aware executor."
+    )
+    item_id: str = Field(description="Item whose context the session still owns.")
+    reason: str | None = Field(None, description="Why the session was abandoned.")
+    session_url: str | None = Field(None, description="Optional deep link to the session.")
+    abandoned_at: float = Field(description="Unix time when the session was retained.")
+
+
+class WorkerInventoryItem(BaseModel):
+    """One live worker, a durable claim, or a recorded worker failure."""
+
+    worker_id: str = Field(description="Runtime worker identity, normally its thread name.")
+    project_id: str | None = Field(None, description="Project served by this worker, if known.")
+    state: str = Field(description="`running`, `idle`, `failed`, or `stale_claim`.")
+    claim_owner: str | None = Field(None, description="Durable queue owner on a claimed item.")
+    item_id: str | None = Field(None, description="Work item currently held by the worker.")
+    lease_until: float | None = Field(None, description="Claim lease expiry, when an item is held.")
+    heartbeat_at: float | None = Field(
+        None, description="Most recent durable claim update, used as the heartbeat evidence."
+    )
+    stage: str | None = Field(None, description="Most recent recorded stage or event outcome.")
+    started_at: float | None = Field(None, description="Runtime worker start time, when attached.")
+    item_started_at: float | None = Field(None, description="When the current item first started.")
+    failure: str | None = Field(None, description="Most recent recorded worker failure.")
+    failed_at: float | None = Field(None, description="Unix time of the worker failure.")
+    abandoned_sessions: list[AbandonedSessionEvidence] = Field(
+        default_factory=list, description="Retained session evidence associated with this item."
+    )
+
+
+class WorkerInventory(BaseModel):
+    """The read-only worker-pool projection used by the GUI and API."""
+
+    configured: bool = Field(description="Whether a supervised worker pool is attached.")
+    mode: Literal["supervised", "monitoring-only"] = Field(
+        description="Monitoring-only deployments have no worker identities to report."
+    )
+    reason: str | None = Field(None, description="Why the inventory is unavailable, when absent.")
+    workers: list[WorkerInventoryItem] = Field(default_factory=list)
 
 
 class AttemptStageEvidence(BaseModel):

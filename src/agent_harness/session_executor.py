@@ -487,6 +487,7 @@ class SessionExecutor:
             self.queue.record_abandoned_session(
                 partial.session_id,
                 record.item_id,
+                project_id=self.project_id,
                 reason=f"worker failed and left this session running: {reason}",
                 session_url=None,
             )
@@ -675,6 +676,7 @@ class SessionExecutor:
                 self.queue.record_abandoned_session(
                     session.id,
                     record.item_id,
+                    project_id=self.project_id,
                     reason=outcome.reason,
                     session_url=session.tab_url(self.ui_base_url) if self.ui_base_url else None,
                 )

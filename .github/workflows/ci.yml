@@ -1,9 +1,31 @@
 name: CI
 
+# Documentation never reaches a gate, so it never starts one. `paths-ignore`
+# means the workflow does not run at all for a prose change -- no runner, no
+# queue, no wait.
+#
+# That is only safe because `main`'s protection no longer requires branches to
+# be up to date (`strict: false`). With `strict` on, a required check that
+# never reports blocks the pull request permanently, which is how a five-line
+# documentation change came to take twenty minutes: every merge invalidated
+# every other branch, each needing a fresh run before it could merge, one at a
+# time.
+#
+# The path list is deliberately conservative. Anything not named here still
+# runs everything: a new top-level file nobody thought about gets the gates
+# rather than a free pass.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '.github/ISSUE_TEMPLATE/**'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '.github/ISSUE_TEMPLATE/**'
   workflow_dispatch:
 
 concurrency:

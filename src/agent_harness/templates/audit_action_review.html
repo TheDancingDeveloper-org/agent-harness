@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Explicit confirmation</p><h1>{{ title }}</h1></div><span class="mode-badge">No changes applied</span></div>
+  <section class="card">
+    {% if action_kind == "reconcile" %}
+      <p>No external request has been made. Confirming contacts GitHub and appends any merge, close, or revert facts returned for the resolved repository.</p>
+      <dl class="detail-facts"><dt>Project</dt><dd>{{ project_id }}</dd><dt>Resolved repository</dt><dd><code>{{ repo }}</code></dd><dt>Dry run</dt><dd>Dry run is not supported by reconciliation; this review is the non-mutating boundary.</dd><dt>Reason</dt><dd>{{ reason }}</dd></dl>
+      <form method="post" action="{{ url_for('audit_reconcile_apply') }}" data-csrf-form>
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <input type="hidden" name="review_id" value="{{ review.review_id }}">
+        <input type="hidden" name="project_id" value="{{ project_id }}">
+        <button type="submit">Run GitHub reconciliation</button>
+      </form>
+    {% else %}
+      <p>No audit rows have been rolled up or thinned. Confirming first closes eligible daily rollups, then removes only covered raw rows older than the reviewed retention window.</p>
+      <dl class="detail-facts"><dt>Raw-event retention</dt><dd>{{ retention_days }} days</dd><dt>Order</dt><dd>Roll up, then thin covered rows</dd><dt>Dry run</dt><dd>Dry run is not supported by audit maintenance; this review is the non-mutating boundary.</dd><dt>Reason</dt><dd>{{ reason }}</dd></dl>
+      <form method="post" action="{{ url_for('audit_maintenance_apply') }}" data-csrf-form>
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <input type="hidden" name="review_id" value="{{ review.review_id }}">
+        <button type="submit">Run audit maintenance</button>
+      </form>
+    {% endif %}
+    <p><a class="button secondary" href="{{ url_for('analytics') }}">Cancel</a></p>
+  </section>
+{% endblock %}

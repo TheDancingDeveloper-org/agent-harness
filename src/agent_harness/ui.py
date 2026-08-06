@@ -23,9 +23,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
+from .audit import AuditStore
+from .audit_service import maintain_audit, reconcile_repository
 from .browser_session import BrowserSession, BrowserSessions
 from .events import WORK, Event
 from .inception import Inception
+from .maintenance import DEFAULT_RETENTION_DAYS
 from .plan_service import PlanSyncConflict, PlanSyncFailure
 from .plan_service import apply as apply_plan_sync
 from .plan_service import preview as preview_plan_sync
@@ -101,6 +104,17 @@ def install_ui(app: FastAPI) -> BrowserSessions:
 
     def require_session(request: Request) -> BrowserSession:
         return sessions.require(request)
+
+    def require_audit(request: Request) -> AuditStore:
+        audit: AuditStore | None = request.app.state.audit
+        if audit is None:
+            raise HTTPException(status_code=409, detail="no audit store is attached")
+        if audit.degraded:
+            raise HTTPException(
+                status_code=409,
+                detail="audit store is degraded; the operator action cannot be recorded",
+            )
+        return audit
 
     async def form(request: Request) -> dict[str, str]:
         values = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
@@ -925,6 +939,249 @@ def install_ui(app: FastAPI) -> BrowserSessions:
             "analytics.html",
             title="Analytics",
             dashboard=dashboard,
+            projects=queries(request).projects(),
+            retention_days=DEFAULT_RETENTION_DAYS,
+        )
+
+    @app.post(
+        "/ui/actions/audit-reconcile/review",
+        name="audit_reconcile_review",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    async def audit_reconcile_review(request: Request) -> HTMLResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        reason = body.get("reason", "").strip()
+        if not project_id:
+            raise HTTPException(status_code=422, detail="a project is required")
+        if not reason:
+            raise HTTPException(status_code=422, detail="a reconciliation reason is required")
+        require_audit(request)
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        project = queue.get_project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        if not project.repo:
+            raise HTTPException(status_code=409, detail="project has no GitHub repository")
+        review = sessions.create_review(
+            session,
+            kind="audit_reconcile",
+            target_id=project_id,
+            baseline_digest=project_spec_digest(project_spec(project)),
+            baseline_version=float(project.updated_at),
+            payload={"repo": project.repo, "reason": reason},
+        )
+        return render(
+            request,
+            "audit_action_review.html",
+            title="Review GitHub reconciliation",
+            action_kind="reconcile",
+            review=review,
+            project_id=project_id,
+            repo=project.repo,
+            reason=reason,
+            retention_days=None,
+        )
+
+    @app.post(
+        "/ui/actions/audit-reconcile/apply",
+        name="audit_reconcile_apply",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    async def audit_reconcile_apply(request: Request) -> HTMLResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        project_id = body.get("project_id", "").strip()
+        try:
+            review = sessions.consume_review(
+                session,
+                body.get("review_id", ""),
+                kind="audit_reconcile",
+                target_id=project_id,
+            )
+        except HTTPException:
+            refusal_audit(
+                request,
+                action="audit_reconcile",
+                reason_kind="invalid_or_expired_review",
+                data={"project_id": project_id},
+            )
+            raise
+        queue = request.app.state.queue
+        if queue is None:
+            raise HTTPException(status_code=503, detail="work queue is not configured")
+        project = queue.get_project(project_id)
+        repo = review.payload.get("repo")
+        reason = review.payload.get("reason")
+        if project is None:
+            refusal_audit(
+                request,
+                action="audit_reconcile",
+                reason_kind="project_missing",
+                data={"project_id": project_id},
+            )
+            raise HTTPException(status_code=409, detail="project was removed after review")
+        if not isinstance(repo, str) or not isinstance(reason, str) or not reason:
+            refusal_audit(
+                request,
+                action="audit_reconcile",
+                reason_kind="invalid_review",
+                data={"project_id": project_id},
+            )
+            raise HTTPException(status_code=409, detail="reconciliation review is invalid")
+        if (
+            project.updated_at != review.baseline_version
+            or project.repo != repo
+            or not secrets.compare_digest(
+                review.baseline_digest, project_spec_digest(project_spec(project))
+            )
+        ):
+            refusal_audit(
+                request,
+                action="audit_reconcile",
+                reason_kind="project_configuration_changed",
+                data={"project_id": project_id, "repo": repo},
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="project configuration changed after reconciliation review",
+            )
+        result = reconcile_repository(queue, require_audit(request), repo, project_id=project_id)
+        action_audit(
+            request,
+            action="audit_reconcile",
+            outcome="operator_reconciled_github",
+            data={
+                "project_id": project_id,
+                "repo": repo,
+                "reason": reason,
+                "merged": result.merged,
+                "closed_unmerged": result.closed_unmerged,
+                "reverted": result.reverted,
+                "skipped": result.skipped,
+                "errors": result.errors,
+            },
+        )
+        return render(
+            request,
+            "audit_action_result.html",
+            title="GitHub reconciliation result",
+            action_kind="reconcile",
+            repo=repo,
+            reason=reason,
+            result=result,
+        )
+
+    @app.post(
+        "/ui/actions/audit-maintenance/review",
+        name="audit_maintenance_review",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    async def audit_maintenance_review(request: Request) -> HTMLResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        reason = body.get("reason", "").strip()
+        if not reason:
+            raise HTTPException(status_code=422, detail="a maintenance reason is required")
+        require_audit(request)
+        try:
+            retention_days = int(body.get("retention_days", ""))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail="retention days must be an integer"
+            ) from exc
+        if retention_days < 0:
+            raise HTTPException(status_code=422, detail="retention days must not be negative")
+        review = sessions.create_review(
+            session,
+            kind="audit_maintenance",
+            target_id="audit",
+            baseline_digest=str(retention_days),
+            baseline_version=0,
+            payload={"retention_days": retention_days, "reason": reason},
+        )
+        return render(
+            request,
+            "audit_action_review.html",
+            title="Review audit maintenance",
+            action_kind="maintenance",
+            review=review,
+            project_id=None,
+            repo=None,
+            reason=reason,
+            retention_days=retention_days,
+        )
+
+    @app.post(
+        "/ui/actions/audit-maintenance/apply",
+        name="audit_maintenance_apply",
+        response_class=HTMLResponse,
+        include_in_schema=False,
+    )
+    async def audit_maintenance_apply(request: Request) -> HTMLResponse:
+        session = require_session(request)
+        body = await form(request)
+        sessions.require_csrf(request, session, body.get("csrf_token"))
+        try:
+            review = sessions.consume_review(
+                session,
+                body.get("review_id", ""),
+                kind="audit_maintenance",
+                target_id="audit",
+            )
+        except HTTPException:
+            refusal_audit(
+                request,
+                action="audit_maintenance",
+                reason_kind="invalid_or_expired_review",
+                data={},
+            )
+            raise
+        retention_days = review.payload.get("retention_days")
+        reason = review.payload.get("reason")
+        if (
+            not isinstance(retention_days, int)
+            or retention_days < 0
+            or not isinstance(reason, str)
+            or not reason
+        ):
+            refusal_audit(
+                request,
+                action="audit_maintenance",
+                reason_kind="invalid_review",
+                data={},
+            )
+            raise HTTPException(status_code=409, detail="maintenance review is invalid")
+        result = maintain_audit(require_audit(request), retention_days)
+        action_audit(
+            request,
+            action="audit_maintenance",
+            outcome="operator_ran_audit_maintenance",
+            data={
+                "reason": reason,
+                "retention_days": retention_days,
+                "rolled_up": result.rolled_up,
+                "thinned": result.thinned,
+                "errors": result.errors,
+            },
+        )
+        return render(
+            request,
+            "audit_action_result.html",
+            title="Audit maintenance result",
+            action_kind="maintenance",
+            repo=None,
+            reason=reason,
+            result=result,
         )
 
     @app.get("/plans", name="plans", response_class=HTMLResponse, include_in_schema=False)

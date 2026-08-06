@@ -30,15 +30,15 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import __version__
 from .audit import AuditStore
+from .audit_service import maintain_audit, reconcile_repository
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
-from .maintenance import DEFAULT_RETENTION_DAYS, run_maintenance
+from .maintenance import DEFAULT_RETENTION_DAYS
 from .plan_service import PlanSyncConflict, PlanSyncFailure
 from .plan_service import execute as execute_plan_sync
 from .plan_service import parse_result as plan_parse_result
 from .preflight import BaseChecks
 from .project_service import configure_project, project_spec
 from .providers import MEANING
-from .reconcile import GitHubReconciler, items_by_pr
 from .routing_service import ROLE_MAP_KEY as ROLE_MAP_KEY
 from .routing_service import configure_roles, role_map_view
 from .schemas import (
@@ -1013,16 +1013,7 @@ def create_api(
         produces two facts, in order, both true when recorded — not one fact
         that changes its mind.
         """
-        queue = app.state.queue
-        mapping = items_by_pr(queue) if queue is not None else {}
-        report = GitHubReconciler(repo, audit_store()).reconcile(mapping)
-        return ReconcileResult(
-            merged=report.merged,
-            closed_unmerged=report.closed_unmerged,
-            reverted=report.reverted,
-            skipped=report.skipped,
-            errors=report.errors,
-        )
+        return reconcile_repository(app.state.queue, audit_store(), repo)
 
     @app.post(
         "/api/audit/maintenance",
@@ -1042,10 +1033,7 @@ def create_api(
         so an operator does not have to wait an hour to see whether retention
         is working, which is exactly when they are most likely to want to know.
         """
-        report = run_maintenance(audit_store(), retention_days=retention_days)
-        return MaintenanceResult(
-            rolled_up=report.rolled_up, thinned=report.thinned, errors=report.errors
-        )
+        return maintain_audit(audit_store(), retention_days)
 
     @app.get(
         "/api/audit/rollups",

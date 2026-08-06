@@ -91,6 +91,15 @@ declared optional dependencies with `uv sync --all-extras`:
 | `uv run ruff format --check .` | passed, 131 files already formatted |
 | `TMPDIR=/tmp/agent-harness-gui-merge-mypy.8cRBKW uv run mypy` | passed, 126 source files |
 
+After the reviewed reconciliation and audit-maintenance controls:
+
+| Check | Result |
+|---|---|
+| `TMPDIR=/tmp/agent-harness-gui-4-8-full.VVKT0C uv run pytest -q` | passed at 100%, 1 skipped |
+| `uv run ruff check .` | passed |
+| `uv run ruff format --check .` | passed, 132 files already formatted |
+| `TMPDIR=/tmp/agent-harness-gui-4-8-full-mypy.MdANch uv run mypy` | passed, 127 source files |
+
 The first full merged pytest attempt is not passing evidence. This older worktree had not
 yet installed `main`'s newly declared `agent-loop` extra, so 38 tests failed consistently
 with `ModuleNotFoundError: minisweagent`. `uv sync --all-extras` installed the declared
@@ -164,6 +173,15 @@ not evidence: the former raced virtualenv creation and the latter filled the
   panels show event and distinct-item denominators; baselines and daily rollups remain
   visible; and missing, degraded or partial audit history is called out rather than inferred
   away. Focused API/audit/browser journeys cover these caveats.
+- Analytics now exposes reviewed GitHub reconciliation and audit-maintenance actions.
+  Review performs no external request or audit mutation; apply consumes a one-time
+  server-held payload. Reconciliation resolves the repository from a persisted project,
+  scopes PR attribution to that project and refuses configuration drift before GitHub.
+  Maintenance validates and binds the raw-event retention window. Neither underlying
+  operation supports a dry run, which the review says explicitly. Success and replay/drift
+  refusals record the authenticated operator and required reason in the healthy append-only
+  audit store, while result pages retain returned counts and errors. Missing or degraded
+  audit stores refuse the controls because the required operator record could not be kept.
 - Typed item evidence exposes append-only events, durable attempt stages and
   retained holds without fabricating absent history or cost.
 - `/api/events/stream` resumes after a monotonic cursor and surfaces disconnects;
@@ -183,13 +201,13 @@ accessibility/security/concurrency journeys remain to run. Milestone 2 remains p
 (bulk-action review, notifications and other controls are not yet wired). Milestone 3
 remains partial (adoption and richer graph interactions are not yet wired). Milestone 4 is
 partial: global routing, worker inventory, filtered events and typed analytics are
-implemented, while confirmed reconciliation, audit-maintenance controls and process-log
+implemented, as are confirmed reconciliation and audit-maintenance controls; process-log
 metrics are not. Milestones 5–8 (internal sessions,
 extensions, automation, RBAC and recovery) remain explicitly incomplete. No real fleet,
 GitHub repository or external deployment was used.
 
 ## Current slice verification
 
-The post-integration four-gate table above is the latest complete implementation evidence.
+The Milestone 4.8 four-gate table above is the latest complete implementation evidence.
 Earlier transient or partial runs are historical context only and are not substituted for
 that complete pass.

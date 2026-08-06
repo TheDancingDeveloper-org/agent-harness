@@ -14,6 +14,8 @@ from agent_harness.api import create_api
 from agent_harness.audit import AuditStore
 from agent_harness.events import WORK, Event
 from agent_harness.github import GitHub, GitHubError
+from agent_harness.maintenance import MaintenanceReport
+from agent_harness.reconcile import ReconcileReport
 from agent_harness.runtime import ExecutorRoles
 from agent_harness.store import EventStore
 from agent_harness.work import Project, WorkQueue, WorkRecord
@@ -885,3 +887,234 @@ def test_global_role_routing_is_secret_safe_reviewed_complete_and_stale_safe(
             event["data"].get("reason_kind") == "role_map_changed"
             for event in store.recent(limit=20)
         )
+
+
+def test_github_reconciliation_is_reviewed_resolved_audited_and_one_time(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    store = EventStore(tmp_path / "events.sqlite")
+    audit = AuditStore(tmp_path / "audit.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(Project(project_id="p", name="Project P", repo="owner/repository"))
+    queue.add(
+        [WorkRecord(item_id="T1", title="Known PR", brief="")],
+        project_id="p",
+    )
+    assert queue.record_pr_url("T1", "https://x/pull/7", project_id="p")
+    queue.add_project(Project(project_id="other", name="Other", repo="elsewhere/repository"))
+    queue.add(
+        [WorkRecord(item_id="O1", title="Other PR", brief="")],
+        project_id="other",
+    )
+    assert queue.record_pr_url("O1", "https://x/pull/8", project_id="other")
+    calls: list[tuple[str, dict[int, dict[str, str]]]] = []
+
+    class FakeReconciler:
+        def __init__(self, repo: str, _audit: AuditStore) -> None:
+            self.repo = repo
+
+        def reconcile(self, mapping: dict[int, dict[str, str]]) -> ReconcileReport:
+            calls.append((self.repo, mapping))
+            return ReconcileReport(merged=2, skipped=1, errors=["one remote row was invalid"])
+
+    monkeypatch.setattr("agent_harness.audit_service.GitHubReconciler", FakeReconciler)
+    with TestClient(create_api(store, queue=queue, audit=audit, token=TOKEN)) as client:
+        login(client)
+        page = client.get("/analytics")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        review = client.post(
+            "/ui/actions/audit-reconcile/review",
+            data={"csrf_token": csrf, "project_id": "p", "reason": "refresh delivery facts"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert review.status_code == 200
+        assert "owner/repository" in review.text
+        assert "No external request has been made" in review.text
+        assert "Dry run is not supported" in review.text
+        assert calls == []
+        review_id = review.text.split('name="review_id" value="', 1)[1].split('"', 1)[0]
+
+        result = client.post(
+            "/ui/actions/audit-reconcile/apply",
+            data={"csrf_token": csrf, "project_id": "p", "review_id": review_id},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert result.status_code == 200
+        assert calls == [("owner/repository", {7: {"project_id": "p", "item_id": "T1"}})]
+        assert "Merged" in result.text and ">2<" in result.text
+        assert "one remote row was invalid" in result.text
+        events = [json.loads(event["data"]) for event in audit.recent(limit=20)]
+        assert any(
+            event.get("action") == "audit_reconcile"
+            and event.get("operator") == "operator"
+            and event.get("reason") == "refresh delivery facts"
+            and event.get("repo") == "owner/repository"
+            for event in events
+        )
+        replay = client.post(
+            "/ui/actions/audit-reconcile/apply",
+            data={"csrf_token": csrf, "project_id": "p", "review_id": review_id},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert replay.status_code == 409
+        assert len(calls) == 1
+        replay_events = [json.loads(event["data"]) for event in audit.recent(limit=20)]
+        assert any(
+            event.get("action") == "audit_reconcile"
+            and event.get("reason_kind") == "invalid_or_expired_review"
+            for event in replay_events
+        )
+
+
+def test_github_reconciliation_refuses_project_drift_and_missing_reason(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    store = EventStore(tmp_path / "events.sqlite")
+    audit = AuditStore(tmp_path / "audit.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(Project(project_id="p", name="Project P", repo="owner/first"))
+    calls: list[str] = []
+
+    class FakeReconciler:
+        def __init__(self, repo: str, _audit: AuditStore) -> None:
+            calls.append(repo)
+
+        def reconcile(self, _mapping: dict[int, dict[str, str]]) -> ReconcileReport:
+            return ReconcileReport()
+
+    monkeypatch.setattr("agent_harness.audit_service.GitHubReconciler", FakeReconciler)
+    with TestClient(create_api(store, queue=queue, audit=audit, token=TOKEN)) as client:
+        login(client)
+        page = client.get("/analytics")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        missing = client.post(
+            "/ui/actions/audit-reconcile/review",
+            data={"csrf_token": csrf, "project_id": "p", "reason": ""},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert missing.status_code == 422
+        review = client.post(
+            "/ui/actions/audit-reconcile/review",
+            data={"csrf_token": csrf, "project_id": "p", "reason": "refresh facts"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        review_id = review.text.split('name="review_id" value="', 1)[1].split('"', 1)[0]
+        queue.add_project(Project(project_id="p", name="Project P", repo="owner/changed"))
+        refused = client.post(
+            "/ui/actions/audit-reconcile/apply",
+            data={"csrf_token": csrf, "project_id": "p", "review_id": review_id},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert refused.status_code == 409
+        assert calls == []
+        events = [json.loads(event["data"]) for event in audit.recent(limit=20)]
+        assert any(
+            event.get("action") == "audit_reconcile"
+            and event.get("reason_kind") == "project_configuration_changed"
+            for event in events
+        )
+
+
+def test_audit_maintenance_is_reviewed_validated_audited_and_reports_errors(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    store = EventStore(tmp_path / "events.sqlite")
+    audit = AuditStore(tmp_path / "audit.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(Project(project_id="p", name="Project P"))
+    calls: list[int] = []
+
+    def fake_maintenance(_audit: AuditStore, *, retention_days: int) -> MaintenanceReport:
+        calls.append(retention_days)
+        return MaintenanceReport(rolled_up=3, thinned=7, errors=["thin: database busy"])
+
+    monkeypatch.setattr("agent_harness.audit_service.run_maintenance", fake_maintenance)
+    with TestClient(create_api(store, queue=queue, audit=audit, token=TOKEN)) as client:
+        login(client)
+        page = client.get("/analytics")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        invalid = client.post(
+            "/ui/actions/audit-maintenance/review",
+            data={"csrf_token": csrf, "retention_days": "-1", "reason": "close history"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert invalid.status_code == 422
+        review = client.post(
+            "/ui/actions/audit-maintenance/review",
+            data={"csrf_token": csrf, "retention_days": "30", "reason": "close history"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert review.status_code == 200
+        assert "30 days" in review.text
+        assert "No audit rows have been rolled up or thinned" in review.text
+        assert "Dry run is not supported" in review.text
+        assert calls == []
+        review_id = review.text.split('name="review_id" value="', 1)[1].split('"', 1)[0]
+        result = client.post(
+            "/ui/actions/audit-maintenance/apply",
+            data={"csrf_token": csrf, "review_id": review_id},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert result.status_code == 200
+        assert calls == [30]
+        assert "thin: database busy" in result.text
+        events = [json.loads(event["data"]) for event in audit.recent(limit=20)]
+        assert any(
+            event.get("action") == "audit_maintenance"
+            and event.get("operator") == "operator"
+            and event.get("reason") == "close history"
+            and event.get("retention_days") == 30
+            for event in events
+        )
+        replay = client.post(
+            "/ui/actions/audit-maintenance/apply",
+            data={"csrf_token": csrf, "review_id": review_id},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert replay.status_code == 409
+        assert calls == [30]
+        replay_events = [json.loads(event["data"]) for event in audit.recent(limit=20)]
+        assert any(
+            event.get("action") == "audit_maintenance"
+            and event.get("reason_kind") == "invalid_or_expired_review"
+            for event in replay_events
+        )
+
+
+def test_audit_actions_refuse_when_no_audit_store_is_attached(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        queue = client.app.state.queue  # type: ignore[attr-defined]
+        queue.add_project(Project(project_id="p", name="Project P", repo="owner/repository"))
+        login(client)
+        html = client.get("/analytics").text
+        csrf = html.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        reconcile = client.post(
+            "/ui/actions/audit-reconcile/review",
+            data={"csrf_token": csrf, "project_id": "p", "reason": "refresh facts"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        maintenance = client.post(
+            "/ui/actions/audit-maintenance/review",
+            data={"csrf_token": csrf, "retention_days": "90", "reason": "close history"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert reconcile.status_code == 409
+        assert maintenance.status_code == 409
+
+
+def test_audit_actions_refuse_when_operator_events_cannot_be_recorded(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.sqlite")
+    audit = AuditStore(tmp_path / "audit.sqlite", degraded=True)
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(Project(project_id="p", name="Project P", repo="owner/repository"))
+    with TestClient(create_api(store, queue=queue, audit=audit, token=TOKEN)) as client:
+        login(client)
+        html = client.get("/analytics").text
+        csrf = html.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        response = client.post(
+            "/ui/actions/audit-reconcile/review",
+            data={"csrf_token": csrf, "project_id": "p", "reason": "refresh facts"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert response.status_code == 409
+        assert "cannot be recorded" in response.json()["detail"]

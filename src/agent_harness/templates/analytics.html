@@ -58,4 +58,25 @@
       {% if dashboard.baselines.baselines %}<table><thead><tr><th>Baseline</th><th>Window</th><th>Items done</th><th>Cost</th></tr></thead><tbody>{% for baseline in dashboard.baselines.baselines %}<tr><td>{{ baseline.label }} <span class="mono">({{ baseline.baseline_id }})</span></td><td>{{ baseline.window_days }}d</td><td>{{ baseline.items_done if baseline.items_done is not none else 'unknown' }}</td><td>{{ baseline.cost_usd if baseline.cost_usd is not none else 'unknown' }}</td></tr>{% endfor %}</tbody></table>{% endif %}
     </section>
   </div>
+
+  <section class="card">
+    <div class="card-heading"><div><p class="eyebrow">Guarded operations</p><h2>Reconciliation and maintenance</h2></div><span class="mode-badge">Explicit review</span></div>
+    <p class="muted">Each operation has a separate non-mutating review, a one-time confirmation, authenticated operator attribution, and a required reason.</p>
+    <div class="analytics-grid">
+      <form method="post" action="{{ url_for('audit_reconcile_review') }}" data-csrf-form>
+        <h3>GitHub reconciliation</h3>
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label>Project<select name="project_id" required><option value="">Select a configured repository</option>{% for summary in projects.projects %}{% if summary.project.repo %}<option value="{{ summary.project.project_id }}">{{ summary.project.name }} — {{ summary.project.repo }}</option>{% endif %}{% endfor %}</select></label>
+        <label>Reason<input name="reason" required placeholder="Why reconcile now?"></label>
+        <button type="submit">Review reconciliation</button>
+      </form>
+      <form method="post" action="{{ url_for('audit_maintenance_review') }}" data-csrf-form>
+        <h3>Audit maintenance</h3>
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label>Raw-event retention days<input name="retention_days" type="number" min="0" value="{{ retention_days }}" required></label>
+        <label>Reason<input name="reason" required placeholder="Why run maintenance now?"></label>
+        <button type="submit">Review maintenance</button>
+      </form>
+    </div>
+  </section>
 {% endblock %}

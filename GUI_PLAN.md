@@ -79,10 +79,10 @@ The complete implementation tree has the following evidence:
 
 | Check | Most recent result |
 |---|---|
-| `TMPDIR=/tmp/agent-harness-gui-merged-sync.jXkgCh uv run pytest -q` | Passed at 100%, 1 skipped |
+| `TMPDIR=/tmp/agent-harness-gui-4-8-full.VVKT0C uv run pytest -q` | Passed at 100%, 1 skipped |
 | `uv run ruff check .` | Passed |
-| `uv run ruff format --check .` | Passed, 131 files checked |
-| `TMPDIR=/tmp/agent-harness-gui-merge-mypy.8cRBKW uv run mypy` | Passed, 126 source files |
+| `uv run ruff format --check .` | Passed, 132 files checked |
+| `TMPDIR=/tmp/agent-harness-gui-4-8-full-mypy.MdANch uv run mypy` | Passed, 127 source files |
 
 The full suite includes the wheel packaging and in-process browser journeys. Browser
 automation, accessibility tooling, a forced browser SSE reconnect, real GitHub concurrency,
@@ -99,14 +99,17 @@ not prove a transaction across remote preview and writes.
 3. Milestone 2 still lacks bulk-action review and notification delivery. Milestone 3 still
    lacks the typed adoption HTTP/wizard flow and richer interactive graph controls.
 4. Milestone 4 rate-limit, cost, delivery, audit-health, worker inventory and filtered
-   event exploration are implemented as read-only typed views. Confirmed GitHub
-   reconciliation, audit-maintenance controls and process-log metrics remain incomplete.
+   event exploration are implemented as read-only typed views. GitHub reconciliation and
+   audit maintenance now have explicit reviewed browser actions. Session-independent
+   process and gateway-log metrics remain incomplete.
 
 ### 0.5 Exact next work
 
-Continue from the reconciled base with Milestone 4.8–4.9: add confirmed GitHub
-reconciliation and audit-maintenance reviews/actions, then expose session-independent
-process and gateway-log metrics through typed, redacted APIs. The analytics views now keep
+Continue from the reconciled base with Milestone 4.9: expose session-independent process
+and gateway-log metrics through typed, redacted APIs. Milestone 4.8 is implemented with
+one-time review/apply actions, persisted-project repository resolution and drift refusal,
+validated retention parameters, required reasons, authenticated operator audit, and result
+pages that retain returned errors. The analytics views now keep
 `rpm`, `window_cap`, `terminal_cap` and `unclassified` separate; show supplied baselines and
 denominators; keep known spend distinct from unpriced calls; and retain table evidence
 behind every summary. Do not mark Milestone 4 complete until every 4.1–4.9 acceptance
@@ -550,7 +553,13 @@ work; audit-health panels for missing, degraded, or partial history; and daily r
 baseline comparisons.
 
 4.8. Add confirmed GitHub reconciliation and audit maintenance actions. Show the resolved
-repository, retention parameters, dry-run where supported, and returned errors.
+repository, retention parameters, dry-run where supported, and returned errors. Implemented:
+both operations share application services with the JSON API and use a non-mutating,
+one-time browser review. Neither underlying operation supports a dry run, so the review
+states that honestly. Reconciliation is project-scoped and refuses repository drift;
+maintenance binds the validated retention window. Both require a reason and a healthy
+append-only audit store, record success/refusal with authenticated identity, and display
+all returned errors.
 
 4.9. Add session-independent process metrics and agent-harness gateway logs through typed,
 redacted APIs. Never make local filesystem log paths a core convention.

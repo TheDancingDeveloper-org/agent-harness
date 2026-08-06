@@ -79,6 +79,7 @@ from .schemas import (
     MaintenanceResult,
     NewBaseline,
     OpenQuestion,
+    OverdueHold,
     PlanParseResult,
     PlanSyncRequest,
     PlanSyncResult,
@@ -407,12 +408,21 @@ def create_api(
         project_id: str = Query("default", description="Which project the item is in."),
         _: None = Depends(require_token),
     ) -> RetryResult:
-        """Put a finished or failed item back to `pending`.
+        """Put a finished, failed or exhausted item back to `pending`.
 
         Refuses while a claim is live: yanking an item out from under a
         running agent produces two workers on one item, which is worse than
         one stuck item. A stale lease expires on its own and is retryable
         without anyone intervening.
+
+        `queue.requeue`, not `queue.release` — this is the operator's only
+        lever over a wedged row, and it has to *mean* it. A release leaves the
+        attempt counter where it was, so retrying an `exhausted` item put it
+        back to `pending`, reported `ok`, and watched the very next claim scan
+        retire it again before any worker saw it. It also leaves the durable
+        attempt position, so the "retry" would resume into the verdict it was
+        retrying. Requeuing clears both, and keeps `last_error`, which is the
+        only record of why the item stopped.
         """
         queue = need_queue()
         record = queue.get(item_id, project_id=project_id)
@@ -424,7 +434,7 @@ def create_api(
                 detail=f"{item_id} is claimed by {record.owner} and its lease is live; "
                 "wait for the lease to expire rather than racing it",
             )
-        queue.release(item_id, PENDING, error=None, project_id=project_id)
+        queue.requeue(item_id, project_id=project_id)
         return RetryResult(ok=True, item_id=item_id, state="pending")
 
     @app.get(
@@ -1812,6 +1822,12 @@ def create_api(
             for event in store.recent(kind="work", limit=200)
             if event["outcome"] == "waiting_for_input"
         ]
+        # Deliberately NOT swept first, unlike `/api/holds`. Sweeping here
+        # would expire the very holds this is meant to show and the field
+        # would read empty for ever — the status line looking healthy while
+        # an item waits is the thing #188 is about.
+        now = queue.now() if queue else time.time()
+        overdue = queue.holds.due(now) if queue else []
         return Summary(
             running=counts.get(CLAIMED, 0),
             pending=counts.get(PENDING, 0),
@@ -1825,6 +1841,18 @@ def create_api(
                     session_url=e["data"].get("session_url"),
                 )
                 for e in waiting[:5]
+            ],
+            holds_open=len(queue.holds.open_holds()) if queue else 0,
+            holds_overdue=[
+                OverdueHold(
+                    project_id=hold.project_id,
+                    item_id=hold.item_id,
+                    question=hold.question,
+                    age_seconds=round(hold.age(now), 1),
+                    overdue_seconds=round(max(0.0, now - hold.expires_at), 1),
+                    session_url=hold.session_url,
+                )
+                for hold in overdue
             ],
         )
 

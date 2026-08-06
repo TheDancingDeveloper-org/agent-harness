@@ -33,6 +33,14 @@ D8 is open.
 Nor does anything here let a gate decline to fail. `ESCALATE` is an *additional*
 outcome for a condition a person has to resolve; it is not a softer `FAIL`, and
 a check cannot reach for it to avoid failing an item.
+
+**And a fix does not let a gate decline to fail either.** `FIX_AVAILABLE` may
+now be acted on rather than merely recorded (#155), but only under the boundary
+`Checks.apply_fixes` documents: the fix runs once, the check is re-run, and the
+*re-run* is the verdict. A gate that still says no after its declared fix has
+run is a `FAIL` and refuses the item exactly as it always did. Nothing here
+suppresses, downgrades or retries a failure — it re-asks the same question of a
+tree the operator's own command rewrote, and takes the answer.
 """
 
 from __future__ import annotations
@@ -84,7 +92,9 @@ RETRY = "retry"
 #: item's fault, and the only one that should be read as a defect.
 FAIL = "fail"
 #: The gate ran, the item's work is wrong, **and** a mechanical fix for it is
-#: derivable. Recorded, never applied — see the rule below.
+#: derivable. Recorded. Run only where the operator has explicitly turned
+#: `Checks.apply_fixes` on, and even then the check is re-run afterwards and
+#: its second answer is the one that counts — see the rule below.
 FIX_AVAILABLE = "fix_available"
 #: The gate could not run, or ran into a condition no retry and no diff will
 #: clear: a full disk, a missing interpreter, a check command that does not
@@ -97,6 +107,37 @@ CHECK_OUTCOMES = (PASS, RETRY, FAIL, FIX_AVAILABLE, ESCALATE)
 #: out as a set so that adding a sixth outcome forces a decision about which
 #: side of this line it falls on rather than defaulting to "not a pass".
 SATISFIED = frozenset({PASS})
+
+
+@dataclass(frozen=True)
+class AppliedFix:
+    """One declared fix the harness ran, and exactly what it changed.
+
+    Exists so that "the harness edited the tree" is a **fact carried in the
+    result**, not an inference somebody has to make by diffing two commits.
+    Every consumer that shows a human what happened — the event stream, the
+    reviewer's prompt — reads this.
+    """
+
+    #: The check that failed and provoked the fix.
+    check: tuple[str, ...] = ()
+    #: The argv that was run, verbatim, in the item's own worktree.
+    fix: tuple[str, ...] = ()
+    #: Repository-relative paths whose content the fix rewrote. Derived from
+    #: git, not from the tool's output: a formatter that lies about what it
+    #: touched still cannot hide from a tree comparison.
+    paths: tuple[str, ...] = ()
+    #: Whether re-running the check afterwards passed. False means the fix was
+    #: run and the gate still said no, which is a real failure and is refused.
+    cleared: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "check": list(self.check),
+            "fix": list(self.fix),
+            "paths": list(self.paths),
+            "cleared": self.cleared,
+        }
 
 
 @dataclass(frozen=True)
@@ -114,11 +155,15 @@ class CheckResult:
     detail: str = ""
     #: The argv that produced this, for a report that has to name the gate.
     command: tuple[str, ...] = ()
-    #: For `FIX_AVAILABLE`: the argv that is believed to clear it. **Recorded,
-    #: not run.** Applying a fix is a decision with its own consequences and
-    #: its own evidence, and a gate that silently repaired what it was meant to
-    #: catch would be a gate that cannot be trusted to have caught anything.
+    #: For `FIX_AVAILABLE`: the argv that is believed to clear it. Recorded
+    #: whether or not it is run, so a deployment that has not turned
+    #: `Checks.apply_fixes` on still learns what would have cleared the gate.
     fix: tuple[str, ...] = ()
+    #: Fixes the harness actually ran while producing this result, in order.
+    #: Never empty on a result whose `PASS` was bought by a fix — that is the
+    #: whole point: a pass that the harness helped produce is distinguishable
+    #: from one the agent earned unaided, at every layer above this one.
+    applied: tuple[AppliedFix, ...] = ()
 
     def __post_init__(self) -> None:
         if self.outcome not in CHECK_OUTCOMES:
@@ -142,6 +187,7 @@ class CheckResult:
             "detail": self.detail,
             "command": list(self.command),
             "fix": list(self.fix),
+            "applied": [one.as_dict() for one in self.applied],
         }
 
 
@@ -168,8 +214,27 @@ WITHHELD = "withheld"
 #: A person has to resolve something before this can be attempted again. Not a
 #: failure of the item and not a transient condition.
 ESCALATED = "escalated"
+#: The harness refused to run a command on the item's behalf: it matched the
+#: deployment's refusal list, or it reached outside the item's tree. See
+#: `guard.py`.
+#:
+#: Kept apart from `REFUSED`, which is a gate's verdict *about the work*, and
+#: from `CRASHED`, which is the harness breaking. Neither is true here: the work
+#: was never judged, and nothing broke — the harness declined, on purpose, and
+#: an operator reading the queue must be able to see that without opening a log.
+#: It is also apart from `ESCALATED` because the two answer different questions:
+#: escalated is "nobody could decide this", and this is "the harness decided,
+#: and the answer is no".
+#:
+#: **A refusal is terminal (owner decision, 2026-08-05.)** The command is
+#: blocked, the item stops in `blocked`, and it is not handed back to the agent
+#: as a correction to retry: terminal is the safest of the two answers, the
+#: cheapest, and it cannot loop. The cost accepted with it is that an agent
+#: reaching for a forbidden command that had a permitted equivalent loses the
+#: whole item and needs a person.
+BLOCKED_BY_POLICY = "blocked_by_policy"
 
-DISPOSITIONS = (COMPLETED, REFUSED, CRASHED, WITHHELD, ESCALATED)
+DISPOSITIONS = (COMPLETED, REFUSED, CRASHED, WITHHELD, ESCALATED, BLOCKED_BY_POLICY)
 
 
 # ------------------------------------------------------------- reason kinds
@@ -212,6 +277,15 @@ CONTEXT_UNAVAILABLE = "context_unavailable"
 #: Retrying is pointless — the brief is the brief — so this needs a person to
 #: rewrite or withdraw the item, which is why it escalates rather than failing.
 ITEM_IMPOSSIBLE = "item_impossible"
+#: A command matched this deployment's refusal list. The command is named in
+#: the detail along with the pattern that refused it, so the answer to "why did
+#: this stop?" is one line of the queue rather than a session scrollback.
+COMMAND_BLOCKED = "command_blocked"
+#: A command the harness was asked to run named a path outside the item's tree.
+#: Kept apart from `COMMAND_BLOCKED` because the two need different responses: a
+#: pattern hit is answered by looking at the policy, and this is answered by
+#: looking at what the command was reaching for.
+PATH_ESCAPE = "path_escape"
 
 REASON_KINDS = (
     CHECKS_FAILED,
@@ -231,6 +305,8 @@ REASON_KINDS = (
     HOLD_EXPIRED,
     CONTEXT_UNAVAILABLE,
     ITEM_IMPOSSIBLE,
+    COMMAND_BLOCKED,
+    PATH_ESCAPE,
 )
 
 
@@ -296,12 +372,14 @@ class Stop:
 #: An attempt that ends in one of these is history; one that ends in
 #: `withheld`, or that never ends at all because its worker was killed, is a
 #: position to continue from.
-DECIDED = frozenset({COMPLETED, REFUSED, ESCALATED, CRASHED})
+DECIDED = frozenset({COMPLETED, REFUSED, ESCALATED, CRASHED, BLOCKED_BY_POLICY})
 
 
 #: Dispositions a human should be looking at rather than waiting through.
 #: `REFUSED` is absent on purpose: a rejected diff is the system working.
-NEEDS_A_PERSON = frozenset({ESCALATED})
+#: `BLOCKED_BY_POLICY` is present because the refusal is terminal — nothing will
+#: pick the item up again, so if no person looks at it, nobody ever does.
+NEEDS_A_PERSON = frozenset({ESCALATED, BLOCKED_BY_POLICY})
 
 
 def stop_for(result: CheckResult) -> Stop:

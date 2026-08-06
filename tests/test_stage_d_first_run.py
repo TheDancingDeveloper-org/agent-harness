@@ -361,17 +361,51 @@ def test_doctor_is_read_only(tmp_path: Path) -> None:
     from agent_harness.doctor import diagnose
     from agent_harness.work import WorkQueue
 
+    def listing_of(where: Path) -> list[str]:
+        """What is in the directory, minus SQLite's own scratch files.
+
+        `queue.sqlite-wal` and `queue.sqlite-shm` come and go with WAL
+        checkpointing, so whether they exist at any instant is a property of
+        timing and the filesystem rather than of anything `doctor` did.
+        Comparing them asserted something nobody meant and no code here
+        controls, and it failed intermittently in CI on a passing branch --
+        once mistaken for an integration failure and investigated as one.
+
+        The byte-for-byte comparison of `queue.sqlite` below is the real
+        guarantee and is deliberately left exactly as it was.
+        """
+        return sorted(p.name for p in where.iterdir() if not p.name.endswith(("-wal", "-shm")))
+
+    def content_of(db: Path) -> str:
+        """Everything the database holds, as SQL.
+
+        Not the file's bytes. Opening a WAL-mode database and closing it
+        checkpoints the log into the main file and allocates pages, so the
+        bytes change with no logical change at all -- measured on an untouched
+        `main`: 12,288 bytes before, 126,976 after, and a full dump identical.
+        The byte comparison therefore failed on every branch including `main`
+        itself, and said nothing about whether `doctor` had changed anything.
+
+        This asserts what the test is actually named for: that `doctor`
+        changes no data. It is stronger than the byte check in the way that
+        matters, because a dump that differs is a real difference.
+        """
+        import sqlite3
+
+        with sqlite3.connect(db) as conn:
+            return "\n".join(conn.iterdump())
+
     target = tmp_path / "demo"
     assert main(["init", "--demo", "--into", str(target)]) == 0
-    before = (target / "queue.sqlite").read_bytes()
-    listing = sorted(p.name for p in target.iterdir())
+    before = content_of(target / "queue.sqlite")
+    listing = listing_of(target)
 
     queue = WorkQueue(str(target / "queue.sqlite"))
     diagnose(queue, queue.projects())
     diagnose(queue, queue.projects())
 
-    assert sorted(p.name for p in target.iterdir()) == listing
-    assert (target / "queue.sqlite").read_bytes() == before
+    assert listing_of(target) == listing
+    assert content_of(target / "queue.sqlite") == before
 
 
 def test_doctor_blocks_and_exits_nonzero_when_the_checkout_is_gone(tmp_path: Path) -> None:

@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +48,9 @@ from .budgets import SPEND as BUDGET_SPEND
 from .budgets import WALL_CLOCK as BUDGET_WALL_CLOCK
 from .budgets import Budget, BudgetExceeded, Spend, budget_for
 from .budgets import check as budget_check
+from .edits import EditError, parse_edits, to_diff
 from .graph import LOCAL_WORK
+from .guard import CommandGuard, CommandRefused, guard_field
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
 from .outcomes import (
     BUDGET_EXHAUSTED,
@@ -63,6 +67,7 @@ from .outcomes import (
     ITEM_SPEND,
     ITEM_WALL_CLOCK,
     NO_TARGET,
+    PASS,
     PASSED,
     PATCH_REJECTED,
     PROVIDER_EXHAUSTED,
@@ -71,6 +76,7 @@ from .outcomes import (
     REVIEW_REJECTED,
     WITHHELD,
     WORKER_ERROR,
+    AppliedFix,
     CheckResult,
     Stop,
     stop_for,
@@ -210,6 +216,11 @@ def run_git(repo: Path, *args: str, check: bool = True) -> str:
 #: cannot be worked on at all until it is raised, and no number chosen here is
 #: right for every project. `run --context-budget` and `HARNESS_CONTEXT_BUDGET`
 #: set it.
+#:
+#: It is a **ceiling**: raising it so one large target fits does not enlarge
+#: what every other item is shown, because selection stops when relevance runs
+#: out rather than when the budget does, and the surroundings are bounded
+#: separately by `ContextPolicy.fallback_allowance`.
 DEFAULT_CONTEXT_BUDGET = 60_000
 
 #: Why a file was left out, as tokens rather than prose. The difference is
@@ -218,6 +229,21 @@ DEFAULT_CONTEXT_BUDGET = 60_000
 #: is about to be asked to edit something it cannot see.
 TARGET_OVER_BUDGET = "named target exceeds remaining content budget"
 BUDGET_SPENT = "content budget exhausted"
+
+#: Why a *fallback* file was left out while the budget still had room. The
+#: budget is a ceiling, not a quota to spend: a file sharing no term with the
+#: brief, the plan or a target path — and not sitting beside one — buys the
+#: implementer nothing, and paying for it on every item is money for nothing.
+#: Measured on an imported repository: 299,985 of a 300,000-character budget
+#: spent on an item whose entire change was one line, the padding being
+#: lockfiles and a vendored patch directory.
+NO_RELEVANCE = "no term in common with the brief, the plan or a target path"
+
+#: Why a relevant fallback file was still left out. The ceiling has to be
+#: raised to whatever the largest *target* in a repository needs (#150); the
+#: surroundings do not become more useful because it was, so they keep an
+#: allowance of their own.
+FALLBACK_ALLOWANCE_SPENT = "surrounding-context allowance spent"
 
 #: What a coordinator says that a worker should act on. `decision` is absent
 #: because that is what an **escalation** is recorded as, addressed to an
@@ -369,6 +395,20 @@ class ContextPolicy:
 
     budget: int = DEFAULT_CONTEXT_BUDGET
     generated_paths: tuple[str, ...] = ()
+    #: How much of the ceiling the *surroundings* may use. `None` means the
+    #: allowance the harness has always supplied — `DEFAULT_CONTEXT_BUDGET`,
+    #: clamped to the ceiling — which is a measured amount of behaviour rather
+    #: than a fraction invented here. A deployment that has measured how much
+    #: surrounding context improves its diffs sets its own; raising `budget`
+    #: so one large target fits never raises this on its own.
+    fallback_budget: int | None = None
+
+    @property
+    def fallback_allowance(self) -> int:
+        return min(
+            self.budget,
+            DEFAULT_CONTEXT_BUDGET if self.fallback_budget is None else self.fallback_budget,
+        )
 
 
 @dataclass(frozen=True)
@@ -383,6 +423,17 @@ class ContextSelection:
     omitted: tuple[tuple[str, str], ...]
     fallback_relevance: bool
     targets: tuple[PlannerTarget, ...]
+    #: What the budget was actually spent on, so an operator can see the
+    #: difference between context and padding rather than one total that is
+    #: always approximately the ceiling.
+    target_files: tuple[str, ...] = ()
+    fallback_files: tuple[str, ...] = ()
+    target_characters: int = 0
+    fallback_characters: int = 0
+    fallback_allowance: int = 0
+    #: Fallback candidates dropped for irrelevance while room remained. A
+    #: non-zero count is the ceiling behaving as a ceiling.
+    fallback_skipped: int = 0
 
 
 def parse_planner_result(reply: str) -> PlannerResult:
@@ -466,6 +517,23 @@ def _normalise_target(repo: Path, path: str) -> tuple[str | None, str | None]:
     return normalised, None
 
 
+def _terms(text: str) -> set[str]:
+    """Words a path and a brief can be compared on.
+
+    Deliberately generous in both directions: a component is kept whole *and*
+    split on the separators identifiers use, so `executor.py` matches a brief
+    that says "executor" and `main.tsx` matches one that says "main". Being
+    generous here is the conservative choice — this set decides what is worth
+    supplying, and the defect being fixed is padding, not selectivity.
+    """
+    found: set[str] = set()
+    for token in re.findall(r"[a-z0-9][a-z0-9_.-]*", text.lower()):
+        if len(token) > 2:
+            found.add(token)
+        found.update(part for part in re.split(r"[._-]+", token) if len(part) > 2)
+    return found
+
+
 def _configured_generated(path: str, configured: Sequence[str]) -> bool:
     candidate = Path(path)
     return any(
@@ -481,7 +549,21 @@ def select_repo_context(
     policy: ContextPolicy | None = None,
     ref: str | None = None,
 ) -> ContextSelection:
-    """Select target-first repository context and retain selection evidence."""
+    """Select target-first repository context and retain selection evidence.
+
+    The budget is a **ceiling, not a target**, and two rules keep it one.
+    Planner targets are supplied whole up to it, unchanged. The surroundings
+    stop when *relevance* runs out rather than when the budget does, and are
+    separately bounded by `ContextPolicy.fallback_allowance` — because a
+    ceiling raised so one 600 KB target fits (#150) says nothing about how
+    much padding the next one-line item deserves.
+
+    How much surrounding context actually improves a diff is unmeasured, and
+    no fraction of the ceiling is invented here to pretend otherwise: the
+    allowance defaults to the amount the harness has always supplied, and the
+    per-item evidence needed to answer the question properly is recorded in
+    `context_selected`.
+    """
     policy = policy or ContextPolicy()
     planner = planner or PlannerResult(
         plan="No structured planner result was supplied.",
@@ -539,30 +621,55 @@ def select_repo_context(
             *(f"{target.path} {target.reason}" for target in validated),
         ]
     ).lower()
-    terms = {term for term in re.findall(r"[a-z0-9][a-z0-9_.-]+", brief) if len(term) > 2}
+    terms = _terms(brief)
+    # A file sitting beside one the planner named is relevant whether or not
+    # its name happens to share a word: it is where that directory's
+    # conventions are written down, and it is the cheapest thing to be wrong
+    # about in the safe direction.
+    target_dirs = {path.rpartition("/")[0] for path in named}
+
+    def score(path: str) -> int:
+        return len(terms & _terms(path))
 
     def relevance(path: str) -> tuple[int, int, str]:
-        components = set(re.findall(r"[a-z0-9][a-z0-9_.-]+", path.lower()))
-        return (-len(terms & components), len(path), path)
+        return (-score(path), len(path), path)
 
-    fallback = sorted(
-        (
-            path
-            for path in tracked
-            if path not in named and not path.lower().endswith(_UNINTERESTING)
-        ),
-        key=relevance,
-    )
+    candidates = []
+    for path in tracked:
+        if path in named or path.lower().endswith(_UNINTERESTING):
+            continue
+        # Named ahead of relevance, so a deployment that told the harness a
+        # path is generated still reads that back rather than a weaker reason
+        # that happens to be true as well.
+        if _configured_generated(path, policy.generated_paths):
+            omitted.append((path, "configured generated artefact"))
+            continue
+        candidates.append(path)
+    candidates.sort(key=relevance)
+    fallback = [
+        path for path in candidates if score(path) > 0 or path.rpartition("/")[0] in target_dirs
+    ]
+    kept = set(fallback)
+    irrelevant = [path for path in candidates if path not in kept]
+    # The one case where padding is the safer answer: nothing was named and
+    # nothing matched, so there is no signal to select on. An implementer
+    # handed only a file listing writes a patch blind, which is the failure
+    # #146 was about — worse than paying for files it may not need.
+    if not fallback and not any(target.usable for target in validated):
+        fallback, irrelevant = candidates, []
+    omitted.extend((path, NO_RELEVANCE) for path in irrelevant)
 
     parts: list[str] = []
     supplied: list[str] = []
+    supplied_targets: list[str] = []
+    supplied_fallback: list[str] = []
+    target_characters = 0
+    fallback_characters = 0
+    allowance = policy.fallback_allowance
     spent = 0
     truncated = False
     for path in [*named, *fallback]:
         explicit = path in named
-        if not explicit and _configured_generated(path, policy.generated_paths):
-            omitted.append((path, "configured generated artefact"))
-            continue
         # Reading a worktree symlink follows it, which could turn an innocent
         # context selection into arbitrary access outside the repository. Git
         # stores the link target, not the pointed-to bytes; the implementer
@@ -583,9 +690,19 @@ def select_repo_context(
             truncated = True
             omitted.append((path, TARGET_OVER_BUDGET if explicit else BUDGET_SPENT))
             continue
+        if not explicit and fallback_characters + len(block) > allowance:
+            truncated = True
+            omitted.append((path, FALLBACK_ALLOWANCE_SPENT))
+            continue
         parts.append(block)
         supplied.append(path)
         spent += len(block)
+        if explicit:
+            supplied_targets.append(path)
+            target_characters += len(block)
+        else:
+            supplied_fallback.append(path)
+            fallback_characters += len(block)
 
     # Listing comes after file content and is bounded by the same budget. It
     # is orientation, not a reason to evict a file the planner named.
@@ -610,6 +727,12 @@ def select_repo_context(
         omitted=tuple(omitted),
         fallback_relevance=bool(fallback),
         targets=tuple(validated),
+        target_files=tuple(supplied_targets),
+        fallback_files=tuple(supplied_fallback),
+        target_characters=target_characters,
+        fallback_characters=fallback_characters,
+        fallback_allowance=allowance,
+        fallback_skipped=len(irrelevant),
     )
 
 
@@ -631,9 +754,11 @@ def repo_context(
 
     Files named in the brief come first and whole: they are the ones being
     edited, and a patch against a file the model has only seen the name of is
-    a patch written blind. The rest fills the remaining budget smallest-first,
-    on the grounds that many small files tell a model more about a codebase's
-    conventions than one large one.
+    a patch written blind. The rest is supplied most-relevant-first and
+    smallest-first within that, on the grounds that many small files tell a
+    model more about a codebase's conventions than one large one — and stops
+    at the point where a candidate has nothing in common with the item, which
+    is well before the budget in any repository large enough to matter.
 
     `ref` is the commit the patch will actually be applied to, and reading
     from it rather than the working tree is the whole point: the tree still
@@ -1115,15 +1240,79 @@ class Checks:
     its failure meant. Guessing at another ecosystem's messages is precisely
     how a generic harness stops being one, and a misread failure here would
     turn a real defect into a retry.
+
+    ## Applying a declared fix (#155)
+
+    With `apply_fixes` on, a check that fails and has a declared fix has that
+    fix **run once, in the item's own worktree**, and is then **re-run**. The
+    re-run is the verdict. If the gate still says no, the item is refused
+    exactly as it always was.
+
+    **This is allowed only because a formatter's fix is deterministic and
+    mechanical.** `cargo fmt`, `ruff format` and `prettier --write` compute the
+    one canonical rendering of code that already says what it says; running one
+    changes where a brace goes, and cannot change what the program does. The
+    gate is not weakened by re-asking it about a tree that a canonical renderer
+    has rewritten — the answer to "is this file formatted?" is being *earned*,
+    not skipped, and the formatted code is the code that would have been merged
+    anyway.
+
+    **A test that fails must never be "fixed" and re-run.** That is a different
+    thing wearing the same shape: a failing test is a statement about
+    behaviour, its repair is a judgement, and re-running it after something
+    edited it would launder the failure instead of reporting it. Nothing in
+    this class may be used to do that, and the guards below narrow how far it
+    can be pushed:
+
+    - **One fix, one re-run, no loop.** A fix never provokes another fix, and
+      a check is never fixed twice. A gate cannot be ground down to a pass.
+    - **The whole suite must pass on the post-fix tree.** Checks that had
+      already passed before a fix ran are re-run afterwards, so a "fix" cannot
+      buy one gate by breaking another that was already green.
+    - **The fix may only rewrite files that already exist.** Adding, deleting
+      or renaming a path is not something a formatter does; it *is* something
+      a fix that deletes a failing test does. It escalates to a person rather
+      than passing the item.
+    - **Confined to the worktree.** The fix runs with the item's tree as its
+      working directory, and an argv naming an absolute path or a `..` segment
+      is refused before anything runs.
+    - **Never silent.** Every fix that runs is recorded on the result as an
+      `AppliedFix` naming the paths it rewrote, is emitted as an event, and is
+      stated to the reviewer. See `review_checks_prompt`.
+    - **Refused by the deployment's policy, like any other command.** `guard`
+      screens the check argv and the fix argv both, before either subprocess
+      exists. That is a different question from the confinement above — it is
+      "is this deployment willing to run this at all?" — and it is terminal
+      rather than an escalation. See `guard.py`.
+
+    **What is not enforceable, stated plainly:** the harness cannot tell a
+    formatter from a test runner. `apply_fixes` is off by default, is per
+    project, and applies only to commands the operator has *personally* paired
+    with a fix. Declaring a fix for a command whose failure is a judgement —
+    a test suite, a type checker, a linter with autofixes that change
+    behaviour — defeats every guard above, and is the operator asserting
+    something the harness has to take on trust. Do not do it.
     """
 
     commands: Sequence[Sequence[str]] = ()
     timeout: float = 900.0
+    #: What this deployment will not run, and the boundary it will not run
+    #: outside. Screened here rather than at configuration time because a check
+    #: command is not always something an operator typed: `verify:` in a plan is
+    #: argv, and a plan is a document a model may have written. A refusal raises
+    #: `CommandRefused` — see `guard.py` for why it is not a check outcome.
+    guard: CommandGuard = guard_field()
     #: `command index or program name -> argv that is believed to clear it`.
     #: Declared by the caller, because only the caller knows that
-    #: `ruff format` fixes what `ruff format --check` reports. Recorded when
-    #: the check fails; **never run** — see `outcomes.CheckResult.fix`.
+    #: `ruff format` fixes what `ruff format --check` reports. Always recorded
+    #: on the result; run only when `apply_fixes` is on.
     fixes: Mapping[str, Sequence[str]] = field(default_factory=dict)
+    #: **Off by default, and deliberately.** On, a declared fix is run and its
+    #: check re-run, under every guard in this class's docstring. Turning it on
+    #: is the operator asserting that every command they have declared a fix
+    #: for is mechanically fixable — which is a promise about the tools, not a
+    #: property the harness can verify.
+    apply_fixes: bool = False
 
     def _fix_for(self, command: Sequence[str]) -> tuple[str, ...]:
         for key in (" ".join(command), command[0] if command else ""):
@@ -1132,49 +1321,300 @@ class Checks:
                 return tuple(found)
         return ()
 
-    def run(self, repo: Path) -> CheckResult:
-        for command in self.commands:
-            argv = list(command)
-            label = " ".join(argv)
-            try:
-                result = subprocess.run(  # noqa: S603 - caller-supplied argv, no shell
-                    argv,
-                    cwd=repo,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout,
-                )
-            except subprocess.TimeoutExpired:
-                # The question was not answered. That is not the same as the
-                # answer being no, and holding it against the item would fail
-                # sound work because a machine was busy.
-                return CheckResult(
-                    RETRY,
-                    f"`{label}` did not finish within {self.timeout:g}s",
-                    command=tuple(argv),
-                )
-            except OSError as exc:
-                # The program is missing or not executable. No diff fixes
-                # that and no retry clears it; it is a deployment fault
-                # wearing a check's clothes.
-                return CheckResult(
-                    ESCALATE,
-                    f"`{label}` could not be started: {exc}",
-                    command=tuple(argv),
-                )
-            if result.returncode != 0:
-                tail = (result.stdout + result.stderr).strip().splitlines()[-40:]
-                detail = f"`{label}` failed:\n" + "\n".join(tail)
-                if is_disk_exhaustion(detail):
-                    # The machine is out of room. Every subsequent item fails
-                    # the same way, and each one pays a planner and an
-                    # implementer first.
-                    return CheckResult(ESCALATE, detail, command=tuple(argv))
-                fix = self._fix_for(argv)
-                if fix:
-                    return CheckResult(FIX_AVAILABLE, detail, command=tuple(argv), fix=fix)
-                return CheckResult(FAIL, detail, command=tuple(argv))
+    def _run_one(self, repo: Path, command: Sequence[str]) -> CheckResult:
+        """One gate, asked once. The classification, and nothing else."""
+        argv = list(command)
+        label = " ".join(argv)
+        # Before the subprocess exists, not after it has done something. Here
+        # rather than in `run`, so every path that asks a gate a question --
+        # the first pass, a post-fix re-run, and the re-run of the gates a fix
+        # invalidated -- is screened by the same call.
+        self.guard.enforce(argv, cwd=repo)
+        try:
+            result = subprocess.run(  # noqa: S603 - caller-supplied argv, no shell
+                argv,
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            # The question was not answered. That is not the same as the
+            # answer being no, and holding it against the item would fail
+            # sound work because a machine was busy.
+            return CheckResult(
+                RETRY,
+                f"`{label}` did not finish within {self.timeout:g}s",
+                command=tuple(argv),
+            )
+        except OSError as exc:
+            # The program is missing or not executable. No diff fixes
+            # that and no retry clears it; it is a deployment fault
+            # wearing a check's clothes.
+            return CheckResult(
+                ESCALATE,
+                f"`{label}` could not be started: {exc}",
+                command=tuple(argv),
+            )
+        if result.returncode != 0:
+            tail = (result.stdout + result.stderr).strip().splitlines()[-40:]
+            detail = f"`{label}` failed:\n" + "\n".join(tail)
+            if is_disk_exhaustion(detail):
+                # The machine is out of room. Every subsequent item fails
+                # the same way, and each one pays a planner and an
+                # implementer first.
+                return CheckResult(ESCALATE, detail, command=tuple(argv))
+            fix = self._fix_for(argv)
+            if fix:
+                return CheckResult(FIX_AVAILABLE, detail, command=tuple(argv), fix=fix)
+            return CheckResult(FAIL, detail, command=tuple(argv))
         return PASSED
+
+    def run(self, repo: Path) -> CheckResult:
+        applied: list[AppliedFix] = []
+        last_fixed: int | None = None
+        for index, command in enumerate(self.commands):
+            result = self._run_one(repo, command)
+            if result.ok:
+                continue
+            if result.outcome != FIX_AVAILABLE or not self.apply_fixes:
+                # Unchanged behaviour, and the default one: the fix is
+                # recorded and the item is refused.
+                return replace(result, applied=tuple(applied))
+            rechecked, record = self._fix_and_recheck(repo, command, result)
+            if record is not None:
+                applied.append(record)
+            if not rechecked.ok:
+                return replace(rechecked, applied=tuple(applied))
+            last_fixed = index
+        if last_fixed is not None:
+            # Every gate that ran BEFORE the last fix did so against a tree the
+            # fix has since rewritten, so its answer is about a tree that no
+            # longer exists. Re-asking them is what makes the guarantee "every
+            # declared check passes on the tree as it now stands" true rather
+            # than the much weaker "every check passed at some point". Nothing
+            # here can provoke another fix, so this terminates. Usually free: a
+            # formatter is conventionally the cheapest check and therefore the
+            # first, and there is then nothing before it to re-run.
+            for command in self.commands[:last_fixed]:
+                result = self._run_one(repo, command)
+                if not result.ok:
+                    return replace(result, applied=tuple(applied))
+        if applied:
+            # A pass the harness helped produce, and it says so.
+            return CheckResult(PASS, applied=tuple(applied))
+        return PASSED
+
+    def _fix_and_recheck(
+        self, repo: Path, command: Sequence[str], failure: CheckResult
+    ) -> tuple[CheckResult, AppliedFix | None]:
+        """Run one declared fix, bound its effect, and ask the gate again.
+
+        Returns the gate's *second* answer and the record of what the fix did.
+        The second answer is the only one that decides anything: this method
+        cannot turn a failure into a pass, it can only give the same command a
+        second look at a tree the operator's own fix rewrote.
+        """
+        argv = tuple(failure.fix)
+        label = " ".join(argv)
+        checked = tuple(command)
+        unconfined = unconfined_argument(argv)
+        if unconfined:
+            return (
+                CheckResult(
+                    ESCALATE,
+                    f"the declared fix `{label}` names {unconfined!r}, which may point "
+                    "outside the item's worktree. A fix may only rewrite files in the "
+                    "tree it is run in, so it was not run.",
+                    command=checked,
+                ),
+                None,
+            )
+        # A declared fix is argv the harness runs on an item's behalf, so the
+        # deployment's refusal list applies to it exactly as it applies to a
+        # check. It is screened *after* `unconfined_argument` on purpose: that
+        # is the narrower, more specific gate, it already answers the "reaches
+        # outside the tree" question for a fix with its own message, and a
+        # second answer to a question already answered would be two policies
+        # disagreeing. What the guard adds here is the dimension #155 cannot
+        # see at all -- `sudo`, a force push, a program this deployment has
+        # named -- none of which is a path, and none of which a formatter
+        # needs. A hit is terminal, like every other refusal.
+        self.guard.enforce(argv, cwd=repo)
+        before = worktree_tree_id(repo)
+        if not before:
+            # Without git there is no way to say what the fix changed, and an
+            # unbounded, invisible edit to the tree a reviewer is about to read
+            # is precisely what must not happen.
+            return (
+                CheckResult(
+                    ESCALATE,
+                    f"the declared fix `{label}` was not run: {repo} is not a git worktree, "
+                    "so what the fix changed could be neither bounded nor shown to a reviewer.",
+                    command=checked,
+                ),
+                None,
+            )
+        try:
+            subprocess.run(  # noqa: S603 - caller-supplied argv, no shell
+                list(argv),
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return (
+                CheckResult(
+                    RETRY,
+                    f"the declared fix `{label}` did not finish within {self.timeout:g}s",
+                    command=checked,
+                ),
+                None,
+            )
+        except OSError as exc:
+            return (
+                CheckResult(
+                    ESCALATE,
+                    f"the declared fix `{label}` could not be started: {exc}",
+                    command=checked,
+                ),
+                None,
+            )
+        structural, rewritten = tree_delta(repo, before, worktree_tree_id(repo))
+        if structural:
+            # A formatter rewrites files; it does not invent or remove them.
+            # Something that does is not the mechanical repair this path is
+            # allowed to run, and a person has to look at the configuration.
+            return (
+                CheckResult(
+                    ESCALATE,
+                    f"the declared fix `{label}` added, removed or renamed "
+                    + ", ".join(structural[:10])
+                    + ". A fix is permitted to rewrite existing files and nothing else; "
+                    "this one is not a mechanical repair and must not be declared as one.",
+                    command=checked,
+                ),
+                AppliedFix(checked, argv, tuple(structural) + tuple(rewritten), cleared=False),
+            )
+        rerun = self._run_one(repo, command)
+        record = AppliedFix(checked, argv, tuple(rewritten), cleared=rerun.ok)
+        if rerun.ok:
+            return rerun, record
+        # The gate has now been asked twice and said no twice. It is a plain
+        # failure: the fix is spent, so the result must not offer it again and
+        # invite another round.
+        outcome = FAIL if rerun.outcome == FIX_AVAILABLE else rerun.outcome
+        detail = (
+            f"{rerun.detail}\n\n(the declared fix `{label}` was run first and did not clear this)"
+        )
+        return CheckResult(outcome, detail, command=checked), record
+
+
+def fix_announcement(one: AppliedFix) -> str:
+    """One sentence saying what the harness ran and what it did to the tree.
+
+    Shared by both executors on purpose: a correction to how a fix is announced
+    must not land in one and not the other (#167).
+    """
+    return (
+        f"`{' '.join(one.fix)}` was run after `{' '.join(one.check)}` failed, and "
+        + ("cleared it" if one.cleared else "did NOT clear it")
+        + "; it rewrote: "
+        + (", ".join(one.paths) or "nothing")
+    )
+
+
+def unconfined_argument(argv: Sequence[str]) -> str:
+    """The first argument that could reach outside the tree, or `""`.
+
+    Cheap and conservative, and checked *before* anything runs. A fix is a
+    command against the item's own worktree; an argument naming an absolute
+    path or climbing out through `..` is either a mistake or a fix doing
+    something a fix may not do, and both are worth refusing loudly.
+
+    The program itself (`argv[0]`) may be absolute — `/usr/bin/cargo` is a
+    normal way to name a tool — but may not climb.
+    """
+    for index, argument in enumerate(argv):
+        if index and (
+            argument.startswith(("/", "~")) or (argument.startswith("--") and "=/" in argument)
+        ):
+            return argument
+        if ".." in Path(argument).parts:
+            return argument
+    return ""
+
+
+def worktree_tree_id(repo: Path) -> str:
+    """A git tree object naming everything in `repo` right now, or `""`.
+
+    Written through a **throwaway index**, so the repository's real index is
+    untouched and an attempt that is later abandoned is abandoned exactly as it
+    would have been. Two of these, side by side, say precisely which files
+    something changed — which is how the harness can show a reviewer what a
+    formatter did rather than asserting it.
+
+    Ignored paths are excluded, because `git add` excludes them: a fix that
+    writes into `target/` or `node_modules/` is invisible here, and so is it to
+    the commit and the reviewer. That is the intended scope, not an oversight.
+    """
+    inside = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["git", "-C", str(repo), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+    )
+    if inside.returncode != 0:
+        return ""
+    with tempfile.TemporaryDirectory() as scratch:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+        staged = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["git", "-C", str(repo), "add", "-A"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if staged.returncode != 0:
+            return ""
+        written = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["git", "-C", str(repo), "write-tree"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if written.returncode != 0:
+            return ""
+        return written.stdout.strip()
+
+
+def tree_delta(repo: Path, before: str, after: str) -> tuple[list[str], list[str]]:
+    """`(paths added/removed/renamed, paths rewritten in place)`.
+
+    The first list is the one that matters: it is what a formatter never does
+    and what a fix is not allowed to do.
+    """
+    if not before or not after or before == after:
+        return [], []
+    output = run_git(repo, "diff", "--name-status", "-z", before, after, check=False)
+    fields = [field for field in output.split("\0") if field]
+    structural: list[str] = []
+    rewritten: list[str] = []
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        # A rename or copy is reported as `R100 old new` — two paths, so the
+        # cursor moves by three rather than two.
+        paths = (
+            fields[index + 1 : index + 3]
+            if status[:1] in ("R", "C")
+            else fields[index + 1 : index + 2]
+        )
+        index += 1 + len(paths)
+        if status.startswith("M") or status.startswith("T"):
+            rewritten.extend(paths)
+        else:
+            structural.extend(paths)
+    return structural, rewritten
 
 
 def is_disk_exhaustion(detail: str) -> bool:
@@ -1213,7 +1653,7 @@ Files in this repository:
 """
 
 IMPLEMENT_PROMPT = """\
-Implement this change and reply with a unified diff and nothing else.
+Implement this change and reply with edit blocks and nothing else.
 
 {brief}
 
@@ -1223,8 +1663,28 @@ Your plan:
 Repository context:
 {context}
 {unavailable}{checks}{guidance}{prior}
-Reply with a single unified diff (`diff --git` / `---` / `+++` / `@@`) that
-applies cleanly at the repository root. No commentary outside the diff.
+Reply with one or more edit blocks, in this exact form:
+
+path/to/file.ext
+<<<<<<< SEARCH
+the exact existing text to find
+=======
+the exact text to put in its place
+>>>>>>> REPLACE
+
+Rules, each of which is refused rather than guessed at:
+
+- SEARCH must reproduce the existing text **exactly**, including indentation,
+  and must match whole lines.
+- SEARCH must appear exactly once in that file. If the text you want appears
+  more than once, include more surrounding lines until it is unique.
+- To create a new file, leave SEARCH empty.
+- Give a separate block for each place you change. Several blocks may name the
+  same file; they are applied in the order you write them.
+
+Do not write a unified diff. Do not compute line numbers -- the harness works
+them out from the text you name, which is the point: a miscounted hunk header
+loses the whole item, and there is nothing here to miscount.
 """
 
 #: Supporting targets the budget could not carry. Named rather than silently
@@ -1357,6 +1817,23 @@ was applied and before you were called. All of them exited zero:
 REVIEW_NO_CHECKS_PROMPT = """
 This project has no checks configured, so nothing has been run against this
 change. You are the only gate it has.
+"""
+
+#: The harness edited the tree. The reviewer is told, in the same breath as it
+#: is told which gates passed, because the alternative is a diff that contains
+#: lines no agent wrote and no note saying so. "Do not hold this against the
+#: change" is *not* said and must not be: the formatting is in the diff, it is
+#: reviewable, and if a fix did something a formatter should not do then
+#: noticing that is exactly the reviewer's job.
+REVIEW_FIXED_PROMPT = """
+**The harness itself modified this tree.** One or more checks failed, the
+project had declared a mechanical fix for them, and the harness ran it and
+re-ran the check. Every command below then exited zero on the tree as you now
+see it. What each fix rewrote:
+{fixes}
+Those lines are in the diff above and are not the agent's work. Review them as
+you would any other part of the change: a fix that changed more than
+formatting is a defect, whoever ran it.
 """
 
 #: The files the diff touched, as they now stand. Without this the reviewer is
@@ -1524,12 +2001,33 @@ def review_context(repo: Path, diff: str, budget: int) -> str:
     return REVIEW_CONTEXT_PROMPT.format(files="\n".join(blocks), omitted=omitted)
 
 
-def review_checks_prompt(commands: Sequence[Sequence[str]]) -> str:
-    """Which commands passed, and that the harness ran them."""
-    commands = [" ".join(command) for command in commands if command]
-    if not commands:
-        return REVIEW_NO_CHECKS_PROMPT
-    return REVIEW_CHECKS_PROMPT.format(commands="\n".join(f"  {command}" for command in commands))
+def review_checks_prompt(
+    commands: Sequence[Sequence[str]], applied: Sequence[AppliedFix] = ()
+) -> str:
+    """Which commands passed, that the harness ran them, and what it rewrote.
+
+    `applied` is not optional information. A declared fix that ran changed the
+    diff the reviewer is about to read, and a reviewer who believes every line
+    in front of it was written by the agent is being misled by omission.
+    """
+    names = [" ".join(command) for command in commands if command]
+    said = (
+        REVIEW_NO_CHECKS_PROMPT
+        if not names
+        else REVIEW_CHECKS_PROMPT.format(commands="\n".join(f"  {command}" for command in names))
+    )
+    if not applied:
+        return said
+    return said + REVIEW_FIXED_PROMPT.format(
+        fixes="\n".join(
+            "  `{fix}` (after `{check}` failed), rewriting: {paths}".format(
+                fix=" ".join(one.fix),
+                check=" ".join(one.check),
+                paths=", ".join(one.paths) or "nothing",
+            )
+            for one in applied
+        )
+    )
 
 
 class Executor:
@@ -1715,6 +2213,42 @@ class Executor:
                 partial.stop = stop
                 return partial
             return Outcome(record.item_id, BLOCKED, reason=exc.detail, stop=stop)
+        except CommandRefused as exc:
+            # Refused by policy, and that is the last word on this item (owner
+            # decision, 2026-08-05). It is caught here, above the generic
+            # handler, so it lands as `blocked_by_policy` with the rule that
+            # fired rather than as `crashed / worker_error` — which is exactly
+            # the "unexplained failure" this guard exists to avoid being.
+            refusal = exc.refusal
+            self._emit(
+                record,
+                "command_blocked",
+                detail=refusal.detail,
+                error_class=refusal.reason_kind,
+                evidence={"rule": refusal.rule},
+            )
+            self.queue.attempts_log.flush(self.durability)
+            self._persist_spend(record)
+            stop = refusal.stop()
+            partial = self._partial_for(record)
+            self.queue.release(
+                record.item_id,
+                stop.state,
+                error=refusal.detail,
+                branch=partial.branch if partial else None,
+                pr_url=partial.pr_url if partial else None,
+                owner=self.owner,
+                consume_attempt=stop.consumes_attempt,
+                disposition=stop.disposition,
+                reason_kind=stop.reason_kind,
+                project_id=self.project_id,
+            )
+            if partial is not None:
+                partial.state = stop.state
+                partial.reason = refusal.detail
+                partial.stop = stop
+                return partial
+            return Outcome(record.item_id, stop.state, reason=refusal.detail, stop=stop)
         except RetryExhausted as exc:
             self._emit(record, "retry_exhausted", detail=str(exc), error_class=exc.kind)
             self.queue.attempts_log.flush(self.durability)
@@ -2049,6 +2583,7 @@ class Executor:
         # no usable diff leaves no branch behind.
         base, stacked_on = self._base_for(record)
         self._base = base
+        self._sync_worktree(base)
 
         # 1. Plan. Cheap, once per item, and the highest-leverage call.
         planner = _planner_from(resume.artefact(A.PLANNED)) if resume.skips(A.PLANNED) else None
@@ -2132,8 +2667,22 @@ class Executor:
                         for target in context.targets
                     ],
                     "files": list(context.files),
+                    "target_files": list(context.target_files),
+                    "fallback_files": list(context.fallback_files),
                     "character_budget": context.budget,
                     "characters": context.characters,
+                    # What the ceiling was spent on. One total is always
+                    # approximately the budget and therefore says nothing;
+                    # this says how much of the prompt was the work and how
+                    # much was surroundings, which is the question an operator
+                    # asking "why did that item cost that much" has.
+                    "target_characters": context.target_characters,
+                    "fallback_characters": context.fallback_characters,
+                    "fallback_character_allowance": context.fallback_allowance,
+                    "listing_characters": (
+                        context.characters - context.target_characters - context.fallback_characters
+                    ),
+                    "fallback_skipped_irrelevant": context.fallback_skipped,
                     "truncated": context.truncated,
                     "omitted": [
                         {"path": path, "reason": reason} for path, reason in context.omitted
@@ -2194,11 +2743,8 @@ class Executor:
             ),
         )
         outcome.stages.append("implement")
-        diff = extract_diff(reply)
-        if not diff:
-            self._emit(record, "no_diff")
-            outcome.reason = "the implementer returned no diff"
-            outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
+        diff = self._changes_from(record, outcome, reply)
+        if diff is None:
             return outcome
         log.record(
             self.project_id,
@@ -2212,6 +2758,58 @@ class Executor:
         return self._from_diff(
             record, outcome, planner, diff, base, stacked_on, resume, log, attempt, mode
         )
+
+    def _changes_from(self, record: WorkRecord, outcome: Outcome, reply: str) -> str | None:
+        """The diff this reply describes, however the model chose to say it.
+
+        Edit blocks are what the implementer is now asked for, because a
+        unified diff makes it compute `@@ -401,7 +401,12 @@` blind and one
+        miscount loses the item. Measured on rdpapp, 2026-08-05: two items in
+        one run, both refused for hunk headers disagreeing with their bodies,
+        neither for misunderstanding the task.
+
+        The blocks are turned into a diff **here**, from file content the
+        harness has read, so every gate downstream is untouched -- the patch
+        validator, the apply ladder, the checks, the reviewer and the commit
+        all still see a diff, and none of them learns a second way for changes
+        to arrive.
+
+        A unified diff is still accepted. Models that ignore the instruction,
+        a `--implementer` pointed at something with its own habits, and every
+        durable attempt recorded before this change all still work; refusing
+        them would turn a format preference into an outage.
+        """
+        blocks = parse_edits(reply)
+        if blocks:
+            try:
+                diff = to_diff(self.repo, blocks)
+            except EditError as exc:
+                # The model named text that is not there, or named it
+                # ambiguously. Both are its mistake and cost an attempt --
+                # and unlike a bad hunk header, the reason can be said back
+                # to it plainly enough to be fixed next time.
+                self._emit(record, "edits_rejected", detail=str(exc))
+                outcome.reason = f"the implementer's edits could not be applied: {exc}"
+                outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
+                return None
+            if diff:
+                self._emit(record, "edits_parsed", detail=f"{len(blocks)} edit block(s)")
+                return diff
+            # Well-formed, and changes nothing: every SEARCH already equals its
+            # REPLACE. Reported as no change rather than as a broken patch,
+            # because that is what it is.
+            self._emit(record, "no_diff", detail="edit blocks that change nothing")
+            outcome.reason = "the implementer's edits change nothing"
+            outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
+            return None
+
+        extracted = extract_diff(reply)
+        if not extracted:
+            self._emit(record, "no_diff")
+            outcome.reason = "the implementer returned no diff"
+            outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
+            return None
+        return extracted
 
     def _from_diff(
         self,
@@ -2362,11 +2960,19 @@ class Executor:
                     "fix_available",
                     detail="`" + " ".join(checked.fix) + "` is declared to clear this",
                 )
+            self._announce_fixes(record, checked)
             outcome.reason = failure
             outcome.stop = stop
             outcome.state = stop.state
             self._abandon_branch(branch)
             return outcome
+        self._announce_fixes(record, checked)
+        if checked.applied:
+            # The tree is not what it was when `applied_diff` was taken: the
+            # harness ran a declared fix over it. Re-reading it is what makes
+            # the reviewer's copy the truth — and what stops the commit below
+            # from containing lines the reviewer was never shown.
+            applied_diff = run_git(self.repo, "diff", "HEAD") or applied_diff
         self._emit(record, "checks_passed")
         # Recorded, though it makes resumption no cheaper: re-running a
         # project's checks is idempotent and costs no model call, so a resumed
@@ -2470,7 +3076,16 @@ class Executor:
                 )
 
         return self._review_stage(
-            record, outcome, applied_diff, branch, base, resume, log, attempt, mode
+            record,
+            outcome,
+            applied_diff,
+            branch,
+            base,
+            resume,
+            log,
+            attempt,
+            mode,
+            applied_fixes=checked.applied,
         )
 
     def _review_stage(
@@ -2484,6 +3099,7 @@ class Executor:
         log: A.AttemptLog,
         attempt: int,
         mode: str,
+        applied_fixes: Sequence[AppliedFix] = (),
     ) -> Outcome:
         """The expensive gate, and what approval buys.
 
@@ -2516,7 +3132,7 @@ class Executor:
                     # above. What the reviewer needs is *which* commands
                     # passed, and that the harness rather than the author ran
                     # them.
-                    checks=self._review_checks_prompt(),
+                    checks=self._review_checks_prompt(applied_fixes),
                 ),
             )
         outcome.stages.append("review")
@@ -2621,8 +3237,24 @@ class Executor:
     def _review_context(self, diff: str) -> str:
         return review_context(self.repo, diff, self.context_policy.budget)
 
-    def _review_checks_prompt(self) -> str:
-        return review_checks_prompt(self.checks.commands)
+    def _review_checks_prompt(self, applied: Sequence[AppliedFix] = ()) -> str:
+        return review_checks_prompt(self.checks.commands, applied)
+
+    def _announce_fixes(self, record: WorkRecord, checked: CheckResult) -> None:
+        """Say what the harness changed, whichever way the checks then went.
+
+        Emitted for a fix that cleared its gate *and* for one that did not: an
+        operator reading the stream has to be able to see that a command ran
+        against the tree even when the item was refused anyway, because the
+        tree it ran against is the one they will be looking at.
+        """
+        for one in checked.applied:
+            self._emit(
+                record,
+                "check_fix_applied",
+                detail=fix_announcement(one),
+                evidence={"fix": one.as_dict()},
+            )
 
     def _starved_prompt(self, starved: Sequence[str]) -> str:
         """Supporting targets that did not fit, named so they are not guessed at."""
@@ -2693,6 +3325,30 @@ class Executor:
             return f"{(self.repo / path).stat().st_size} bytes"
         except OSError:
             return "size unknown"
+
+    def _sync_worktree(self, base: str) -> None:
+        """Put the tree at `base` before anything reads it.
+
+        `select_repo_context` already refuses to read the working tree, for a
+        reason it states plainly: at this point the tree still holds the
+        *previous* item's branch, so a model shown it writes about a file its
+        patch will never meet. It reads through `git show base:path` instead.
+
+        `edits.to_diff` reads the tree. Those two disagreeing is not a
+        cosmetic inconsistency — it is the second item to touch any file being
+        told that text it was shown, and that is present on the base its
+        branch will be cut from, "does not occur in the file". The model is
+        right and the harness blames it, and the better the previous item did
+        the more certain the next one is to fail.
+
+        So the tree is moved to the base *before* the implementer is asked,
+        rather than in `_prepare_branch` after it has answered. No branch is
+        created here: an item that produces no usable diff still leaves none
+        behind, which is why the branch is cut late.
+        """
+        run_git(self.repo, "checkout", "--", ".", check=False)
+        run_git(self.repo, "clean", "-fd", check=False)
+        run_git(self.repo, "checkout", base)
 
     def _prepare_branch(self, branch: str, base: str | None = None) -> None:
         """A clean tree at `base`, on a branch of this item's own.

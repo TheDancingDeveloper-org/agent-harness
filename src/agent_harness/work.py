@@ -26,7 +26,7 @@ import socket
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,6 +40,7 @@ from .graph import (
     Resolver,
     parse_dependencies,
 )
+from .holds import CANCELLED as HOLD_CANCELLED
 from .holds import DEFAULT_MAX_HOLD_SECONDS, Answer, Hold, HoldError, Holds
 
 # Re-exported deliberately, in the `X as X` form mypy reads as explicit. The
@@ -93,11 +94,17 @@ DRAINING = "draining"
 STOPPED = "stopped"
 CONTROL_STATES = (RUNNING, PAUSED, DRAINING, STOPPED)
 
-#: How many candidate rows a single claim considers. The whole eligible
-#: backlog used to be loaded into memory inside the write transaction on
-#: every claim, which holds the write lock for longer the larger the backlog
-#: gets. Ordering is by attempts then id, so the most deserving rows are in
-#: the first page and a dependency-blocked page simply yields nothing.
+#: How many candidate rows a single claim reads **at a time**. The whole
+#: eligible backlog used to be loaded into memory inside the write transaction
+#: on every claim, which holds the write lock for longer the larger the
+#: backlog gets. Ordering is by attempts then id, so the most deserving rows
+#: are in the first page.
+#:
+#: A page, not the whole scan. This was once the scan, and a project whose
+#: first page was entirely dependency-blocked was handed nothing at all while
+#: ready work sat one row past the limit -- a permanently stalled fleet with a
+#: full queue. `claim` now walks the pages until it finds something or runs
+#: out; the limit still bounds how much is in memory at once.
 CLAIM_SCAN_LIMIT = 200
 
 #: Where work with no project of its own lives. Pre-project databases migrate
@@ -113,8 +120,11 @@ CREATE TABLE IF NOT EXISTS projects (
     base_branch TEXT NOT NULL DEFAULT 'main',
     checks      TEXT NOT NULL DEFAULT '[]',
     -- Stage K: `check command -> argv believed to clear it`. Recorded when a
-    -- check fails, never run.
+    -- check fails; run only when `apply_fixes` is on.
     fixes       TEXT NOT NULL DEFAULT '{}',
+    -- #155. Whether a declared fix may be run and its check re-run. Zero by
+    -- default, so an upgrade changes nothing until an operator says so.
+    apply_fixes INTEGER NOT NULL DEFAULT 0,
     -- Stage H: how often an attempt at this project is made durable.
     durability  TEXT NOT NULL DEFAULT '',
     -- Stage L. Per-item ceilings for this project. Zero is unlimited, which
@@ -388,9 +398,15 @@ class Project:
     checks: list[str] = field(default_factory=list)
     #: `check command -> argv believed to clear it`. Declared, because only
     #: the person who wrote the check knows that `ruff format` fixes what
-    #: `ruff format --check` reports. Recorded when the check fails and
-    #: **never run** — see `outcomes.CheckResult.fix`.
+    #: `ruff format --check` reports. Always recorded when the check fails;
+    #: run only if `apply_fixes` is on.
     fixes: dict[str, list[str]] = field(default_factory=dict)
+    #: Whether a declared fix may be **run**, with its check then re-run and
+    #: the re-run taken as the verdict (#155). Off by default: turning it on
+    #: is the operator asserting that every command they declared a fix for is
+    #: mechanically fixable — true of a formatter, false of a test suite, and
+    #: not something the harness can check. See `executor.Checks`.
+    apply_fixes: bool = False
     #: How often this project's attempts are made durable: `exit`, `boundary`
     #: or `sync`. Empty takes the deployment's default. See `attempts.py`.
     durability: str = ""
@@ -417,6 +433,7 @@ class Project:
         data = dict(row)
         data["checks"] = json.loads(data.get("checks") or "[]")
         data["fixes"] = json.loads(data.get("fixes") or "{}")
+        data["apply_fixes"] = bool(data.get("apply_fixes"))
         data["durability"] = data.get("durability") or ""
         data["roles"] = json.loads(data["roles"]) if data.get("roles") else None
         return cls(**data)
@@ -492,6 +509,7 @@ class WorkQueue:
         *,
         resolvers: Mapping[str, Resolver] | None = None,
         durability: str = DEFAULT_DURABILITY,
+        on_hold: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.path = path
         self.lease_seconds = lease_seconds
@@ -507,13 +525,26 @@ class WorkQueue:
         #: Items waiting on a person. Same file for the same reason: a
         #: question that can vanish independently of the item it is about is a
         #: question somebody answers into nothing.
-        self.holds = Holds(self._connect, now=now)
+        #: `on_hold` is told once, when a question is opened, so a held item
+        #: is not something only a poll can discover (#188). Delivery cannot
+        #: reach the item: see `holds.deliver`.
+        self.holds = Holds(self._connect, now=now, on_hold=on_hold)
         self._migrate()
-        with self._connect() as conn:
+        # `try/finally`, not `with`: a sqlite3 connection's context manager
+        # manages a TRANSACTION and does not close anything. Under
+        # `isolation_level=None` there is no transaction for it to manage, so
+        # `with` here left the connection open for the cyclic collector to
+        # find -- and this object holds a reference cycle (its graph, attempt
+        # log and holds all carry its bound `_connect`), so "eventually" meant
+        # a gc pass, not a scope exit. #206.
+        conn = self._connect()
+        try:
             conn.executescript(SCHEMA)
             self.graph.create_schema(conn)
             self.attempts_log.migrate(conn)
             self.holds.migrate(conn)
+        finally:
+            conn.close()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
@@ -583,6 +614,9 @@ class WorkQueue:
             # Stage K. Additive; an older build ignores it and a project that
             # declares no fix reads as `{}`.
             "fixes": "TEXT NOT NULL DEFAULT '{}'",
+            # #155. Additive on the same terms: an older build ignores it, and
+            # a database that predates it reads as off, which is the default.
+            "apply_fixes": "INTEGER NOT NULL DEFAULT 0",
             # Stage H, additive on the same terms.
             "durability": "TEXT NOT NULL DEFAULT ''",
             "max_item_seconds": "REAL NOT NULL DEFAULT 0",
@@ -720,14 +754,15 @@ class WorkQueue:
         try:
             conn.execute(
                 "INSERT INTO projects (project_id, name, repo, work_dir, base_branch, "
-                "checks, fixes, durability, max_item_seconds, max_item_spend_usd, "
+                "checks, fixes, apply_fixes, durability, max_item_seconds, max_item_spend_usd, "
                 "max_hold_seconds, plan_path, roles, max_workers, max_attempts, "
                 "min_free_disk_gb, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET "
                 "name=excluded.name, repo=excluded.repo, work_dir=excluded.work_dir, "
                 "base_branch=excluded.base_branch, checks=excluded.checks, "
-                "fixes=excluded.fixes, durability=excluded.durability, "
+                "fixes=excluded.fixes, apply_fixes=excluded.apply_fixes, "
+                "durability=excluded.durability, "
                 "max_item_seconds=excluded.max_item_seconds, "
                 "max_item_spend_usd=excluded.max_item_spend_usd, "
                 "max_hold_seconds=excluded.max_hold_seconds, "
@@ -743,6 +778,7 @@ class WorkQueue:
                     project.base_branch,
                     json.dumps(project.checks),
                     json.dumps(project.fixes),
+                    int(project.apply_fixes),
                     project.durability,
                     project.max_item_seconds,
                     project.max_item_spend_usd,
@@ -1107,82 +1143,112 @@ class WorkQueue:
             # cycle is a property of the project's graph, not of one row.
             cycles = self.graph.cycles(project_id, conn=conn)
             revision = self.graph.revision(project_id, conn=conn)
-            row = conn.execute(
-                "SELECT * FROM work WHERE project_id = ? "
-                "AND (state = ? OR (state = ? AND lease_until < ?)) "
-                "ORDER BY attempts, item_id LIMIT ?",
-                (project_id, PENDING, CLAIMED, now, CLAIM_SCAN_LIMIT),
-            ).fetchall()
-            for candidate in row:
-                record = WorkRecord.from_row(candidate)
-                if limit and record.attempts >= limit:
-                    # Give up rather than recycle. An item that reliably kills
-                    # its worker is never released, so its lease expires and it
-                    # is re-claimed forever -- spending money every cycle while
-                    # looking exactly like an item that is merely busy.
-                    conn.execute(
-                        "UPDATE work SET state = ?, owner = NULL, lease_until = 0, "
-                        "last_error = ?, updated_at = ? WHERE project_id = ? AND item_id = ?",
-                        (
-                            EXHAUSTED,
+            # Paged, and the paging is the point. A single `LIMIT` over the
+            # eligible rows makes "the queue has ready work" and "the first
+            # page has ready work" the same question, and they are not: a
+            # project whose first page is entirely dependency-blocked used to
+            # be handed nothing at all, for ever, while a ready item sat one
+            # row past the limit. That is a stalled fleet with a full queue,
+            # and nothing in the queue says why.
+            #
+            # Keyset, not OFFSET: rows are retired to `exhausted` inside this
+            # very loop, so a positional window would skip whatever slid up
+            # into the gap.
+            cursor_attempts, cursor_item = -1, ""
+            while True:
+                page = conn.execute(
+                    "SELECT * FROM work WHERE project_id = ? "
+                    "AND (state = ? OR (state = ? AND lease_until < ?)) "
+                    "AND (attempts > ? OR (attempts = ? AND item_id > ?)) "
+                    "ORDER BY attempts, item_id LIMIT ?",
+                    (
+                        project_id,
+                        PENDING,
+                        CLAIMED,
+                        now,
+                        cursor_attempts,
+                        cursor_attempts,
+                        cursor_item,
+                        CLAIM_SCAN_LIMIT,
+                    ),
+                ).fetchall()
+                if not page:
+                    break
+                cursor_attempts = page[-1]["attempts"]
+                cursor_item = page[-1]["item_id"]
+                for candidate in page:
+                    record = WorkRecord.from_row(candidate)
+                    if limit and record.attempts >= limit:
+                        # Give up rather than recycle. An item that reliably
+                        # kills its worker is never released, so its lease
+                        # expires and it is re-claimed forever -- spending
+                        # money every cycle while looking exactly like an item
+                        # that is merely busy.
+                        conn.execute(
+                            "UPDATE work SET state = ?, owner = NULL, lease_until = 0, "
+                            "last_error = ?, updated_at = ? WHERE project_id = ? AND item_id = ?",
                             (
-                                f"gave up after {record.attempts} attempts"
-                                + (f": {record.last_error}" if record.last_error else "")
+                                EXHAUSTED,
+                                (
+                                    f"gave up after {record.attempts} attempts"
+                                    + (f": {record.last_error}" if record.last_error else "")
+                                ),
+                                now,
+                                project_id,
+                                record.item_id,
                             ),
+                        )
+                        continue
+                    admission = self.graph.readiness(
+                        project_id, record.item_id, conn=conn, cycles=cycles
+                    )
+                    if not admission.ready:
+                        continue
+                    # D11, resolved 2026-08-04: **a resumed attempt continues
+                    # the existing one.** A crash is not a failure of the work,
+                    # so re-claiming an item that left a durable position keeps
+                    # its attempt number, and `max_attempts` goes on bounding
+                    # genuine failures rather than crashes. The consequence is
+                    # named rather than hidden: an item that crashes in a loop
+                    # is then bounded by a wall-clock or spend budget and by
+                    # nothing else.
+                    resuming = self.attempts_log.has_resumable_work(
+                        project_id, record.item_id, record.attempts
+                    )
+                    conn.execute(
+                        "UPDATE work SET state = ?, owner = ?, lease_until = ?, "
+                        "attempts = CASE WHEN ? THEN attempts ELSE attempts + 1 END, "
+                        "admitted_revision = ?, "
+                        # Stamped once and never again. The wall-clock ceiling
+                        # bounds the ITEM, so an item that crashes in a loop
+                        # must not reset its own clock on every re-claim --
+                        # which is exactly the failure D11's ruling left for
+                        # this to catch.
+                        "first_started_at = CASE WHEN first_started_at > 0 "
+                        "THEN first_started_at ELSE ? END, "
+                        "updated_at = ? "
+                        "WHERE project_id = ? AND item_id = ?",
+                        (
+                            CLAIMED,
+                            owner,
+                            now + self.lease_seconds,
+                            resuming,
+                            revision,
+                            now,
                             now,
                             project_id,
                             record.item_id,
                         ),
                     )
-                    continue
-                admission = self.graph.readiness(
-                    project_id, record.item_id, conn=conn, cycles=cycles
-                )
-                if not admission.ready:
-                    continue
-                # D11, resolved 2026-08-04: **a resumed attempt continues
-                # the existing one.** A crash is not a failure of the work, so
-                # re-claiming an item that left a durable position keeps its
-                # attempt number, and `max_attempts` goes on bounding genuine
-                # failures rather than crashes. The consequence is named
-                # rather than hidden: an item that crashes in a loop is then
-                # bounded by a wall-clock or spend budget and by nothing else.
-                resuming = self.attempts_log.has_resumable_work(
-                    project_id, record.item_id, record.attempts
-                )
-                conn.execute(
-                    "UPDATE work SET state = ?, owner = ?, lease_until = ?, "
-                    "attempts = CASE WHEN ? THEN attempts ELSE attempts + 1 END, "
-                    "admitted_revision = ?, "
-                    # Stamped once and never again. The wall-clock ceiling
-                    # bounds the ITEM, so an item that crashes in a loop must
-                    # not reset its own clock on every re-claim -- which is
-                    # exactly the failure D11's ruling left for this to catch.
-                    "first_started_at = CASE WHEN first_started_at > 0 "
-                    "THEN first_started_at ELSE ? END, "
-                    "updated_at = ? "
-                    "WHERE project_id = ? AND item_id = ?",
-                    (
-                        CLAIMED,
-                        owner,
-                        now + self.lease_seconds,
-                        resuming,
-                        revision,
-                        now,
-                        now,
-                        project_id,
-                        record.item_id,
-                    ),
-                )
-                conn.execute("COMMIT")
-                record.state = CLAIMED
-                record.owner = owner
-                record.lease_until = now + self.lease_seconds
-                if not resuming:
-                    record.attempts += 1
-                record.admitted_revision = revision
-                record.first_started_at = record.first_started_at or now
-                return record
+                    conn.execute("COMMIT")
+                    record.state = CLAIMED
+                    record.owner = owner
+                    record.lease_until = now + self.lease_seconds
+                    if not resuming:
+                        record.attempts += 1
+                    record.admitted_revision = revision
+                    record.first_started_at = record.first_started_at or now
+                    return record
             conn.execute("COMMIT")
             return None
         finally:
@@ -1337,9 +1403,36 @@ class WorkQueue:
                     owner,
                     state,
                 )
-            return applied
         finally:
             conn.close()
+        if applied:
+            self._cancel_open_hold(item_id, project_id, "released")
+        return applied
+
+    def _cancel_open_hold(self, item_id: str, project_id: str, what: str) -> None:
+        """Close any question left open on an item that has moved on.
+
+        A hold is a *suspended attempt*. Once the item has been released,
+        retried or requeued, the attempt that asked is over — but the question
+        used to stay `open` for ever, and `holds.CANCELLED` was a state
+        nothing in the codebase ever wrote. Three things followed: the
+        operator's inbox showed a question answering could no longer affect;
+        the item's **new** owner was refused a question of its own with
+        "already has an unanswered question"; and the abandoned hold went on
+        to expire and be recorded as "nobody answered", which is not what
+        happened.
+
+        `expired` and `cancelled` are deliberately different facts, and this
+        writes the one that is true.
+        """
+        closed = self.holds.close(project_id, item_id, HOLD_CANCELLED)
+        if closed:
+            log.info(
+                "%s/%s: %s while a question was open, so the question was cancelled",
+                project_id,
+                item_id,
+                what,
+            )
 
     def hold(
         self,
@@ -1564,16 +1657,19 @@ class WorkQueue:
                 "updated_at = ? WHERE project_id = ? AND item_id = ?",
                 (PENDING, self.now(), project_id, item_id),
             )
-            if cursor.rowcount > 0:
+            requeued = cursor.rowcount > 0
+            if requeued:
                 # And every durable position with it. "Retry this" means from
                 # the start, against the current plan -- not resumed into the
                 # verdict the operator is retrying. Keeping the position here
                 # would make a retry indistinguishable from a resume, and the
                 # rejected item would be re-rejected without a model call.
                 self.attempts_log.forget_item(project_id, item_id)
-            return cursor.rowcount > 0
         finally:
             conn.close()
+        if requeued:
+            self._cancel_open_hold(item_id, project_id, "requeued")
+        return requeued
 
     def reclaim_dead_workers(self, *, project_id: str | None = None) -> list[str]:
         """Release claims held by a process on this host that no longer exists.

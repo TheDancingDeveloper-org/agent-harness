@@ -33,7 +33,7 @@ import shutil
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +47,7 @@ from .executor import (
     run_git,
 )
 from .graph import LOCAL_WORK
+from .guard import CommandGuard, CommandRefused
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
 from .outcomes import (
     AGENT_TIMEOUT,
@@ -64,6 +65,8 @@ from .outcomes import (
     REVIEW_REJECTED,
     WITHHELD,
     WORKER_ERROR,
+    AppliedFix,
+    CheckResult,
     Stop,
     stop_for,
 )
@@ -296,6 +299,7 @@ class SessionExecutor:
         push: bool = True,
         now: Callable[[], float] = time.time,
         project_id: str = DEFAULT_PROJECT,
+        guard: CommandGuard | None = None,
     ) -> None:
         self.queue = queue
         # Which project's queue this worker serves. Without it a worker in a
@@ -305,7 +309,14 @@ class SessionExecutor:
         self.devenv = devenv
         self.repo = Path(repo)
         self.agent = agent or AgentSpec()
-        self.checks = checks or Checks()
+        #: What this deployment refuses to run, and the tree it refuses to run
+        #: outside. It screens the agent command this executor launches; the
+        #: same policy screens the checks, through `Checks.guard`, so a
+        #: deployment cannot end up with two disagreeing policies.
+        self.guard = guard or (checks.guard if checks is not None else CommandGuard())
+        self.checks = (
+            replace(checks, guard=self.guard) if checks is not None else Checks(guard=self.guard)
+        )
         self.reviewer = reviewer
         self.github = github
         self.base_branch = base_branch
@@ -388,6 +399,40 @@ class SessionExecutor:
                 project_id=self.project_id,
             )
             raise
+        except CommandRefused as exc:
+            # Refused by policy, and terminal (owner decision, 2026-08-05). It
+            # is caught above the generic handler so it reaches the queue as
+            # `blocked_by_policy` with the rule that fired — an operator can
+            # tell it from a crashed worker by reading one column.
+            refusal = exc.refusal
+            self._emit(
+                record,
+                "command_blocked",
+                detail=refusal.detail,
+                error_class=refusal.reason_kind,
+                rule=refusal.rule,
+            )
+            self._orphan_session(record, refusal.detail)
+            stop = refusal.stop()
+            partial = self._partial_for(record)
+            self.queue.release(
+                record.item_id,
+                stop.state,
+                error=refusal.detail,
+                branch=partial.branch if partial else None,
+                pr_url=partial.pr_url if partial else None,
+                owner=self.owner,
+                consume_attempt=stop.consumes_attempt,
+                disposition=stop.disposition,
+                reason_kind=stop.reason_kind,
+                project_id=self.project_id,
+            )
+            if partial is not None:
+                partial.state = stop.state
+                partial.reason = refusal.detail
+                partial.stop = stop
+                return partial
+            return Outcome(record.item_id, stop.state, reason=refusal.detail, stop=stop)
         except RetryExhausted as exc:
             # The call-level ladder is spent, not the item's life. Returning
             # it to pending lets WorkQueue's per-project max_attempts retire a
@@ -638,9 +683,20 @@ class SessionExecutor:
                 )
             )
 
+            agent_command = self.agent.render(prompt_file, record.item_id)
+            # The agent command is configuration (`$HARNESS_AGENT_COMMAND`),
+            # and it is the one command here that runs with the whole worktree
+            # in front of it. Screened before a session exists, because once
+            # the host has started the process the harness has no say left.
+            #
+            # This screens the command the harness LAUNCHES. It does not, and
+            # cannot, screen what the agent then types into its own terminal —
+            # that is the session host's isolation to own, and pretending
+            # otherwise here would be the more dangerous claim.
+            self.guard.enforce(agent_command, cwd=tree)
             session = self.devenv.create_session(
                 name=f"{record.item_id}: {record.title[:40]}",
-                command=self.agent.render(prompt_file, record.item_id),
+                command=agent_command,
                 cwd=str(tree),
                 env=dict(self.agent.env),
             )
@@ -776,9 +832,11 @@ class SessionExecutor:
                         detail="`" + " ".join(checked.fix) + "` is declared to clear this",
                         session_id=session.id,
                     )
+                self._announce_fixes(record, checked, session.id)
                 outcome.stop = stop
                 outcome.state = stop.state
                 return outcome
+            self._announce_fixes(record, checked, session.id)
             self._emit(record, "checks_passed", session_id=session.id)
             self._keepalive(record)
 
@@ -834,7 +892,9 @@ class SessionExecutor:
                         record, "draft_pr_opened", detail=outcome.pr_url, session_id=session.id
                     )
 
-            verdict_text = self._review(record, tree, True, "", base=base)
+            verdict_text = self._review(
+                record, tree, True, "", base=base, applied_fixes=checked.applied
+            )
             outcome.stages.append("review")
             verdict = APPROVED if verdict_text.strip().upper().startswith("APPROVED") else REJECTED
             for proposal in record_follow_ups(
@@ -963,8 +1023,33 @@ class SessionExecutor:
         error = (record.last_error or "").strip()
         return PRIOR_FAILURE_PROMPT.format(error=error[:4000]) if error else ""
 
+    def _announce_fixes(
+        self, record: WorkRecord, checked: CheckResult, session_id: str | None = None
+    ) -> None:
+        """What the harness itself changed in this worktree, said out loud.
+
+        The same event the headless executor emits, for the same reason: a
+        declared fix that ran modified the tree a reviewer and an operator are
+        about to read, and neither may have to infer that from a diff.
+        """
+        from .executor import fix_announcement
+
+        for one in checked.applied:
+            self._emit(
+                record,
+                "check_fix_applied",
+                detail=fix_announcement(one),
+                session_id=session_id,
+            )
+
     def _review(
-        self, record: WorkRecord, tree: Path, passed: bool, failure: str, base: str = ""
+        self,
+        record: WorkRecord,
+        tree: Path,
+        passed: bool,
+        failure: str,
+        base: str = "",
+        applied_fixes: Sequence[AppliedFix] = (),
     ) -> str:
         if self.reviewer is None:
             # Checked before the diff is computed: there is no point building
@@ -985,7 +1070,7 @@ class SessionExecutor:
             # The same helpers the headless reviewer uses, so a correction to
             # either cannot land in one executor and not the other (#167).
             context=review_context(tree, diff, self.context_budget),
-            checks=review_checks_prompt(self.checks.commands),
+            checks=review_checks_prompt(self.checks.commands, applied_fixes),
         )
         try:
             response = self.reviewer.call("reviewer", [{"role": "user", "content": prompt}])

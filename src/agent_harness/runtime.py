@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .executor import Checks
+from .guard import GUARD_KEY, CommandGuard
 from .model_client import Route
 from .session_executor import AgentSpec, SessionExecutor
 from .work import Project, WorkQueue
@@ -141,12 +142,19 @@ def session_executor_factory(
                 f"project {project_id!r} has no work_dir, so there is nothing to "
                 "make a worktree from"
             )
+        # The deployment's command policy, read when the worker is built
+        # rather than closed over, so `agent-harness guard` reaches a
+        # supervised deployment without a restart. Absent is not "off": an
+        # unconfigured guard still carries the built-in default, and doctor
+        # is where "nobody chose this" gets said.
+        guard = CommandGuard.from_settings(queue.get_setting(GUARD_KEY))
         executor = SessionExecutor(
             queue,
             host,
             Path(project.work_dir),
             agent=agent or AgentSpec(),
-            checks=_checks_for(project),
+            checks=_checks_for(project, guard),
+            guard=guard,
             reviewer=_reviewer_for(project_id),
             github=(github_for(project.repo) if github_for and project.repo else None),
             base_branch=project.base_branch,
@@ -172,7 +180,7 @@ def session_executor_factory(
     return build
 
 
-def _checks_for(project: Project) -> Checks:
+def _checks_for(project: Project, guard: CommandGuard | None = None) -> Checks:
     """The project's own verification commands, split without a shell.
 
     `shlex`, never `shell=True`: these strings come from an API request, and
@@ -182,12 +190,17 @@ def _checks_for(project: Project) -> Checks:
     for command in project.checks or []:
         validate_check_command(command)
         commands.append(shlex.split(command))
-    # A declared fix is argv too, and gets the same refusal: it is recorded
-    # rather than run today, but a string that would be unsafe to run is
-    # unsafe to store as runnable.
+    # A declared fix is argv too, and gets the same refusal: a string that
+    # would be unsafe to run is unsafe to store as runnable — and since
+    # `apply_fixes` can make it runnable, that is now literal.
     fixes: dict[str, list[str]] = {}
     for command, fix in (project.fixes or {}).items():
         if not fix:
             continue
         fixes[command] = list(fix)
-    return Checks(commands=commands, fixes=fixes)
+    return Checks(
+        commands=commands,
+        fixes=fixes,
+        apply_fixes=bool(project.apply_fixes),
+        guard=guard or CommandGuard(),
+    )

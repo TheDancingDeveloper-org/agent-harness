@@ -945,11 +945,31 @@ def test_stage_e1_protocol_experiment(tmp_path: Path) -> None:
     }
     assert all(len(prompts) == 3 for prompts in review_prompts.values())
 
-    # The experiment's safety boundary: only this test module implements the
-    # alternatives. Production still names unified diffs as its sole response.
+    # The experiment's safety boundary, as it now stands.
+    #
+    # D10 chose the unified diff on these ten cases, where it and
+    # search/replace scored identically and only whole-file put a change in
+    # the wrong place. That held until a real workload disagreed: rdpapp,
+    # 2026-08-05, four model calls all HTTP 200 against a healthy gateway and
+    # 0 of 2 items delivered --
+    #
+    #     T1: hunk ends 0 source and 7 result line(s) short of its header
+    #     T2: the last hunk supplies 1 fewer source line
+    #
+    # -- neither for misunderstanding the item. The cases here are small and
+    # synthetic; the arithmetic a hunk header demands gets harder as a file
+    # grows, and rdpapp's is 704 KB. D10 was reopened on that evidence by the
+    # owner on 2026-08-05, and production now asks for edit blocks.
+    #
+    # What has NOT changed: whole-file remains rejected, and remains
+    # implemented only here. Its wrong-location result is the finding this
+    # boundary exists to keep out of core.
     production = (Path(__file__).parents[1] / "src/agent_harness/executor.py").read_text()
-    assert "Implement this change and reply with a unified diff and nothing else." in production
+    assert "Implement this change and reply with edit blocks and nothing else." in production
     assert "WholeFileProtocol" not in production and "SearchReplaceProtocol" not in production
+    # A unified diff is still *read*, so nothing recorded before the change is
+    # stranded -- but it is no longer what the implementer is asked for.
+    assert "extract_diff(reply)" in production
 
     if os.environ.get("STAGE_E1_REPORT") == "1":
         printable = {name: asdict(summary) for name, summary in summaries.items()}

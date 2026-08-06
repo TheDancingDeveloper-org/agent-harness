@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .events import Event
+from .redaction import Redact, from_environment, redact_event
 
 SCHEMA_VERSION = 1
 
@@ -61,8 +62,14 @@ class EventStore:
     """Append-only store. Safe to share between threads; each thread gets
     its own connection because SQLite objects are not thread-safe."""
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, redact: Redact | None = None) -> None:
         self.path = Path(path)
+        # Every write goes through `append`, so this is the whole surface a
+        # credential can enter the store through. Redaction is attached here
+        # rather than at each caller because a caller added later cannot then
+        # forget it -- append-only means a miss is unrecoverable, so the
+        # filter has to be somewhere no new write path can route around.
+        self.redact: Redact = redact if redact is not None else from_environment()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         with self._connect() as conn:
@@ -103,8 +110,14 @@ class EventStore:
         Returns the number actually inserted. Re-ingesting the same history
         is therefore a no-op returning 0, which is what makes the ingester
         replayable (T22) without tracking file offsets.
+
+        Credentials are removed here, before the row exists. `dedupe_key` is
+        taken from the redacted event, so a replay of the same source records
+        still collapses onto the same rows -- redaction is deterministic, and
+        the key is derived from content either way.
         """
         conn = self._connect()
+        events = [redact_event(e, self.redact) for e in events]
         rows = [
             (
                 e.dedupe_key,

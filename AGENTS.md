@@ -77,6 +77,7 @@ trade and it is rejected.
 | What a route is made of, and how a vendor is added | `src/agent_harness/protocols.py` |
 | Event schema | `src/agent_harness/events.py` |
 | Event store (append-only) | `src/agent_harness/store.py` |
+| Credentials removed before the first write | `src/agent_harness/redaction.py` — applied in `store.append` and `audit.append`, the only ways in. **A reduction in exposure, never a guarantee** |
 | Scoping a project from a paragraph | `agent-harness inception`; `src/agent_harness/inception.py` — produces a `PLAN.md`, never queue rows |
 | A plan, parsed into work | `src/agent_harness/plan.py` — never silently drops a heading |
 | The queue, and what a claim is | `src/agent_harness/work.py` — a claim is a **lease**, not a lock |
@@ -84,6 +85,7 @@ trade and it is rejected.
 | Can this project finish an item? | `src/agent_harness/preflight.py` — refuses a start rather than failing every item |
 | Typed dependency graph | `src/agent_harness/graph.py` — contract in `docs/COORDINATION-PLANE.md` §8 |
 | What a gate answered, and what stopped an item | `src/agent_harness/outcomes.py` — **not** `providers.py`, which is what a *provider* answered |
+| Commands the harness will not run | `agent-harness guard`; `src/agent_harness/guard.py` — a deterministic refusal list and a worktree path boundary. A refusal is **terminal**: `blocked_by_policy`, never handed back to the agent. Screening, not a sandbox |
 | Where an attempt got to, durably | `src/agent_harness/attempts.py` — a fixed stage list, **not** a workflow engine |
 | How long one item may take, and what it may spend | `src/agent_harness/budgets.py` — **not** a provider cost cap, and never parks an endpoint |
 | An item waiting on a person | `src/agent_harness/holds.py` — a state of the item, **not** a projection over events, and **not** the coordination plane |
@@ -212,8 +214,7 @@ worth quoting**.
 
 ## Decision hygiene
 
-**Settled — do not re-litigate.** D1–D6 (plan §0.2b). D10, resolved by Stage E1: retain the
-model-authored unified diff. D11, resolved 2026-08-04: a resumed attempt **continues** the
+**Settled — do not re-litigate.** D1–D6 (plan §0.2b). D11, resolved 2026-08-04: a resumed attempt **continues** the
 existing one, so `max_attempts` bounds genuine failures rather than crashes. D12, resolved
 2026-08-04: a hold **suspends the lease and keeps the claim**. D13 and D14 are recorded with
 the safe answer taken — telemetry is export-only, and budget ceilings default to unlimited
@@ -223,6 +224,23 @@ so an upgrade changes no behaviour.
 mechanism; it became load-bearing for the typed check outcomes and was deliberately not
 answered, and a test fails if `outcomes.py` ever grows a registry. D9 — blocked on #84, and
 **no stage may hold the review prompt as a variable** while it is.
+
+**Reopened, and answered again.** D10 — the change protocol. Stage E1 chose the
+model-authored unified diff, on ten cases where it and search/replace scored *identically*
+and only whole-file put a change in the wrong place. That decision was correct on the
+evidence it had. It was reopened by the owner on 2026-08-05 on evidence E1 could not have
+had: against rdpapp, four model calls all returned HTTP 200 against a healthy gateway and
+**0 of 2 items were delivered** — `hunk ends 0 source and 7 result line(s) short of what its
+header declares`, and `the last hunk supplies 1 fewer source line`. Neither model
+misunderstood its item; both miscounted. E1's cases are small and synthetic, and the
+arithmetic a hunk header demands gets harder as a file grows.
+
+**The answer now:** the implementer is asked for edit blocks, and the harness computes the
+line numbers from text it has read. A unified diff is still *read*, so nothing recorded
+earlier is stranded. **Whole-file remains rejected** and remains implemented only in the
+experiment — its wrong-location result is the finding that boundary exists to keep out of
+core. This is rule 7 in use: the document is corrected when reality disagrees, and the
+disagreement is named rather than the decision quietly changed.
 
 D1–D10 are recorded in `docs/backlog-seed-2026-08-02.json`; D11–D14 in
 `docs/PROPOSAL-2026-08-finish-then-extend.md` §11.

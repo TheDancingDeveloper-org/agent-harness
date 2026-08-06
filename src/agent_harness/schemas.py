@@ -105,8 +105,10 @@ class WorkItem(BaseModel):
         description="WHY the item is in `state`, from the Stage K taxonomy: "
         "`completed`, `refused` (a gate said no about this item's work), `crashed` "
         "(the worker or harness broke, and nothing judged the work), `withheld` "
-        "(never attempted, or discarded through no fault of the item) or `escalated` "
-        "(a person has to resolve something). `state` alone cannot tell a reviewer's "
+        "(never attempted, or discarded through no fault of the item), `escalated` "
+        "(a person has to resolve something) or `blocked_by_policy` (the harness "
+        "refused to run a command on this item's behalf, which is terminal: the item "
+        "is never handed back to the agent to retry). `state` alone cannot tell a reviewer's "
         "rejection from a crashed worker — both are `failed` — and those want "
         "different responses. Empty means nobody has finished with it yet, which is "
         "not a sixth disposition.",
@@ -118,7 +120,9 @@ class WorkItem(BaseModel):
         "`review_rejected`, `patch_rejected`, `no_target`, `worker_error`, "
         "`provider_exhausted`, `budget_exhausted`, `dependency_invalidated`, "
         "`agent_timeout`, `claim_lost`, `item_wall_clock`, `item_spend`, "
-        "`hold_expired`, `context_unavailable`.",
+        "`hold_expired`, `context_unavailable`, `item_impossible`, `command_blocked` "
+        "(a command matched this deployment's refusal list) or `path_escape` (a "
+        "command named a path outside the item's worktree).",
     )
     branch: str | None = None
     pr_url: str | None = None
@@ -159,8 +163,16 @@ class HoldView(BaseModel):
         description="Project containing the held item. Together with `item_id`, this "
         "is the stable identity used by detail and answer routes."
     )
-    item_id: str = Field(description="Plan id of the item waiting for this answer.")
-    attempt: int = Field(0, description="Attempt that asked the question.")
+    item_id: str = Field(
+        description="Which item is asking. `GET /api/holds` is an inbox, and an "
+        "inbox entry that does not say what it is about cannot be acted on — "
+        "`POST /api/work/{item_id}/answer` needs exactly this id.",
+    )
+    attempt: int = Field(
+        0,
+        description="The attempt that asked. An item may legitimately ask more than "
+        "once, and an answer belongs to the attempt that asked rather than to the item.",
+    )
     state: str = Field(description="`open`, `answered`, `expired` or `cancelled`.")
     question: str = Field(
         description="What is being asked. Never empty — a hold with no "
@@ -505,10 +517,28 @@ class ProjectSpec(BaseModel):
         description=(
             "`check command -> argv believed to clear it`. When a check with a declared "
             "fix fails, the item's outcome is `fix_available` rather than plain `fail` "
-            "and the fix is recorded in the event stream. **It is never run.** A gate "
-            "that silently repaired what it was meant to catch could not be trusted to "
-            "have caught anything; applying it is a separate decision. The key must be "
-            "one of `checks`, verbatim."
+            "and the fix is recorded in the event stream. It is run only if "
+            "`apply_fixes` is true. The key must be one of `checks`, verbatim."
+        ),
+    )
+    apply_fixes: bool = Field(
+        False,
+        description=(
+            "Whether a declared fix may actually be RUN. False, the default, keeps the "
+            "old behaviour exactly: the fix is recorded and the item is refused. True "
+            "means a failing check with a declared fix has that fix run once in the "
+            "item's worktree and the check re-run — and **the re-run is the verdict**, "
+            "so a gate that still fails still refuses the item. "
+            "**Only ever turn this on for formatters.** It is allowed at all because a "
+            "formatter's fix is deterministic and mechanical: it changes where a brace "
+            "goes, never what the code does, and its effect lands in the reviewed diff. "
+            "A failing test must never be 'fixed' and re-run — that hides the failure "
+            "instead of reporting it, and no guard here can tell your test runner from "
+            "your formatter. The harness enforces what it can (the fix runs only in the "
+            "item's worktree, once, with no loop; it may only rewrite files that already "
+            "exist; every check must pass on the resulting tree; and every fix that runs "
+            "is announced in the event stream and to the reviewer). The rest is your "
+            "assertion about the commands you declared."
         ),
     )
     max_item_seconds: float = Field(
@@ -615,6 +645,12 @@ class ProjectSpec(BaseModel):
         for command, fix in self.fixes.items():
             if not fix or not all(part for part in fix):
                 raise ValueError(f"the fix for {command!r} must be a non-empty argv list")
+        if self.apply_fixes and not self.fixes:
+            raise ValueError(
+                "apply_fixes is on and no fixes are declared. It is a permission to run "
+                "the fixes you named, not a mode; with nothing named it does nothing, "
+                "and reading it as 'the harness will repair failures' would be wrong."
+            )
         return self
 
 
@@ -1485,6 +1521,24 @@ class WaitingItem(BaseModel):
     session_url: str | None = None
 
 
+class OverdueHold(BaseModel):
+    """A question that has been open past the deadline it was given.
+
+    The pull path for anyone who configured no outbound hook (#188). A hold is
+    swept back to `blocked` by the next claim scan, so seeing one here means
+    either nothing is claiming for that project or the sweep has not run yet —
+    both of which are things an unattended fleet should be able to notice
+    without anyone thinking to look at the inbox.
+    """
+
+    project_id: str
+    item_id: str
+    question: str
+    age_seconds: float = Field(description="How long it has been unanswered.")
+    overdue_seconds: float = Field(description="How long past its own deadline it has been open.")
+    session_url: str | None = None
+
+
 class Summary(BaseModel):
     running: int
     pending: int
@@ -1501,6 +1555,17 @@ class Summary(BaseModel):
     waiting_for_input: list[WaitingItem] = Field(
         description="Agents that have stopped to ask a human something. Its own field "
         "rather than a count, because it is the one state that needs a person."
+    )
+    holds_open: int = Field(
+        0,
+        description="Unanswered questions on held items. A durable state of the work "
+        "item, unlike `waiting_for_input`, which is read from recent events.",
+    )
+    holds_overdue: list[OverdueHold] = Field(
+        default_factory=list,
+        description="Questions still open past their own deadline. Listed rather than "
+        "counted because each one names an item nobody answered, and a status line that "
+        "reads healthy while one of these exists is the failure issue #188 is about.",
     )
 
 

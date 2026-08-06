@@ -23,6 +23,9 @@ EXECUTION_PATH = [
     "fleet.py",
     "session_executor.py",
     "executor.py",
+    # The refusal list is on the path an item passes through, and a refusal
+    # list is exactly where one workload's commands would get hardcoded.
+    "guard.py",
     "model_client.py",
     "providers.py",
     "protocols.py",

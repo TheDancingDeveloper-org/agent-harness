@@ -115,6 +115,7 @@ environment
   ?     gh cli: gh at /usr/bin/gh; whether it can WRITE is not checked here …
   ok    route presets: resolvable by name: chat-completions, claw-bay, generic
   ok    dependency resolvers: declared: github-issue
+  warn  command guard: not configured — the built-in default is in force …
 
 project demo
   ok    checkout: /home/you/demo/repo
@@ -142,6 +143,38 @@ usable in a script. `--json` gives the same report machine-readably.
 filesystem and installed package metadata. `--probe-models` opts into the one
 question that needs a network, and needs `HARNESS_API_KEY` and `--endpoint` to
 do it. A `?` is never a pass — it is a thing nobody has checked.
+
+### 0a.2 Say what this machine must never be asked to run
+
+An item's work happens in a real worktree on a real filesystem, and the argv the
+harness executes on an item's behalf is not always something you typed: a plan's
+`verify:` line is argv, and a plan is a document a model may have written.
+
+```console
+$ agent-harness --db harness.sqlite guard --refuse 'sh -c' --refuse 'aws s3 rm'
+command guard: 12 refusal pattern(s); paths confined to the item's tree
+  configured by this deployment: yes
+  refuse  sh -c
+  refuse  aws s3 rm
+  refuse  sudo   (built-in default)
+  …
+A refused command is terminal for its item: it stops in `blocked` with
+disposition `blocked_by_policy`, and is never retried.
+```
+
+Two rules, both deterministic and neither asking a model to co-operate: a
+**refusal list**, matched against argv however the command is spelled, and a
+**path boundary** — an argument naming anything outside the item's worktree is
+refused, which is what puts `~/.ssh`, `/etc` and `rm -rf /` out of reach.
+
+Until you run this, `doctor` reports the guard as `warn … not configured`. The
+built-in default is small, generic and in force regardless, but nobody in this
+deployment chose it, and a guard nobody enabled is not a guard.
+
+**It is screening, not a sandbox.** It bounds the commands *the harness* runs;
+it cannot see what an agent types inside its own session — that is the session
+host's isolation to own — and it cannot read inside `sh -c '…'`, which is one
+opaque token to it. Add the interpreter to your own list if that matters here.
 
 `doctor` and `preflight` overlap on purpose and share their probes, so the
 report cannot disagree with the gate that actually refuses a start. What
@@ -418,13 +451,16 @@ and no `--repo` (line-wrapped here to fit the page):
 ```
 project widgets: proposed
 repository /home/you/widgets
-3 plan item(s); 2 proposed as already delivered; 0 needing a human decision
+3 plan item(s); 2 proposed as already delivered (1 unconfirmed); 0 needing a
+  human decision
   W1 -> done  [proposed done]
       explicit/done: the plan item is checked
       would create queue row item W1 in project widgets: insert as done if this
         drop is approved, otherwise pending
-  W2 -> done  [proposed done]
-      runnable/passed: `python -m unittest -q tests.test_serials` succeeded
+  W2 -> pending  [possible drop, unconfirmed: droppable only if a human names it]
+      runnable/passed: `python -m unittest -q tests.test_serials` exited 0,
+        which says the command did not fail; it does not say the command
+        tested anything
       would create queue row item W2 in project widgets: insert as done if this
         drop is approved, otherwise pending
   W3 -> pending
@@ -449,8 +485,16 @@ Three rungs, in this order, and every rung that ran stays in the report:
 | Rung | What it is | What it can do |
 |---|---|---|
 | **explicit** | The plan item is checked, or a closed issue / merged PR names the item id exactly. | Propose a drop. |
-| **runnable** | The item's own `verify:` command exits 0. | Propose a drop. |
+| **runnable** | The item's own `verify:` command exits 0. | **Offer** a drop. On its own it proposes nothing — see below. |
 | **judged** | The `assessor` role says `done`, `partial` or `not_started`, with citations. | Propose a drop, and only with citations. |
+
+**An exit code is not a rung on its own.** A `verify:` that exits 0 has not
+failed; that is not the same fact as "the work is there", because in most test
+runners a name filter that matches nothing passes. So a passing `verify:`
+proposes `done` only when a second rung agrees — explicit evidence, or an
+assessor `done` with citations. Alone, the item is listed as a drop you *may*
+approve, marked `unconfirmed`, and it stays `pending` if you say nothing.
+[How to write one that fails when the work is absent](#verify--how-an-item-proves-it-is-already-done).
 
 **A proposal is not a decision.** Nothing enters the queue as `done` unless a
 human names it:
@@ -466,8 +510,9 @@ way and needs a reason: `--reject "W2 is not finished"` or `--revise "..."`.
 
 Uncertainty always resolves downwards. Two equally-good candidates for one
 item, an assessor that says `done` and cites nothing, an assessor whose route
-is down, or a `verify:` command that ran and *failed* while the assessor said
-`done` — all of them come back as work to do, flagged for a human.
+is down, a `verify:` command that ran and *failed* while the assessor said
+`done`, or a `verify:` that passed with nothing to corroborate it — all of them
+come back as work to do, flagged for a human.
 
 ### What it will and will not touch outside the harness
 
@@ -549,8 +594,10 @@ verify: ["python", "-m", "pytest", "-q", "tests/test_serials.py::test_duplicate"
 A **JSON array of argv strings**, never shell text. `adopt` runs it in the
 repository under exactly the same rules as a project check — fixed argv, no
 shell, a timeout (`--verify-timeout`, defaulting to the project-check
-timeout) — and an exit code of 0 is evidence that this item's work already
-exists.
+timeout) — and an exit code of 0 is *one* piece of evidence that this item's
+work already exists. On its own it never drops the item: read the next
+paragraph for why, because it is the reason the word "one" is doing work
+there.
 
 | | |
 |---|---|
@@ -572,18 +619,26 @@ verify: ["cargo", "test", "-p", "gateway", "secure_cookies"]
 
 That looks like "the test for this item passes". On a tree where the item has
 not been done, the test does not exist, `cargo test` runs zero tests and exits
-`0` — and adoption reports:
+`0`. `pytest -k`, `go test -run` and `npm test -- -t` behave the same way;
+`pytest path::name` is the exception, exiting 4 when the name is absent.
+
+The harness cannot tell those apart, and deliberately will not try: reading
+another ecosystem's output to guess how many tests it ran is exactly what an
+adapter is for, and a wrong guess here **drops work that is then never done**.
+What it does instead is refuse to decide on that one fact. Adoption reports:
 
 ```
-R2 -> done  [proposed done]
-    runnable/passed: `cargo test -p gateway secure_cookies` succeeded
+R2 -> pending  [possible drop, unconfirmed: droppable only if a human names it]
+    runnable/passed: `cargo test -p gateway secure_cookies` exited 0, which
+      says the command did not fail; it does not say the command tested
+      anything
 ```
 
-`pytest -k`, `go test -run` and `npm test -- -t` behave the same way;
-`pytest path::name` is the exception, exiting 4 when the name is absent. The
-harness cannot tell the difference, and deliberately will not try: reading
-another ecosystem's output to guess what it meant is exactly what an adapter is
-for, and a wrong guess here **drops work that is then never done**.
+The item is offered to `--approve-drop R2` — you may know the command is a
+real one — but nothing proposes it, and approving the report without naming it
+leaves the work to do. A second rung changes that: an assessor `done` with
+citations, or a closed issue naming the item, and the drop is proposed
+outright.
 
 So before trusting a `verify:`, run it on a tree where the item is *not*
 finished and confirm it fails. A command that asserts a fact about the tree —
@@ -1427,6 +1482,29 @@ window, which the harness does not know and will not guess — a budget large
 enough to overflow it turns a working item into a provider error, so raise it
 deliberately rather than to the maximum.
 
+Raising it is safe for everything else, because **the budget is a ceiling and
+not a target**. Selection stops when relevance runs out: a file sharing no word
+with the brief, the plan or a target path — and not sitting beside one — is not
+supplied at all, however much room is left. The surroundings are also bounded
+separately from the ceiling:
+
+```bash
+agent-harness run --context-budget 700000 --context-fallback-budget 60000 …
+```
+
+`--context-fallback-budget` (or `$HARNESS_CONTEXT_FALLBACK_BUDGET`) defaults to
+60,000 — what the harness has always supplied — and is never more than
+`--context-budget`. Targets are unaffected by it and are still supplied whole.
+So one 612 KB file in one repository no longer taxes every trivial item in it:
+before this split, an item whose whole change was one line of `.gitignore` was
+measured spending 299,985 characters of a 300,000-character budget on a
+lockfile and a vendored patch directory.
+
+The `context_selected` event says where the characters went, so the trade is
+observable rather than asserted: `target_characters`, `fallback_characters`,
+`listing_characters`, `fallback_character_allowance` and
+`fallback_skipped_irrelevant`, alongside the files themselves.
+
 ### 6b. A check has five answers, not two
 
 `Checks` classifies **how the subprocess ended**, never what your project's
@@ -1437,7 +1515,7 @@ stops being one.
 |---|---|---|
 | `pass` | exit 0 | On to the reviewer |
 | `fail` | exit non-zero | The item is refused. Costs an attempt. |
-| `fix_available` | exit non-zero, **and** you declared a fix for that command | The item is refused, and the fix is **recorded in the event stream and never run** |
+| `fix_available` | exit non-zero, **and** you declared a fix for that command | The fix is recorded in the event stream. With `apply_fixes` off (the default) the item is refused there; with it on, the fix is run once and the check re-run |
 | `retry` | the command did not finish in time | The item goes back to pending. **Costs no attempt** — the question was not answered, which is not the answer being no |
 | `escalate` | the program is not installed, or the disk is full | The item is **blocked**. No diff fixes that and no retry clears it |
 
@@ -1447,9 +1525,57 @@ Declaring a fix, per project:
 {"checks": ["ruff format --check ."], "fixes": {"ruff format --check .": ["ruff", "format", "."]}}
 ```
 
-It is recorded, not applied. A gate that silently repaired what it was meant to
-catch could not be trusted to have caught anything; applying it is a decision
-with its own consequences.
+It is recorded, not applied — unless you also say `"apply_fixes": true`.
+
+#### Running a declared fix (#155)
+
+A formatter in check mode is a gate no model reliably passes. It is not a
+judgement about the work: it is column arithmetic, the model cannot compute what
+`rustfmt` would have done, and a measured run of one item was refused four times
+out of seven for brace placement while being substantively correct every time.
+
+With `apply_fixes` on, a check that fails and has a declared fix has that fix run
+**once, in the item's own worktree**, and the check **re-run**. The re-run is the
+verdict:
+
+```json
+{
+  "checks": ["cargo fmt --all -- --check", "cargo test"],
+  "fixes": {"cargo fmt --all -- --check": ["cargo", "fmt", "--all"]},
+  "apply_fixes": true
+}
+```
+
+**This is allowed only because a formatter's fix is deterministic and
+mechanical.** It changes where a brace goes, never what the program does, and
+what it produces is the code that would have been merged anyway. **A failing
+test must never be "fixed" and re-run** — a test failure is a statement about
+behaviour, repairing it is a judgement, and re-running it after something edited
+it launders the failure rather than reporting it. Declaring a fix for a test
+suite, a type checker, or a linter whose autofix changes behaviour defeats every
+guard below.
+
+The gate is not weakened. What the harness enforces:
+
+- the fix runs **once**, and never provokes another fix. A gate cannot be ground
+  down to a pass;
+- **the whole suite must pass on the post-fix tree** — checks that had already
+  passed are re-run after a fix, so a fix cannot buy one gate by breaking
+  another;
+- the fix may only **rewrite files that already exist**. Adding, deleting or
+  renaming a path is not something a formatter does, and it escalates to a
+  person rather than passing the item;
+- the fix runs with the **item's worktree** as its working directory, and an
+  argv naming an absolute path or a `..` segment is refused before it runs;
+- **nothing is silent.** Each fix that runs emits a `check_fix_applied` event
+  naming the check, the fix and the exact paths it rewrote; those paths are in
+  the committed diff; and the reviewer is told, in its prompt, that the harness
+  modified the tree and which files it touched.
+
+What the harness **cannot** enforce is that the command you declared is a
+formatter. `apply_fixes` is off by default, is per project, and applies only to
+commands you personally paired with a fix. That last step is your assertion, and
+nothing checks it.
 
 `escalate` is an **additional** outcome and never a softer `fail`. A check
 cannot reach for it to avoid failing an item, and an escalating check still
@@ -1600,6 +1726,50 @@ durable stage.
   for ever — a hold keeps its claim, so unlike the budgets its default is
   deliberately **not** unlimited.
 
+#### Being told, instead of thinking to look
+
+A hold used to be durable and completely silent (#188): every route to one was
+a pull, so an item could sit on a thirty-second question overnight while every
+dashboard read healthy.
+
+Opening a hold now emits one notice — into the event stream the run already
+writes, and to one URL you name:
+
+```bash
+uv run agent-harness --db harness.sqlite serve --hold-webhook https://your-host/holds
+# or: HARNESS_HOLD_WEBHOOK=https://your-host/holds
+```
+
+```json
+{"kind": "work", "outcome": "hold_opened", "ts": 1754000000.0,
+ "project_id": "default", "item_id": "T4", "worker": "worker-1",
+ "question": "Which database should this use?",
+ "reason": "the schema is not decided",
+ "who_may_answer": "anyone", "expires_at": 1754021600.0,
+ "session_url": "https://…/t/abc",
+ "answer_path": "/api/work/T4/answer?project_id=default",
+ "detail": "T4 is waiting on a person: Which database should this use?"}
+```
+
+Three things about it are deliberate.
+
+- **It is not a notification system.** One URL, one POST, no retries and no
+  queue. What is on the other end — a session host that already has push
+  notifications, a chat relay you wrote, a log file — is not this service's
+  business, and adding a product here would be the coupling `AGENTS.md`
+  forbids.
+- **A failed delivery is dropped, never raised.** It cannot fail the item,
+  stall it, or un-hold it. This is the rule telemetry already follows, for the
+  same reason: the fleet must not depend on it.
+- **It carries no resume token.** `answer_path` says where the answer goes;
+  spending it is an authenticated call to the API, which looks the token up
+  itself.
+
+Configure nothing and nothing changes: the inbox is still `GET /api/holds`, and
+`GET /api/summary` reports `holds_open` plus a `holds_overdue` entry for any
+question still open past its own deadline — a status line that reads healthy
+while one of those exists is exactly the failure this closes.
+
 ---
 
 ## Configuration reference
@@ -1610,9 +1780,11 @@ durable stage.
 | `HARNESS_DB` | all | SQLite path. Default `./harness.sqlite`. |
 | `HARNESS_API_KEY` | `run`, `serve` | Key for the model provider. In `serve` it is the reviewer's. |
 | `HARNESS_ENDPOINT` | `run`, `serve` | Model API base URL. |
+| `HARNESS_HOLD_WEBHOOK` | `run`, `serve` | URL POSTed a JSON notice when an item stops to ask a person something (`--hold-webhook`). Unset means nothing is sent and the pull routes are unchanged. Delivery is best-effort: it can never fail or stall the item. |
 | `HARNESS_ROUTE_PRESET` | `run`, `serve` | Default route preset (`--preset`) for roles that name none: the wire protocol, the authentication header, the response reader and a failure classifier, as one name. Default `chat-completions`. |
 | `HARNESS_ROUTE_PRESETS` | all | Extra presets to make resolvable, as `name=module:attribute` pairs. For a preset that lives in your own code rather than in an installed distribution's entry points. |
-| `HARNESS_CONTEXT_BUDGET` | `run` | How many characters of repository the implementer is shown (`--context-budget`, default 60000). A file bigger than this cannot be supplied at all — see [§6a.1](#6a1-when-the-target-does-not-fit-in-the-prompt). |
+| `HARNESS_CONTEXT_BUDGET` | `run` | The most characters of repository the implementer may be shown (`--context-budget`, default 60000). A file bigger than this cannot be supplied at all — see [§6a.1](#6a1-when-the-target-does-not-fit-in-the-prompt). A ceiling, not a target. |
+| `HARNESS_CONTEXT_FALLBACK_BUDGET` | `run` | How much of that the *surroundings* — files the planner did not name — may use (`--context-fallback-budget`, default 60000, never more than the budget). Raising the budget for one large target does not raise this. |
 | `HARNESS_ROOT_PATH` | `serve` | Prefix when behind a proxy, e.g. `/api/harness`. |
 | `AIDEVENV_URL` | `run`, `serve` | Session host, enabling attachable agents. In `serve` it is what makes the deployment supervised rather than monitoring-only. |
 | `AIDEVENV_TOKEN` | `run`, `serve` | Session host token. |

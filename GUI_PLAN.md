@@ -25,11 +25,13 @@ default `main` checkout is not the GUI implementation tree.
 This section is the resume point as of 2026-08-06. Continue in this worktree; the default
 `main` checkout is not the implementation source of truth.
 
-At the start of this continuation, the branch head is `a245679`: four GUI commits ahead of
-the merge base and 18 commits behind `main` at `be7abe1`. The Milestone 2–4 continuation is
-still a dirty worktree, not a commit. Preserve and verify that continuation, checkpoint it,
-then integrate current `main` before treating later implementation or gate results as
-release evidence.
+At the start of this continuation, the branch head was `a245679`: four GUI commits ahead of
+the merge base and 18 commits behind `main` at `be7abe1`. The Milestone 2–4 continuation was
+revalidated and checkpointed as `4059d22`, then current `main` was integrated. The merged
+tree passes all four gates with the declared `--all-extras` environment. The first merged
+pytest attempt was invalid because this older worktree had not installed the newly declared
+`agent-loop` extra; all 38 failures were `ModuleNotFoundError: minisweagent`. After
+`uv sync --all-extras`, that failure group and the full suite passed.
 
 ### 0.1 Landed foundation
 
@@ -77,10 +79,10 @@ The complete implementation tree has the following evidence:
 
 | Check | Most recent result |
 |---|---|
-| `TMPDIR=/tmp/agent-harness-gui-resume.vVPDQ5 uv run pytest -q` | Passed at 100%, 1 skipped |
+| `TMPDIR=/tmp/agent-harness-gui-merged-sync.jXkgCh uv run pytest -q` | Passed at 100%, 1 skipped |
 | `uv run ruff check .` | Passed |
-| `uv run ruff format --check .` | Passed, 119 files checked |
-| `TMPDIR=/tmp/agent-harness-gui-resume-mypy.KCzFMT uv run mypy` | Passed, 114 source files |
+| `uv run ruff format --check .` | Passed, 131 files checked |
+| `TMPDIR=/tmp/agent-harness-gui-merge-mypy.8cRBKW uv run mypy` | Passed, 126 source files |
 
 The full suite includes the wheel packaging and in-process browser journeys. Browser
 automation, accessibility tooling, a forced browser SSE reconnect, real GitHub concurrency,
@@ -102,14 +104,13 @@ not prove a transaction across remote preview and writes.
 
 ### 0.5 Exact next work
 
-First revalidate and checkpoint the uncommitted Milestone 2–4 continuation, then integrate
-the 18 newer `main` commits and rerun proportionate regression gates. Continue with
-Milestone 4.8–4.9 only from that reconciled base: add confirmed GitHub reconciliation and
-audit-maintenance reviews/actions, then expose session-independent process and gateway-log
-metrics through typed, redacted APIs. The analytics views now keep `rpm`, `window_cap`,
-`terminal_cap` and `unclassified` separate; show supplied baselines and denominators; keep
-known spend distinct from unpriced calls; and retain table evidence behind every summary.
-Do not mark Milestone 4 complete until every 4.1–4.9 acceptance requirement is evidenced.
+Continue from the reconciled base with Milestone 4.8–4.9: add confirmed GitHub
+reconciliation and audit-maintenance reviews/actions, then expose session-independent
+process and gateway-log metrics through typed, redacted APIs. The analytics views now keep
+`rpm`, `window_cap`, `terminal_cap` and `unclassified` separate; show supplied baselines and
+denominators; keep known spend distinct from unpriced calls; and retain table evidence
+behind every summary. Do not mark Milestone 4 complete until every 4.1–4.9 acceptance
+requirement is evidenced.
 
 ## 1. Product decision
 

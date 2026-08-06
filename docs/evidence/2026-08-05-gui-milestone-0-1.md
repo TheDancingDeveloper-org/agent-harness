@@ -6,20 +6,14 @@ Status: implementation slice complete; the full GUI program is not complete.
 
 - Branch: `codex/gui-plan`
 - Worktree: `/home/sprooty/Working/Active/apps/agent-harness-worktrees/gui-plan`
-- Committed branch head: `a245679`; the slices after that commit are currently an
-  uncommitted continuation and therefore are not yet commit-addressable evidence
-- Branch relationship at the 2026-08-06 resume check: four commits ahead of the merge base
-  and 18 commits behind `main` at `be7abe1`
-- Plan: `GUI_PLAN.md`; its exact post-checkpoint blob/commit identifier must replace the
-  transient working-tree hash when this continuation is checkpointed
+- Continuation checkpoint: `4059d22`
+- Integration base: `main` at `be7abe1`; merged after the checkpoint
+- Plan: `GUI_PLAN.md` in the integration commit containing this evidence update
 - Python: CPython 3.14.4; package installed with `uv sync --all-extras`
 - Temporary test volume: `/tmp` (separate ext4 filesystem, 361 GiB free at baseline)
 
 This evidence file was refreshed on 2026-08-06 after the worker-inventory, filtered-event
-and typed-analytics slices. The complete four-gate result below predates this
-documentation-only resume edit. It verifies the implementation continuation as it then
-stood, but does not remove the need to rerun the gates after checkpointing and integrating
-current `main`.
+and typed-analytics slices, then refreshed again after current `main` was integrated.
 
 ## Commands and results
 
@@ -86,6 +80,22 @@ continuation:
 | `uv run ruff check .` | passed |
 | `uv run ruff format --check .` | passed, 119 files already formatted |
 | `TMPDIR=/tmp/agent-harness-gui-resume-mypy.KCzFMT uv run mypy` | passed, 114 source files |
+
+After checkpoint `4059d22`, integrating `main` at `be7abe1`, and synchronizing the newly
+declared optional dependencies with `uv sync --all-extras`:
+
+| Check | Result |
+|---|---|
+| `TMPDIR=/tmp/agent-harness-gui-merged-sync.jXkgCh uv run pytest -q` | passed at 100%, 1 skipped |
+| `uv run ruff check .` | passed |
+| `uv run ruff format --check .` | passed, 131 files already formatted |
+| `TMPDIR=/tmp/agent-harness-gui-merge-mypy.8cRBKW uv run mypy` | passed, 126 source files |
+
+The first full merged pytest attempt is not passing evidence. This older worktree had not
+yet installed `main`'s newly declared `agent-loop` extra, so 38 tests failed consistently
+with `ModuleNotFoundError: minisweagent`. `uv sync --all-extras` installed the declared
+dependency; the complete affected test files then passed before the successful full run
+above. No application-code workaround was made for the missing package.
 
 An earlier concurrent setup attempt and an earlier `/dev/shm` pytest attempt are
 not evidence: the former raced virtualenv creation and the latter filled the
@@ -180,7 +190,6 @@ GitHub repository or external deployment was used.
 
 ## Current slice verification
 
-The resume-checkpoint four-gate table above is the latest complete implementation evidence. Earlier
-transient or partial runs are historical context only and are not substituted for that
-complete pass. Because the branch is still dirty and behind `main`, this is not yet a
-commit-addressable or integration-current release result.
+The post-integration four-gate table above is the latest complete implementation evidence.
+Earlier transient or partial runs are historical context only and are not substituted for
+that complete pass.

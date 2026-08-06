@@ -32,12 +32,13 @@ than the problems it exists to resolve.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -115,7 +116,7 @@ class AuthorityStore:
     def __init__(self, path: str | object, *, now: Callable[[], float] = time.time) -> None:
         self.path = str(path)
         self.now = now
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.executescript(self._SCHEMA)
 
     def _connect(self) -> sqlite3.Connection:
@@ -123,6 +124,23 @@ class AuthorityStore:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
+
+    @contextlib.contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """One connection, committed like `with conn:` and then **closed**.
+
+        A sqlite3 connection's context manager manages a transaction, not the
+        connection, so `with self._connect() as conn` left a handle open on
+        every call in a process meant to run for weeks (#206). The `with conn`
+        stays inside: `acquire` runs an explicit `BEGIN IMMEDIATE` and relies
+        on it.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def acquire(
         self, project_id: str, holder_id: str, *, lease_seconds: float = DEFAULT_LEASE_SECONDS
@@ -135,7 +153,7 @@ class AuthorityStore:
         """
 
         now = self.now()
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT holder_id, generation, valid_until FROM oversight_authority "
@@ -172,7 +190,7 @@ class AuthorityStore:
     def release(self, project_id: str, holder_id: str) -> bool:
         """Give up authority early, so a clean shutdown is not a dead wait."""
 
-        with self._connect() as conn:
+        with self._connection() as conn:
             cursor = conn.execute(
                 "UPDATE oversight_authority SET valid_until = 0 "
                 "WHERE project_id = ? AND holder_id = ?",
@@ -181,7 +199,7 @@ class AuthorityStore:
         return cursor.rowcount > 0
 
     def current(self, project_id: str) -> Authority | None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT holder_id, generation, valid_until FROM oversight_authority "
                 "WHERE project_id = ?",

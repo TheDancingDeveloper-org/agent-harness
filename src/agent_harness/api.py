@@ -383,12 +383,21 @@ def create_api(
         project_id: str = Query("default", description="Which project the item is in."),
         _: None = Depends(require_token),
     ) -> RetryResult:
-        """Put a finished or failed item back to `pending`.
+        """Put a finished, failed or exhausted item back to `pending`.
 
         Refuses while a claim is live: yanking an item out from under a
         running agent produces two workers on one item, which is worse than
         one stuck item. A stale lease expires on its own and is retryable
         without anyone intervening.
+
+        `queue.requeue`, not `queue.release` — this is the operator's only
+        lever over a wedged row, and it has to *mean* it. A release leaves the
+        attempt counter where it was, so retrying an `exhausted` item put it
+        back to `pending`, reported `ok`, and watched the very next claim scan
+        retire it again before any worker saw it. It also leaves the durable
+        attempt position, so the "retry" would resume into the verdict it was
+        retrying. Requeuing clears both, and keeps `last_error`, which is the
+        only record of why the item stopped.
         """
         queue = need_queue()
         record = queue.get(item_id, project_id=project_id)
@@ -400,7 +409,7 @@ def create_api(
                 detail=f"{item_id} is claimed by {record.owner} and its lease is live; "
                 "wait for the lease to expire rather than racing it",
             )
-        queue.release(item_id, PENDING, error=None, project_id=project_id)
+        queue.requeue(item_id, project_id=project_id)
         return RetryResult(ok=True, item_id=item_id, state="pending")
 
     @app.get(

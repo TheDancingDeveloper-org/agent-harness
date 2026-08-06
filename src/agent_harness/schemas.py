@@ -158,6 +158,17 @@ class WorkList(BaseModel):
 class HoldView(BaseModel):
     """A question an item is waiting on, and how long it has been waiting."""
 
+    item_id: str = Field(
+        "",
+        description="Which item is asking. `GET /api/holds` is an inbox, and an "
+        "inbox entry that does not say what it is about cannot be acted on — "
+        "`POST /api/work/{item_id}/answer` needs exactly this id.",
+    )
+    attempt: int = Field(
+        0,
+        description="The attempt that asked. An item may legitimately ask more than "
+        "once, and an answer belongs to the attempt that asked rather than to the item.",
+    )
     state: str = Field(description="`open`, `answered`, `expired` or `cancelled`.")
     question: str = Field(
         description="What is being asked. Never empty — a hold with no "

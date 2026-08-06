@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from agent_harness.api import create_api
 from agent_harness.audit import AuditStore
-from agent_harness.events import WORK, Event
+from agent_harness.events import MODEL_CALL, WORK, Event
 from agent_harness.github import GitHub, GitHubError
 from agent_harness.maintenance import MaintenanceReport
 from agent_harness.reconcile import ReconcileReport
@@ -114,6 +114,57 @@ def test_root_and_pages_fail_closed_until_login(tmp_path: Path) -> None:
         assert client.get("/projects").status_code == 401
         assert client.get("/work").status_code == 401
         assert client.get("/api/work").status_code == 401
+
+
+def test_analytics_shows_session_independent_process_and_gateway_evidence(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(tmp_path / "events.sqlite")
+    audit = AuditStore(tmp_path / "audit.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(Project(project_id="p", name="Project P"))
+    audit.append(
+        [
+            Event(
+                ts=3.0,
+                kind=MODEL_CALL,
+                source="serve",
+                role="reviewer",
+                model="model-a",
+                endpoint="https://user:password123@gateway.example/v1?token=secret123",
+                outcome="ok",
+                latency_s=0.5,
+                data={"project_id": "p", "detail": "completed"},
+            )
+        ]
+    )
+
+    class PoisonSessionHost:
+        def __getattribute__(self, name: str) -> Any:
+            raise AssertionError(f"analytics read session-host state: {name}")
+
+    with TestClient(
+        create_api(
+            store,
+            queue=queue,
+            audit=audit,
+            token=TOKEN,
+            session_host=PoisonSessionHost(),
+        )
+    ) as client:
+        login(client)
+        response = client.get("/analytics")
+    assert response.status_code == 200
+    html = response.text
+    assert "Service process" in html
+    assert "monitoring-only" in html
+    assert "Gateway calls" in html
+    assert "model-a" in html
+    assert "https://gateway.example/v1" in html
+    assert "password123" not in html
+    assert "secret123" not in html
+    assert "/api/process" in html
+    assert "/api/gateway-logs" in html
 
 
 def test_login_cookie_is_opaque_and_pages_are_read_only(tmp_path: Path) -> None:

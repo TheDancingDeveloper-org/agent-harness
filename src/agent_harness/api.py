@@ -37,6 +37,7 @@ from .plan_service import PlanSyncConflict, PlanSyncFailure
 from .plan_service import execute as execute_plan_sync
 from .plan_service import parse_result as plan_parse_result
 from .preflight import BaseChecks
+from .process_metrics import ProcessMetricsSampler, ProcessMetricsSource
 from .project_service import configure_project, project_spec
 from .providers import MEANING
 from .routing_service import ROLE_MAP_KEY as ROLE_MAP_KEY
@@ -68,6 +69,7 @@ from .schemas import (
     EventPage,
     ExecutionReadiness,
     FleetControl,
+    GatewayLogPage,
     Health,
     HoldList,
     HoldView,
@@ -85,6 +87,7 @@ from .schemas import (
     PlanSyncResult,
     PreflightCheck,
     PreflightResult,
+    ProcessMetrics,
     ProjectList,
     ProjectReadiness,
     ProjectSpec,
@@ -182,6 +185,7 @@ def create_api(
     executor_roles: Any | None = None,
     default_preset: str = "",
     github_factory: Any | None = None,
+    process_metrics: ProcessMetricsSource | None = None,
 ) -> FastAPI:
     """Build the API.
 
@@ -231,6 +235,7 @@ def create_api(
     app.state.executor_roles = executor_roles
     app.state.default_preset = default_preset
     app.state.github_factory = github_factory
+    app.state.process_metrics = process_metrics or ProcessMetricsSampler()
     app.state.ask_model = _model_asker(model_client)
     app.state.base_checks = BaseChecks()
     app.state.token = token
@@ -1694,6 +1699,53 @@ def create_api(
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     # ------------------------------------------------------- observability
+
+    @app.get(
+        "/api/process",
+        tags=["observability"],
+        summary="Session-independent service-process metrics",
+        response_model=ProcessMetrics,
+    )
+    def process_metrics_api(_: None = Depends(require_token)) -> ProcessMetrics:
+        """Sample the process serving this API.
+
+        This does not query a session host or infer a process tree. The start
+        timestamp is the moment this API application began tracking itself.
+        """
+        from .query_service import HarnessQueries
+
+        return HarnessQueries(
+            store,
+            app.state.queue,
+            audit=app.state.audit,
+            fleet=app.state.fleet,
+            process_metrics=app.state.process_metrics,
+        ).process_metrics()
+
+    @app.get(
+        "/api/gateway-logs",
+        tags=["observability"],
+        summary="Redacted model gateway call log",
+        response_model=GatewayLogPage,
+    )
+    def gateway_logs(
+        since_id: int = Query(0, ge=0, description="Exclusive source-event cursor."),
+        limit: int = Query(200, ge=1, le=1000, description="Maximum model calls to return."),
+        project_id: str | None = Query(None, description="Limit to one recorded project id."),
+        _: None = Depends(require_token),
+    ) -> GatewayLogPage:
+        """Allowlisted `model_call` evidence from the active event source.
+
+        The live audit store is preferred and the ingest event store is the
+        monitoring-only fallback. Both redact before writing. Model answer
+        bodies and arbitrary payload fields are deliberately excluded, and
+        no filesystem log path is part of this contract.
+        """
+        from .query_service import HarnessQueries
+
+        return HarnessQueries(store, app.state.queue, audit=app.state.audit).gateway_logs(
+            since_id, limit, project_id=project_id
+        )
 
     @app.get(
         "/api/errors",

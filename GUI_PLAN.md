@@ -70,7 +70,11 @@ The implementation now includes:
 9. URL-backed event filters for project, item, worker, endpoint, role, model, outcome,
    error class, reason kind and time, including filtered SSE resume on the same monotonic
    cursor; and
-10. focused in-process journeys for replay, stale project/routing configuration, CSRF,
+10. Milestone 4.9 portable service-process sampling and a
+   narrowed projection of already-redacted `model_call` events from the live append-only
+   event source. This uses no session-host state, exposes no arbitrary model payload, and
+   introduces no filesystem log-path convention; and
+11. focused in-process journeys for replay, stale project/routing configuration, CSRF,
    preview-without-write, plan mutation, remote preview drift and refused external writes.
 
 ### 0.3 Current verification
@@ -79,10 +83,10 @@ The complete implementation tree has the following evidence:
 
 | Check | Most recent result |
 |---|---|
-| `TMPDIR=/tmp/agent-harness-gui-4-8-full.VVKT0C uv run pytest -q` | Passed at 100%, 1 skipped |
+| `TMPDIR=/tmp/agent-harness-gui-4-9-full.7JtLkQ uv run pytest -q` | Passed at 100%, 1 skipped |
 | `uv run ruff check .` | Passed |
-| `uv run ruff format --check .` | Passed, 132 files checked |
-| `TMPDIR=/tmp/agent-harness-gui-4-8-full-mypy.MdANch uv run mypy` | Passed, 127 source files |
+| `uv run ruff format --check .` | Passed, 134 files checked |
+| `TMPDIR=/tmp/agent-harness-gui-4-9-mypy.Ce6jNh uv run mypy` | Passed, 129 source files |
 
 The full suite includes the wheel packaging and in-process browser journeys. Browser
 automation, accessibility tooling, a forced browser SSE reconnect, real GitHub concurrency,
@@ -100,20 +104,26 @@ not prove a transaction across remote preview and writes.
    lacks the typed adoption HTTP/wizard flow and richer interactive graph controls.
 4. Milestone 4 rate-limit, cost, delivery, audit-health, worker inventory and filtered
    event exploration are implemented as read-only typed views. GitHub reconciliation and
-   audit maintenance now have explicit reviewed browser actions. Session-independent
-   process and gateway-log metrics remain incomplete.
+   audit maintenance have explicit reviewed browser actions. Process metrics and gateway
+   call history are session-independent; the latter is deliberately structured harness
+   `model_call` evidence, not a claim that core can discover or parse an arbitrary gateway
+   daemon's filesystem logs.
 
 ### 0.5 Exact next work
 
-Continue from the reconciled base with Milestone 4.9: expose session-independent process
-and gateway-log metrics through typed, redacted APIs. Milestone 4.8 is implemented with
-one-time review/apply actions, persisted-project repository resolution and drift refusal,
-validated retention parameters, required reasons, authenticated operator audit, and result
-pages that retain returned errors. The analytics views now keep
-`rpm`, `window_cap`, `terminal_cap` and `unclassified` separate; show supplied baselines and
-denominators; keep known spend distinct from unpriced calls; and retain table evidence
-behind every summary. Do not mark Milestone 4 complete until every 4.1–4.9 acceptance
-requirement is evidenced.
+Milestone 4.9 is implemented through typed `GET /api/process` and
+`GET /api/gateway-logs` contracts plus table evidence on the analytics page. The process
+sampler is per-application and stdlib-only. Gateway pages prefer the live audit source,
+fall back to the ingest event store, page sparse `model_call` rows without breaking cursor
+meaning, allowlist fields, re-redact displayed text, remove URL userinfo/query/fragment,
+bound detail, and report degraded history. Focused tests prove both reads avoid session-host
+state, omit arbitrary model output, scope projects, and fail closed for malformed endpoints.
+
+Milestone 4's substantially owned control-plane surface is implemented. Continue with the
+remaining earlier acceptance gaps rather than starting Milestone 5: first reconcile the
+Milestone 2 bulk-action review/notification requirements and Milestone 3 typed adoption and
+interactive-graph requirements against current code, then implement the smallest complete
+missing contract and update this state section before and after it.
 
 ## 1. Product decision
 
@@ -562,7 +572,13 @@ append-only audit store, record success/refusal with authenticated identity, and
 all returned errors.
 
 4.9. Add session-independent process metrics and agent-harness gateway logs through typed,
-redacted APIs. Never make local filesystem log paths a core convention.
+redacted APIs. Never make local filesystem log paths a core convention. Implemented:
+`/api/process` samples the serving process without querying session-host state, and
+`/api/gateway-logs` provides a cursor-paged, project-filterable, allowlisted projection of
+already-redacted harness `model_call` events. The analytics page supplies table evidence
+for both. Live audit history is preferred, ingest history is the explicit fallback,
+degradation is visible, arbitrary payloads are omitted, detail is bounded, and endpoint
+userinfo/query/fragment are removed with malformed values failing closed.
 
 **Acceptance:** An operator can explain fleet state, failure classes, route use,
 reviewer-independence risk, cost caveats, delivery outcomes, worker leases, and audit health

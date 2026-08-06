@@ -80,7 +80,31 @@ def role_map_view_for(state: Any, stored: dict[str, Any]) -> RoleMapView:
 
 def safe_endpoint(endpoint: str) -> str:
     """Render route identity without URL credentials, query strings, or fragments."""
-    parsed = urlsplit(endpoint)
+    # Redaction runs before persistence and its visible marker contains square
+    # brackets. When that marker replaces a password in URL userinfo,
+    # `urlsplit` can mistake it for a bracketed IP literal and reject the
+    # otherwise useful endpoint. Userinfo is discarded anyway, so remove it
+    # from the raw authority before asking the URL parser for the safe fields.
+    scheme_end = endpoint.find("://")
+    candidate = endpoint if scheme_end >= 0 else f"//{endpoint}"
+    authority_start = scheme_end + 3 if scheme_end >= 0 else 2
+    authority_end = len(candidate)
+    for marker in "/?#":
+        index = candidate.find(marker, authority_start)
+        if index >= 0:
+            authority_end = min(authority_end, index)
+    authority = candidate[authority_start:authority_end]
+    if "@" in authority:
+        candidate = (
+            candidate[:authority_start] + authority.rsplit("@", 1)[1] + candidate[authority_end:]
+        )
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        # A malformed stored endpoint is still untrusted display text. Do not
+        # echo it as the fallback: it may be malformed precisely because it
+        # contains credential-bearing userinfo the parser cannot separate.
+        return "redacted-endpoint"
     hostname = parsed.hostname or ""
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"

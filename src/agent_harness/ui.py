@@ -80,6 +80,7 @@ def install_ui(app: FastAPI) -> BrowserSessions:
             request.app.state.queue,
             audit=request.app.state.audit,
             fleet=request.app.state.fleet,
+            process_metrics=request.app.state.process_metrics,
         )
 
     def render(
@@ -939,6 +940,8 @@ def install_ui(app: FastAPI) -> BrowserSessions:
             "analytics.html",
             title="Analytics",
             dashboard=dashboard,
+            process=queries(request).process_metrics(),
+            gateway_logs=queries(request).gateway_logs(limit=50, project_id=project_id),
             projects=queries(request).projects(),
             retention_days=DEFAULT_RETENTION_DAYS,
         )

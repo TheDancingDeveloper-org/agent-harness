@@ -182,6 +182,14 @@ not evidence: the former raced virtualenv creation and the latter filled the
   refusals record the authenticated operator and required reason in the healthy append-only
   audit store, while result pages retain returned counts and errors. Missing or degraded
   audit stores refuse the controls because the required operator record could not be kept.
+- Milestone 4.9 is implemented against a fixed generic boundary: service-process
+  metrics come from a portable in-process sampler, and gateway logs are a narrowed
+  projection of `model_call` rows from the live append-only event source. Those rows have
+  already crossed the store redaction boundary. The projection does not expose arbitrary
+  model payloads, depend on session-host state, or establish a filesystem log-path
+  convention. It re-redacts allowlisted display fields, strips endpoint userinfo/query/
+  fragment, bounds detail, filters by project without breaking sparse cursor paging, and
+  reports degraded live history instead of silently falling back to stale ingest data.
 - Typed item evidence exposes append-only events, durable attempt stages and
   retained holds without fabricating absent history or cost.
 - `/api/events/stream` resumes after a monotonic cursor and surfaces disconnects;
@@ -199,15 +207,16 @@ This is not a release claim for the full `GUI_PLAN`: browser automation,
 screen-reader checks, forced reconnect with replayed events, and all additional
 accessibility/security/concurrency journeys remain to run. Milestone 2 remains partial
 (bulk-action review, notifications and other controls are not yet wired). Milestone 3
-remains partial (adoption and richer graph interactions are not yet wired). Milestone 4 is
-partial: global routing, worker inventory, filtered events and typed analytics are
-implemented, as are confirmed reconciliation and audit-maintenance controls; process-log
-metrics are not. Milestones 5–8 (internal sessions,
+remains partial (adoption and richer graph interactions are not yet wired). Milestone 4's
+substantially owned control-plane surface is implemented: global routing, worker inventory,
+filtered events, typed analytics, confirmed reconciliation and maintenance, portable
+process metrics and structured gateway-call evidence. This is not a claim that core reads
+an arbitrary gateway daemon's local log files. Milestones 5–8 (internal sessions,
 extensions, automation, RBAC and recovery) remain explicitly incomplete. No real fleet,
 GitHub repository or external deployment was used.
 
 ## Current slice verification
 
-The Milestone 4.8 four-gate table above is the latest complete implementation evidence.
+The Milestone 4.9 four-gate table above is the latest complete implementation evidence.
 Earlier transient or partial runs are historical context only and are not substituted for
 that complete pass.

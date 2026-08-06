@@ -89,6 +89,7 @@ dd { margin: .1rem 0 0; font-weight: 700; overflow-wrap: anywhere; }
 .timeline li { padding: .55rem 0 .55rem .3rem; border-bottom: 1px solid var(--line); }
 .timeline .muted { display: block; font-size: .8rem; }
 table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+.table-scroll { overflow-x: auto; }
 th, td { border-bottom: 1px solid var(--line); text-align: left; padding: .6rem .35rem; vertical-align: top; }
 .login-card { max-width: 430px; margin: 10vh auto; }
 .breadcrumb { margin-top: 0; }

@@ -1382,6 +1382,72 @@ class EventPage(BaseModel):
     cursor: int = Field(description="Pass as `since_id` next time. Unchanged when empty.")
 
 
+class ProcessMetrics(BaseModel):
+    """A session-independent observation of the serving process."""
+
+    sampled_at: float = Field(description="Unix time at which this snapshot was sampled.")
+    started_at: float = Field(
+        description="Unix time at which this API application began tracking its process."
+    )
+    uptime_seconds: float = Field(
+        description="Monotonic seconds since this API application began tracking its process."
+    )
+    pid: int = Field(description="Operating-system id of the process serving this API.")
+    thread_count: int = Field(description="Live Python threads in the serving process.")
+    cpu_seconds: float = Field(description="CPU seconds consumed by the serving process.")
+    mode: Literal["supervised", "monitoring-only"] = Field(
+        description="Whether an in-process worker fleet is attached; no session host is queried."
+    )
+    active_workers: int = Field(
+        description="Live workers reported by the attached fleet, or zero in monitoring-only mode."
+    )
+
+
+class GatewayLog(BaseModel):
+    """Allowlisted fields from one redacted model gateway call."""
+
+    id: int = Field(description="Monotonic source-event id used for cursor paging.")
+    ts: float = Field(description="Unix time at which the gateway outcome was recorded.")
+    project_id: str | None = Field(None, description="Project attributed to the call, if recorded.")
+    item_id: str | None = Field(None, description="Work item attributed to the call, if recorded.")
+    worker: str | None = Field(None, description="Worker identity attributed to the call.")
+    role: str | None = Field(None, description="Routed model role used by the call.")
+    model: str | None = Field(None, description="Model identifier recorded for the call.")
+    endpoint: str | None = Field(
+        None,
+        description="Credential-safe endpoint identity with URL userinfo, query and fragment "
+        "removed.",
+    )
+    outcome: str | None = Field(None, description="Recorded gateway outcome token.")
+    error_class: str | None = Field(None, description="Classified failure kind, when one occurred.")
+    latency_s: float | None = Field(None, description="Recorded call latency in seconds.")
+    attempt: int | None = Field(None, description="Attempt number within the model call ladder.")
+    detail: str | None = Field(
+        None,
+        description="Bounded redacted gateway detail; model answer payloads are never exposed "
+        "here.",
+    )
+
+
+class GatewayLogPage(BaseModel):
+    """Cursor-paged model gateway evidence from the active event source."""
+
+    configured: bool = Field(description="Whether the selected event source is readable.")
+    degraded: bool = Field(
+        description="Whether the selected live audit source reports degraded persistence."
+    )
+    source: Literal["live_audit", "ingested_events"] = Field(
+        description="The append-only source projected; never a local filesystem log path."
+    )
+    logs: list[GatewayLog] = Field(
+        default_factory=list,
+        description="Allowlisted, already-redacted model-call records in source cursor order.",
+    )
+    cursor: int = Field(
+        description="Pass as `since_id` next time; advances across scanned non-model events."
+    )
+
+
 class EventFilters(BaseModel):
     """Typed, URL-safe filters for the append-only event explorer.
 

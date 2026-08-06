@@ -12,8 +12,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_harness.api import create_api
+from agent_harness.audit import AuditStore
 from agent_harness.events import MODEL_CALL, UNCLASSIFIED, WORK, Event
 from agent_harness.fleet import WorkerSnapshot
+from agent_harness.process_metrics import ProcessSample
+from agent_harness.redaction import Redactor
 from agent_harness.store import EventStore
 from agent_harness.work import CLAIMED, DONE, PENDING, Project, WorkQueue, WorkRecord
 from conftest import make_queue
@@ -430,6 +433,202 @@ def test_event_filters_scan_past_non_matching_rows_and_keep_stream_cursor(
     assert payload["cursor"] == 2
 
 
+def test_process_metrics_are_typed_and_do_not_read_session_host(tmp_path: Path) -> None:
+    class FakeMetrics:
+        def sample(self) -> ProcessSample:
+            return ProcessSample(
+                sampled_at=120.0,
+                started_at=100.0,
+                uptime_seconds=20.0,
+                pid=42,
+                thread_count=3,
+                cpu_seconds=1.25,
+            )
+
+    class PoisonSessionHost:
+        def __getattribute__(self, name: str) -> Any:
+            raise AssertionError(f"process metrics read session-host state: {name}")
+
+    store = EventStore(tmp_path / "process-events.sqlite")
+    with TestClient(
+        create_api(
+            store,
+            token=TOKEN,
+            session_host=PoisonSessionHost(),
+            process_metrics=FakeMetrics(),
+        )
+    ) as client:
+        payload = client.get("/api/process", headers=auth()).json()
+    assert payload == {
+        "sampled_at": 120.0,
+        "started_at": 100.0,
+        "uptime_seconds": 20.0,
+        "pid": 42,
+        "thread_count": 3,
+        "cpu_seconds": 1.25,
+        "mode": "monitoring-only",
+        "active_workers": 0,
+    }
+
+
+def test_gateway_logs_use_live_redacted_model_calls_and_omit_arbitrary_payload(
+    tmp_path: Path,
+) -> None:
+    secret = "gateway-secret-value"  # noqa: S105 - redaction fixture
+    redact = Redactor([secret])
+    store = EventStore(tmp_path / "ingest.sqlite", redact=redact)
+    audit = AuditStore(tmp_path / "audit.sqlite", redact=redact)
+    store.append([Event(ts=1.0, kind=MODEL_CALL, source="ingest", model="not-live")])
+    audit.append(
+        [
+            Event(ts=2.0, kind=WORK, source="serve", outcome="claimed"),
+            Event(
+                ts=3.0,
+                kind=MODEL_CALL,
+                source="serve",
+                worker="worker-1",
+                role="reviewer",
+                model="model-a",
+                endpoint=f"https://user:{secret}@gateway.example/v1?token={secret}",
+                outcome="error",
+                error_class="rpm",
+                latency_s=0.75,
+                data={
+                    "project_id": "p",
+                    "item_id": "T1",
+                    "attempt": 2,
+                    "detail": f"Bearer {secret}",
+                    "answer": f"arbitrary model output {secret}",
+                },
+            ),
+        ]
+    )
+    with TestClient(create_api(store, audit=audit, token=TOKEN)) as client:
+        response = client.get("/api/gateway-logs", headers=auth())
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == "live_audit"
+    assert payload["configured"] is True
+    assert payload["degraded"] is False
+    assert len(payload["logs"]) == 1
+    row = payload["logs"][0]
+    assert row == {
+        "id": 2,
+        "ts": 3.0,
+        "project_id": "p",
+        "item_id": "T1",
+        "worker": "worker-1",
+        "role": "reviewer",
+        "model": "model-a",
+        "endpoint": "https://gateway.example/v1",
+        "outcome": "error",
+        "error_class": "rpm",
+        "latency_s": 0.75,
+        "attempt": 2,
+        "detail": "Bearer [redacted]",
+    }
+    rendered = response.text
+    assert secret not in rendered
+    assert "arbitrary model output" not in rendered
+    assert "not-live" not in rendered
+
+
+def test_gateway_log_cursor_pages_model_calls_and_falls_back_to_ingest_store(
+    client: TestClient, store: EventStore
+) -> None:
+    store.append(
+        [
+            Event(ts=1.0, kind=MODEL_CALL, source="ingest", model="first"),
+            Event(ts=2.0, kind=WORK, source="ingest", outcome="between"),
+            Event(ts=3.0, kind=MODEL_CALL, source="ingest", model="second"),
+        ]
+    )
+    first = client.get("/api/gateway-logs?since_id=0&limit=1", headers=auth()).json()
+    assert first["source"] == "ingested_events"
+    assert [row["model"] for row in first["logs"]] == ["first"]
+    second = client.get(
+        f"/api/gateway-logs?since_id={first['cursor']}&limit=1", headers=auth()
+    ).json()
+    assert [row["model"] for row in second["logs"]] == ["second"]
+    assert second["cursor"] > first["cursor"]
+
+
+def test_gateway_logs_scope_projects_and_report_degraded_live_history(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "ingest.sqlite")
+    audit = AuditStore(tmp_path / "audit.sqlite")
+    audit.append(
+        [
+            Event(
+                ts=1.0,
+                kind=MODEL_CALL,
+                source="serve",
+                model="project-a",
+                data={"project_id": "a"},
+            ),
+            Event(
+                ts=2.0,
+                kind=MODEL_CALL,
+                source="serve",
+                model="project-b",
+                data={"project_id": "b"},
+            ),
+        ]
+    )
+    with TestClient(create_api(store, audit=audit, token=TOKEN)) as client:
+        scoped = client.get("/api/gateway-logs?project_id=b", headers=auth()).json()
+    assert [row["model"] for row in scoped["logs"]] == ["project-b"]
+    assert scoped["cursor"] == 2
+
+    degraded = AuditStore(tmp_path / "not-opened.sqlite", degraded=True)
+    with TestClient(create_api(store, audit=degraded, token=TOKEN)) as client:
+        unavailable = client.get("/api/gateway-logs?since_id=7", headers=auth()).json()
+    assert unavailable == {
+        "configured": False,
+        "degraded": True,
+        "source": "live_audit",
+        "logs": [],
+        "cursor": 7,
+    }
+
+
+def test_gateway_logs_never_echo_a_malformed_endpoint(
+    client: TestClient, store: EventStore
+) -> None:
+    store.append(
+        [
+            Event(
+                ts=1.0,
+                kind=MODEL_CALL,
+                source="ingest",
+                endpoint="https://secret-user:secret-password@[not-an-ip/v1?token=secret-token",
+            )
+        ]
+    )
+    response = client.get("/api/gateway-logs", headers=auth())
+    assert response.status_code == 200
+    assert response.json()["logs"][0]["endpoint"] == "redacted-endpoint"
+    assert "secret" not in response.text
+
+
+def test_gateway_logs_strip_userinfo_from_endpoints_without_a_scheme(
+    client: TestClient, store: EventStore
+) -> None:
+    store.append(
+        [
+            Event(
+                ts=1.0,
+                kind=MODEL_CALL,
+                source="ingest",
+                endpoint="secret-user:secret-password@gateway.example/v1?token=secret-token",
+            )
+        ]
+    )
+    response = client.get("/api/gateway-logs", headers=auth())
+    assert response.status_code == 200
+    assert response.json()["logs"][0]["endpoint"] == "//gateway.example/v1"
+    assert "secret" not in response.text
+
+
 def test_worker_inventory_is_explicitly_monitoring_only_without_fleet(
     client: TestClient,
 ) -> None:
@@ -520,6 +719,8 @@ def test_the_schema_documents_response_shapes_not_empty_objects(
         ("/api/summary", "get"),
         ("/api/errors", "get"),
         ("/api/events", "get"),
+        ("/api/gateway-logs", "get"),
+        ("/api/process", "get"),
         ("/api/workers", "get"),
         ("/api/analytics", "get"),
         ("/healthz", "get"),

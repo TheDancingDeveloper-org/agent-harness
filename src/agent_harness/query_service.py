@@ -13,7 +13,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
+from .events import MODEL_CALL, RATE_LIMIT_CLASSES, UNCLASSIFIED
+from .process_metrics import ProcessMetricsSource
 from .project_service import project_spec
 from .providers import MEANING
 from .schemas import (
@@ -35,12 +36,15 @@ from .schemas import (
     EventFilters,
     EventPage,
     FleetControl,
+    GatewayLog,
+    GatewayLogPage,
     HoldList,
     HoldView,
     ItemReadiness,
     LatestEvent,
     OpenQuestion,
     PlanParseResult,
+    ProcessMetrics,
     ProjectList,
     ProjectSummary,
     ProposalModel,
@@ -64,6 +68,26 @@ ANALYTICS_WINDOWS: dict[str, float | None] = {
 }
 
 
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _redacted_text(value: Any, redact: Any) -> str | None:
+    """Defence-in-depth at projection time; omit text if the filter fails."""
+    if value is None:
+        return None
+    try:
+        clean = redact(str(value))
+    except Exception:  # noqa: BLE001 - returning the raw value would expose it
+        return None
+    return None if clean is None else str(clean)
+
+
 class HarnessQueries:
     """Read the control plane without exposing storage layout to controllers."""
 
@@ -74,11 +98,13 @@ class HarnessQueries:
         *,
         audit: Any | None = None,
         fleet: Any | None = None,
+        process_metrics: ProcessMetricsSource | None = None,
     ) -> None:
         self.store = store
         self.queue = queue
         self.audit = audit
         self.fleet = fleet
+        self.process_metrics_source = process_metrics
 
     def projects(self) -> ProjectList:
         if self.queue is None:
@@ -328,6 +354,101 @@ class HarnessQueries:
         fallback is explicit and preserves each store's monotonic cursor.
         """
         return self.filtered_events(since_id, limit, live=True)
+
+    def process_metrics(self) -> ProcessMetrics:
+        """Observe this service process without consulting session-host state."""
+        source = self.process_metrics_source
+        if source is None:
+            raise RuntimeError("no process metrics source is attached")
+        sample = source.sample()
+        fleet = self.fleet
+        if fleet is None:
+            active_workers = 0
+        elif hasattr(fleet, "workers"):
+            active_workers = len(fleet.workers())
+        else:
+            active_workers = sum(fleet.running().values())
+        return ProcessMetrics(
+            sampled_at=sample.sampled_at,
+            started_at=sample.started_at,
+            uptime_seconds=sample.uptime_seconds,
+            pid=sample.pid,
+            thread_count=sample.thread_count,
+            cpu_seconds=sample.cpu_seconds,
+            mode="supervised" if fleet is not None else "monitoring-only",
+            active_workers=active_workers,
+        )
+
+    def gateway_logs(
+        self,
+        since_id: int = 0,
+        limit: int = 200,
+        *,
+        project_id: str | None = None,
+    ) -> GatewayLogPage:
+        """Project model calls from the live redacted event source.
+
+        Model answer bodies and arbitrary event data are intentionally not in
+        the schema. The audit store is the live source when attached; a plain
+        ingest-and-serve deployment falls back to its event store. Neither
+        route asks a session host where it writes files.
+        """
+        from .routing_service import safe_endpoint
+
+        source = self.audit if self.audit is not None else self.store
+        source_name = "live_audit" if self.audit is not None else "ingested_events"
+        degraded = bool(getattr(source, "degraded", False))
+        cursor = since_id
+        matched: list[GatewayLog] = []
+        chunk_size = min(1000, max(limit, 200))
+        while not degraded and len(matched) < limit:
+            rows = source.since_id(cursor, limit=chunk_size)
+            if not rows:
+                break
+            for raw in rows:
+                cursor = int(raw["id"])
+                row = self._audit_event_fields(raw) if source is self.audit else raw
+                if row.get("kind") != MODEL_CALL:
+                    continue
+                data = row.get("data") or {}
+                if project_id is not None and str(data.get("project_id") or "") != project_id:
+                    continue
+                endpoint = row.get("endpoint")
+                redact = source.redact
+                detail = _redacted_text(data.get("detail"), redact)
+                if detail is not None:
+                    detail = detail[:2000]
+                clean_endpoint = _redacted_text(endpoint, redact)
+                matched.append(
+                    GatewayLog(
+                        id=cursor,
+                        ts=float(row["ts"]),
+                        project_id=_redacted_text(data.get("project_id"), redact),
+                        item_id=_redacted_text(data.get("item_id"), redact),
+                        worker=_redacted_text(row.get("worker"), redact),
+                        role=_redacted_text(row.get("role"), redact),
+                        model=_redacted_text(row.get("model"), redact),
+                        endpoint=(
+                            safe_endpoint(clean_endpoint) if clean_endpoint is not None else None
+                        ),
+                        outcome=_redacted_text(row.get("outcome"), redact),
+                        error_class=_redacted_text(row.get("error_class"), redact),
+                        latency_s=row.get("latency_s"),
+                        attempt=_optional_int(data.get("attempt")),
+                        detail=detail,
+                    )
+                )
+                if len(matched) >= limit:
+                    break
+            if len(rows) < chunk_size:
+                break
+        return GatewayLogPage(
+            configured=not degraded,
+            degraded=degraded,
+            source=source_name,
+            logs=matched,
+            cursor=cursor,
+        )
 
     @staticmethod
     def _event_matches(event: dict[str, Any], filters: EventFilters) -> bool:

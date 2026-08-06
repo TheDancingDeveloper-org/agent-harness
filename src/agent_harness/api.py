@@ -1994,6 +1994,11 @@ def _preflight(
             else None
         ),
     }
+    selected_runner = str(queue.get_setting("role_runner") or "")
+    if selected_runner:
+        from .role_runners import probe as runner_probe
+
+        kwargs["role_runner"] = lambda: runner_probe(selected_runner)
     # Injected probes win, so a test can answer any of these without a
     # network, a subprocess or a model.
     kwargs.update(getattr(state, "probes", None) or {})

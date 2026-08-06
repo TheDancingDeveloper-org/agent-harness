@@ -848,6 +848,36 @@ agent-harness run --repo owner/name --work ./target-repo \
     --endpoint https://api.your-gateway.example --check 'pytest -q'
 ```
 
+That command keeps the historical single-shot implementer. To select an
+installed tool-using loop instead:
+
+```bash
+uv sync --extra agent-loop
+
+agent-harness run --repo owner/name --work ./target-repo \
+    --role-runner agent-loop --runner-step-limit 80 \
+    --planner gpt-5.6 --implementer gpt-5.6-terra --reviewer claude-sonnet-4-6 \
+    --endpoint https://api.your-gateway.example --check 'pytest -q'
+```
+
+The runner name is resolved through the installed
+`agent_harness.role_runners` metadata. `run` refuses an unknown or incompatible
+runner before claiming work, stores an explicitly selected name in the queue
+database, and prints the implementation version plus contract compatibility.
+`doctor` and project preflight report that same selection.
+
+The loop may run the declared checks itself for feedback. That result is not a
+gate: after the loop submits, the harness captures the complete candidate tree
+(including new files and local commits), validates and reapplies its diff, and
+runs every declared check again before review. `--runner-step-limit` bounds the
+whole loop; `--runner-command-timeout` bounds one feedback command. Project and
+item wall-clock/spend ceilings still apply across attempts.
+
+This selectable path is the Stage 1 execution path, not the autonomous fleet.
+It still works in the shared checkout and its command subprocess inherits the
+controller environment. Do not use it for a secret-bearing real repository
+until the OS-enforced confinement described in `STATUS.md` Stage 2 is present.
+
 **A role may name several models, in preference order.** The first that
 answers does the work; the others are tried only when it will not:
 
@@ -1782,6 +1812,9 @@ while one of those exists is exactly the failure this closes.
 | `HARNESS_HOLD_WEBHOOK` | `run`, `serve` | URL POSTed a JSON notice when an item stops to ask a person something (`--hold-webhook`). Unset means nothing is sent and the pull routes are unchanged. Delivery is best-effort: it can never fail or stall the item. |
 | `HARNESS_ROUTE_PRESET` | `run`, `serve` | Default route preset (`--preset`) for roles that name none: the wire protocol, the authentication header, the response reader and a failure classifier, as one name. Default `chat-completions`. |
 | `HARNESS_ROUTE_PRESETS` | all | Extra presets to make resolvable, as `name=module:attribute` pairs. For a preset that lives in your own code rather than in an installed distribution's entry points. |
+| `HARNESS_ROLE_RUNNER` | `run` | Installed role runner selected for implementation (`--role-runner`). Empty keeps the historical single-shot implementer. An explicit flag is stored in the deployment database. |
+| `HARNESS_RUNNER_STEP_LIMIT` | `run` | Whole-loop model-call ceiling (`--runner-step-limit`, default 80). An emergency control, not a call-minimisation target. |
+| `HARNESS_RUNNER_COMMAND_TIMEOUT` | `run` | Timeout in seconds for one feedback command inside the loop (`--runner-command-timeout`, default 300). |
 | `HARNESS_CONTEXT_BUDGET` | `run` | The most characters of repository the implementer may be shown (`--context-budget`, default 60000). A file bigger than this cannot be supplied at all — see [§6a.1](#6a1-when-the-target-does-not-fit-in-the-prompt). A ceiling, not a target. |
 | `HARNESS_CONTEXT_FALLBACK_BUDGET` | `run` | How much of that the *surroundings* — files the planner did not name — may use (`--context-fallback-budget`, default 60000, never more than the budget). Raising the budget for one large target does not raise this. |
 | `HARNESS_ROOT_PATH` | `serve` | Prefix when behind a proxy, e.g. `/api/harness`. |

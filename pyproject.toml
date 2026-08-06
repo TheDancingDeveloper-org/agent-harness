@@ -53,6 +53,12 @@ claw-bay = "agent_harness.adapters.claw_bay:PRESET"
 [project.entry-points."agent_harness.dependency_resolvers"]
 github-issue = "agent_harness.adapters.github_issue:resolver"
 
+# Repository-aware role loops, selected by name on the same terms as route
+# presets and dependency resolvers. Core owns the contract and lookup; only
+# installed metadata knows which adapter supplies a selected implementation.
+[project.entry-points."agent_harness.role_runners"]
+agent-loop = "agent_harness.adapters.minisweagent:RUNNER"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

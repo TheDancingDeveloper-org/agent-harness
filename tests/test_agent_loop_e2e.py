@@ -701,6 +701,55 @@ def test_an_unpriced_call_is_not_a_free_one(repo: Path) -> None:
     assert agent.model.serialize()["cost_measurable"] is False
 
 
+def test_one_unpriced_call_makes_the_loop_s_dollar_ceiling_unenforceable(repo: Path) -> None:
+    """A known subtotal is not an enforceable total after one unknown call."""
+    replies = iter(("echo first", "echo second", DONE))
+    calls = 0
+
+    def transport(route: Route, messages: Any, options: Any) -> Response:
+        nonlocal calls
+        del route, messages, options
+        calls += 1
+        command = next(replies)
+        payload: dict[str, Any] = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "working",
+                        "tool_calls": [
+                            {
+                                "id": f"call_{calls}",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": json.dumps({"command": command}),
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+        if calls > 1:
+            payload["usage"] = {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}
+        return Response(200, {}, json.dumps(payload))
+
+    client = ModelClient(
+        roles={"implementer": Route("scripted", "https://e.example")},
+        transport=transport,
+        prices=PriceTable(version="test", prices={"scripted": Price(1.0, 1.0)}),
+    )
+    agent = build(client, repo, step_limit=5, budget=Budget(spend_usd=1.0))
+
+    result = agent.run("Finish despite an unenforceable dollar total.")
+
+    assert result.get("exit_status") == "Submitted"
+    assert calls == 3
+    assert agent.model.spend.unpriced == 1
+    assert agent.model.spend.usd == pytest.approx(4.0)
+
+
 def test_a_wall_clock_budget_reaches_the_loop(repo: Path) -> None:
     """The item's ceilings were never handed to the thing that runs long.
 
@@ -715,8 +764,10 @@ def test_a_wall_clock_budget_reaches_the_loop(repo: Path) -> None:
     assert agent.config.cost_limit == 2.5
 
     other, _ = scripted(DONE)
-    assert build(other, repo).config.wall_time_limit_seconds == 0, (
-        "a budget nobody set is not a ceiling"
+    unlimited = build(other, repo)
+    assert unlimited.config.wall_time_limit_seconds == 0, "a budget nobody set is not a ceiling"
+    assert unlimited.config.cost_limit == 0.0, (
+        "the loop library's finite default must not override an unlimited item budget"
     )
 
 

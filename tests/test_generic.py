@@ -21,6 +21,7 @@ EXECUTION_PATH = [
     "work.py",
     "graph.py",
     "fleet.py",
+    "role_runners.py",
     "session_executor.py",
     "executor.py",
     # The refusal list is on the path an item passes through, and a refusal
@@ -152,4 +153,14 @@ def test_the_shipped_dependency_resolvers_are_declared_the_same_way() -> None:
     manifest = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text())
     declared = manifest["project"]["entry-points"]["agent_harness.dependency_resolvers"]
     assert set(declared) == {"github-issue"}
+    assert all(value.startswith("agent_harness.adapters.") for value in declared.values())
+
+
+def test_the_shipped_role_runners_are_declared_the_same_way() -> None:
+    """A runner is an adapter even when it is the primary execution path."""
+    import tomllib
+
+    manifest = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text())
+    declared = manifest["project"]["entry-points"]["agent_harness.role_runners"]
+    assert set(declared) == {"agent-loop"}
     assert all(value.startswith("agent_harness.adapters.") for value in declared.values())

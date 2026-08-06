@@ -573,6 +573,22 @@ def _run(args: argparse.Namespace) -> int:
     # that varies per terminal. `agent-harness guard` writes it.
     guard = CommandGuard.from_settings(queue.get_setting(GUARD_KEY))
     checks = Checks(commands=[shlex.split(c) for c in args.check], guard=guard)
+    role_runner = None
+    runner_name = str(args.role_runner or queue.get_setting("role_runner") or "").strip()
+    if runner_name:
+        from .role_runners import describe, resolve
+
+        try:
+            role_runner = resolve(runner_name)
+            runner_detail = describe(role_runner)
+        except Exception as exc:  # noqa: BLE001 - configuration refusal
+            print(f"role runner: {exc}", file=sys.stderr)
+            return 2
+        if args.role_runner and queue.get_setting("role_runner") != runner_name:
+            queue.set_setting("role_runner", runner_name)
+        print(f"role runner: {runner_detail}")
+    else:
+        print("role runner: direct single-shot implementer (historical path)")
     # This project's counts, not the rollup. `--project` decides which queue
     # this run works, so a cross-project total here would report items no
     # worker in this process can claim.
@@ -839,6 +855,9 @@ def _run(args: argparse.Namespace) -> int:
             # from `default` — which is nobody's project once more than one
             # exists, and reports "nothing to do" over a full queue.
             project_id=args.project,
+            role_runner=role_runner,
+            runner_step_limit=args.runner_step_limit,
+            runner_command_timeout=args.runner_command_timeout,
         )
     # Typing `agent-harness run` IS the human deciding to start this project.
     # A project starts `stopped` so a restart never resumes on its own, but
@@ -1464,6 +1483,28 @@ def main(argv: list[str] | None = None) -> int:
         help="base URL of a session host (AIDevEnv). With this, each agent runs as a "
         "TERMINAL SESSION you can attach to, which is the point. Without it, the "
         "harness calls the model API directly and there is nothing to watch.",
+    )
+    p_run.add_argument(
+        "--role-runner",
+        default=os.environ.get("HARNESS_ROLE_RUNNER", ""),
+        metavar="NAME",
+        help="installed role runner for implementation (or $HARNESS_ROLE_RUNNER). "
+        "Resolved by name through installed metadata; empty keeps the historical "
+        "single-shot implementer while the loop path earns delivery evidence.",
+    )
+    p_run.add_argument(
+        "--runner-step-limit",
+        type=int,
+        default=int(os.environ.get("HARNESS_RUNNER_STEP_LIMIT", "") or 80),
+        metavar="N",
+        help="whole-loop model-call ceiling (default 80, or $HARNESS_RUNNER_STEP_LIMIT).",
+    )
+    p_run.add_argument(
+        "--runner-command-timeout",
+        type=int,
+        default=int(os.environ.get("HARNESS_RUNNER_COMMAND_TIMEOUT", "") or 300),
+        metavar="SECONDS",
+        help="timeout for one feedback command inside the role loop (default 300).",
     )
     p_run.add_argument(
         "--agent",

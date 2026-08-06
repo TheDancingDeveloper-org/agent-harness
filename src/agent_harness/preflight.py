@@ -621,6 +621,7 @@ def preflight_project(
     reviewer_independent: tuple[bool, str] | None = None,
     role_probe: Callable[[], RoleReachability] | None = None,
     session_host: Probe | None = None,
+    role_runner: Probe | None = None,
     git_probe: Callable[[str], tuple[bool, str]] = _is_git_repo,
     github_probe: Callable[[str], tuple[bool, str]] = _gh_can_write,
     checks_probe: Probe | None = None,
@@ -661,6 +662,10 @@ def preflight_project(
                 detail if ok else f"{detail} — agents run as sessions on it, so none can start",
             )
         )
+
+    if role_runner is not None:
+        ok, detail = role_runner()
+        checks.append(Check("role runner", ok, detail))
 
     work_dir = getattr(project, "work_dir", None)
     if work_dir:

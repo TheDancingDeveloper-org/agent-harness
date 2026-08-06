@@ -81,6 +81,7 @@ from .outcomes import (
     Stop,
     stop_for,
 )
+from .role_runners import RoleRunner, RoleRunRequest, RoleRunResult
 from .work import (
     BLOCKED,
     DEFAULT_PROJECT,
@@ -207,6 +208,37 @@ def run_git(repo: Path, *args: str, check: bool = True) -> str:
     if check and result.returncode != 0:
         raise GitError(f"git {' '.join(args)}: {result.stderr.strip()}")
     return result.stdout
+
+
+def candidate_diff(repo: Path, base: str = "HEAD") -> str:
+    """The complete candidate tree as a patch against ``base``.
+
+    ``git diff HEAD`` omits untracked files and also omits commits an agent
+    made while working.  Both are ordinary loop outcomes, and losing either
+    here turns correct work into "completed without changing the repository".
+
+    A temporary index lets git describe the worktree exactly as ``git add -A``
+    followed by a cached diff would, without changing the repository's real
+    index.  ``--binary`` keeps new or modified binary files representable by
+    the same downstream patch pipeline.
+    """
+    with tempfile.TemporaryDirectory(prefix="agent-harness-index-") as directory:
+        environment = {**os.environ, "GIT_INDEX_FILE": str(Path(directory) / "index")}
+
+        def indexed(*args: str) -> subprocess.CompletedProcess[str]:
+            result = subprocess.run(  # noqa: S603 - fixed argv, no shell
+                ["git", "-C", str(repo), *args],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            if result.returncode != 0:
+                raise GitError(f"git {' '.join(args)}: {result.stderr.strip()}")
+            return result
+
+        indexed("read-tree", "HEAD")
+        indexed("add", "-A")
+        return indexed("diff", "--cached", "--binary", base).stdout
 
 
 #: How much repository the implementer is shown. Big enough that a small
@@ -2054,6 +2086,9 @@ class Executor:
         artifacts: Path | None = None,
         project_id: str = DEFAULT_PROJECT,
         durability: str | None = None,
+        role_runner: RoleRunner | None = None,
+        runner_step_limit: int = 80,
+        runner_command_timeout: int = 300,
     ) -> None:
         self.queue = queue
         #: How often this worker makes progress durable. None takes the
@@ -2112,6 +2147,11 @@ class Executor:
         self._spend = Spend()
         self._budget_cache: Budget | None = None
         self._unenforceable_said: set[str] = set()
+        #: Optional and injected: direct mode remains available while the new
+        #: path earns delivery evidence. Core knows only this protocol.
+        self.role_runner = role_runner
+        self.runner_step_limit = runner_step_limit
+        self.runner_command_timeout = runner_command_timeout
 
     # ------------------------------------------------------------- driving
 
@@ -2127,7 +2167,17 @@ class Executor:
         )
         self._heartbeat = heartbeat
         try:
-            with heartbeat:
+            # Every call in every role gets the work identity. The client
+            # still owns request-attempt identity; this scope supplies the
+            # project/item/attempt no transport can infer.
+            with (
+                heartbeat,
+                self.client.event_scope(
+                    project_id=self.project_id,
+                    item_id=record.item_id,
+                    work_attempt=record.attempts,
+                ),
+            ):
                 return self._execute(record)
         finally:
             self._heartbeat = None
@@ -2428,6 +2478,34 @@ class Executor:
             self._budget_cache = budget_for(self.queue.get_project(self.project_id), record)
         return self._budget_cache
 
+    def _remaining_runner_budget(self, record: WorkRecord) -> Budget:
+        """Translate the whole-item ceiling to what this loop may consume.
+
+        Item spend and time accumulate across attempts. Passing the configured
+        total to every loop would let one item spend it once per attempt.
+        """
+        budget = self._budget(record)
+        started = record.first_started_at
+        elapsed = max(0.0, self.now() - started) if started is not None else 0.0
+        seconds = max(0.0, budget.seconds - elapsed) if budget.seconds else 0.0
+        spent = record.spend_usd + self._spend.usd
+        # A prior unpriced call makes the item's total a lower bound across
+        # attempts. Do not hand a fresh loop a dollar ceiling it could enforce
+        # against only its known subtotal; the next boundary will report the
+        # ceiling as unenforceable, as budgets.py requires.
+        unknown_spend = bool(record.unpriced_calls or self._spend.unpriced)
+        spend = (
+            max(0.0, budget.spend_usd - spent) if budget.spend_usd and not unknown_spend else 0.0
+        )
+        # In the public Budget type zero means unlimited. Here a zero remainder
+        # under a configured total means the opposite, so preserve a positive
+        # sentinel and let the loop stop at its next call boundary.
+        if budget.seconds and not seconds:
+            seconds = 1e-9
+        if budget.spend_usd and not spend and not unknown_spend:
+            spend = 1e-12
+        return Budget(seconds=seconds, spend_usd=spend)
+
     def _budget_stop(self, record: WorkRecord) -> None:
         """Refuse to go past a ceiling this item declared.
 
@@ -2440,7 +2518,12 @@ class Executor:
         if not budget.bounded:
             return
         started = record.first_started_at or self.now()
-        verdict = budget_check(budget, elapsed=self.now() - started, spend=self._spend)
+        spend = Spend(
+            usd=record.spend_usd + self._spend.usd,
+            unpriced=record.unpriced_calls + self._spend.unpriced,
+            priced=self._spend.priced,
+        )
+        verdict = budget_check(budget, elapsed=self.now() - started, spend=spend)
         for ceiling, why in verdict.unenforceable:
             # Said once per stop, and said as a fact rather than a warning
             # nobody reads: a ceiling that cannot be checked is not a ceiling
@@ -2632,6 +2715,11 @@ class Executor:
                 record, outcome, planner, stored, base, stacked_on, resume, log, attempt, mode
             )
 
+        if self.role_runner is not None:
+            return self._run_implementer(
+                record, outcome, base, stacked_on, resume, log, attempt, mode
+            )
+
         if planner.cannot_identify_target and self.ask_when_uncertain:
             # The planner has said, in as many words, that the task is
             # ambiguous, contradicts the codebase, or depends on something
@@ -2757,6 +2845,170 @@ class Executor:
         )
         return self._from_diff(
             record, outcome, planner, diff, base, stacked_on, resume, log, attempt, mode
+        )
+
+    def _run_implementer(
+        self,
+        record: WorkRecord,
+        outcome: Outcome,
+        base: str,
+        stacked_on: str | None,
+        resume: A.Resume,
+        log: A.AttemptLog,
+        attempt: int,
+        mode: str,
+    ) -> Outcome:
+        """Run implementation as a loop, then rejoin the existing gates."""
+        runner = self.role_runner
+        assert runner is not None
+        branch = f"{self.branch_prefix}{record.item_id.lower()}"
+        outcome.branch = branch
+        outcome.base = base
+        self._prepare_branch(branch, base)
+        if stacked_on:
+            self._emit(record, "stacked", detail=f"based on {base} ({stacked_on})")
+
+        self._budget_stop(record)
+
+        def report(stage: str, detail: str, evidence: Mapping[str, Any]) -> None:
+            self._emit(record, stage, detail=detail, evidence=evidence)
+
+        self._emit(record, "calling", detail=f"{IMPLEMENTER} through {runner.name}")
+        try:
+            with self.client.event_scope(
+                project_id=self.project_id,
+                item_id=record.item_id,
+                work_attempt=attempt,
+            ):
+                result = runner.run(
+                    RoleRunRequest(
+                        role=IMPLEMENTER,
+                        task=self._runner_task(record),
+                        repo=self.repo,
+                        project_id=self.project_id,
+                        item_id=record.item_id,
+                        attempt=attempt,
+                        client=self.client,
+                        guard=self.checks.guard,
+                        budget=self._remaining_runner_budget(record),
+                        step_limit=self.runner_step_limit,
+                        command_timeout=self.runner_command_timeout,
+                        writable=True,
+                        report=report,
+                        account=self._spend.add,
+                    )
+                )
+        except Exception:
+            self._abandon_branch(branch)
+            outcome.branch = None
+            raise
+        outcome.stages.append("implement")
+
+        if result.exit_status == "wall_clock_limit":
+            self._abandon_branch(branch)
+            outcome.branch = None
+            raise self._runner_budget_exceeded(record, result, BUDGET_WALL_CLOCK)
+        if result.exit_status == "spend_limit":
+            self._abandon_branch(branch)
+            outcome.branch = None
+            raise self._runner_budget_exceeded(record, result, BUDGET_SPEND)
+        if result.exit_status != "completed":
+            outcome.reason = (
+                f"role runner {runner.name} stopped with {result.exit_status} "
+                f"after {result.calls} model call(s)"
+            )
+            self._emit(
+                record,
+                "runner_incomplete",
+                detail=outcome.reason,
+                evidence={"submission": result.submission[:4000]},
+            )
+            outcome.stop = Stop(CRASHED, WORKER_ERROR, detail=outcome.reason)
+            self._abandon_branch(branch)
+            outcome.branch = None
+            return outcome
+
+        # Against the item base, not merely the current HEAD: a tool-using
+        # agent may create untracked files or make local commits, and both are
+        # part of the candidate the gates must judge.
+        diff = candidate_diff(self.repo, base)
+        if not diff:
+            outcome.reason = "the role runner completed without changing the repository"
+            self._emit(record, "no_diff", detail=outcome.reason)
+            outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
+            self._abandon_branch(branch)
+            outcome.branch = None
+            return outcome
+        log.record(
+            self.project_id,
+            record.item_id,
+            attempt,
+            A.IMPLEMENTED,
+            {
+                "diff": diff,
+                "runner": runner.name,
+                "calls": result.calls,
+                "submission": result.submission[:4000],
+            },
+            admitted_revision=record.admitted_revision,
+            mode=mode,
+        )
+        # `_from_diff` stays the sole downstream path. It cuts this branch
+        # afresh and applies the observed diff, so the validator, authoritative
+        # checks, checkpoint and reviewer all see the loop's exact candidate.
+        return self._from_diff(
+            record,
+            outcome,
+            PlannerResult(plan="role runner inspected the repository directly"),
+            diff,
+            base,
+            stacked_on,
+            resume,
+            log,
+            attempt,
+            mode,
+        )
+
+    def _runner_task(self, record: WorkRecord) -> str:
+        checks = [" ".join(command) for command in self.checks.commands if command]
+        parts = [
+            record.brief.strip(),
+            "Work in the repository directly. Inspect what you need, make the change, "
+            "and use the project's checks for feedback before submitting.",
+        ]
+        if checks:
+            parts.append(
+                "Declared checks (feedback only; the harness reruns them as gates):\n"
+                + "\n".join(checks)
+            )
+        prior = self._prior_failure_prompt(record).strip()
+        guidance = self._guidance(record).strip()
+        if prior:
+            parts.append(prior)
+        if guidance:
+            parts.append(guidance)
+        return "\n\n".join(parts)
+
+    def _runner_budget_exceeded(
+        self, record: WorkRecord, result: RoleRunResult, ceiling: str
+    ) -> BudgetExceeded:
+        budget = self._budget(record)
+        if ceiling == BUDGET_WALL_CLOCK:
+            observed = self.now() - (record.first_started_at or self.now())
+            return BudgetExceeded(
+                ceiling,
+                budget.seconds,
+                observed,
+                f"the role runner reached this item's {budget.seconds:g}s wall-clock ceiling "
+                f"after {result.calls} model call(s)",
+            )
+        observed = record.spend_usd + self._spend.usd
+        return BudgetExceeded(
+            ceiling,
+            budget.spend_usd,
+            observed,
+            f"the role runner reached this item's {budget.spend_usd:g} spend ceiling "
+            f"after {result.calls} model call(s); recorded spend is {observed:.4f}",
         )
 
     def _changes_from(self, record: WorkRecord, outcome: Outcome, reply: str) -> str | None:
@@ -2923,7 +3175,7 @@ class Executor:
         # reviewer has to see the second one: reviewing the first rejects good
         # work for an artefact of the plumbing, and, worse, makes the gate
         # structurally unable to catch a diff that claims more than it did.
-        applied_diff = run_git(self.repo, "diff", "HEAD") or diff
+        applied_diff = candidate_diff(self.repo) or diff
         self._keepalive(record)
 
         # 5. Cheap checks BEFORE the expensive reviewer call. Paying a model
@@ -2972,7 +3224,7 @@ class Executor:
             # harness ran a declared fix over it. Re-reading it is what makes
             # the reviewer's copy the truth — and what stops the commit below
             # from containing lines the reviewer was never shown.
-            applied_diff = run_git(self.repo, "diff", "HEAD") or applied_diff
+            applied_diff = candidate_diff(self.repo) or applied_diff
         self._emit(record, "checks_passed")
         # Recorded, though it makes resumption no cheaper: re-running a
         # project's checks is idempotent and costs no model call, so a resumed
@@ -3486,6 +3738,7 @@ class Executor:
                         "error_class": error_class,
                         "detail": detail,
                         "project_id": self.project_id,
+                        **({"evidence": dict(evidence)} if evidence else {}),
                     }
                 )
         self._say(record, stage, detail, evidence or {})

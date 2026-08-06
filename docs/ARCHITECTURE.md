@@ -1,5 +1,14 @@
 # Architecture
 
+> # Superseded — 2026-08-06
+>
+> Consolidated into `DESIGN.md`, which carries the diagrams that earned their place and drops those that only restated a list.
+>
+> **Current documentation:** [`docs/DESIGN.md`](DESIGN.md) — how the harness
+> works and why. [`docs/STATUS.md`](STATUS.md) — where it stands.
+>
+> Where this document and the code disagree, the code is right.
+
 How AIDevEnv and agent-harness fit together, and what happens inside the
 harness when work runs.
 

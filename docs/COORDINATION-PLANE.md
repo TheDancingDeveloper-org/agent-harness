@@ -1,5 +1,14 @@
 # Agent coordination and oversight
 
+> # Superseded — 2026-08-06
+>
+> **Half superseded, half still the only record.** The typed work graph (§8) is built and is described in `DESIGN.md`. The message ledger, rooms and oversight actor remain **proposed and not built**, and this document is still the only place they are specified — that part is not replaced by anything.
+>
+> **Current documentation:** [`docs/DESIGN.md`](DESIGN.md) — how the harness
+> works and why. [`docs/STATUS.md`](STATUS.md) — where it stands.
+>
+> Where this document and the code disagree, the code is right.
+
 Status: written 2026-08-03. **Partly implemented — updated 2026-08-04.**
 
 | Section | State |

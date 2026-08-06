@@ -119,44 +119,61 @@ If all seven hold, v1 is done regardless of what remains unimplemented.
 
 ## Documentation
 
-- **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how it fits together.**
-  Diagrams: the whole system, what an agent actually is, the components, the
-  life of a work item, failure classification, the audit layer, and project
-  isolation.
-- **[`docs/INTERNALS.md`](docs/INTERNALS.md) — a layer deeper.** What actually happens
-  inside: backlog building, triage and claiming, model routing, the retry ladder,
-  completion, review, and merge/revert reconciliation.
-- **[`docs/USAGE.md`](docs/USAGE.md) — start here.** A worked example end to end, with
-  real output. Its **"Which way in?"** table routes you by where you are starting from:
-  a demo with no credentials, a new project from a paragraph, a plan you already wrote,
-  or a project already half-built that you want to take on. Then: sync it, execute it,
-  resume it, drive it from the API, and read the failures.
-- **[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — running it as a service.** The two
-  `serve` modes, what a supervised deployment must provide, and a non-destructive smoke
-  test that distinguishes "healthy" from "able to run anything".
+Two documents carry the current state. Everything else is a how-to, an
+operational runbook, or history.
+
+- **[`docs/DESIGN.md`](docs/DESIGN.md) — how the harness works, and why it is
+  shaped that way.** The execution pipeline, the invariants and the failure
+  each one came from, model routing and failure classification, the dependency
+  graph, durability, and the extension points. Start here to understand it.
+- **[`docs/STATUS.md`](docs/STATUS.md) — where it stands, and everything
+  outstanding.** What is proven, observed and merely tested; the open work in
+  the order it can be done; and how to run the harness against **rdpapp**, the
+  first application it is being tested against.
+
+### How to use it
+
+- **[`docs/USAGE.md`](docs/USAGE.md) — a worked example, end to end, with real
+  output.** Its **"Which way in?"** table routes you by where you are starting
+  from: a demo needing no credentials, a new project from a paragraph, a plan
+  you already wrote, or a project already half-built.
 - [`examples/PLAN.md`](examples/PLAN.md) — the sample plan that walkthrough uses.
-- [`docs/HARNESS-PLAN.md`](docs/HARNESS-PLAN.md) — the original plan. **Superseded in
-  part:** it was written assuming one specific consumer, and the harness is now generic.
-  Read it for the evidence and the reasoning, not the phase order, and see §0.1 for what
-  changed.
-- [`docs/MULTI-PROJECT-PLAN.md`](docs/MULTI-PROJECT-PLAN.md) — project scoping, the GUI
-  that scoping makes possible, and project inception. Phases 0-2 are built.
-- [`docs/AUDIT-PLAN.md`](docs/AUDIT-PLAN.md) — the durable audit layer: what is worth
-  measuring and the rules that keep the numbers defensible.
-- [`docs/backlog-seed-2026-08-02.json`](docs/backlog-seed-2026-08-02.json) — the manifest
-  that seeded the GitHub issues on that date, plus the decision records `D1`–`D10`. It is
-  a historical artefact: it has no state field and is not kept in sync. GitHub is the
-  tracker (D1); this file cannot tell you whether anything is open.
-- [`docs/COORDINATION-PLANE.md`](docs/COORDINATION-PLANE.md) — the typed work graph (§8,
-  built) and the message ledger, rooms and oversight actor (**proposed, not built**).
-- [`docs/MIGRATION-graph.md`](docs/MIGRATION-graph.md) — backing up, exporting, rebuilding
-  and rolling back the queue's schema.
-- [`docs/evidence/`](docs/evidence/) — append-only evidence packages, one per stage, each
-  with a blind-spots section saying which of its own claims are untested.
-  [`2026-08-04-programme-report.md`](docs/evidence/2026-08-04-programme-report.md) is the
-  summary over all of them.
-- [`AGENTS.md`](AGENTS.md) — binding rules of engagement for anyone, human or agent,
-  working in this repository.
+- **[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — running it as a service.** The
+  two `serve` modes, what a supervised deployment must provide, and a
+  non-destructive smoke test that distinguishes "healthy" from "able to run
+  anything".
+- [`docs/MIGRATION-graph.md`](docs/MIGRATION-graph.md) — backing up, exporting,
+  rebuilding and rolling back the queue's schema.
+
+### The record
+
+- [`docs/evidence/`](docs/evidence/) — append-only evidence packages, each with
+  a blind-spots section saying which of its own claims are untested.
+  [`2026-08-04-programme-report.md`](docs/evidence/2026-08-04-programme-report.md)
+  summarises the stage programme;
+  [`2026-08-05-06-rdpapp-m2-status.md`](docs/evidence/2026-08-05-06-rdpapp-m2-status.md)
+  is the running record of the first real workload.
+- [`AGENTS.md`](AGENTS.md) — binding rules of engagement for anyone, human or
+  agent, working in this repository. Includes the decisions that are settled
+  and must not be re-litigated, and the one that was reopened.
+
+### Superseded
+
+Kept for their reasoning and evidence. Each carries a banner saying what
+replaced it. **Do not follow their plans, phase orders, or statements of
+current state.**
+
+[`HARNESS-PLAN.md`](docs/HARNESS-PLAN.md) ·
+[`MULTI-PROJECT-PLAN.md`](docs/MULTI-PROJECT-PLAN.md) ·
+[`AUDIT-PLAN.md`](docs/AUDIT-PLAN.md) ·
+[`FIT-FOR-PURPOSE-STATUS.md`](docs/FIT-FOR-PURPOSE-STATUS.md) ·
+[`COORDINATION-PLANE.md`](docs/COORDINATION-PLANE.md) ·
+[`ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
+[`INTERNALS.md`](docs/INTERNALS.md) ·
+[`PROPOSAL-2026-08-*.md`](docs/) ·
+[`backlog-seed-2026-08-02.json`](docs/backlog-seed-2026-08-02.json) — the
+manifest that seeded the issues on that date, plus decision records `D1`–`D10`.
+It has no state field and is not kept in sync; GitHub is the tracker (D1).
 
 ## Using it
 

@@ -1,5 +1,18 @@
 # Multi-project harness and a real Work GUI
 
+> # Superseded — 2026-08-06
+>
+> Project scoping, inception and the GUI that scoping was to make possible. Phases 0–2 are built and are described in `DESIGN.md`; the rest is not a current plan.
+>
+> **Current documentation:**
+> [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
+> [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
+>
+> Kept for the reasoning and the evidence, which are not reproduced elsewhere.
+> **Do not follow its plan, its phase order, or its statements of current
+> state** — all three are out of date. Where this document and the code
+> disagree, the code is right.
+
 Status: written 2026-08-02. **Partly implemented — updated 2026-08-04.**
 
 | Phase | State |

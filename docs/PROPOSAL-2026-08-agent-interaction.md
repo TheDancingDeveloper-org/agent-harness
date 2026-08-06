@@ -1,5 +1,18 @@
 # Proposal — make the coordination plane worth having
 
+> # Superseded — 2026-08-06
+>
+> A proposal about how the harness talks to an agent. Overtaken by #195, which reframes the problem: the single-shot model call is the defect, and every role that answers questions about a repository must be a loop.
+>
+> **Current documentation:**
+> [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
+> [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
+>
+> Kept for the reasoning and the evidence, which are not reproduced elsewhere.
+> **Do not follow its plan, its phase order, or its statements of current
+> state** — all three are out of date. Where this document and the code
+> disagree, the code is right.
+
 **Status:** proposal, not accepted. Written 2026-08-04, after connecting the
 oversight actor to a real fleet and running it against a real model.
 

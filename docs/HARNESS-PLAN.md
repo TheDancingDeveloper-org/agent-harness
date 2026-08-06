@@ -1,5 +1,18 @@
 # agent-harness: Comprehensive Plan
 
+> # Superseded — 2026-08-06
+>
+> The original design document. It assumes one named consumer throughout, and the harness is generic — an owner ruling recorded in `AGENTS.md`. Its phase order was overtaken and its §0.1 already said so.
+>
+> **Current documentation:**
+> [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
+> [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
+>
+> Kept for the reasoning and the evidence, which are not reproduced elsewhere.
+> **Do not follow its plan, its phase order, or its statements of current
+> state** — all three are out of date. Where this document and the code
+> disagree, the code is right.
+
 **Status (2026-08-02).** P0 complete. P1's code is written and under review as
 `swack-tools/oxidex#417`; its *deliverable* — the 72-hour measurement — has not been run.
 P2's code is merged and the dashboard runs, but it has never seen live traffic, is not

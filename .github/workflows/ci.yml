@@ -11,24 +11,74 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Does this change touch anything a gate can have an opinion about?
+  #
+  # `lint` and `test` are required status checks on `main`, so they cannot
+  # simply be skipped: a required check that never reports blocks the pull
+  # request forever, which is worse than running it. So the jobs always run and
+  # always report; what changes is whether they do the expensive part.
+  changes:
+    runs-on: [self-hosted, node-b, linux, x64]
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: filter
+        # A push to `main`, or a manual run, always counts as code: the cost of
+        # being wrong there is a defect on the default branch.
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          changed=$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+          echo "changed files:"; echo "$changed"
+          # Anything that is not documentation counts. Note the direction:
+          # unknown paths are CODE. A new top-level file nobody thought about
+          # gets the gates rather than a pass.
+          if echo "$changed" | grep -qvE '^(docs/|[^/]*\.md$|\.github/ISSUE_TEMPLATE/)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   lint:
+    needs: changes
     runs-on: [self-hosted, node-b, linux, x64]
     steps:
       - uses: actions/checkout@v5
+        if: needs.changes.outputs.code == 'true'
       - uses: astral-sh/setup-uv@v6
+        if: needs.changes.outputs.code == 'true'
         with:
           enable-cache: true
       - run: uv sync --all-extras
+        if: needs.changes.outputs.code == 'true'
       - run: uv run ruff check .
+        if: needs.changes.outputs.code == 'true'
       - run: uv run ruff format --check .
+        if: needs.changes.outputs.code == 'true'
       - run: uv run mypy .
+        if: needs.changes.outputs.code == 'true'
+      - run: echo "documentation only; nothing here has an opinion about prose"
+        if: needs.changes.outputs.code != 'true'
 
   test:
+    needs: changes
     runs-on: [self-hosted, node-b, linux, x64]
     steps:
       - uses: actions/checkout@v5
+        if: needs.changes.outputs.code == 'true'
       - uses: astral-sh/setup-uv@v6
+        if: needs.changes.outputs.code == 'true'
         with:
           enable-cache: true
       - run: uv sync --all-extras
+        if: needs.changes.outputs.code == 'true'
       - run: uv run pytest
+        if: needs.changes.outputs.code == 'true'
+      - run: echo "documentation only; the suite tests code and none changed"
+        if: needs.changes.outputs.code != 'true'

@@ -1,5 +1,18 @@
 # Proposal — finish the fit-for-purpose programme, then extend it
 
+> # Superseded — 2026-08-06
+>
+> A sequencing proposal. Its decisions D11–D14 are recorded in `AGENTS.md` and remain in force; the sequencing itself is spent.
+>
+> **Current documentation:**
+> [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
+> [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
+>
+> Kept for the reasoning and the evidence, which are not reproduced elsewhere.
+> **Do not follow its plan, its phase order, or its statements of current
+> state** — all three are out of date. Where this document and the code
+> disagree, the code is right.
+
 **Status:** proposal, not accepted. Written 2026-08-04, after a review of five
 comparable systems: [Conductor](https://github.com/conductor-oss/conductor),
 [agentspan](https://github.com/agentspan-ai/agentspan),

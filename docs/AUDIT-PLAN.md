@@ -1,5 +1,18 @@
 # A durable audit layer
 
+> # Superseded — 2026-08-06
+>
+> The durable audit layer, which is built. What survives is in `DESIGN.md`; the plan itself is history.
+>
+> **Current documentation:**
+> [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
+> [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
+>
+> Kept for the reasoning and the evidence, which are not reproduced elsewhere.
+> **Do not follow its plan, its phase order, or its statements of current
+> state** — all three are out of date. Where this document and the code
+> disagree, the code is right.
+
 Status: proposed, not started. Written 2026-08-02.
 
 Tracking whether the harness is getting better or worse, over months, across

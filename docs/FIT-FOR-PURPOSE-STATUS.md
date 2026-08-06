@@ -1,5 +1,18 @@
 # Fit-for-purpose programme — status and handoff
 
+> # Superseded — 2026-08-06
+>
+> Frozen at 2026-08-04 by its own header, and superseded on 2026-08-06 by `docs/STATUS.md`. Its stage-by-stage record is still the account of how each stage was verified in isolation.
+>
+> **Current documentation:**
+> [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
+> [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
+>
+> Kept for the reasoning and the evidence, which are not reproduced elsewhere.
+> **Do not follow its plan, its phase order, or its statements of current
+> state** — all three are out of date. Where this document and the code
+> disagree, the code is right.
+
 **Frozen:** 2026-08-04. **Rewritten 2026-08-04 after stages F, D, K, H, L, J and M.**
 **Read this before doing any work on the proposal.**
 

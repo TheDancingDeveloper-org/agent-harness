@@ -1,5 +1,14 @@
 # Internals
 
+> # Superseded — 2026-08-06
+>
+> Consolidated into `DESIGN.md`. It described the direct executor's single-shot implementer in detail; #195 reframes that as the defect rather than the design, so read it as history.
+>
+> **Current documentation:** [`docs/DESIGN.md`](DESIGN.md) — how the harness
+> works and why. [`docs/STATUS.md`](STATUS.md) — where it stands.
+>
+> Where this document and the code disagree, the code is right.
+
 A layer below [`ARCHITECTURE.md`](ARCHITECTURE.md). That one says what the
 pieces are; this says what actually happens inside them — how a backlog gets
 built, how work is triaged and claimed, where a model call goes and what

@@ -1,5 +1,18 @@
 # Proposal — making agent-harness fit for purpose
 
+> # Superseded — 2026-08-06
+>
+> The proposal the fit-for-purpose programme ran against. The programme finished; its report is in `docs/evidence/2026-08-04-programme-report.md`.
+>
+> **Current documentation:**
+> [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
+> [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
+>
+> Kept for the reasoning and the evidence, which are not reproduced elsewhere.
+> **Do not follow its plan, its phase order, or its statements of current
+> state** — all three are out of date. Where this document and the code
+> disagree, the code is right.
+
 **Status:** proposal, not accepted. Revised 2026-08-04 after the first
 sustained attempt to run a real workload through the harness.
 

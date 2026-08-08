@@ -229,17 +229,36 @@ the currently measured delivery failure.
   Model-call events carry project, item and work-attempt identity; item budgets
   and terminal policy refusals stop at loop boundaries. Evidence is in
   [`evidence/2026-08-06-stage-1-role-runner.md`](evidence/2026-08-06-stage-1-role-runner.md).
-- **Stage 2 is in implementation; its exit is pending.** The generic
-  execution-environment contract, metadata-selected Docker backend, disposable
-  per-item self-contained Git checkout, explicit image/network/mount configuration,
-  controller-environment allow-list, pre-claim readiness check and teardown path
-  are implemented and covered by local contract tests. The current host has
-  Docker CLI but no reachable daemon, so the required tests against the actual
-  backend — repository-wide work, undeclared sibling/host refusal, declared
-  mount modes, allowed network access and clean teardown — have not yet run. No
-  real workload run is authorised by the Stage 2 implementation evidence. See
-
+- **Stage 2 has run against a real daemon; its exit is still not claimed.**
+  The generic execution-environment contract, metadata-selected Docker backend,
+  disposable per-item self-contained Git checkout, explicit image/network/mount
+  configuration, controller-environment allow-list, pre-claim readiness check
+  and teardown path are implemented and covered by local contract tests. See
   [`evidence/2026-08-06-stage-2-execution-environment.md`](evidence/2026-08-06-stage-2-execution-environment.md).
+
+  On 2026-08-08 the live suite ran on Node B against a dedicated Docker-in-
+  Docker daemon deployed beside the controller, and passed: an agent reads and
+  writes its own worktree, reads a declared mount, cannot reach an undeclared
+  sibling path, does not receive controller credentials, is denied the network
+  under `network=none` and allowed it under `bridge`, and its container is gone
+  after teardown. Image digests, the update id and the reproduction command are
+  in
+  [`evidence/2026-08-08-stage-2-live-execution-boundary.md`](evidence/2026-08-08-stage-2-live-execution-boundary.md).
+
+  **That is a substantial part of the exit, not the whole of it.** §2.7 also
+  requires the security profile itself — `no-new-privileges`, dropped
+  capabilities, a read-only root filesystem, resource limits and the recorded
+  image digest — and those are asserted only in the `docker create` argv, never
+  verified from inside a live container. The nested daemon's own confinement is
+  untested. Only one sandbox image has been used (Alpine/BusyBox), and the last
+  defect this suite found was an assumption about exactly that. **No real
+  workload run is authorised.**
+
+  The live run earned its cost. Five defects were found that local runs and CI
+  could not see, the sharpest being that every sandbox command failed against
+  BusyBox because the harness wrapped them in GNU-only `timeout --signal=TERM`
+  — a failure that reads as the agent failing rather than the harness, which is
+  the misattribution class of #216.
 - **Stage 3 wiring is present but its exit is not claimed.** `serve` can now
   construct an AIDevEnv-independent local fleet from the metadata-selected
   role runner and execution backend; readiness and preflight use that executor
@@ -788,6 +807,7 @@ evidence and do not build on them.
 | One plan branch yields exactly one pull request: a correction updates it, an unchanged head touches no remote, an existing PR is adopted, a foreign push is refused, and nothing is merged | **tested** | `tests/test_plan_publication.py` — against a local bare remote and a fake pull-request client, never GitHub |
 | A fleet publishes that one pull request only once the plan has stopped moving, pushes no item branch, and updates the same PR for a later correction | **tested** | `tests/test_plan_integration.py::test_fleet_publishes_one_plan_pr_only_when_the_plan_is_finished` |
 | An installed review source gives reviews and review comments distinct immutable identities and decides disposition without a model, defaulting unmarked prose to a hold | **tested** | `tests/test_github_pr_review_source.py` — `gh` is injected; no real pull request has been polled |
+| An agent reads and writes its own worktree, reads a declared mount, cannot reach an undeclared sibling path, receives no controller credentials, is denied the network under `none` and allowed it under `bridge`, and its container is removed on teardown — against a real Docker daemon | **observed** | [`evidence/2026-08-08-stage-2-live-execution-boundary.md`](evidence/2026-08-08-stage-2-live-execution-boundary.md) — one run, one host, one sandbox image, with the image digests and update id recorded. The security profile itself is argv-tested only. |
 | The service runs and is deployed inside AIDevEnv | **observed** | no preserved artefacts |
 | An earlier supervised NGMS attempt and later direct calls exercised real agents and providers | **observed** | [`evidence/2026-08-03-04-ngms-first-sustained-run-v1.md`](evidence/2026-08-03-04-ngms-first-sustained-run-v1.md) — lacks a common run ID, complete configuration, checksums and a comparable follow-up |
 | Four executor passes against rdpapp delivered nothing, and why each failed | **observed** | [`evidence/2026-08-05-06-rdpapp-m2-status.md`](evidence/2026-08-05-06-rdpapp-m2-status.md); the pass 3–4 attribution is hindsight and has not been confirmed by re-running against the fix |

@@ -69,6 +69,27 @@ def wait_for(predicate, timeout: float = 5.0) -> bool:  # type: ignore[no-untype
     return False
 
 
+def settle(sample, timeout: float = 20.0, quiet: float = 0.2):  # type: ignore[no-untyped-def]
+    """Wait until `sample()` stops changing, and return the settled value.
+
+    A condition, not a sleep. Work already in flight when a project is paused
+    still finishes, and how long that takes is a fact about the host -- so
+    waiting for movement to stop tolerates a slow machine, where a fixed
+    window silently becomes an assertion about CPU contention (#207).
+    """
+    deadline = time.time() + timeout
+    last = sample()
+    stable_since = time.time()
+    while time.time() < deadline:
+        time.sleep(0.02)
+        current = sample()
+        if current != last:
+            last, stable_since = current, time.time()
+        elif time.time() - stable_since >= quiet:
+            return last
+    return last
+
+
 # ------------------------------------------------------------- starting
 
 
@@ -486,10 +507,16 @@ def test_pausing_a_project_stops_claiming_without_a_restart(tmp_path: Path) -> N
         fleet.start("a")
         assert wait_for(lambda: len(seen) >= 1)
         q.set_control("paused", reason="testing", project_id="a")
-        time.sleep(0.1)
-        settled = len(seen)
-        time.sleep(0.15)
-        assert len(seen) == settled, "work continued after the project was paused"
+
+        # An item already in flight finishes; that is not work *claimed* after
+        # the pause, and how long it takes belongs to the host. So settle,
+        # then assert the property the pause actually promises.
+        settled = settle(lambda: len(seen))
+        assert q.claim("probe", project_id="a") is None, "a paused project handed out work"
+        assert q.counts("a").get(PENDING, 0) > 0, (
+            "the backlog drained before the pause, so this proved nothing"
+        )
+        assert settle(lambda: len(seen)) == settled, "claiming continued while paused"
 
         q.set_control(RUNNING, project_id="a")
         assert wait_for(lambda: len(seen) > settled), "resuming needed a restart"

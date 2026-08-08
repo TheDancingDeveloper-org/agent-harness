@@ -616,3 +616,68 @@ def test_serve_event_sink_writes_live_telemetry_to_the_audit_store(tmp_path: Pat
     assert errors["total"] == 1
     assert errors["by_role"][0]["key"] == "reviewer"
     assert errors["by_endpoint"][0]["key"] == "https://e"
+
+
+def test_a_local_fleet_without_routes_serves_instead_of_crash_looping(
+    repo: Path, tmp_path: Path, capsys: Any, monkeypatch: Any
+) -> None:
+    """Observed on the Node B deployment, and fixed here.
+
+    A container configured for a local fleet with no routes exited 2, so a
+    process manager restarted it every 60 seconds and the one sentence
+    explaining why was visible only in container logs -- the API and GUI never
+    came up to say it. Nothing unsafe is permitted by starting: preflight
+    still refuses a project whose roles are not routed, and a fleet with no
+    routes claims nothing. The reviewer-only case three lines away already
+    took this decision; this makes the two agree.
+    """
+    from agent_harness import execution_environments, role_runners
+
+    class Backend:
+        name = "fixture-host"
+        api_version = 1
+        version = "test"
+
+        def check(self) -> tuple[bool, str]:
+            return True, "fixture environment available"
+
+    class Runner:
+        name = "fixture-runner"
+        api_version = 1
+        version = "test"
+
+    monkeypatch.setattr(role_runners, "resolve", lambda _name: Runner())
+    monkeypatch.setattr(role_runners, "describe", lambda _name: "fixture-runner test")
+    monkeypatch.setattr(execution_environments, "resolve", lambda _name: Backend())
+
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue.add_project(Project(project_id="p", name="P", work_dir=str(repo)))
+    args = argparse.Namespace(
+        session_host="",
+        role_runner="fixture-runner",
+        environment_backend="fixture-host",
+        environment_image="fixture-image",
+        environment_network="bridge",
+        environment_mount=[],
+        reviewer="",
+        planner="",
+        implementer="",
+        endpoint="",
+        preset="",
+        events=tmp_path / "events.jsonl",
+        db=str(tmp_path / "w.sqlite"),
+        agent="",
+        no_push=True,
+        poll=1.0,
+        runner_step_limit=10,
+        runner_command_timeout=30,
+    )
+
+    fleet, _client, _host, _roles = _fleet_for_serve(args, queue)
+
+    assert fleet is not None, "serve refused to come up with no routes configured"
+    warning = capsys.readouterr().err
+    assert "no route for role(s)" in warning
+    assert "implementer" in warning and "planner" in warning
+    # The operator is told what to do about it, not merely what is wrong.
+    assert "PUT /api/roles" in warning

@@ -133,9 +133,76 @@ def test_docker_backend_constructs_an_isolated_container_and_tears_it_down(
     assert "SAFE=yes" in create
     assert "TOKEN" not in " ".join(create)
     exec_call = next(call for call in calls if call[1] == "exec")
-    assert "7s" in " ".join(exec_call)
+    # Portable `timeout`, not GNU's. An agent image is not required to ship
+    # coreutils, and asserting the GNU spelling is what let the unportable
+    # form reach a real daemon (see the BusyBox test below).
+    assert "timeout -s TERM 7 " in " ".join(exec_call)
     assert result.stdout == "ok\n"
     assert any(call[1:4] == ["rm", "--force", "--volumes"] for call in calls)
+
+
+def test_the_command_timeout_works_on_busybox_not_only_gnu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wrapper must not assume GNU coreutils inside the agent image.
+
+    The first live run against a real daemon used Alpine, whose BusyBox
+    `timeout` rejects `--signal=TERM` and a `30s` suffix. Every command in the
+    sandbox returned 1 with `timeout: unrecognized option: signal=TERM`, which
+    reads as the agent's command failing rather than the harness's wrapper
+    being unportable -- the exact misattribution this repository keeps paying
+    for. `-s TERM` with bare seconds is accepted by both implementations.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1] == "inspect":
+            return subprocess.CompletedProcess(argv, 0, "sha256:resolved\n", "")
+        return subprocess.CompletedProcess(argv, 0, "container-id\n", "")
+
+    monkeypatch.setattr("agent_harness.adapters.docker.shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr("agent_harness.adapters.docker.subprocess.run", fake_run)
+    item = tmp_path / "item"
+    item.mkdir()
+    environment = DockerItemEnvironment(
+        EnvironmentSpec(image="alpine:3.21", worktree=item.resolve(), network="none")
+    )
+
+    environment.start()
+    environment.run("printf ok", cwd=item, timeout=30)
+
+    wrapper = " ".join(next(call for call in calls if call[1] == "exec"))
+    assert "timeout -s TERM 30 " in wrapper
+    assert "--signal" not in wrapper, "GNU-only long option is back"
+    assert "30s" not in wrapper, "GNU-only unit suffix is back"
+
+
+def test_the_item_environment_and_its_factory_report_the_daemon_the_same_way(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two copies of one check drifted, and only one of them was fixed."""
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv,
+            1,
+            "",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\n"
+            'template: :1:2: executing "" at <.ServerVersion>: reflect: '
+            "indirection through nil pointer to embedded struct field Info\n",
+        )
+
+    monkeypatch.setattr("agent_harness.adapters.docker.shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr("agent_harness.adapters.docker.subprocess.run", fake_run)
+    item = tmp_path / "item"
+    item.mkdir()
+    environment = DockerItemEnvironment(EnvironmentSpec(image="alpine:3.21", worktree=item))
+
+    for ok, detail in (environment.check(), DockerEnvironmentFactory().check()):
+        assert ok is False
+        assert "Cannot connect to the Docker daemon" in detail
+        assert "reflect:" not in detail and "template:" not in detail
 
 
 def test_docker_reaps_only_containers_for_the_requested_worktree(

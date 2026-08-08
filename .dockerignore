@@ -1,0 +1,17 @@
+# The build copies the whole tree so the gates run against the same files the
+# repository gates do — see the Dockerfile. These are the ones that must not
+# come with it: build caches, the local virtualenv (wrong platform inside the
+# image), and git history the wheel build does not need.
+.git
+.github
+.venv
+dist
+build
+*.egg-info
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov

@@ -8,7 +8,12 @@ from typing import Any
 
 import pytest
 
-from agent_harness.adapters.docker import DockerEnvironmentFactory, DockerItemEnvironment
+from agent_harness.adapters.docker import (
+    DockerEnvironmentFactory,
+    DockerItemEnvironment,
+    _diagnosis,
+    _server_version,
+)
 from agent_harness.execution_environment import EnvironmentMount, EnvironmentSpec
 from agent_harness.execution_environments import names, probe, resolve
 
@@ -19,6 +24,39 @@ def test_docker_backend_is_selected_by_installed_metadata() -> None:
     assert ok or "daemon" in detail.lower() or "docker api" in detail.lower(), detail
     backend = resolve("docker")
     assert backend.name == "docker"
+
+
+def test_readiness_names_the_daemon_not_a_go_template_error() -> None:
+    """What an operator reads when the fleet will not start.
+
+    Asked with `--format`, an unreachable daemon makes the CLI render a nil
+    `Info` struct, so the LAST line of stderr is a Go template error and the
+    line that says the daemon could not be reached is above it. Reporting the
+    last line blamed reflection for a stopped service -- found when this image
+    was first built, where the CLI is installed and no daemon answers.
+    """
+    stderr = (
+        "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. "
+        "Is the docker daemon running?\n"
+        'template: :1:2: executing "" at <.ServerVersion>: reflect: '
+        "indirection through nil pointer to embedded struct field Info\n"
+    )
+
+    assert _diagnosis(stderr).startswith("Cannot connect to the Docker daemon")
+    assert "reflect:" not in _diagnosis(stderr)
+    assert "template:" not in _diagnosis(stderr)
+    # Nothing usable at all still says which component is being reported on.
+    assert _diagnosis("") == "no reason given"
+    assert _diagnosis("template: bad\n") == "template: bad"
+
+
+def test_readiness_reports_the_server_version_when_a_daemon_answers() -> None:
+    info = (
+        "Client:\n Version: 28.0.1\nServer:\n Server Version: 28.0.1\n Storage Driver: overlay2\n"
+    )
+
+    assert _server_version(info) == "28.0.1"
+    assert _server_version("Client:\n Version: 28.0.1\n") == ""
 
 
 def test_environment_spec_rejects_host_networking_and_unsafe_mounts(tmp_path: Path) -> None:

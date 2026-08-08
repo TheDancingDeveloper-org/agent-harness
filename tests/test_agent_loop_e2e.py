@@ -344,6 +344,31 @@ def test_an_observation_goes_back_as_a_well_formed_turn(repo: Path) -> None:
     assert "wrong" in seen, "the command output never returned to the model"
 
 
+def test_a_tool_message_cannot_reach_the_wire_without_its_id() -> None:
+    """The allow-list must agree with what this function can actually emit.
+
+    `_for_the_wire` strips everything but `role` and `content`, so it cannot
+    produce a valid `tool` message — that role requires the `tool_call_id` it
+    answers. Permitting the role anyway left a latent contradiction: nothing
+    emits one today, and the day something does, the request is malformed and
+    the refusal names no message. The content still goes through, as a user
+    turn; only the unsendable role is refused.
+    """
+    from agent_harness.adapters.minisweagent import _for_the_wire
+
+    wire = _for_the_wire(
+        [
+            {"role": "assistant", "content": "running it"},
+            {"role": "tool", "content": "<returncode>0</returncode>", "tool_call_id": "call_1"},
+            {"role": "exit", "content": "done"},
+        ]
+    )
+
+    assert [message["role"] for message in wire] == ["assistant", "user", "user"]
+    assert "<returncode>0</returncode>" in wire[1]["content"]
+    assert all(set(message) == {"role", "content"} for message in wire)
+
+
 def test_the_prompts_match_the_protocol() -> None:
     """Prompts and protocol must agree, and once they did not.
 

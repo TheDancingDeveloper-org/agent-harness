@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .budgets import Budget, Spend
+from .execution_environment import ExecutionEnvironment
 from .guard import CommandGuard
 from .model_client import ModelClient
 
@@ -66,6 +67,7 @@ class RoleRunRequest:
     writable: bool = True
     report: Report | None = None
     account: Account | None = None
+    environment: ExecutionEnvironment | None = None
 
 
 @dataclass(frozen=True)

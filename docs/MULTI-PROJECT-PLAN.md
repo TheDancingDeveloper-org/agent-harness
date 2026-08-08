@@ -137,7 +137,7 @@ Found by reviewing the code, not by it failing. Ordered by what breaks first.
 ```python
 outcome = self.run_once()
 if outcome is None:
-    break            # queue empty -> return -> process exits
+    break  # queue empty -> return -> process exits
 ```
 
 `--watch` exists, but only for `ingest`. The executor drains the backlog and

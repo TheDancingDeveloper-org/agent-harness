@@ -36,6 +36,7 @@ def project_spec(project: Project) -> ProjectSpec:
         max_item_spend_usd=project.max_item_spend_usd,
         max_hold_seconds=project.max_hold_seconds,
         plan_path=project.plan_path,
+        plan_branch=project.plan_branch,
         roles=(
             {name: RoleRoute(**route) for name, route in project.roles.items()}
             if project.roles
@@ -75,6 +76,7 @@ def configure_project(
         max_item_spend_usd=spec.max_item_spend_usd,
         max_hold_seconds=spec.max_hold_seconds,
         plan_path=spec.plan_path,
+        plan_branch=spec.plan_branch,
         roles=(
             {name: route.model_dump() for name, route in spec.roles.items()} if spec.roles else None
         ),

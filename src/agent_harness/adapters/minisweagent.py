@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from ..budgets import Budget, Spend
+from ..execution_environment import ExecutionEnvironment, LocalExecutionEnvironment
 from ..guard import CommandGuard, CommandRefused, Refusal
 from ..model_client import ModelClient
 from ..role_runners import API_VERSION, RoleRunRequest, RoleRunResult
@@ -434,9 +435,18 @@ def _segments(command: str, depth: int = 0) -> list[list[str]]:
     return out
 
 
-#: Roles a chat-completions endpoint defines. The loop uses `exit` for its own
-#: bookkeeping, which is its business and not a role any API knows.
-_WIRE_ROLES = frozenset({"system", "user", "assistant", "tool"})
+#: Roles a chat-completions endpoint defines **and this function can emit
+#: validly**. The loop uses `exit` for its own bookkeeping, which is its
+#: business and not a role any API knows.
+#:
+#: `tool` is deliberately absent even though endpoints define it. A `tool`
+#: message must carry the `tool_call_id` it answers, and `_for_the_wire`
+#: reduces every message to `role` and `content` — so passing one through
+#: would send a malformed request whose refusal names no message, the exact
+#: shape that cost a live run. An observation goes back as a `user` turn
+#: instead: the pairing is lost, which costs nothing while there is one tool,
+#: and the conversation stays valid.
+_WIRE_ROLES = frozenset({"system", "user", "assistant"})
 
 
 def _for_the_wire(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
@@ -589,6 +599,7 @@ class HarnessModel:
     spend: Spend = field(default_factory=Spend)
     n_calls: int = 0
     config: Any = None
+    environment: ExecutionEnvironment | None = None
     #: Theirs, read from the same config the prompts come from. Hand-copied,
     #: these drifted: the error template told a model on the *tool call* path
     #: to "provide EXACTLY ONE action in triple backticks" -- the text
@@ -768,6 +779,7 @@ class HarnessEnvironment:
     #: adapter supplies only the command and its eventual return code.
     on_command: Callable[[str, int | None], None] | None = None
     config: Any = None
+    environment: ExecutionEnvironment | None = None
 
     def execute(self, action: dict[str, Any], cwd: str = "") -> dict[str, Any]:
         import subprocess
@@ -783,15 +795,9 @@ class HarnessEnvironment:
         if self.on_command is not None:
             self.on_command(str(command), None)
 
+        backend = self.environment or LocalExecutionEnvironment(self.repo)
         try:
-            result = subprocess.run(  # noqa: S602 - screened above, agent-supplied by design
-                str(command),
-                shell=True,
-                cwd=where,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
+            result = backend.run(str(command), cwd=where, timeout=self.timeout)
         except subprocess.TimeoutExpired as expired:
             # Unhandled, this left `execute` as a `TimeoutExpired` that the
             # loop does not catch: `DefaultAgent.run` records an exit message
@@ -811,6 +817,18 @@ class HarnessEnvironment:
             if self.on_command is not None:
                 self.on_command(str(command), TIMED_OUT)
             return timed_out
+
+        if result.timed_out:
+            if self.on_command is not None:
+                self.on_command(str(command), TIMED_OUT)
+            return {
+                "output": _bounded(result.stdout + result.stderr),
+                "returncode": TIMED_OUT,
+                "exception_info": (
+                    f"the command was killed after {self.timeout}s by this "
+                    "deployment's command timeout; any output above is partial"
+                ),
+            }
 
         full = result.stdout + result.stderr
         if self.on_command is not None:
@@ -897,14 +915,8 @@ class HarnessEnvironment:
         curated: the templates are theirs, and guessing which variables they
         will reference next is how this breaks again on an upgrade.
         """
-        import platform
-
-        return {
-            **platform.uname()._asdict(),
-            **os.environ,
-            "cwd": str(self.repo),
-            **kwargs,
-        }
+        backend = self.environment or LocalExecutionEnvironment(self.repo)
+        return {**backend.template_vars(), **kwargs}
 
     def serialize(self) -> dict[str, Any]:
         """What the trajectory keeps. The refusals themselves, not a count.
@@ -937,6 +949,7 @@ def build(
     terminal_refusals: bool = False,
     on_command: Callable[[str, int | None], None] | None = None,
     on_usage: Callable[[Spend], None] | None = None,
+    environment: ExecutionEnvironment | None = None,
 ) -> Any:
     """A loop wired to this harness's client, guard and budget.
 
@@ -993,6 +1006,7 @@ def build(
             on_refusal=on_refusal,
             terminal_refusals=terminal_refusals,
             on_command=on_command,
+            environment=environment,
         ),
         system_template=prompts["system_template"],
         instance_template=prompts["instance_template"],
@@ -1044,6 +1058,11 @@ class MiniSweRoleRunner:
                     "step_limit": request.step_limit,
                     "budget": request.budget.as_dict(),
                     "writable": request.writable,
+                    "environment": (
+                        dict(request.environment.describe())
+                        if request.environment is not None
+                        else {"backend": "host", "security_boundary": "none; compatibility backend"}
+                    ),
                 },
             )
         agent = build(
@@ -1058,6 +1077,7 @@ class MiniSweRoleRunner:
             terminal_refusals=True,
             on_command=command,
             on_usage=request.account,
+            environment=request.environment,
         )
         raw = agent.run(
             request.task,

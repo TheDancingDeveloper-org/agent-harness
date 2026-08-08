@@ -242,6 +242,37 @@ def test_retry_allows_an_item_whose_lease_expired(tmp_path: Path, store: EventSt
         assert c.post("/api/work/W1/retry", headers=auth()).status_code == 200
 
 
+def test_retry_honours_the_queue_clock_not_the_wall_clock(
+    tmp_path: Path, store: EventStore
+) -> None:
+    """The lease belongs to the queue's clock, which is injectable so lease
+    behaviour can be tested at all. A route reading `time.time()` instead
+    opts out of that silently, and reports a live claim as expired."""
+    clock = [1000.0]
+    q = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=10.0, now=lambda: clock[0])
+    q.add([WorkRecord(item_id="W1", title="t", brief="b")])
+    q.claim("worker-a")
+    with TestClient(create_api(store, queue=q, token=TOKEN)) as c:
+        response = c.post("/api/work/W1/retry", headers=auth())
+    assert response.status_code == 409
+    assert "worker-a" in response.json()["detail"]
+    assert q.get("W1").state == CLAIMED  # type: ignore[union-attr]
+
+
+def test_blocking_honours_the_queue_clock_not_the_wall_clock(
+    tmp_path: Path, store: EventStore
+) -> None:
+    clock = [1000.0]
+    q = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=10.0, now=lambda: clock[0])
+    q.add([WorkRecord(item_id="W1", title="t", brief="b")])
+    q.claim("worker-a")
+    with TestClient(create_api(store, queue=q, token=TOKEN)) as c:
+        response = c.post("/api/work/W1/block", json={"reason": "decision"}, headers=auth())
+    assert response.status_code == 409
+    assert "worker-a" in response.json()["detail"]
+    assert q.get("W1").state == CLAIMED  # type: ignore[union-attr]
+
+
 def test_retry_on_an_unknown_item_is_404(client: TestClient) -> None:
     assert client.post("/api/work/NOPE/retry", headers=auth()).status_code == 404
 

@@ -14,6 +14,7 @@ from agent_harness import __main__ as cli
 from agent_harness.adapters.minisweagent import RUNNER
 from agent_harness.audit import AuditStore
 from agent_harness.events import KINDS, MODEL_CALL, Event
+from agent_harness.execution_environment import LocalExecutionEnvironment
 from agent_harness.executor import Checks, Executor
 from agent_harness.model_client import ModelClient, Response, Route
 from agent_harness.pricing import Price, PriceTable
@@ -139,6 +140,35 @@ def repository(tmp_path: Path) -> Path:
     return repo
 
 
+class RecordingEnvironmentFactory:
+    """A host-backed test seam for executor/worktree wiring only."""
+
+    name = "recording"
+    api_version = 1
+    version = "test"
+
+    def __init__(self) -> None:
+        self.worktree: Path | None = None
+        self.closed = False
+        self.git_is_self_contained = False
+
+    def check(self) -> tuple[bool, str]:
+        return True, "test backend available"
+
+    def create(self, worktree: Path, **_: Any) -> LocalExecutionEnvironment:
+        self.worktree = worktree
+        self.git_is_self_contained = (worktree / ".git").is_dir()
+        environment = LocalExecutionEnvironment(worktree)
+        original_close = environment.close
+
+        def close() -> None:
+            self.closed = True
+            original_close()
+
+        environment.close = close  # type: ignore[method-assign]
+        return environment
+
+
 def test_loop_changes_feed_the_existing_checks_review_and_attempt_pipeline(
     tmp_path: Path,
 ) -> None:
@@ -211,6 +241,80 @@ def test_loop_changes_feed_the_existing_checks_review_and_attempt_pipeline(
         str(message.get("content") or "") for message in transport.implementer_messages[-1]
     )
     assert "hello world" in final_messages, "the first observation did not reach later turns"
+
+
+def test_selected_environment_gets_a_disposable_item_worktree(
+    tmp_path: Path,
+) -> None:
+    repo = repository(tmp_path)
+    queue = make_queue(str(tmp_path / "queue.sqlite"))
+    queue.add([WorkRecord(item_id="T1", title="Change the greeting", brief="Change greeting.txt.")])
+    transport = ScriptedLoop(("printf 'hello harness\\n' > greeting.txt", DONE_COMMAND))
+    client = ModelClient(
+        roles={
+            role: Route("scripted", "https://example.invalid", options={"role": role})
+            for role in ("planner", "implementer", "reviewer")
+        },
+        transport=transport,
+    )
+    factory = RecordingEnvironmentFactory()
+
+    outcome = Executor(
+        queue,
+        client,
+        repo,
+        checks=Checks(),
+        role_runner=RUNNER,
+        push=False,
+        environment_factory=factory,
+        environment_image="test-image",
+    ).run_once()
+
+    assert outcome is not None and outcome.state == DONE, outcome.reason if outcome else "missing"
+    assert factory.worktree is not None and factory.worktree != repo
+    assert factory.closed
+    assert factory.git_is_self_contained
+    assert not factory.worktree.exists()
+    assert git(repo, "show", "harness/t1:greeting.txt") == "hello harness\n"
+    assert str(factory.worktree) not in git(repo, "worktree", "list")
+
+
+def test_selected_environment_reuses_and_reaps_a_stale_item_worktree(
+    tmp_path: Path,
+) -> None:
+    repo = repository(tmp_path)
+    queue = make_queue(str(tmp_path / "queue.sqlite"))
+    queue.add([WorkRecord(item_id="T1", title="Change the greeting", brief="Change greeting.txt.")])
+    transport = ScriptedLoop(("printf 'hello harness\\n' > greeting.txt", DONE_COMMAND))
+    client = ModelClient(
+        roles={
+            role: Route("scripted", "https://example.invalid", options={"role": role})
+            for role in ("planner", "implementer", "reviewer")
+        },
+        transport=transport,
+    )
+    factory = RecordingEnvironmentFactory()
+    executor = Executor(
+        queue,
+        client,
+        repo,
+        checks=Checks(),
+        role_runner=RUNNER,
+        push=False,
+        environment_factory=factory,
+        environment_image="test-image",
+    )
+    record = queue.get("T1")
+    assert record is not None
+    stale = executor._execution_tree_path(record)
+    stale.mkdir(parents=True)
+    (stale / "stale.txt").write_text("orphaned\n")
+
+    outcome = executor.run_once()
+
+    assert outcome is not None and outcome.state == DONE, outcome.reason if outcome else "missing"
+    assert not stale.exists()
+    assert not (stale / "stale.txt").exists()
 
 
 def test_loop_events_can_be_written_to_the_append_only_audit_sink(tmp_path: Path) -> None:

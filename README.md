@@ -407,7 +407,7 @@ uv run agent-harness --db harness.sqlite ingest --events ./run/events.jsonl
 HARNESS_TOKEN=$(openssl rand -hex 16) \
   uv run agent-harness --db harness.sqlite serve --port 8099
 
-# Supervised: the same API, plus a worker pool it can actually start.
+# Supervised session-host mode: the same API, plus a worker pool it can actually start.
 # Still nothing runs until someone starts a project through the API.
 HARNESS_TOKEN=$(openssl rand -hex 16) HARNESS_API_KEY=… \
   uv run agent-harness --db harness.sqlite serve --port 8099 \
@@ -415,9 +415,11 @@ HARNESS_TOKEN=$(openssl rand -hex 16) HARNESS_API_KEY=… \
     --reviewer claude-sonnet-4-6 --endpoint https://api.your-gateway.example
 ```
 
-Without `--session-host` the service is **monitoring only**: everything reads,
+Without `--session-host`, configure `--role-runner`, `--environment-backend`
+and `--environment-image` for the local in-process fleet. If neither executor
+capability is configured, the service is **monitoring only**: everything reads,
 and starting a project is refused rather than setting a flag no worker acts on.
-Both modes, and the read-only check that tells them apart after a deploy, are
+All three modes, and the read-only check that tells them apart after a deploy, are
 in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 Keep it fed with `ingest --watch 30`. Optionally pass `--baseline TOTAL:DAYS:LABEL` to

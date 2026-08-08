@@ -1191,9 +1191,22 @@ to any harness module. See
 
 ## 4d. Serve the API *and* the workers
 
-`serve` on its own is monitoring only — it exposes the API and has no workers,
-so starting a project is refused rather than marking it running with nothing
-able to claim. Give it a session host and it owns both:
+`serve` with no executor configuration is monitoring only — it exposes the API
+and has no workers, so starting a project is refused rather than marking it
+running with nothing able to claim. For an AIDevEnv-independent local fleet,
+give it a metadata-selected role runner and execution backend:
+
+```bash
+HARNESS_TOKEN=… HARNESS_API_KEY=… \
+agent-harness --db harness.sqlite serve --port 8099 \
+    --role-runner agent-loop \
+    --environment-backend docker \
+    --environment-image registry.example/project-toolchain@sha256:… \
+    --planner claude-sonnet-4-6 --implementer claude-sonnet-4-6 \
+    --reviewer claude-sonnet-4-6 --endpoint https://api.your-gateway.example
+```
+
+For the supported session-host deployment, give it a session host and it owns both:
 
 ```bash
 HARNESS_TOKEN=… HARNESS_API_KEY=… AIDEVENV_TOKEN=… \
@@ -1766,8 +1779,10 @@ Opening a hold now emits one notice — into the event stream the run already
 writes, and to one URL you name:
 
 ```bash
-uv run agent-harness --db harness.sqlite serve --hold-webhook https://your-host/holds
-# or: HARNESS_HOLD_WEBHOOK=https://your-host/holds
+uv run agent-harness --db harness.sqlite serve \
+  --notification-webhook https://your-host/notifications \
+  --notification-db notifications.sqlite
+# Configure HARNESS_NOTIFICATION_TOKEN or HARNESS_NOTIFICATION_SECRET as well.
 ```
 
 ```json
@@ -1783,17 +1798,28 @@ uv run agent-harness --db harness.sqlite serve --hold-webhook https://your-host/
 
 Three things about it are deliberate.
 
-- **It is not a notification system.** One URL, one POST, no retries and no
-  queue. What is on the other end — a session host that already has push
-  notifications, a chat relay you wrote, a log file — is not this service's
-  business, and adding a product here would be the coupling `AGENTS.md`
-  forbids.
+- **Delivery is a durable notification subsystem.** Selected hold, failure,
+  completion and review outcomes enter an append-only outbox and are retried
+  after receiver failure or process restart. The built-in webhook channel
+  requires a bearer token or HMAC secret; other destinations remain opt-in
+  channels rather than core knowledge.
 - **A failed delivery is dropped, never raised.** It cannot fail the item,
   stall it, or un-hold it. This is the rule telemetry already follows, for the
   same reason: the fleet must not depend on it.
 - **It carries no resume token.** `answer_path` says where the answer goes;
   spending it is an authenticated call to the API, which looks the token up
   itself.
+
+### Normalized remote review sources
+
+Remote polling or webhook translation is an adapter concern. An installed
+adapter publishes the `agent_harness.review_sources` entry point and returns
+`ReviewBatch` values; the harness stores the source cursor only after every
+event in that batch is accepted. `POST /api/review-poll` invokes one configured
+source poll through the normal authenticated API and returns typed,
+duplicate-aware results. A repeated batch is safe because `(source,
+remote_id)` is the durable identity journal. No external system is contacted
+unless a source adapter is installed and configured.
 
 Configure nothing and nothing changes: the inbox is still `GET /api/holds`, and
 `GET /api/summary` reports `holds_open` plus a `holds_overdue` entry for any

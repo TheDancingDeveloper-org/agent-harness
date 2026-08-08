@@ -22,6 +22,8 @@ EXECUTION_PATH = [
     "graph.py",
     "fleet.py",
     "role_runners.py",
+    "execution_environment.py",
+    "execution_environments.py",
     "session_executor.py",
     "executor.py",
     # The refusal list is on the path an item passes through, and a refusal
@@ -32,6 +34,15 @@ EXECUTION_PATH = [
     "protocols.py",
     "pricing.py",
     "plan.py",
+    # Plan integration and its single publication step are on the path an
+    # item reaches "done" through, so they are held to the same rule.
+    "plan_integration.py",
+    "plan_publication.py",
+    # Review intake decides what becomes correction work. A source adapter
+    # owns one upstream's format; core must never import one.
+    "review_events.py",
+    "review_sources.py",
+    "notifications.py",
     "github.py",
     "preflight.py",
     "audit.py",
@@ -163,4 +174,14 @@ def test_the_shipped_role_runners_are_declared_the_same_way() -> None:
     manifest = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text())
     declared = manifest["project"]["entry-points"]["agent_harness.role_runners"]
     assert set(declared) == {"agent-loop"}
+    assert all(value.startswith("agent_harness.adapters.") for value in declared.values())
+
+
+def test_the_shipped_execution_backends_are_declared_the_same_way() -> None:
+    """The OS boundary is an adapter too: core selects it by name."""
+    import tomllib
+
+    manifest = tomllib.loads((SRC.parents[1] / "pyproject.toml").read_text())
+    declared = manifest["project"]["entry-points"]["agent_harness.execution_environments"]
+    assert set(declared) == {"docker"}
     assert all(value.startswith("agent_harness.adapters.") for value in declared.values())

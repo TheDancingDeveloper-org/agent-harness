@@ -1149,7 +1149,7 @@ from agent_harness.providers import VendorEnvelopeProvider
 PRESET = RoutePreset(
     name="somevendor",
     request=JsonChatRequest(path="/v2/generate", model_key="model_id", messages_key="turns"),
-    auth=BearerAuth(header="x-api-key", scheme=""),      # no scheme word
+    auth=BearerAuth(header="x-api-key", scheme=""),  # no scheme word
     reader=JsonResponseReader(text_paths=("result.reply",), usage_key="counters"),
     classifier=VendorEnvelopeProvider(vendor_field="problem", quota_categories=("budget",)),
 )
@@ -1180,6 +1180,20 @@ and resolves `agent_harness.role_runners` entry points by name. The distribution
 declares its shipped loop in metadata; `executor.py` receives only a structural
 runner and neither imports nor names its adapter. An incompatible contract is a
 configuration failure before work is claimed, not a substitution.
+
+**Review sources, the same door once more.** `review_events.py` owns what a
+piece of remote feedback *becomes* — one correction item, one hold, or nothing
+— and deduplicates on an immutable source identity. It never owns what a
+particular forge's record looks like, and it never asks a model whether a
+human's comment was actionable. An adapter declared under
+`agent_harness.review_sources` supplies that upstream's authentication,
+polling, identity and an **explicit** disposition; the shipped
+`github-pr-review` adapter reaches core through that entry point like anyone
+else's would. Its disposition rules are deterministic and legible — explicit
+markers first, then review state — and anything unmarked defaults to
+`ambiguous`, which opens a hold for a person. Defaulting the other way would
+put an agent to work on a guess about what somebody meant, which is the
+failure this whole contract exists to prevent.
 
 **Adapters generally.** Log readers, telemetry export and the agent loop are all
 opt-in and lazily loaded, and nothing in core imports any of them. Telemetry is
@@ -1216,12 +1230,13 @@ Named here rather than left for a reader to discover.
   messages and human participation over the API are designed and not built, and
   two modules currently spell an item's room differently — harmless only
   because nothing in production constructs a ledger.
-- **The role-runner path still works in one shared checkout.** It is selectable
-  from `run`, but it is not yet the isolated per-item worktree fleet described
-  by the accepted product direction. Its subprocess inherits the controller's
-  environment, and `CommandGuard` remains screening rather than an OS security
-  boundary. No secret-bearing real workload should be run through it until the
-  Stage 2 confinement boundary exists.
+- **The host compatibility path still works in one shared checkout.** It remains
+  useful for fixtures and explicitly selected local development, but it inherits
+  the controller's environment and `CommandGuard` remains screening rather than
+  an OS security boundary. When an execution backend is selected, the role runner
+  gets a disposable per-item Git worktree and the backend owns the command
+  boundary; the shipped Docker backend still requires live-daemon acceptance
+  evidence before a secret-bearing real workload is authorised.
 
 Where to go next: [`AGENTS.md`](../AGENTS.md) for the binding rules,
 [`STATUS.md`](STATUS.md) for what is built and what has been proven,

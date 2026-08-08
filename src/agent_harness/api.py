@@ -17,6 +17,7 @@ configured token, both surfaces fail closed.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import secrets
 import time
@@ -43,6 +44,7 @@ from .adoption_service import (
 from .audit import AuditStore
 from .audit_service import maintain_audit, reconcile_repository
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
+from .events import Event as AuditEvent
 from .maintenance import DEFAULT_RETENTION_DAYS
 from .plan_service import PlanSyncConflict, PlanSyncFailure
 from .plan_service import execute as execute_plan_sync
@@ -114,6 +116,9 @@ from .schemas import (
     ReconcileResult,
     ResolveQuestion,
     RetryResult,
+    ReviewEventRequest,
+    ReviewEventResult,
+    ReviewPollResultModel,
     RoleMap,
     RoleMapView,
     RouteReachability,
@@ -193,6 +198,8 @@ def create_api(
     token: str | None = None,
     root_path: str = "",
     audit: AuditStore | None = None,
+    notifications: Any | None = None,
+    review_poller: Any | None = None,
     fleet: Any | None = None,
     model_client: Any | None = None,
     session_host: Any | None = None,
@@ -202,6 +209,8 @@ def create_api(
     github_factory: Any | None = None,
     process_metrics: ProcessMetricsSource | None = None,
     adoption_branches: Any | None = None,
+    execution_environment: Any | None = None,
+    remote_required: bool = True,
 ) -> FastAPI:
     """Build the API.
 
@@ -240,6 +249,8 @@ def create_api(
     app.state.store = store
     app.state.queue = queue
     app.state.audit = audit
+    app.state.notifications = notifications
+    app.state.review_poller = review_poller
     app.state.fleet = fleet
     app.state.model_client = model_client
     app.state.session_host = session_host
@@ -253,6 +264,8 @@ def create_api(
     app.state.github_factory = github_factory
     app.state.process_metrics = process_metrics or ProcessMetricsSampler()
     app.state.adoption_branches = adoption_branches
+    app.state.execution_environment = execution_environment
+    app.state.remote_required = remote_required
     app.state.ask_model = _model_asker(model_client)
     app.state.base_checks = BaseChecks()
     app.state.token = token
@@ -360,6 +373,85 @@ def create_api(
             queue.now(),
         )
 
+    @app.post(
+        "/api/review-events",
+        tags=["work", "observability"],
+        summary="Accept one normalized remote review event",
+        response_model=ReviewEventResult,
+    )
+    def review_event(
+        request: ReviewEventRequest,
+        _: None = Depends(require_token),
+    ) -> ReviewEventResult:
+        """Deduplicate remote feedback and create only explicit correction work.
+
+        The caller supplies the disposition. This route does not parse human
+        prose, contact a remote service, or let a model decide what feedback
+        means.
+        """
+        from .review_events import RemoteReviewEvent, ReviewEventProcessor
+
+        queue = need_queue()
+        sink = app.state.audit
+        notifications = app.state.notifications
+
+        def emit(event: dict[str, Any]) -> None:
+            if sink is not None:
+                sink.append(
+                    [
+                        AuditEvent(
+                            ts=float(event.get("ts") or time.time()),
+                            kind="work",
+                            source="review-event",
+                            outcome=str(event.get("outcome") or "remote_review_received"),
+                            data={
+                                k: v for k, v in event.items() if k not in {"ts", "kind", "outcome"}
+                            },
+                        )
+                    ]
+                )
+            if notifications is not None:
+                with contextlib.suppress(Exception):
+                    notifications.enqueue_event(event)
+
+        try:
+            result = ReviewEventProcessor(queue, on_event=emit).process(
+                RemoteReviewEvent(**request.model_dump())
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return ReviewEventResult(**result.__dict__)
+
+    @app.post(
+        "/api/review-poll",
+        tags=["work", "observability"],
+        summary="Poll the configured remote review source once",
+        response_model=ReviewPollResultModel,
+    )
+    def review_poll(_: None = Depends(require_token)) -> ReviewPollResultModel:
+        """Run one adapter-owned poll and persist its cursor after intake.
+
+        The adapter owns remote authentication and translation. The harness
+        only applies its normalized event contract and never advances a cursor
+        when any event in the batch fails to persist.
+        """
+        poller = app.state.review_poller
+        if poller is None:
+            raise HTTPException(status_code=409, detail="no review source is configured")
+        try:
+            result = poller.poll_once()
+        except Exception as exc:  # noqa: BLE001 - source failure is an API outcome
+            raise HTTPException(
+                status_code=502, detail=f"review source poll failed: {exc}"
+            ) from exc
+        return ReviewPollResultModel(
+            fetched=result.fetched,
+            accepted=result.accepted,
+            duplicates=result.duplicates,
+            cursor=result.cursor,
+            results=[ReviewEventResult(**item.__dict__) for item in result.results],
+        )
+
     @app.get(
         "/api/work/{item_id}/evidence",
         tags=["work"],
@@ -450,7 +542,10 @@ def create_api(
         record = queue.get(item_id, project_id=project_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
-        if record.state == CLAIMED and record.lease_until > time.time():
+        # `queue.now()`, not `time.time()`: the queue's clock is injectable
+        # precisely so lease behaviour can be exercised, and a route that
+        # reads the wall clock instead silently opts out of that.
+        if record.state == CLAIMED and record.lease_until > queue.now():
             raise HTTPException(
                 status_code=409,
                 detail=f"{item_id} is claimed by {record.owner} and its lease is live; "
@@ -580,7 +675,9 @@ def create_api(
         record = queue.get(item_id, project_id=project_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"no item {item_id!r}")
-        if record.state == CLAIMED and record.lease_until > time.time() and not request.override:
+        # The queue's clock is authoritative for a lease -- see the same
+        # decision on the retry route.
+        if record.state == CLAIMED and record.lease_until > queue.now() and not request.override:
             raise HTTPException(
                 status_code=409,
                 detail=f"{item_id} is claimed by {record.owner} and its lease is live; "
@@ -1537,6 +1634,21 @@ def create_api(
             session_host_state = ReadinessProbe(configured=True, ok=ok, detail=detail)
             probe = lambda ok=ok, detail=detail: (ok, detail)  # noqa: E731
 
+        environment_probe = getattr(app.state, "execution_environment", None)
+        if environment_probe is None:
+            execution_environment_state = ReadinessProbe(
+                configured=False,
+                ok=False,
+                detail="no item execution backend is configured; local execution is unavailable",
+            )
+        else:
+            environment_ok, environment_detail = environment_probe()
+            execution_environment_state = ReadinessProbe(
+                configured=True,
+                ok=environment_ok,
+                detail=environment_detail,
+            )
+
         projects = [p for p in queue.projects() if project_id is None or p.project_id == project_id]
         if project_id is not None and not projects:
             raise HTTPException(status_code=404, detail=f"no project {project_id!r}")
@@ -1597,10 +1709,17 @@ def create_api(
             )
 
         return ExecutionReadiness(
-            mode="supervised" if fleet_ is not None else "monitoring-only",
+            mode=(
+                "local"
+                if fleet_ is not None and environment_probe is not None
+                else "supervised"
+                if fleet_ is not None
+                else "monitoring-only"
+            ),
             ready_to_start=any(r.ready_to_start for r in reports),
             workers=workers,
             session_host=session_host_state,
+            execution_environment=execution_environment_state,
             reviewer=reviewer_state,
             projects=reports,
         )
@@ -2250,6 +2369,8 @@ def _preflight(
             else None
         ),
         "session_host": session_host or (session_host_probe(host) if host is not None else None),
+        "execution_environment": getattr(state, "execution_environment", None),
+        "remote_required": getattr(state, "remote_required", True),
         "checks_probe": (
             last_base_result_probe(state.base_checks, project.project_id)
             if check_base and getattr(state, "base_checks", None) is not None

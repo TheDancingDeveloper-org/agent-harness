@@ -33,10 +33,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -49,6 +52,7 @@ from .budgets import WALL_CLOCK as BUDGET_WALL_CLOCK
 from .budgets import Budget, BudgetExceeded, Spend, budget_for
 from .budgets import check as budget_check
 from .edits import EditError, parse_edits, to_diff
+from .execution_environment import EnvironmentMount, ExecutionEnvironment
 from .graph import LOCAL_WORK
 from .guard import CommandGuard, CommandRefused, guard_field
 from .model_client import CapExhausted, ModelClient, RequestRefused, RetryExhausted
@@ -70,6 +74,7 @@ from .outcomes import (
     PASS,
     PASSED,
     PATCH_REJECTED,
+    PLAN_PROMOTION_CONFLICT,
     PROVIDER_EXHAUSTED,
     REFUSED,
     RETRY,
@@ -95,6 +100,8 @@ from .work import (
     WorkRecord,
     worker_identity,
 )
+
+log = logging.getLogger(__name__)
 
 #: Which reason kind each ceiling reports. Named here so the executor never
 #: has to branch on a ceiling string.
@@ -1400,7 +1407,7 @@ class Checks:
             if fix:
                 return CheckResult(FIX_AVAILABLE, detail, command=tuple(argv), fix=fix)
             return CheckResult(FAIL, detail, command=tuple(argv))
-        return PASSED
+        return CheckResult(PASS, command=tuple(argv))
 
     def run(self, repo: Path) -> CheckResult:
         applied: list[AppliedFix] = []
@@ -2089,6 +2096,13 @@ class Executor:
         role_runner: RoleRunner | None = None,
         runner_step_limit: int = 80,
         runner_command_timeout: int = 300,
+        environment_factory: Any | None = None,
+        environment_image: str = "",
+        environment_mounts: tuple[EnvironmentMount, ...] = (),
+        environment_variables: Mapping[str, str] | None = None,
+        environment_network: str = "bridge",
+        plan_base_for: Callable[[WorkRecord], tuple[str, str | None]] | None = None,
+        plan_promote: Callable[[WorkRecord, str, str], tuple[str, str]] | None = None,
     ) -> None:
         self.queue = queue
         #: How often this worker makes progress durable. None takes the
@@ -2134,6 +2148,7 @@ class Executor:
         #: before the implementer is called, because that is what it needs to
         #: be looking at.
         self._base: str | None = None
+        self._base_sha: str | None = None
         # Where a patch that could not be applied is kept. Supplied, never
         # guessed: the core owns no directory layout. Without it the reply is
         # gone the moment the item fails, and the only way to see what the
@@ -2152,6 +2167,13 @@ class Executor:
         self.role_runner = role_runner
         self.runner_step_limit = runner_step_limit
         self.runner_command_timeout = runner_command_timeout
+        self.environment_factory = environment_factory
+        self.environment_image = environment_image
+        self.environment_mounts = environment_mounts
+        self.environment_variables = dict(environment_variables or {})
+        self.environment_network = environment_network
+        self.plan_base_for = plan_base_for
+        self.plan_promote = plan_promote
 
     # ------------------------------------------------------------- driving
 
@@ -2380,6 +2402,37 @@ class Executor:
             with contextlib.suppress(Exception):
                 self._hold(record, outcome)
                 return outcome
+        if outcome.state == DONE and self.plan_promote is not None:
+            try:
+                status, detail = self.plan_promote(
+                    record, outcome.branch or "", self._base_sha or outcome.base or self.base_branch
+                )
+            except Exception as exc:  # noqa: BLE001 - integration must not kill a worker
+                status, detail = "deferred", f"plan promotion could not be attempted: {exc}"
+            if status == "conflict":
+                outcome.state = PENDING
+                outcome.reason = detail
+                outcome.stop = Stop(
+                    WITHHELD,
+                    PLAN_PROMOTION_CONFLICT,
+                    detail=detail,
+                    state=PENDING,
+                    consumes_attempt=False,
+                )
+                self._emit(record, "plan_promotion_conflict", detail=detail)
+            elif status != "promoted":
+                outcome.state = BLOCKED
+                outcome.reason = detail
+                outcome.stop = Stop(
+                    ESCALATED,
+                    PLAN_PROMOTION_CONFLICT,
+                    detail=detail,
+                    state=BLOCKED,
+                    consumes_attempt=False,
+                )
+                self._emit(record, "plan_promotion_deferred", detail=detail)
+            else:
+                self._emit(record, "plan_promoted", detail=detail)
         self.queue.release(
             record.item_id,
             outcome.state,
@@ -2468,6 +2521,33 @@ class Executor:
                 break
             if outcome is None:
                 break
+            outcomes.append(outcome)
+        return outcomes
+
+    def serve(
+        self,
+        *,
+        poll_seconds: float = 15.0,
+        stop: threading.Event | None = None,
+        max_idle_polls: int | None = None,
+    ) -> list[Outcome]:
+        """Keep one in-process worker alive, waiting for later queue additions."""
+        outcomes: list[Outcome] = []
+        stop = stop or threading.Event()
+        idle = 0
+        while not stop.is_set():
+            try:
+                outcome = self.run_once()
+            except CapExhausted as exc:
+                log.info("budget exhausted, waiting: %s", exc)
+                outcome = None
+            if outcome is None:
+                idle += 1
+                if max_idle_polls is not None and idle >= max_idle_polls:
+                    return outcomes
+                stop.wait(poll_seconds)
+                continue
+            idle = 0
             outcomes.append(outcome)
         return outcomes
 
@@ -2666,7 +2746,9 @@ class Executor:
         # no usable diff leaves no branch behind.
         base, stacked_on = self._base_for(record)
         self._base = base
-        self._sync_worktree(base)
+        self._base_sha = run_git(self.repo, "rev-parse", base).strip()
+        if self.environment_factory is None:
+            self._sync_worktree(base)
 
         # 1. Plan. Cheap, once per item, and the highest-leverage call.
         planner = _planner_from(resume.artefact(A.PLANNED)) if resume.skips(A.PLANNED) else None
@@ -2676,7 +2758,7 @@ class Executor:
             planner_reply = self._call(
                 record,
                 PLANNER,
-                PLAN_PROMPT.format(brief=record.brief, listing=self._repo_listing()),
+                PLAN_PROMPT.format(brief=record.brief, listing=self._repo_listing(base)),
             )
             planner = parse_planner_result(planner_reply)
             log.record(
@@ -2864,9 +2946,80 @@ class Executor:
         branch = f"{self.branch_prefix}{record.item_id.lower()}"
         outcome.branch = branch
         outcome.base = base
-        self._prepare_branch(branch, base)
-        if stacked_on:
-            self._emit(record, "stacked", detail=f"based on {base} ({stacked_on})")
+        execution_tree: Path | None = None
+        environment: ExecutionEnvironment | None = None
+        runner_repo = self.repo
+        if self.environment_factory is None:
+            self._prepare_branch(branch, base)
+            if stacked_on:
+                self._emit(record, "stacked", detail=f"based on {base} ({stacked_on})")
+        else:
+            execution_tree = self._execution_tree_path(record)
+            try:
+                # A killed controller can leave both the worktree and its
+                # container behind.  This item has just been claimed by this
+                # executor, so no live sibling may own this deterministic
+                # path.  Backends that support lifecycle reaping remove their
+                # orphan before the path is reused.
+                reap = getattr(self.environment_factory, "reap", None)
+                if callable(reap):
+                    reap(execution_tree)
+                if execution_tree.exists():
+                    if (execution_tree / ".git").is_dir():
+                        shutil.rmtree(execution_tree)
+                    else:
+                        run_git(
+                            self.repo,
+                            "worktree",
+                            "remove",
+                            "--force",
+                            str(execution_tree),
+                            check=False,
+                        )
+                        run_git(self.repo, "worktree", "prune", check=False)
+                        if execution_tree.exists():
+                            shutil.rmtree(execution_tree)
+                # A linked Git worktree's `.git` file points into the
+                # controller checkout.  That metadata is intentionally not
+                # mounted into an item container, so use a self-contained
+                # local clone for the loop checkout instead.  The exact base
+                # SHA keeps this equivalent to `worktree add` without
+                # exposing the controller's Git directory.
+                clone = subprocess.run(
+                    [
+                        "git",
+                        "clone",
+                        "--no-local",
+                        "--no-checkout",
+                        str(self.repo),
+                        str(execution_tree),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if clone.returncode != 0:
+                    raise GitError(f"git clone: {clone.stderr.strip()}")
+                run_git(
+                    execution_tree,
+                    "checkout",
+                    "--detach",
+                    self._base_sha or run_git(self.repo, "rev-parse", base).strip(),
+                )
+            except Exception:
+                with contextlib.suppress(OSError):
+                    if execution_tree.exists():
+                        shutil.rmtree(execution_tree)
+                raise
+            runner_repo = execution_tree
+            if stacked_on:
+                self._emit(record, "stacked", detail=f"based on {base} ({stacked_on})")
+
+        def cleanup_execution_tree() -> None:
+            if execution_tree is None:
+                return
+            with contextlib.suppress(OSError):
+                shutil.rmtree(execution_tree)
 
         self._budget_stop(record)
 
@@ -2875,6 +3028,23 @@ class Executor:
 
         self._emit(record, "calling", detail=f"{IMPLEMENTER} through {runner.name}")
         try:
+            if self.environment_factory is not None:
+                if not self.environment_image:
+                    raise ValueError("an execution backend requires an image reference")
+                environment = self.environment_factory.create(
+                    runner_repo,
+                    image=self.environment_image,
+                    mounts=self.environment_mounts,
+                    environment=self.environment_variables,
+                    network=self.environment_network,
+                )
+                environment.start()
+                self._emit(
+                    record,
+                    "execution_environment_created",
+                    detail=f"{environment.name} {environment.version}",
+                    evidence=dict(environment.describe()),
+                )
             with self.client.event_scope(
                 project_id=self.project_id,
                 item_id=record.item_id,
@@ -2884,7 +3054,7 @@ class Executor:
                     RoleRunRequest(
                         role=IMPLEMENTER,
                         task=self._runner_task(record),
-                        repo=self.repo,
+                        repo=runner_repo,
                         project_id=self.project_id,
                         item_id=record.item_id,
                         attempt=attempt,
@@ -2896,21 +3066,34 @@ class Executor:
                         writable=True,
                         report=report,
                         account=self._spend.add,
+                        environment=environment,
                     )
                 )
         except Exception:
-            self._abandon_branch(branch)
-            outcome.branch = None
+            if self.environment_factory is None:
+                self._abandon_branch(branch)
+                outcome.branch = None
+            else:
+                cleanup_execution_tree()
             raise
+        finally:
+            if environment is not None:
+                environment.close()
         outcome.stages.append("implement")
 
         if result.exit_status == "wall_clock_limit":
-            self._abandon_branch(branch)
-            outcome.branch = None
+            if self.environment_factory is None:
+                self._abandon_branch(branch)
+                outcome.branch = None
+            else:
+                cleanup_execution_tree()
             raise self._runner_budget_exceeded(record, result, BUDGET_WALL_CLOCK)
         if result.exit_status == "spend_limit":
-            self._abandon_branch(branch)
-            outcome.branch = None
+            if self.environment_factory is None:
+                self._abandon_branch(branch)
+                outcome.branch = None
+            else:
+                cleanup_execution_tree()
             raise self._runner_budget_exceeded(record, result, BUDGET_SPEND)
         if result.exit_status != "completed":
             outcome.reason = (
@@ -2924,21 +3107,33 @@ class Executor:
                 evidence={"submission": result.submission[:4000]},
             )
             outcome.stop = Stop(CRASHED, WORKER_ERROR, detail=outcome.reason)
-            self._abandon_branch(branch)
-            outcome.branch = None
+            if self.environment_factory is None:
+                self._abandon_branch(branch)
+                outcome.branch = None
+            else:
+                cleanup_execution_tree()
             return outcome
 
         # Against the item base, not merely the current HEAD: a tool-using
         # agent may create untracked files or make local commits, and both are
         # part of the candidate the gates must judge.
-        diff = candidate_diff(self.repo, base)
+        # The self-contained item clone has the exact base commit checked out,
+        # but it deliberately does not expose the controller's local branch
+        # refs (including a plan branch advanced by another worker).  Compare
+        # against the immutable SHA so dependent work remains isolated from
+        # controller metadata while still capturing the full candidate.
+        diff = candidate_diff(runner_repo, self._base_sha or base)
         if not diff:
             outcome.reason = "the role runner completed without changing the repository"
             self._emit(record, "no_diff", detail=outcome.reason)
             outcome.stop = Stop(REFUSED, NO_TARGET, detail=outcome.reason)
-            self._abandon_branch(branch)
-            outcome.branch = None
+            if self.environment_factory is None:
+                self._abandon_branch(branch)
+                outcome.branch = None
+            else:
+                cleanup_execution_tree()
             return outcome
+        cleanup_execution_tree()
         log.record(
             self.project_id,
             record.item_id,
@@ -3192,11 +3387,14 @@ class Executor:
                 detail=failure[:2000],
                 evidence={
                     "check": " ".join(checked.command) if checked.command else "",
+                    "command": list(checked.command),
+                    "commands": [list(checked.command)] if checked.command else [],
                     "outcome": checked.outcome,
                     # The tail is where a build tool prints what it objected
                     # to, which is the part a person reads first.
                     "output": failure[-4000:],
                     "fix_declared": " ".join(checked.fix) if checked.fix else "",
+                    "fix": list(checked.fix),
                 },
                 # The gate's own word for what happened, so a client branches
                 # on a token rather than on English. `disk_exhausted` is kept
@@ -3211,6 +3409,10 @@ class Executor:
                     record,
                     "fix_available",
                     detail="`" + " ".join(checked.fix) + "` is declared to clear this",
+                    evidence={
+                        "command": list(checked.command),
+                        "fix": list(checked.fix),
+                    },
                 )
             self._announce_fixes(record, checked)
             outcome.reason = failure
@@ -3225,7 +3427,9 @@ class Executor:
             # the reviewer's copy the truth — and what stops the commit below
             # from containing lines the reviewer was never shown.
             applied_diff = candidate_diff(self.repo) or applied_diff
-        self._emit(record, "checks_passed")
+        passed_evidence = checked.as_dict()
+        passed_evidence["commands"] = [list(command) for command in self.checks.commands]
+        self._emit(record, "checks_passed", evidence=passed_evidence)
         # Recorded, though it makes resumption no cheaper: re-running a
         # project's checks is idempotent and costs no model call, so a resumed
         # attempt runs them again rather than trusting a result from a tree
@@ -3469,6 +3673,8 @@ class Executor:
         them, so the first is used and the fact is reported rather than
         hidden.
         """
+        if self.plan_base_for is not None:
+            return self.plan_base_for(record)
         candidates = [
             spec.target_id
             for spec in record.dependency_specs()
@@ -3516,7 +3722,7 @@ class Executor:
             paths="\n".join(f"  {path} ({self._size_of(path)})" for path in starved)
         )
 
-    def _repo_listing(self) -> str:
+    def _repo_listing(self, base: str | None = None) -> str:
         """The tracked paths, for the planner.
 
         The planner's whole job is to name files, and it was given only the
@@ -3531,7 +3737,13 @@ class Executor:
         implementer's job and it has its own budget for that.
         """
         try:
-            tracked = [path for path in run_git(self.repo, "ls-files").splitlines() if path]
+            tracked = [
+                path
+                for path in run_git(
+                    self.repo, "ls-tree", "-r", "--name-only", base or "HEAD"
+                ).splitlines()
+                if path
+            ]
         except GitError:
             return ""
         if not tracked:
@@ -3602,6 +3814,21 @@ class Executor:
         run_git(self.repo, "clean", "-fd", check=False)
         run_git(self.repo, "checkout", base)
 
+    def _execution_tree_path(self, record: WorkRecord) -> Path:
+        """The stable private worktree path for one project item.
+
+        ``mkdtemp`` made cleanup after a killed worker impossible: after a
+        restart there was no durable relationship between a random directory
+        and the item that owned it.  The digest avoids putting item text into
+        a path while making one item map to one exact harness-owned location.
+        """
+        import hashlib
+
+        identity = f"{self.repo}\0{self.project_id}\0{record.item_id}".encode()
+        root = self.repo.parent / ".agent-harness-items"
+        root.mkdir(parents=True, exist_ok=True)
+        return root / hashlib.sha256(identity).hexdigest()[:32]
+
     def _prepare_branch(self, branch: str, base: str | None = None) -> None:
         """A clean tree at `base`, on a branch of this item's own.
 
@@ -3614,6 +3841,14 @@ class Executor:
         """
         run_git(self.repo, "checkout", "--", ".", check=False)
         run_git(self.repo, "clean", "-fd", check=False)
+        if self.environment_factory is not None:
+            # The worker checkout is itself a disposable worktree whose source
+            # branch is checked out by the user's repository.  Checking that
+            # branch out here would make git reject the operation because the
+            # source worktree owns it; create the item branch directly from
+            # the detached base instead.
+            run_git(self.repo, "checkout", "-B", branch, base or self.base_branch)
+            return
         run_git(self.repo, "checkout", base or self.base_branch)
         run_git(self.repo, "checkout", "-B", branch)
 
@@ -3626,7 +3861,10 @@ class Executor:
         """
         run_git(self.repo, "checkout", "--", ".", check=False)
         run_git(self.repo, "clean", "-fd", check=False)
-        run_git(self.repo, "checkout", self.base_branch, check=False)
+        if self.environment_factory is not None:
+            run_git(self.repo, "checkout", "--detach", self.base_branch, check=False)
+        else:
+            run_git(self.repo, "checkout", self.base_branch, check=False)
         run_git(self.repo, "branch", "-D", branch, check=False)
 
     def _commit(self, record: WorkRecord, verdict: str = "", checkpoint: bool = False) -> None:

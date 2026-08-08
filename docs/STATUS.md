@@ -68,11 +68,11 @@ unobserved. The standalone
 run is **observed**, once, on one item — it is not evidence that the harness
 works, and it is explicitly not a delivered item.
 
-**Stage 1 / #215 is implemented and tested locally; Stage 2 is the next
-implementation block.** The GitHub issue remains open while this exists only
-locally, per P12 and D1. A useful loop must now be confined before it touches a
-real workload, then become reachable from an AIDevEnv-independent service
-fleet, execute in isolated worktrees, promote
+**Stage 1 / #215 is implemented and tested locally. Stage 2 live acceptance
+remains a prerequisite; Stage 3 wiring is now the next implementation block.**
+The GitHub issue remains open while this exists only locally, per P12 and D1. A
+useful loop must now be confined before it touches a real workload, then become
+reachable from an AIDevEnv-independent service fleet, execute in isolated worktrees, promote
 several items safely to one plan branch, surface exceptions, and attribute its
 calls and outcomes to the item that caused them. None of that end-to-end path
 has run.
@@ -150,7 +150,7 @@ target branch.
 | **P10 — human involvement is exceptional** | Before publication, people are involved only for questions, holds and failures. The single final PR review and merge is the normal human approval point. | There is no approval ceremony per item and no need to watch agents work. A held item keeps its claim under D12; unrelated workers continue. The GUI/API must make the exception and the evidence needed to answer it visible. |
 | **P11 — calls are not the optimisation target** | Use generous configurable loop bounds. Keep time, spend and call ceilings as emergency controls and continue measuring them, but do not shorten the loop to minimise request count. | The useful run took 31 turns; the failed design used one. Number of calls is not currently a material product concern. A limit still must stop a pathological loop, and a provider cost cap is still terminal and never retried. |
 | **P12 — local development cadence** | Develop, commit, gate and integrate locally. Do not push, open a PR, wait for hosted CI, or deploy each implementation slice. | Those remote steps are materially delaying the feedback loop. GitHub support is retained and tested with local fakes; GitHub issues remain the state record required by D1, but issues stay open while implementation exists only locally. Publication happens once at the explicit milestone in §2.4. |
-| **P13 — GUI is a client, not an execution dependency** | The GUI consumes typed API state and event/notification contracts. It is owned and served by `agent-harness`, but is not an input to executor design. | The imported browser control plane is a first-party client over shared services. Authenticated webhook/notification delivery is still unbuilt. Execution must continue with the GUI offline. Holds, failures, completion and review events live in durable harness stores/API; the GUI or a later external channel presents and notifies. |
+| **P13 — GUI is a client, not an execution dependency** | The GUI consumes typed API state and event/notification contracts. It is owned and served by `agent-harness`, but is not an input to executor design. | The imported browser control plane is a first-party client over shared services. Authenticated notification delivery and a generic review-source contract exist, while a deployed external source adapter remains optional. Execution must continue with the GUI offline. Holds, failures, completion and review events live in durable harness stores/API; the GUI or a later external channel presents and notifies. |
 
 ### 2.3 Plan-branch and dependency semantics
 
@@ -229,10 +229,71 @@ the currently measured delivery failure.
   Model-call events carry project, item and work-attempt identity; item budgets
   and terminal policy refusals stop at loop boundaries. Evidence is in
   [`evidence/2026-08-06-stage-1-role-runner.md`](evidence/2026-08-06-stage-1-role-runner.md).
-- **Next: Stage 2.** The current `HarnessEnvironment` invokes the host shell in
-  the controller environment. `CommandGuard` explains and terminates known
-  refusals, but it is not confinement. No real workload run is authorised by
-  the Stage 1 result.
+- **Stage 2 is in implementation; its exit is pending.** The generic
+  execution-environment contract, metadata-selected Docker backend, disposable
+  per-item self-contained Git checkout, explicit image/network/mount configuration,
+  controller-environment allow-list, pre-claim readiness check and teardown path
+  are implemented and covered by local contract tests. The current host has
+  Docker CLI but no reachable daemon, so the required tests against the actual
+  backend — repository-wide work, undeclared sibling/host refusal, declared
+  mount modes, allowed network access and clean teardown — have not yet run. No
+  real workload run is authorised by the Stage 2 implementation evidence. See
+
+  [`evidence/2026-08-06-stage-2-execution-environment.md`](evidence/2026-08-06-stage-2-execution-environment.md).
+- **Stage 3 wiring is present but its exit is not claimed.** `serve` can now
+  construct an AIDevEnv-independent local fleet from the metadata-selected
+  role runner and execution backend; readiness and preflight use that executor
+  capability, fixture coverage runs two items through separate self-contained
+  checkouts, and restart cleanup now has deterministic item paths plus
+  worktree-scoped Docker reaping. The live-backend evidence required by Stage 2
+  is still missing, and Stage 3 has not yet proved killed-backend isolation or
+  the full acceptance graph. Plan-branch promotion now has local fixture
+  evidence: two independent items are promoted under the in-process lock and
+  durable cross-process lease, and a dependent item sees both changes. No real
+  workload run is authorised.
+- **Stage 4 implementation has local fixture evidence but its exit is not
+  claimed.** The fleet fixture runs two independent items and one item depending
+  on both, preserves promotion records, exposes both promoted files to the
+  dependent runner, and retains the conflicting-promotion repair path. It does
+  not contact a remote. The live execution boundary and Stage 3 failure
+  isolation criteria remain open prerequisites.
+- **Stage 5 is in implementation; its exit is not claimed.** A generic
+  normalized remote-review contract now accepts an immutable source/event id,
+  an explicit adapter-supplied disposition, and bounded feedback. Intake is
+  durably deduplicated in the queue database: actionable feedback creates one
+  correction item dependent on the reviewed item, ambiguous feedback creates a
+  pending correction held for a person, and already-resolved feedback creates
+  no work. An answer returns an ambiguity correction to `pending`; audit
+  delivery is best-effort and item-scoped. The typed API route and local tests
+  cover these semantics. `WorkEvidence` now also projects retained runner
+  progress, authoritative gate answers (including argv), plan-promotion state
+  and normalized review intake without replacing the raw event history.
+  A local-plan fleet acceptance now proves an actionable correction is claimed
+  once on the configured integration branch while a sibling item continues;
+  duplicates remain no-ops. A durable generic notification outbox now records
+  selected hold, failure, completion and review outcomes and retries them
+  through an authenticated bearer/HMAC webhook channel.
+  Two of the three remaining items now have implementations and local tests.
+  An installed review source (`github-pr-review`) resolves through metadata,
+  gives reviews and review comments distinct immutable identities, and decides
+  disposition by explicit markers and review state — with unmarked human prose
+  defaulting to a hold rather than to guessed work. A `PlanPublisher` pushes
+  one plan branch under `--force-with-lease` and maintains exactly one pull
+  request: a correction updates that same PR, an unchanged plan head touches no
+  remote, an existing PR is adopted rather than duplicated, a branch moved by
+  somebody else is refused, and nothing merges, approves or marks ready. That
+  publisher is wired into `direct_executor_factory`: `push=True` on a project
+  with a plan branch now means one plan branch and one pull request rather than
+  being refused, the executor is given no GitHub client and pushes no item
+  branch, publication waits until nothing is in flight and nothing failed, and
+  a remote failure is an event rather than a failed item.
+  Evidence is in
+  [`evidence/2026-08-08-stage-5-review-source-and-publication.md`](evidence/2026-08-08-stage-5-review-source-and-publication.md).
+  **No real remote was contacted for any of it**: the pull-request client is a
+  fake and the Git remote is a bare repository in a temporary directory. The
+  review source has never polled a real pull request, no publication has ever
+  reached GitHub, and remote workload acceptance remains open. No Stage 5 exit
+  and no remote workload run is authorised.
 
 ### 2.7 Execution backend recommendation — Docker/OCI, selectively adopted
 
@@ -352,19 +413,24 @@ Implemented and covered by in-process tests:
 
 Remaining work, in dependency order:
 
-1. **Finish the execution-facing contracts in Stage 5.** Expose item-scoped
-   runner progress, questions, authoritative gate evidence and plan-promotion
-   state through typed API/events. Add deduplicated remote-review events and the
-   correction/resume path before adding UI for them. The GUI must consume those
-   contracts and remain optional to execution.
+1. **Finish the remaining execution-facing work in Stage 5.** The single-PR
+   publication/resume mechanism and an installed `github-pr-review` source now
+   exist with local tests, and the typed evidence projections, deduplicated
+   intake contract, local fleet acceptance and generic notification outbox were
+   already present, and publication is now wired into the executor factory so a
+   promoted correction updates the plan PR without an operator. What remains:
+   run that path against a real remote (Stage 7's milestone), deploy and poll
+   the review source against a real pull request, and prove fleet continuation
+   while an item is held or receives review feedback. The GUI must consume
+   these contracts and remain optional to execution.
 2. **Complete existing operator controls.** Add exact-state reviewed bulk
    transitions, complete continue/force-start and refusal parity, preserve hold
    answers across expiry/version conflicts, and add any missing item filters or
    artifact/diff links. No visual gesture is authority for a transition.
-3. **Build notification delivery as a subsystem.** Holds, failures, completion
-   and remote review need a durable generic notification contract and an
-   authenticated webhook/channel adapter. The current GUI has no proven push or
-   phone-notification path; do not infer one from the optional session host.
+3. **Extend notification delivery beyond the first channel.** The durable
+   generic contract and authenticated webhook/channel adapter are present.
+   Add any deployment-specific presentation or phone channel only as an
+   opt-in adapter; do not infer one from the optional session host.
 4. **Prove the browser boundary.** Add browser-runtime journeys for forced SSE
    disconnect/replay and polling fallback, keyboard-only use, focus handling,
    reduced motion, desktop/phone layouts and screen-reader semantics. Add the
@@ -432,9 +498,9 @@ reviewing a real failure, and none is waiting on anything.
 | # | what it is | why it is where it is |
 |---|---|---|
 | #219 | two edit blocks naming one file by different path strings (`a.txt` and `./a.txt`) render its diff twice; the second copy cannot apply | found during the #216 review and deliberately left out of it, because the fix changes `plan_edits`' public keying. Low severity and fails safely — but the message blames the model for an edit it got right, which is the class of bug this repository spent a day removing. |
-| #220 | two API routes compare a lease against `time.time()`, not `queue.now()` | identical in production; the divergence matters because the queue's clock is injectable *so that* lease behaviour can be tested, and two routes silently opt out. Needs a one-line ruling that `queue.now()` is authoritative, applied everywhere. |
+| ~~#220~~ | two API routes compare a lease against `time.time()`, not `queue.now()` | **fixed locally, 2026-08-08.** The ruling taken is that `queue.now()` is authoritative for a lease everywhere; the retry and block routes now use it. Red-first: with the wall-clock comparison both new tests return 200 where 409 is correct. Tracker stays open until the publication milestone (P12/D1). `tests/test_api.py::test_retry_honours_the_queue_clock_not_the_wall_clock`, `…::test_blocking_honours_the_queue_clock_not_the_wall_clock`. |
 | #221 | two holds opened by one attempt in the same tick raise a bare `sqlite3.IntegrityError` instead of a `HoldError` | `asked_at` is a float used as part of an identity. Effectively unreachable against a real clock, immediately reachable with an injected one. The fix needs a small design call: may one attempt hold twice at all? |
-| #223 | `_WIRE_ROLES` permits a `tool` message that `_for_the_wire` has already stripped the `tool_call_id` from | latent, not live: nothing currently emits a `tool` role. The allow-list contradicts the rule `format_observation_messages` was written to enforce. The failure mode when it is reached is a gateway refusal naming no message, which has already cost one live run. |
+| ~~#223~~ | `_WIRE_ROLES` permits a `tool` message that `_for_the_wire` has already stripped the `tool_call_id` from | **fixed locally, 2026-08-08.** `tool` is removed from the allow-list, so the role a reduced message cannot validly carry can no longer reach the wire; the observation still goes back as a `user` turn and no content is lost. Tracker stays open until the publication milestone (P12/D1). `tests/test_agent_loop_e2e.py::test_a_tool_message_cannot_reach_the_wire_without_its_id`. |
 | #207 | `test_pausing_a_project_stops_claiming` asserts completions stop within 100 ms, which is a timing assumption about the host | a CI flake on an unrelated branch. The property worth protecting is that pausing stops *claiming*; the assertion instead measures how fast an in-flight item finishes. The resume half of the same test already waits on a condition and is not flaky. |
 | #209 | a stored model answer is redacted, so it cannot be used to reproduce what the model actually said | two promises in tension — "what did the model say" and "no credential reaches an append-only store" — with the second silently winning. It bites hardest on rdpapp, a credential vault whose fixtures are full of credential-shaped source. It matters most for exact-match edit failures, which are questions about characters, in a record whose characters were changed. |
 | #103 | silent-but-active CLI sessions are indistinguishable from hangs | session-host path: PTY output is the only activity signal, so a working agent that prints nothing reports `activity: idle`. Independent of the #195 programme; note that #195 also deprecates `--session-host` in help and docs, so weigh effort here against that. |
@@ -719,6 +785,9 @@ evidence and do not build on them.
 | The store has no UPDATE and no DELETE | **tested** | the source-level assertion in the store tests |
 | The four rdpapp-derived defects: edit-block rendering, stale worktree, guard false positives, claim-scan page deadlock | **tested** | regression tests landed with #216, #217, #218 |
 | A metadata-selected multi-turn implementer can inspect, edit, run feedback checks, create new files, and then pass through the harness's authoritative checks, attempt record and reviewer with item-scoped events and budgets | **tested** | `tests/test_role_runners.py`, `tests/test_role_runner_e2e.py`, and the adapter regressions in `tests/test_agent_loop_e2e.py` |
+| One plan branch yields exactly one pull request: a correction updates it, an unchanged head touches no remote, an existing PR is adopted, a foreign push is refused, and nothing is merged | **tested** | `tests/test_plan_publication.py` — against a local bare remote and a fake pull-request client, never GitHub |
+| A fleet publishes that one pull request only once the plan has stopped moving, pushes no item branch, and updates the same PR for a later correction | **tested** | `tests/test_plan_integration.py::test_fleet_publishes_one_plan_pr_only_when_the_plan_is_finished` |
+| An installed review source gives reviews and review comments distinct immutable identities and decides disposition without a model, defaulting unmarked prose to a hold | **tested** | `tests/test_github_pr_review_source.py` — `gh` is injected; no real pull request has been polled |
 | The service runs and is deployed inside AIDevEnv | **observed** | no preserved artefacts |
 | An earlier supervised NGMS attempt and later direct calls exercised real agents and providers | **observed** | [`evidence/2026-08-03-04-ngms-first-sustained-run-v1.md`](evidence/2026-08-03-04-ngms-first-sustained-run-v1.md) — lacks a common run ID, complete configuration, checksums and a comparable follow-up |
 | Four executor passes against rdpapp delivered nothing, and why each failed | **observed** | [`evidence/2026-08-05-06-rdpapp-m2-status.md`](evidence/2026-08-05-06-rdpapp-m2-status.md); the pass 3–4 attribution is hindsight and has not been confirmed by re-running against the fix |

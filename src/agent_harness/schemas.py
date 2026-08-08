@@ -587,6 +587,12 @@ class ProjectSpec(BaseModel):
         ),
     )
     plan_path: str | None = None
+    plan_branch: str | None = Field(
+        None,
+        description=(
+            "Local integration branch receiving gated item promotions. No remote is contacted."
+        ),
+    )
     roles: dict[str, RoleRoute] | None = Field(
         None, description="Role overrides for this project. Null uses the global map."
     )
@@ -761,10 +767,10 @@ class ExecutionReadiness(BaseModel):
     is claimed, and no state is mutated.
     """
 
-    mode: Literal["supervised", "monitoring-only"] = Field(
-        description="`supervised` means a worker pool is attached and starting a project "
-        "can create workers. `monitoring-only` is a legitimate deployment — a dashboard "
-        "over someone else's harness — and starting is expected to refuse."
+    mode: Literal["local", "supervised", "monitoring-only"] = Field(
+        description="`local` means the in-process executor and its item environment are "
+        "attached; `supervised` means a session-host worker pool is attached; "
+        "`monitoring-only` has no executor and starting is expected to refuse."
     )
     ready_to_start: bool = Field(
         description="Whether at least one project could be started right now. False on a "
@@ -774,6 +780,11 @@ class ExecutionReadiness(BaseModel):
     session_host: ReadinessProbe = Field(
         description="The terminal-session host the agents run in. Probed with a read, so "
         "it proves reachability AND that the token is accepted, without creating a session."
+    )
+    execution_environment: ReadinessProbe = Field(
+        description="The selected item execution backend. In local mode this is the "
+        "capability that makes item commands runnable; it is never inferred from a "
+        "session-host setting."
     )
     reviewer: ReadinessProbe = Field(
         description="Is a reviewer role routed? Without one every review fails closed, so "
@@ -1507,6 +1518,51 @@ class EventPage(BaseModel):
     cursor: int = Field(description="Pass as `since_id` next time. Unchanged when empty.")
 
 
+class ReviewEventRequest(BaseModel):
+    """A normalized review event supplied by an optional remote adapter."""
+
+    source: str = Field(description="Adapter identity, not a vendor-specific protocol name.")
+    remote_id: str = Field(description="Immutable identity of the remote review record.")
+    project_id: str = Field(description="Harness project containing the reviewed item.")
+    item_id: str = Field(description="Harness item the remote review concerns.")
+    disposition: Literal["actionable", "ambiguous", "already_resolved"] = Field(
+        description="Explicit adapter classification. The harness never infers this from text."
+    )
+    summary: str = Field(
+        min_length=1,
+        max_length=4000,
+        description="Bounded, adapter-normalized feedback summary retained for the correction.",
+    )
+    pr_url: str | None = Field(None, description="Remote review URL, when one exists.")
+    received_at: float | None = Field(None, description="Remote event time, when supplied.")
+
+
+class ReviewEventResult(BaseModel):
+    """The idempotent result of accepting one remote review event."""
+
+    accepted: bool = Field(description="Whether this request inserted a new remote event.")
+    duplicate: bool = Field(description="True when source and remote_id had already been seen.")
+    status: str = Field(description="queued, needs_human or already_resolved.")
+    correction_item_id: str | None = Field(
+        None, description="Stable generated correction item, when one was created."
+    )
+    detail: str = Field(description="Bounded explanation of the intake result.")
+
+
+class ReviewPollResultModel(BaseModel):
+    """The result of one authenticated, adapter-owned review-source poll."""
+
+    fetched: int = Field(description="Normalized review records returned by the source.")
+    accepted: int = Field(description="Records newly accepted by the harness.")
+    duplicates: int = Field(description="Records replayed from the source identity journal.")
+    cursor: str | None = Field(
+        description="The source cursor saved after the complete batch was accepted."
+    )
+    results: list[ReviewEventResult] = Field(
+        description="Per-record idempotent intake results, in source order."
+    )
+
+
 class ProcessMetrics(BaseModel):
     """A session-independent observation of the serving process."""
 
@@ -1684,6 +1740,81 @@ class AttemptStageEvidence(BaseModel):
     )
 
 
+class RunnerProgressEvidence(BaseModel):
+    """A runner event projected into stable item-scoped progress fields."""
+
+    event_id: int = Field(description="Monotonic event id for this progress observation.")
+    stage: str = Field(description="Executor stage or runner progress token.")
+    ts: float = Field(description="Unix timestamp when the progress was recorded.")
+    detail: str | None = Field(None, description="Bounded human-readable stage detail.")
+    worker: str | None = Field(None, description="Worker identity, when one was attached.")
+    attempt: int | None = Field(None, description="Attempt number, when the runner supplied it.")
+    evidence: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Structured runner evidence retained with the event.",
+    )
+
+
+class GateEvidence(BaseModel):
+    """The answer and argv evidence for an authoritative cheap gate."""
+
+    event_id: int = Field(description="Monotonic event id for this gate answer.")
+    outcome: str = Field(description="Gate answer token, such as `pass` or `fail`.")
+    ts: float = Field(description="Unix timestamp when the gate answered.")
+    detail: str | None = Field(None, description="Bounded gate detail or failure output.")
+    command: list[str] = Field(
+        default_factory=list,
+        description="Exact argv that produced this gate answer, when available.",
+    )
+    commands: list[list[str]] = Field(
+        default_factory=list,
+        description="All configured gate argv values for a successful gate run.",
+    )
+    fix: list[str] = Field(
+        default_factory=list,
+        description="Declared fix argv, when the gate exposed one.",
+    )
+    applied: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Mechanical fixes actually applied before this answer.",
+    )
+    authoritative: bool = Field(
+        True,
+        description="This answer came from the configured gate, not a model or projection.",
+    )
+
+
+class PlanPromotionEvidence(BaseModel):
+    """Durable state from local, gated plan-branch promotion."""
+
+    event_id: int = Field(description="Monotonic event id for this promotion observation.")
+    ts: float = Field(description="Unix timestamp when promotion state was recorded.")
+    status: str = Field(description="Promotion state token, such as promoted or conflict.")
+    plan_branch: str | None = Field(None, description="Integration branch, when configured.")
+    base_sha: str | None = Field(None, description="Immutable item base commit, when known.")
+    item_sha: str | None = Field(None, description="Candidate item commit, when known.")
+    old_head_sha: str | None = Field(None, description="Plan branch head before promotion.")
+    new_head_sha: str | None = Field(None, description="Plan branch head after promotion.")
+    target_sha: str | None = Field(None, description="Promotion target commit, when known.")
+    detail: str | None = Field(None, description="Bounded promotion detail.")
+
+
+class RemoteReviewEvidence(BaseModel):
+    """The normalized and idempotent remote-review intake result."""
+
+    event_id: int = Field(description="Monotonic event id for this review observation.")
+    ts: float = Field(description="Unix timestamp when intake was recorded.")
+    source: str = Field(description="Normalized adapter identity.")
+    remote_id: str = Field(description="Immutable remote review identity.")
+    disposition: str = Field(description="Explicit adapter disposition.")
+    status: str = Field(description="Intake status, such as queued or needs_human.")
+    duplicate: bool = Field(description="Whether this was a replay of an accepted event.")
+    correction_item_id: str | None = Field(
+        None, description="Generated correction item, when intake created one."
+    )
+    detail: str | None = Field(None, description="Bounded intake detail.")
+
+
 class WorkEvidence(BaseModel):
     """Item-scoped history without fabricated gaps."""
 
@@ -1701,6 +1832,22 @@ class WorkEvidence(BaseModel):
     holds: list[HoldView] = Field(
         default_factory=list,
         description="Every retained question for the item, including closed questions.",
+    )
+    runner_progress: list[RunnerProgressEvidence] = Field(
+        default_factory=list,
+        description="Typed runner progress, oldest first; derived from retained events.",
+    )
+    gates: list[GateEvidence] = Field(
+        default_factory=list,
+        description="Authoritative gate answers, oldest first; derived from retained events.",
+    )
+    promotions: list[PlanPromotionEvidence] = Field(
+        default_factory=list,
+        description="Plan-branch promotion state observations, oldest first.",
+    )
+    remote_reviews: list[RemoteReviewEvidence] = Field(
+        default_factory=list,
+        description="Normalized remote-review intake observations, oldest first.",
     )
 
 

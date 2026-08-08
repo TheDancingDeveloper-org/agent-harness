@@ -36,6 +36,7 @@ from .schemas import (
     EventFilters,
     EventPage,
     FleetControl,
+    GateEvidence,
     GatewayLog,
     GatewayLogPage,
     HoldList,
@@ -44,12 +45,15 @@ from .schemas import (
     LatestEvent,
     OpenQuestion,
     PlanParseResult,
+    PlanPromotionEvidence,
     ProcessMetrics,
     ProjectList,
     ProjectSummary,
     ProposalModel,
     RateLimits,
     ReadinessReasonModel,
+    RemoteReviewEvidence,
+    RunnerProgressEvidence,
     WorkerInventory,
     WorkerInventoryItem,
     WorkEvidence,
@@ -693,13 +697,122 @@ class HarnessQueries:
             HoldView(**hold.as_dict(queue.now()))
             for hold in queue.holds.history(project_id, item_id)
         ]
+        runner_progress, gates, promotions, remote_reviews = self._typed_item_events(events)
         return WorkEvidence(
             project_id=project_id,
             item_id=item_id,
             events=events,
             stages=stages,
             holds=holds,
+            runner_progress=runner_progress,
+            gates=gates,
+            promotions=promotions,
+            remote_reviews=remote_reviews,
         )
+
+    @staticmethod
+    def _typed_item_events(
+        events: list[Event],
+    ) -> tuple[
+        list[RunnerProgressEvidence],
+        list[GateEvidence],
+        list[PlanPromotionEvidence],
+        list[RemoteReviewEvidence],
+    ]:
+        progress: list[RunnerProgressEvidence] = []
+        gates: list[GateEvidence] = []
+        promotions: list[PlanPromotionEvidence] = []
+        reviews: list[RemoteReviewEvidence] = []
+        gate_stages = {"checks_passed", "checks_failed", "fix_available"}
+        promotion_stages = {
+            "plan_promotion",
+            "plan_promoted",
+            "plan_promotion_conflict",
+            "plan_promotion_deferred",
+        }
+
+        def text(value: Any) -> str | None:
+            return None if value is None else str(value)
+
+        def argv(value: Any) -> list[str]:
+            return [str(part) for part in value] if isinstance(value, list) else []
+
+        for event in events:
+            data = event.data
+            raw_evidence = data.get("evidence")
+            evidence = raw_evidence if isinstance(raw_evidence, dict) else {}
+            if event.outcome in gate_stages:
+                command = argv(evidence.get("command"))
+                if not command:
+                    command = argv(data.get("command"))
+                commands_raw = evidence.get("commands")
+                commands = (
+                    [argv(one) for one in commands_raw] if isinstance(commands_raw, list) else []
+                )
+                if not commands and command:
+                    commands = [command]
+                applied = evidence.get("applied")
+                applied_fixes = (
+                    [dict(one) for one in applied if isinstance(one, dict)]
+                    if isinstance(applied, list)
+                    else []
+                )
+                gates.append(
+                    GateEvidence(
+                        event_id=event.id,
+                        outcome=str(evidence.get("outcome") or event.outcome),
+                        ts=event.ts,
+                        detail=text(data.get("detail") or evidence.get("detail")),
+                        command=command,
+                        commands=commands,
+                        fix=argv(evidence.get("fix") or evidence.get("fix_declared")),
+                        applied=applied_fixes,
+                    )
+                )
+                continue
+            if event.outcome in promotion_stages:
+                promotions.append(
+                    PlanPromotionEvidence(
+                        event_id=event.id,
+                        ts=event.ts,
+                        status=str(data.get("status") or event.outcome),
+                        plan_branch=text(data.get("plan_branch")),
+                        base_sha=text(data.get("base_sha")),
+                        item_sha=text(data.get("item_sha")),
+                        old_head_sha=text(data.get("old_head_sha")),
+                        new_head_sha=text(data.get("new_head_sha")),
+                        target_sha=text(data.get("target_sha")),
+                        detail=text(data.get("detail")),
+                    )
+                )
+                continue
+            if event.outcome == "remote_review_received":
+                reviews.append(
+                    RemoteReviewEvidence(
+                        event_id=event.id,
+                        ts=event.ts,
+                        source=str(data.get("source") or event.source),
+                        remote_id=str(data.get("remote_id") or ""),
+                        disposition=str(data.get("disposition") or ""),
+                        status=str(data.get("status") or ""),
+                        duplicate=bool(data.get("duplicate", False)),
+                        correction_item_id=text(data.get("correction_item_id")),
+                        detail=text(data.get("detail")),
+                    )
+                )
+                continue
+            progress.append(
+                RunnerProgressEvidence(
+                    event_id=event.id,
+                    stage=str(event.outcome or event.kind),
+                    ts=event.ts,
+                    detail=text(data.get("detail")),
+                    worker=event.worker,
+                    attempt=_optional_int(data.get("attempt")),
+                    evidence=dict(evidence),
+                )
+            )
+        return progress, gates, promotions, reviews
 
     def _latest_by_item(self, project_id: str | None = None) -> dict[str, dict[str, Any]]:
         if self.audit is not None:

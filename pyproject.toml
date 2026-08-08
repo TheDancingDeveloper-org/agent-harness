@@ -60,6 +60,15 @@ github-issue = "agent_harness.adapters.github_issue:resolver"
 [project.entry-points."agent_harness.role_runners"]
 agent-loop = "agent_harness.adapters.minisweagent:RUNNER"
 
+[project.entry-points."agent_harness.execution_environments"]
+docker = "agent_harness.adapters.docker:BACKEND"
+
+# Sources of normalized remote review events. Core owns correction semantics
+# and deduplication; a source adapter owns one upstream's authentication,
+# polling and immutable record identity. Nothing in core imports one.
+[project.entry-points."agent_harness.review_sources"]
+github-pr-review = "agent_harness.adapters.github_pr_review:source"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

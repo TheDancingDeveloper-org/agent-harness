@@ -63,9 +63,14 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-install-project --all-extras
 
-COPY src ./src
-COPY tests ./tests
-COPY examples ./examples
+# The whole tree, not a hand-listed subset. The `test` stage below runs the
+# repository's own gates, and those gates read the repository: the suite
+# asserts against `docs/DEPLOYMENT.md`, builds a wheel from `pyproject.toml`,
+# and reads `README.md`. A curated COPY list makes that a build failure every
+# time a test starts reading a file nobody remembered to add — which is
+# exactly how the first build of this image failed. `.dockerignore` names what
+# must stay out.
+COPY . .
 RUN uv sync --frozen --all-extras
 
 # ---------------------------------------------------------------- test

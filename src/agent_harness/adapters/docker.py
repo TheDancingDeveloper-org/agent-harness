@@ -177,28 +177,62 @@ class DockerItemEnvironment:
         self.started = False
 
 
+def _diagnosis(stderr: str) -> str:
+    """The line a person can act on, not the last line the CLI printed.
+
+    Go template noise is dropped: it is a consequence of the daemon being
+    absent, never the reason, and letting it win means readiness blames
+    reflection for a stopped service.
+    """
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    useful = [
+        line
+        for line in lines
+        if not line.startswith("template:") and "reflect:" not in line and line != "ERROR:"
+    ]
+    return (useful or lines or ["no reason given"])[0].removeprefix("ERROR: ").strip()
+
+
+def _server_version(stdout: str) -> str:
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Server Version:"):
+            return stripped.split(":", 1)[1].strip()
+    return ""
+
+
 class DockerEnvironmentFactory:
     name = "docker"
     api_version = API_VERSION
     version = "docker-cli"
 
     def check(self) -> tuple[bool, str]:
+        """Is a daemon reachable, and what should an operator be told?
+
+        `docker info` is asked **without** `--format`. With a format string,
+        an unreachable daemon does not produce the message a person needs: the
+        CLI still renders a mostly-nil `Info` struct, so the last line of
+        stderr is a Go template error about "indirection through nil pointer
+        to embedded struct field Info", and the line that actually says the
+        daemon could not be reached is buried above it. Readiness then reports
+        a reflect error, which names the wrong component — the failure mode
+        this repository keeps paying for.
+        """
         if shutil.which("docker") is None:
             return False, "docker is not installed or is not on PATH"
         try:
             result = subprocess.run(
-                ["docker", "info", "--format", "{{.ServerVersion}}"],
+                ["docker", "info"],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=10,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return False, f"Docker daemon check failed: {exc}"
         if result.returncode != 0:
-            detail = result.stderr.strip().splitlines()
-            return False, detail[-1] if detail else "Docker daemon is unavailable"
-        return True, f"Docker daemon {result.stdout.strip() or 'available'}"
+            return False, f"Docker daemon is unreachable: {_diagnosis(result.stderr)}"
+        return True, f"Docker daemon {_server_version(result.stdout) or 'available'}"
 
     def reap(self, worktree: Path) -> None:
         """Remove containers left by a killed controller for one item tree."""

@@ -317,7 +317,7 @@ from agent_harness.providers import VendorEnvelopeProvider
 PRESET = RoutePreset(
     name="somevendor",
     request=JsonChatRequest(path="/v2/generate", model_key="model_id", messages_key="turns"),
-    auth=BearerAuth(header="x-api-key", scheme=""),      # no scheme word
+    auth=BearerAuth(header="x-api-key", scheme=""),  # no scheme word
     reader=JsonResponseReader(text_paths=("result.reply",), usage_key="counters"),
     classifier=VendorEnvelopeProvider(vendor_field="problem", quota_categories=("budget",)),
 )
@@ -408,7 +408,7 @@ endpoint**, and jitter.
 ### Full jitter, not a jittered cap
 
 ```python
-delay = random() * min(base * 2 ** attempt, cap)
+delay = random() * min(base * 2**attempt, cap)
 ```
 
 The cap bounds the curve, not the result. Capping after jittering

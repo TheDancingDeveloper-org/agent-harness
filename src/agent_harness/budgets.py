@@ -154,6 +154,12 @@ class Spend:
         self.usd += cost
         self.priced += 1
 
+    def add(self, other: Spend) -> None:
+        """Fold an already classified set of calls into this item."""
+        self.usd += other.usd
+        self.unpriced += other.unpriced
+        self.priced += other.priced
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "usd": round(self.usd, 6),

@@ -621,6 +621,7 @@ def preflight_project(
     reviewer_independent: tuple[bool, str] | None = None,
     role_probe: Callable[[], RoleReachability] | None = None,
     session_host: Probe | None = None,
+    role_runner: Probe | None = None,
     git_probe: Callable[[str], tuple[bool, str]] = _is_git_repo,
     github_probe: Callable[[str], tuple[bool, str]] = _gh_can_write,
     checks_probe: Probe | None = None,
@@ -629,6 +630,8 @@ def preflight_project(
     allow_dirty: bool = False,
     base_probe: Callable[[str, str], tuple[bool, str]] = _base_is_current,
     allow_stale_base: bool = False,
+    execution_environment: Probe | None = None,
+    remote_required: bool = True,
 ) -> Preflight:
     """Everything that must hold before this project can produce a pull request."""
     checks: list[Check] = []
@@ -661,6 +664,14 @@ def preflight_project(
                 detail if ok else f"{detail} — agents run as sessions on it, so none can start",
             )
         )
+
+    if role_runner is not None:
+        ok, detail = role_runner()
+        checks.append(Check("role runner", ok, detail))
+
+    if execution_environment is not None:
+        ok, detail = execution_environment()
+        checks.append(Check("execution environment", ok, detail))
 
     work_dir = getattr(project, "work_dir", None)
     if work_dir:
@@ -703,7 +714,7 @@ def preflight_project(
         )
 
     repo = getattr(project, "repo", None)
-    if repo:
+    if repo and remote_required:
         ok, detail = github_probe(repo)
         checks.append(
             Check(
@@ -712,9 +723,18 @@ def preflight_project(
                 detail if ok else f"{detail} — items cannot reach a pull request",
             )
         )
-    else:
+    elif remote_required:
         checks.append(
             Check("github write", False, "no repo is configured, so no pull request can be opened")
+        )
+    else:
+        checks.append(
+            Check(
+                "github write",
+                True,
+                "remote publication is disabled; local promotion is the configured destination",
+                blocking=False,
+            )
         )
 
     # No reviewer means every review fails closed, so every item fails. That

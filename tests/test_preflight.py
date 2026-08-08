@@ -68,6 +68,21 @@ def test_a_fully_configured_project_is_ready() -> None:
     assert report.summary() == "ready"
 
 
+def test_a_selected_runner_is_a_required_preflight_check() -> None:
+    report = run(project(), role_runner=lambda: (True, "agent-loop 1.0 compatible"))
+
+    check = next(item for item in report.checks if item.name == "role runner")
+    assert check.ok and check.blocking
+
+
+def test_an_unavailable_selected_runner_blocks_preflight() -> None:
+    report = run(project(), role_runner=lambda: (False, "agent-loop is unavailable"))
+
+    assert not report.ready
+    check = next(item for item in report.blockers if item.name == "role runner")
+    assert "unavailable" in check.detail
+
+
 def test_no_worker_pool_blocks() -> None:
     """The false-running state, refused at source. Without a pool, starting
     can only set a flag nobody acts on."""

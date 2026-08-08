@@ -28,6 +28,7 @@ from agent_harness import providers as P
 from agent_harness.__main__ import _fleet_for_serve
 from agent_harness.api import ROLE_MAP_KEY, create_api
 from agent_harness.audit import AuditStore
+from agent_harness.execution_environment import LocalExecutionEnvironment
 from agent_harness.fleet import Fleet
 from agent_harness.model_client import (
     ModelClient,
@@ -36,7 +37,11 @@ from agent_harness.model_client import (
     effective_routes,
     routes_from_map,
 )
-from agent_harness.runtime import NotExecutable, session_executor_factory
+from agent_harness.runtime import (
+    NotExecutable,
+    direct_executor_factory,
+    session_executor_factory,
+)
 from agent_harness.session_executor import AgentSpec, SessionExecutor
 from agent_harness.session_host import IDLE, RUNNING, Session
 from agent_harness.store import EventStore
@@ -265,6 +270,172 @@ def test_a_project_with_no_checkout_is_refused_at_build_time(tmp_path: Path) -> 
 
     with pytest.raises(NotExecutable, match="work_dir"):
         build("p")
+
+
+class LocalFleetBackend:
+    name = "test-local"
+    api_version = 1
+    version = "test"
+
+    def __init__(self) -> None:
+        self.created: list[Path] = []
+
+    def check(self) -> tuple[bool, str]:
+        return True, "test execution backend available"
+
+    def create(self, worktree: Path, **_: Any) -> LocalExecutionEnvironment:
+        self.created.append(worktree)
+        return LocalExecutionEnvironment(worktree)
+
+
+class LocalRoleRunner:
+    name = "test-runner"
+    api_version = 1
+    version = "test"
+
+    def __init__(self) -> None:
+        self.repositories: list[Path] = []
+
+    def run(self, request: Any) -> Any:
+        self.repositories.append(request.repo)
+        (request.repo / f"{request.item_id}.txt").write_text(request.item_id + "\n")
+        return type("Result", (), {"exit_status": "completed", "submission": "done", "calls": 1})()
+
+
+def local_client() -> ModelClient:
+    def transport(
+        route: Route, messages: Sequence[Mapping[str, Any]], options: Mapping[str, Any]
+    ) -> Response:
+        del messages, options
+        role = str(route.options.get("role") or "")
+        if role == "planner":
+            content = json.dumps(
+                {
+                    "plan": "write the item marker",
+                    "targets": [{"path": "calc.py", "reason": "item context"}],
+                    "cannot_identify_target": None,
+                }
+            )
+        else:
+            content = "APPROVED\nlocal test"
+        return Response(200, {}, json.dumps({"choices": [{"message": {"content": content}}]}))
+
+    return ModelClient(
+        roles={
+            role: Route("test-model", "https://example.invalid", options={"role": role})
+            for role in ("planner", "implementer", "reviewer")
+        },
+        transport=transport,
+        sleep=lambda _seconds: None,
+    )
+
+
+def test_local_factory_runs_two_items_in_separate_environment_worktrees(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The in-process fleet owns execution without sharing a mutable checkout."""
+    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    queue.add_project(
+        Project(
+            project_id="p",
+            name="P",
+            work_dir=str(repo),
+            base_branch="main",
+            checks=["true"],
+            max_workers=2,
+        )
+    )
+    queue.add(
+        [
+            WorkRecord(item_id="A", title="A", brief="Write marker A."),
+            WorkRecord(item_id="B", title="B", brief="Write marker B."),
+        ],
+        project_id="p",
+    )
+    backend = LocalFleetBackend()
+    runner = LocalRoleRunner()
+    fleet = Fleet(
+        queue,
+        direct_executor_factory(
+            queue,
+            reviewer=local_client(),
+            role_runner=runner,
+            push=False,
+            environment_factory=backend,
+            environment_image="test-image",
+        ),
+        poll_seconds=0.01,
+    )
+
+    fleet.start("p")
+
+    def is_finished() -> bool:
+        records = [queue.get(item, project_id="p") for item in ("A", "B")]
+        return all(record is not None and record.state == DONE for record in records)
+
+    finished = wait_for(is_finished, timeout=15)
+    if not finished:
+        states = {
+            item: (record.state if (record := queue.get(item, project_id="p")) else "missing")
+            for item in ("A", "B")
+        }
+        raise AssertionError(f"local items did not finish: {states}; failures={fleet.failures()}")
+    fleet.stop_all()
+
+    assert len(runner.repositories) == 2
+    assert len(set(runner.repositories)) == 2
+    assert len(backend.created) == 2
+    assert all(path != repo and not path.exists() for path in backend.created)
+    assert git(repo, "status", "--porcelain") == ""
+
+
+def test_local_preflight_names_environment_and_does_not_require_remote(
+    repo: Path, tmp_path: Path
+) -> None:
+    queue = WorkQueue(str(tmp_path / "w.sqlite"))
+    queue.add_project(project_for(repo))
+    queue.set_setting(
+        ROLE_MAP_KEY,
+        {"reviewer": {"model": "reviewer", "endpoint": "https://e", "provider": "generic"}},
+    )
+    store = EventStore(tmp_path / "e.sqlite")
+    fleet = Fleet(queue, lambda _project_id: object())
+
+    class Roles:
+        implemented_by = ""
+
+        @staticmethod
+        def calls_role(_role: str) -> bool:
+            return True
+
+    with TestClient(
+        create_api(
+            store,
+            queue=queue,
+            token=TOKEN,
+            fleet=fleet,
+            executor_roles=Roles(),
+            execution_environment=lambda: (True, "test-local available"),
+            remote_required=False,
+            probes={
+                "git_probe": lambda _path: (True, "git"),
+                "clean_probe": lambda _path: (True, "clean"),
+                "base_probe": lambda _path, _base: (True, "current"),
+                "disk_probe": lambda _path, _floor: (True, "space"),
+            },
+        )
+    ) as client:
+        body = client.get("/api/readiness", headers=hdr()).json()
+
+    assert body["mode"] == "local"
+    assert body["execution_environment"] == {
+        "configured": True,
+        "ok": True,
+        "detail": "test-local available",
+    }
+    assert body["projects"][0]["blockers"] == []
+    assert body["projects"][0]["ready_to_start"] is True
+    assert not any(check["name"] == "github write" for check in body["projects"][0]["blockers"])
 
 
 # ------------------------------------------------------- API start -> work

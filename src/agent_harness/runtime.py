@@ -25,9 +25,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .executor import Checks
+from .execution_environment import EnvironmentMount
+from .executor import DEFAULT_CONTEXT_BUDGET, Checks, ContextPolicy, Executor
 from .guard import GUARD_KEY, CommandGuard
 from .model_client import Route
+from .plan_integration import PlanCoordinator, PromotionConflict, PromotionError
+from .plan_publication import PlanPublisher
 from .session_executor import AgentSpec, SessionExecutor
 from .work import Project, WorkQueue
 
@@ -176,6 +179,219 @@ def session_executor_factory(
         if reviewer is None or routes_for is None:
             return reviewer
         return reviewer.routed_by(lambda: routes_for(project_id))
+
+    return build
+
+
+def direct_executor_factory(
+    queue: WorkQueue,
+    *,
+    reviewer: Any,
+    routes_for: Callable[[str], Mapping[str, Route | Sequence[Route]]] | None = None,
+    github_for: Callable[[str], Any] | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    push: bool = True,
+    role_runner: Any,
+    runner_step_limit: int = 80,
+    runner_command_timeout: int = 300,
+    context_budget: int | None = None,
+    context_fallback_budget: int | None = None,
+    environment_factory: Any,
+    environment_image: str,
+    environment_mounts: tuple[EnvironmentMount, ...] = (),
+    environment_variables: Mapping[str, str] | None = None,
+    environment_network: str = "bridge",
+    publication_remote: str = "origin",
+) -> ExecutorFactory:
+    """Build the in-process role-runner executor used by ``serve``.
+
+    A worker owns a disposable checkout for its whole lifetime. The executor
+    then creates a second, item-scoped worktree for the model loop and feeds
+    its candidate through the existing authoritative gates. Keeping the
+    worker checkout separate is essential: the gate path still commits an
+    item branch, and two workers must never checkout those branches in the
+    same directory.
+
+    The selected environment backend is required here rather than silently
+    falling back to the host shell. The host compatibility backend remains a
+    fixture-only option for direct tests; a real ``serve`` fleet needs the
+    operating-system boundary selected by deployment metadata.
+    """
+    import contextlib
+    import subprocess
+    import tempfile
+
+    def git(repo: Path, *args: str, check: bool = True) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if check and result.returncode != 0:
+            raise NotExecutable(f"git {' '.join(args)}: {result.stderr.strip()}")
+        return result.stdout
+
+    def build(project_id: str) -> Any:
+        project = queue.get_project(project_id)
+        if project is None:
+            raise NotExecutable(f"no project {project_id!r}")
+        if not project.work_dir:
+            raise NotExecutable(
+                f"project {project_id!r} has no work_dir, so there is nothing to "
+                "make a worker checkout from"
+            )
+        ready, detail = environment_factory.check()
+        if not ready:
+            raise NotExecutable(f"execution environment is not ready: {detail}")
+
+        source = Path(project.work_dir).resolve()
+        if not (source / ".git").exists():
+            raise NotExecutable(f"project {project_id!r} work_dir is not a git repository")
+        worker_tree = Path(
+            tempfile.mkdtemp(prefix=f".harness-worker-{project_id}-", dir=source.parent)
+        )
+        try:
+            git(source, "worktree", "add", "--detach", str(worker_tree), project.base_branch)
+        except Exception:
+            with contextlib.suppress(OSError):
+                worker_tree.rmdir()
+            raise
+
+        client = reviewer.routed_by(lambda: routes_for(project_id)) if routes_for else reviewer
+        guard = CommandGuard.from_settings(queue.get_setting(GUARD_KEY))
+        checks = _checks_for(project, guard)
+        coordinator: PlanCoordinator | None = None
+        publisher: PlanPublisher | None = None
+        if project.plan_path and project.plan_branch:
+            if push:
+                # Publishing a plan never means publishing its items. When a
+                # deployment asks for a remote, it gets exactly one plan
+                # branch and one pull request (P7/P8); the executor keeps its
+                # item branches local and is given no client of its own.
+                if github_for is None or not project.repo:
+                    raise NotExecutable(
+                        "publishing a plan needs a configured GitHub client and a "
+                        "project repo; set push=False to integrate locally only"
+                    )
+                publisher = PlanPublisher(
+                    queue,
+                    project_id,
+                    source,
+                    github_for(project.repo),
+                    remote=publication_remote,
+                    on_event=on_event,
+                )
+            coordinator = PlanCoordinator(
+                queue,
+                project_id,
+                source,
+                checks=checks,
+                on_event=on_event,
+            )
+            coordinator.ensure(
+                target_branch=project.base_branch,
+                branch=project.plan_branch,
+                plan_path=project.plan_path,
+            )
+
+        def plan_base_for(record: Any) -> tuple[str, str | None]:
+            assert coordinator is not None
+            return coordinator.base_for(record)
+
+        def plan_promote(record: Any, item_branch: str, base: str) -> tuple[str, str]:
+            assert coordinator is not None
+            try:
+                promotion = coordinator.promote(record, item_branch=item_branch, base=base)
+            except PromotionConflict as exc:
+                return "conflict", str(exc)
+            except PromotionError as exc:
+                return "deferred", str(exc)
+            _publish_if_ready(promotion)
+            return promotion.status, promotion.detail
+
+        def _publish_if_ready(promotion: Any) -> None:
+            """Offer the finished plan to a person, without risking the item.
+
+            The item is already promoted and gated locally when this runs. A
+            remote that is down, slow or refusing must not undo that or fail
+            the item, so a publication failure is reported as an event and
+            the promotion stands.
+            """
+            if publisher is None or coordinator is None or promotion.status != "promoted":
+                return
+            try:
+                publisher.publish_if_ready(
+                    coordinator.state(),
+                    title=f"{project.name or project_id}: {project.plan_branch}",
+                    summary=(
+                        f"Promoted `{promotion.item_id}` to the plan branch "
+                        f"({(promotion.new_head_sha or '')[:12]})."
+                    ),
+                    excluding=promotion.item_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - a remote cannot fail local work
+                if on_event is not None:
+                    with contextlib.suppress(Exception):
+                        on_event(
+                            {
+                                "kind": "work",
+                                "outcome": "plan_publication_failed",
+                                "project_id": project_id,
+                                "item_id": promotion.item_id,
+                                "detail": str(exc),
+                            }
+                        )
+
+        executor = Executor(
+            queue,
+            client,
+            worker_tree,
+            checks=checks,
+            github=(
+                github_for(project.repo)
+                if github_for and push and project.repo and coordinator is None
+                else None
+            ),
+            base_branch=project.base_branch,
+            on_event=on_event,
+            # An item branch is never published when a plan owns integration:
+            # the plan branch is the only thing that reaches a remote.
+            push=push and coordinator is None,
+            context_policy=ContextPolicy(
+                budget=context_budget or DEFAULT_CONTEXT_BUDGET,
+                fallback_budget=context_fallback_budget,
+            ),
+            project_id=project_id,
+            role_runner=role_runner,
+            runner_step_limit=runner_step_limit,
+            runner_command_timeout=runner_command_timeout,
+            environment_factory=environment_factory,
+            environment_image=environment_image,
+            environment_mounts=environment_mounts,
+            environment_variables=environment_variables,
+            environment_network=environment_network,
+            durability=project.durability or None,
+            plan_base_for=plan_base_for if coordinator else None,
+            plan_promote=plan_promote if coordinator else None,
+        )
+
+        class ManagedExecutor:
+            owner = executor.owner
+
+            def serve(self, **kwargs: Any) -> Any:
+                try:
+                    return executor.serve(**kwargs)
+                finally:
+                    git(source, "worktree", "remove", "--force", str(worker_tree), check=False)
+                    git(source, "worktree", "prune", check=False)
+                    with contextlib.suppress(OSError):
+                        worker_tree.rmdir()
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(executor, name)
+
+        return ManagedExecutor()
 
     return build
 

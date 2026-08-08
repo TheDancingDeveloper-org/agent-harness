@@ -19,6 +19,7 @@ append-only even though current state does not.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -28,15 +29,17 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from .attempts import DEFAULT_MODE as DEFAULT_DURABILITY
 from .attempts import AttemptLog
 from .graph import (
+    LOCAL_WORK,
     WORK_DECLARATION,
     DependencyGraph,
     DependencySpec,
     Readiness,
+    ReadinessReason,
     Resolver,
     parse_dependencies,
 )
@@ -138,6 +141,7 @@ CREATE TABLE IF NOT EXISTS projects (
     -- question from consuming a worker indefinitely.
     max_hold_seconds REAL NOT NULL DEFAULT 21600,
     plan_path   TEXT,
+    plan_branch TEXT,
     roles       TEXT,
     max_workers INTEGER NOT NULL DEFAULT 1,
     max_attempts INTEGER NOT NULL DEFAULT 5,
@@ -203,6 +207,74 @@ CREATE TABLE IF NOT EXISTS work (
 );
 CREATE INDEX IF NOT EXISTS work_state ON work (project_id, state, lease_until);
 
+-- The mutable current plan projection. The event stream records transitions;
+-- this table answers which exact local ref is current after a restart.
+CREATE TABLE IF NOT EXISTS plans (
+    project_id  TEXT PRIMARY KEY,
+    branch      TEXT NOT NULL,
+    target_branch TEXT NOT NULL,
+    target_sha  TEXT NOT NULL,
+    head_sha    TEXT NOT NULL,
+    plan_digest TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL DEFAULT 0,
+    updated_at  REAL NOT NULL DEFAULT 0
+);
+
+-- A short-lived, per-project lease for the serialized plan integration path.
+-- It is separate from work claims: a promotion lease protects the expensive
+-- read/gate/publish sequence across serving processes, while the append-only
+-- promotion journal remains the recovery record if a process dies.
+CREATE TABLE IF NOT EXISTS plan_promotion_leases (
+    project_id  TEXT PRIMARY KEY,
+    owner       TEXT NOT NULL,
+    lease_until REAL NOT NULL,
+    updated_at  REAL NOT NULL DEFAULT 0
+);
+
+-- Append-only promotion history. A conflict or failed integration gate is a
+-- fact worth retaining, even though it does not advance the plan head.
+CREATE TABLE IF NOT EXISTS plan_promotions (
+    promotion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    item_branch TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    item_sha TEXT,
+    old_head_sha TEXT NOT NULL,
+    new_head_sha TEXT,
+    status TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0
+);
+
+-- Durable journal for rebuilding a plan branch after its target branch moves.
+CREATE TABLE IF NOT EXISTS plan_refreshes (
+    refresh_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    old_target_sha TEXT NOT NULL,
+    new_target_sha TEXT NOT NULL,
+    old_head_sha TEXT NOT NULL,
+    new_head_sha TEXT NOT NULL,
+    status TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0
+);
+
+-- Immutable identity journal for remote review webhooks or polling records.
+-- The source adapter owns interpretation; this table only prevents a replay
+-- from creating a second correction item.
+CREATE TABLE IF NOT EXISTS remote_review_events (
+    source TEXT NOT NULL,
+    remote_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    disposition TEXT NOT NULL,
+    status TEXT NOT NULL,
+    correction_item_id TEXT,
+    received_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (source, remote_id)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key     TEXT PRIMARY KEY,
     value   TEXT NOT NULL,
@@ -227,6 +299,7 @@ CREATE TABLE IF NOT EXISTS control (
 -- same thing after a week.
 CREATE TABLE IF NOT EXISTS abandoned_sessions (
     session_id  TEXT PRIMARY KEY,
+    project_id  TEXT,
     item_id     TEXT NOT NULL,
     reason      TEXT,
     session_url TEXT,
@@ -420,6 +493,7 @@ class Project:
     #: ever, and "unlimited" is not a safe reading of "nobody said".
     max_hold_seconds: float = DEFAULT_MAX_HOLD_SECONDS
     plan_path: str | None = None
+    plan_branch: str | None = None
     roles: dict[str, Any] | None = None
     max_workers: int = 1
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
@@ -582,6 +656,7 @@ class WorkQueue:
                     base_branch TEXT NOT NULL DEFAULT 'main',
                     checks      TEXT NOT NULL DEFAULT '[]',
                     plan_path   TEXT,
+                    plan_branch TEXT,
                     roles       TEXT,
                     max_workers INTEGER NOT NULL DEFAULT 1,
                     created_at  REAL NOT NULL DEFAULT 0,
@@ -621,6 +696,7 @@ class WorkQueue:
             "max_item_seconds": "REAL NOT NULL DEFAULT 0",
             "max_item_spend_usd": "REAL NOT NULL DEFAULT 0",
             "max_hold_seconds": "REAL NOT NULL DEFAULT 21600",
+            "plan_branch": "TEXT",
         },
         # Stage G. Additive, so a rollback to an older build still reads every
         # column it knows and simply ignores this one. The migration plan is
@@ -646,6 +722,12 @@ class WorkQueue:
             # #182, additive: every existing item produces a diff, which is
             # what it always did.
             "deliverable": "TEXT NOT NULL DEFAULT 'code'",
+        },
+        "abandoned_sessions": {
+            "project_id": "TEXT",
+        },
+        "plan_promotions": {
+            "item_sha": "TEXT",
         },
     }
 
@@ -751,9 +833,9 @@ class WorkQueue:
             conn.execute(
                 "INSERT INTO projects (project_id, name, repo, work_dir, base_branch, "
                 "checks, fixes, apply_fixes, durability, max_item_seconds, max_item_spend_usd, "
-                "max_hold_seconds, plan_path, roles, max_workers, max_attempts, "
+                "max_hold_seconds, plan_path, plan_branch, roles, max_workers, max_attempts, "
                 "min_free_disk_gb, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(project_id) DO UPDATE SET "
                 "name=excluded.name, repo=excluded.repo, work_dir=excluded.work_dir, "
                 "base_branch=excluded.base_branch, checks=excluded.checks, "
@@ -763,6 +845,7 @@ class WorkQueue:
                 "max_item_spend_usd=excluded.max_item_spend_usd, "
                 "max_hold_seconds=excluded.max_hold_seconds, "
                 "plan_path=excluded.plan_path, roles=excluded.roles, "
+                "plan_branch=excluded.plan_branch, "
                 "max_workers=excluded.max_workers, max_attempts=excluded.max_attempts, "
                 "min_free_disk_gb=excluded.min_free_disk_gb, "
                 "updated_at=excluded.updated_at",
@@ -780,6 +863,7 @@ class WorkQueue:
                     project.max_item_spend_usd,
                     project.max_hold_seconds,
                     project.plan_path,
+                    project.plan_branch,
                     json.dumps(project.roles) if project.roles else None,
                     project.max_workers,
                     project.max_attempts,
@@ -794,6 +878,48 @@ class WorkQueue:
                 "INSERT OR IGNORE INTO control (project_id, state, changed_at) VALUES (?, ?, ?)",
                 (project.project_id, STOPPED, self.now()),
             )
+        finally:
+            conn.close()
+
+    def update_project(self, project: Project, *, expected_updated_at: float) -> bool:
+        """Replace an existing project only if it is still the reviewed version.
+
+        Browser review is a judgement about exact values. A compare followed
+        by an unconditional update leaves a race for another process between
+        those operations, so the version predicate belongs in the UPDATE.
+        """
+        conn = self._connect()
+        try:
+            changed = conn.execute(
+                "UPDATE projects SET name = ?, repo = ?, work_dir = ?, base_branch = ?, "
+                "checks = ?, fixes = ?, durability = ?, max_item_seconds = ?, "
+                "max_item_spend_usd = ?, max_hold_seconds = ?, plan_path = ?, "
+                "plan_branch = ?, roles = ?, "
+                "max_workers = ?, max_attempts = ?, min_free_disk_gb = ?, updated_at = ? "
+                "WHERE project_id = ? AND updated_at = ?",
+                (
+                    project.name,
+                    project.repo,
+                    project.work_dir,
+                    project.base_branch,
+                    json.dumps(project.checks),
+                    json.dumps(project.fixes),
+                    project.durability,
+                    project.max_item_seconds,
+                    project.max_item_spend_usd,
+                    project.max_hold_seconds,
+                    project.plan_path,
+                    project.plan_branch,
+                    json.dumps(project.roles) if project.roles else None,
+                    project.max_workers,
+                    project.max_attempts,
+                    project.min_free_disk_gb,
+                    self.now(),
+                    project.project_id,
+                    expected_updated_at,
+                ),
+            ).rowcount
+            return changed == 1
         finally:
             conn.close()
 
@@ -813,6 +939,483 @@ class WorkQueue:
                 "SELECT * FROM projects WHERE project_id = ?", (project_id,)
             ).fetchone()
             return Project.from_row(row) if row else None
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------ plan integration
+
+    def plan(self, project_id: str) -> sqlite3.Row | None:
+        conn = self._connect()
+        try:
+            return cast(
+                sqlite3.Row | None,
+                conn.execute(
+                    "SELECT project_id, branch, target_branch, target_sha, head_sha, plan_digest "
+                    "FROM plans WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone(),
+            )
+        finally:
+            conn.close()
+
+    def create_plan(
+        self,
+        project_id: str,
+        *,
+        branch: str,
+        target_branch: str,
+        target_sha: str,
+        head_sha: str,
+        plan_digest: str,
+    ) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO plans (project_id, branch, target_branch, target_sha, head_sha, "
+                "plan_digest, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    project_id,
+                    branch,
+                    target_branch,
+                    target_sha,
+                    head_sha,
+                    plan_digest,
+                    self.now(),
+                    self.now(),
+                ),
+            )
+        finally:
+            conn.close()
+
+    def acquire_plan_promotion_lease(
+        self, project_id: str, owner: str, lease_seconds: float
+    ) -> tuple[bool, float]:
+        """Acquire a cross-process lease for serialized plan integration.
+
+        The compare-and-replace is one immediate SQLite transaction. A live
+        owner cannot be displaced; an expired owner can be taken over after a
+        crash without an operator clearing state.
+        """
+        if lease_seconds <= 0:
+            raise ValueError("plan promotion lease must be positive")
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = self.now()
+            row = conn.execute(
+                "SELECT owner, lease_until FROM plan_promotion_leases WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is not None and row["owner"] != owner and float(row["lease_until"]) > now:
+                conn.rollback()
+                return False, float(row["lease_until"])
+            lease_until = now + lease_seconds
+            conn.execute(
+                "INSERT INTO plan_promotion_leases (project_id, owner, lease_until, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET owner = excluded.owner, "
+                "lease_until = excluded.lease_until, updated_at = excluded.updated_at",
+                (project_id, owner, lease_until, now),
+            )
+            conn.commit()
+            return True, lease_until
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def renew_plan_promotion_lease(self, project_id: str, owner: str, lease_seconds: float) -> bool:
+        """Extend a still-owned promotion lease; false means it was lost."""
+        if lease_seconds <= 0:
+            raise ValueError("plan promotion lease must be positive")
+        conn = self._connect()
+        try:
+            now = self.now()
+            changed = conn.execute(
+                "UPDATE plan_promotion_leases SET lease_until = ?, updated_at = ? "
+                "WHERE project_id = ? AND owner = ? AND lease_until > ?",
+                (now + lease_seconds, now, project_id, owner, now),
+            ).rowcount
+            return changed == 1
+        finally:
+            conn.close()
+
+    def release_plan_promotion_lease(self, project_id: str, owner: str) -> bool:
+        """Release only this coordinator's promotion lease."""
+        conn = self._connect()
+        try:
+            changed = conn.execute(
+                "DELETE FROM plan_promotion_leases WHERE project_id = ? AND owner = ?",
+                (project_id, owner),
+            ).rowcount
+            return changed == 1
+        finally:
+            conn.close()
+
+    def advance_plan(self, project_id: str, head_sha: str) -> None:
+        conn = self._connect()
+        try:
+            changed = conn.execute(
+                "UPDATE plans SET head_sha = ?, updated_at = ? WHERE project_id = ?",
+                (head_sha, self.now(), project_id),
+            ).rowcount
+            if changed != 1:
+                raise KeyError(f"no plan for project {project_id!r}")
+        finally:
+            conn.close()
+
+    def complete_promotion(
+        self,
+        project_id: str,
+        item_id: str,
+        item_branch: str,
+        base_sha: str,
+        old_head_sha: str,
+        new_head_sha: str,
+        promotion_id: int | None = None,
+        detail: str = "",
+    ) -> None:
+        """Commit the plan head and its successful promotion fact together.
+
+        The git ref is advanced before this method is called, but the two
+        durable SQLite projections must still be one fact.  Keeping the
+        ``plans`` update and the successful ``plan_promotions`` row in
+        separate transactions creates a restart window in which a dependent
+        item can see the new head but no promoted prerequisite.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                "UPDATE plans SET head_sha = ?, updated_at = ? "
+                "WHERE project_id = ? AND head_sha = ?",
+                (new_head_sha, self.now(), project_id, old_head_sha),
+            ).rowcount
+            if changed != 1:
+                conn.execute("ROLLBACK")
+                raise KeyError(
+                    f"plan {project_id!r} no longer has head {old_head_sha!r}; "
+                    "promotion must be replayed from its current head"
+                )
+            if promotion_id is None:
+                changed = conn.execute(
+                    "UPDATE plan_promotions SET status = 'promoted', detail = ? "
+                    "WHERE project_id = ? AND item_id = ? AND item_branch = ? "
+                    "AND base_sha = ? AND old_head_sha = ? AND new_head_sha = ? "
+                    "AND status = 'applying'",
+                    (
+                        detail,
+                        project_id,
+                        item_id,
+                        item_branch,
+                        base_sha,
+                        old_head_sha,
+                        new_head_sha,
+                    ),
+                ).rowcount
+            else:
+                changed = conn.execute(
+                    "UPDATE plan_promotions SET status = 'promoted', detail = ? "
+                    "WHERE promotion_id = ? AND project_id = ? AND status = 'applying'",
+                    (detail, promotion_id, project_id),
+                ).rowcount
+            if changed != 1:
+                conn.execute("ROLLBACK")
+                raise KeyError("no matching in-progress promotion to complete")
+            conn.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
+
+    def begin_promotion(
+        self,
+        project_id: str,
+        item_id: str,
+        item_branch: str,
+        base_sha: str,
+        old_head_sha: str,
+        new_head_sha: str,
+        item_sha: str | None = None,
+    ) -> int:
+        """Durably record the Git ref update that is about to happen."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT head_sha FROM plans WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            if row is None or row["head_sha"] != old_head_sha:
+                conn.execute("ROLLBACK")
+                raise KeyError("plan head changed before promotion began")
+            cursor = conn.execute(
+                "INSERT INTO plan_promotions (project_id, item_id, item_branch, base_sha, "
+                "item_sha, old_head_sha, new_head_sha, status, detail, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'applying', '', ?)",
+                (
+                    project_id,
+                    item_id,
+                    item_branch,
+                    base_sha,
+                    item_sha,
+                    old_head_sha,
+                    new_head_sha,
+                    self.now(),
+                ),
+            )
+            conn.execute("COMMIT")
+            if cursor.lastrowid is None:
+                raise RuntimeError("SQLite did not return the promotion id")
+            return cursor.lastrowid
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
+
+    def in_progress_promotions(self, project_id: str) -> list[sqlite3.Row]:
+        conn = self._connect()
+        try:
+            return cast(
+                list[sqlite3.Row],
+                conn.execute(
+                    "SELECT * FROM plan_promotions WHERE project_id = ? "
+                    "AND status = 'applying' ORDER BY promotion_id",
+                    (project_id,),
+                ).fetchall(),
+            )
+        finally:
+            conn.close()
+
+    def promotion(self, promotion_id: int) -> sqlite3.Row | None:
+        """Return one durable promotion fact by its immutable identity."""
+        conn = self._connect()
+        try:
+            return cast(
+                sqlite3.Row | None,
+                conn.execute(
+                    "SELECT * FROM plan_promotions WHERE promotion_id = ?",
+                    (promotion_id,),
+                ).fetchone(),
+            )
+        finally:
+            conn.close()
+
+    def finish_promotion(self, promotion_id: int, status: str, detail: str) -> None:
+        """Close an interrupted promotion without claiming success."""
+        conn = self._connect()
+        try:
+            changed = conn.execute(
+                "UPDATE plan_promotions SET status = ?, detail = ? "
+                "WHERE promotion_id = ? AND status = 'applying'",
+                (status, detail, promotion_id),
+            ).rowcount
+            if changed != 1:
+                raise KeyError(f"no in-progress promotion {promotion_id}")
+        finally:
+            conn.close()
+
+    def record_promotion(
+        self,
+        project_id: str,
+        item_id: str,
+        item_branch: str,
+        base_sha: str,
+        old_head_sha: str,
+        new_head_sha: str | None,
+        status: str,
+        detail: str = "",
+        item_sha: str | None = None,
+    ) -> int:
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                "INSERT INTO plan_promotions (project_id, item_id, item_branch, base_sha, "
+                "item_sha, old_head_sha, new_head_sha, status, detail, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    project_id,
+                    item_id,
+                    item_branch,
+                    base_sha,
+                    item_sha,
+                    old_head_sha,
+                    new_head_sha,
+                    status,
+                    detail,
+                    self.now(),
+                ),
+            )
+            if cursor.lastrowid is None:
+                raise RuntimeError("SQLite did not return the promotion id")
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+    def successful_promotions(self, project_id: str) -> list[sqlite3.Row]:
+        conn = self._connect()
+        try:
+            return cast(
+                list[sqlite3.Row],
+                conn.execute(
+                    "SELECT * FROM plan_promotions WHERE project_id = ? "
+                    "AND status = 'promoted' ORDER BY promotion_id",
+                    (project_id,),
+                ).fetchall(),
+            )
+        finally:
+            conn.close()
+
+    def begin_refresh(
+        self,
+        project_id: str,
+        old_target_sha: str,
+        new_target_sha: str,
+        old_head_sha: str,
+        new_head_sha: str,
+    ) -> int:
+        """Journal a plan rebuild before changing its Git ref."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT target_sha, head_sha FROM plans WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["target_sha"] != old_target_sha
+                or row["head_sha"] != old_head_sha
+            ):
+                conn.execute("ROLLBACK")
+                raise KeyError("plan changed before refresh began")
+            cursor = conn.execute(
+                "INSERT INTO plan_refreshes (project_id, old_target_sha, new_target_sha, "
+                "old_head_sha, new_head_sha, status, detail, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 'applying', '', ?)",
+                (
+                    project_id,
+                    old_target_sha,
+                    new_target_sha,
+                    old_head_sha,
+                    new_head_sha,
+                    self.now(),
+                ),
+            )
+            conn.execute("COMMIT")
+            if cursor.lastrowid is None:
+                raise RuntimeError("SQLite did not return the refresh id")
+            return cursor.lastrowid
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
+
+    def set_refresh_head(self, refresh_id: int, new_head_sha: str) -> None:
+        """Durably set the ref value before the Git ref update is attempted."""
+        conn = self._connect()
+        try:
+            changed = conn.execute(
+                "UPDATE plan_refreshes SET new_head_sha = ? "
+                "WHERE refresh_id = ? AND status = 'applying'",
+                (new_head_sha, refresh_id),
+            ).rowcount
+            if changed != 1:
+                raise KeyError(f"no in-progress refresh {refresh_id}")
+        finally:
+            conn.close()
+
+    def complete_refresh(
+        self,
+        refresh_id: int,
+        project_id: str,
+        old_target_sha: str,
+        new_target_sha: str,
+        old_head_sha: str,
+        new_head_sha: str,
+        detail: str = "",
+    ) -> None:
+        """Commit a rebuilt Git ref and plan projection together."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                "UPDATE plans SET target_sha = ?, head_sha = ?, updated_at = ? "
+                "WHERE project_id = ? AND target_sha = ? AND head_sha = ?",
+                (
+                    new_target_sha,
+                    new_head_sha,
+                    self.now(),
+                    project_id,
+                    old_target_sha,
+                    old_head_sha,
+                ),
+            ).rowcount
+            if changed != 1:
+                conn.execute("ROLLBACK")
+                raise KeyError("plan changed before refresh completed")
+            changed = conn.execute(
+                "UPDATE plan_refreshes SET status = 'refreshed', detail = ? "
+                "WHERE refresh_id = ? AND project_id = ? AND status = 'applying' "
+                "AND old_target_sha = ? AND new_target_sha = ? AND old_head_sha = ? "
+                "AND new_head_sha = ?",
+                (
+                    detail,
+                    refresh_id,
+                    project_id,
+                    old_target_sha,
+                    new_target_sha,
+                    old_head_sha,
+                    new_head_sha,
+                ),
+            ).rowcount
+            if changed != 1:
+                conn.execute("ROLLBACK")
+                raise KeyError("no matching in-progress refresh to complete")
+            conn.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
+
+    def in_progress_refreshes(self, project_id: str) -> list[sqlite3.Row]:
+        conn = self._connect()
+        try:
+            return cast(
+                list[sqlite3.Row],
+                conn.execute(
+                    "SELECT * FROM plan_refreshes WHERE project_id = ? "
+                    "AND status = 'applying' ORDER BY refresh_id",
+                    (project_id,),
+                ).fetchall(),
+            )
+        finally:
+            conn.close()
+
+    def finish_refresh(self, refresh_id: int, status: str, detail: str) -> None:
+        conn = self._connect()
+        try:
+            changed = conn.execute(
+                "UPDATE plan_refreshes SET status = ?, detail = ? "
+                "WHERE refresh_id = ? AND status = 'applying'",
+                (status, detail, refresh_id),
+            ).rowcount
+            if changed != 1:
+                raise KeyError(f"no in-progress refresh {refresh_id}")
+        finally:
+            conn.close()
+
+    def latest_promotion(self, project_id: str, item_id: str) -> sqlite3.Row | None:
+        conn = self._connect()
+        try:
+            return cast(
+                sqlite3.Row | None,
+                conn.execute(
+                    "SELECT * FROM plan_promotions WHERE project_id = ? AND item_id = ? "
+                    "AND status = 'promoted' ORDER BY promotion_id DESC LIMIT 1",
+                    (project_id, item_id),
+                ).fetchone(),
+            )
         finally:
             conn.close()
 
@@ -913,6 +1516,96 @@ class WorkQueue:
             )
         conn.close()
         return added
+
+    def accept_remote_review(
+        self,
+        *,
+        source: str,
+        remote_id: str,
+        project_id: str,
+        item_id: str,
+        disposition: str,
+        status: str,
+        correction_item_id: str | None,
+        title: str,
+        brief: str,
+        depends_on: list[str],
+        state: str,
+        last_error: str | None,
+        received_at: float | None = None,
+    ) -> tuple[bool, sqlite3.Row | None]:
+        """Record one remote review and its correction projection atomically."""
+        if disposition not in {"actionable", "ambiguous", "already_resolved"}:
+            raise ValueError(f"unknown remote review disposition {disposition!r}")
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO remote_review_events "
+                "(source, remote_id, project_id, item_id, disposition, status, "
+                "correction_item_id, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    source,
+                    remote_id,
+                    project_id,
+                    item_id,
+                    disposition,
+                    status,
+                    correction_item_id,
+                    received_at if received_at is not None else self.now(),
+                ),
+            )
+            if cursor.rowcount == 0:
+                row = conn.execute(
+                    "SELECT status, correction_item_id FROM remote_review_events "
+                    "WHERE source = ? AND remote_id = ?",
+                    (source, remote_id),
+                ).fetchone()
+                conn.execute("COMMIT")
+                return False, row
+            conn.execute(
+                "INSERT OR IGNORE INTO projects (project_id, name, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                (project_id, project_id, self.now(), self.now()),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO control (project_id, state, changed_at) VALUES (?, ?, ?)",
+                (project_id, STOPPED, self.now()),
+            )
+            if correction_item_id is not None:
+                conn.execute(
+                    "INSERT INTO work (project_id, item_id, title, brief, depends_on, state, "
+                    "last_error, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        project_id,
+                        correction_item_id,
+                        title,
+                        brief,
+                        json.dumps(depends_on),
+                        state,
+                        last_error,
+                        self.now(),
+                    ),
+                )
+                self.graph.set_edges(
+                    project_id,
+                    correction_item_id,
+                    WorkRecord(
+                        correction_item_id,
+                        title,
+                        brief=brief,
+                        depends_on=depends_on,
+                    ).dependency_specs(),
+                    conn=conn,
+                )
+            conn.execute("COMMIT")
+            return True, None
+        except Exception:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------ control
 
@@ -1029,6 +1722,37 @@ class WorkQueue:
         finally:
             conn.close()
 
+    def compare_and_set_setting(self, key: str, expected: Any | None, value: Any) -> bool:
+        """Replace a setting only when its complete stored value is unchanged.
+
+        Browser reviews use this instead of comparing a timestamp and then
+        writing in a second transaction.  The immediate transaction makes
+        the comparison and replacement one operation, so an API or CLI edit
+        cannot be overwritten between those two steps.  ``None`` means the
+        setting was absent when reviewed.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            current = json.loads(row["value"]) if row else None
+            if current != expected:
+                conn.rollback()
+                return False
+            conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (key, json.dumps(value), self.now()),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------- claims
 
     def claim(
@@ -1129,6 +1853,11 @@ class WorkQueue:
                     )
                     if not admission.ready:
                         continue
+                    # A plan's graph can say a prerequisite is done before its
+                    # promotion fact is durable.  Do not release a dependent
+                    # into a checkout that cannot contain that prerequisite.
+                    if self._plan_promotion_reasons(conn, record):
+                        continue
                     # D11, resolved 2026-08-04: **a resumed attempt continues
                     # the existing one.** A crash is not a failure of the work,
                     # so re-claiming an item that left a durable position keeps
@@ -1198,7 +1927,94 @@ class WorkQueue:
         is two answers, and the one that disagreed would be the one that let
         ineligible work reach a durable gate.
         """
-        return self.graph.readiness(project_id, item_id)
+        state = self.graph.readiness(project_id, item_id)
+        if not state.ready:
+            return state
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM work WHERE project_id = ? AND item_id = ?",
+                (project_id, item_id),
+            ).fetchone()
+            if row is None:
+                return state
+            reasons = self._plan_promotion_reasons(conn, WorkRecord.from_row(row))
+            if not reasons:
+                return state
+            return Readiness(
+                project_id,
+                item_id,
+                False,
+                state.revision,
+                reasons=(*state.reasons, *reasons),
+                advisory=state.advisory,
+                overridden=state.overridden,
+                override_reason=state.override_reason,
+            )
+        finally:
+            conn.close()
+
+    def _plan_promotion_reasons(
+        self, conn: sqlite3.Connection, record: WorkRecord
+    ) -> tuple[ReadinessReason, ...]:
+        """Require local prerequisites to be promoted before plan admission.
+
+        The dependency graph answers whether prerequisite work is complete;
+        this projection answers whether that completed work is present on the
+        plan's durable integration branch.  It runs inside ``claim``'s write
+        transaction, so a dependent cannot slip in between those two facts.
+        """
+        plan_configured = conn.execute(
+            "SELECT 1 FROM projects WHERE project_id = ? "
+            "AND plan_path IS NOT NULL AND TRIM(plan_path) <> '' "
+            "AND plan_branch IS NOT NULL AND TRIM(plan_branch) <> ''",
+            (record.project_id,),
+        ).fetchone()
+        plan_initialized = conn.execute(
+            "SELECT 1 FROM plans WHERE project_id = ?", (record.project_id,)
+        ).fetchone()
+        if plan_configured is None and plan_initialized is None:
+            return ()
+        reasons: list[ReadinessReason] = []
+        for dependency in record.dependency_specs():
+            if not dependency.required or dependency.target_kind != LOCAL_WORK:
+                continue
+            if plan_initialized is None:
+                reasons.append(
+                    ReadinessReason(
+                        kind="plan_promotion",
+                        explanation=(
+                            f"local work target {dependency.target_id!r} cannot be released "
+                            "until the configured plan branch is initialized"
+                        ),
+                        target_kind=dependency.target_kind,
+                        target_id=dependency.target_id,
+                        state="blocked",
+                        evidence="durable plan identity is absent",
+                    )
+                )
+                continue
+            promoted = conn.execute(
+                "SELECT 1 FROM plan_promotions WHERE project_id = ? AND item_id = ? "
+                "AND status = 'promoted' LIMIT 1",
+                (record.project_id, dependency.target_id),
+            ).fetchone()
+            if promoted is not None:
+                continue
+            reasons.append(
+                ReadinessReason(
+                    kind="plan_promotion",
+                    explanation=(
+                        f"local work target {dependency.target_id!r} is complete but "
+                        "has not been promoted to the local plan branch"
+                    ),
+                    target_kind=dependency.target_kind,
+                    target_id=dependency.target_id,
+                    state="blocked",
+                    evidence="promotion record is absent",
+                )
+            )
+        return tuple(reasons)
 
     def unmet_dependencies(self, item_id: str, *, project_id: str = DEFAULT_PROJECT) -> list[str]:
         """Required targets of an item that are not satisfied, right now.
@@ -1429,6 +2245,51 @@ class WorkQueue:
             conn.close()
         return hold
 
+    def hold_pending(
+        self,
+        item_id: str,
+        *,
+        question: str,
+        reason: str = "",
+        project_id: str = DEFAULT_PROJECT,
+        max_seconds: float | None = None,
+    ) -> Hold:
+        """Open a human hold before a worker exists.
+
+        Remote review can be ambiguous before correction work is claimable.
+        This narrow path is distinct from ``hold``: it accepts only a pending
+        or blocked correction item, gives it no worker owner, and answering
+        returns it to ``pending`` so a later worker can claim it.
+        """
+        record = self.get(item_id, project_id=project_id)
+        if record is None:
+            raise HoldError(f"no item {item_id!r} in project {project_id!r}")
+        if record.state not in {PENDING, BLOCKED}:
+            raise HoldError(f"{item_id} is {record.state!r}, not a waiting correction item")
+        project = self.get_project(project_id)
+        limit = (
+            max_seconds
+            if max_seconds is not None
+            else float(getattr(project, "max_hold_seconds", DEFAULT_MAX_HOLD_SECONDS) or 0.0)
+        )
+        hold = self.holds.open(
+            project_id,
+            item_id,
+            question=question,
+            reason=reason,
+            max_seconds=limit,
+        )
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE work SET state = ?, owner = NULL, lease_until = 0, held_until = ?, "
+                "updated_at = ? WHERE project_id = ? AND item_id = ? AND state IN (?, ?)",
+                (HELD, hold.expires_at, self.now(), project_id, item_id, PENDING, BLOCKED),
+            )
+        finally:
+            conn.close()
+        return hold
+
     def answer_hold(
         self,
         item_id: str,
@@ -1457,7 +2318,14 @@ class WorkQueue:
             conn.execute(
                 "UPDATE work SET state = ?, lease_until = ?, held_until = 0, updated_at = ? "
                 "WHERE project_id = ? AND item_id = ? AND state = ?",
-                (CLAIMED, now + self.lease_seconds, now, project_id, item_id, HELD),
+                (
+                    CLAIMED if hold.owner else PENDING,
+                    now + self.lease_seconds if hold.owner else 0,
+                    now,
+                    project_id,
+                    item_id,
+                    HELD,
+                ),
             )
         finally:
             conn.close()
@@ -1729,6 +2597,7 @@ class WorkQueue:
         session_id: str,
         item_id: str,
         *,
+        project_id: str | None = None,
         reason: str | None = None,
         session_url: str | None = None,
     ) -> None:
@@ -1742,8 +2611,9 @@ class WorkQueue:
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO abandoned_sessions "
-                "(session_id, item_id, reason, session_url, abandoned_at) VALUES (?, ?, ?, ?, ?)",
-                (session_id, item_id, reason, session_url, self.now()),
+                "(session_id, project_id, item_id, reason, session_url, abandoned_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, project_id, item_id, reason, session_url, self.now()),
             )
         finally:
             conn.close()

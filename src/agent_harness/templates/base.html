@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="description" content="agent-harness operator control plane">
+    <link rel="stylesheet" href="{{ root_path }}/assets/app.css">
+    <script src="{{ root_path }}/assets/htmx.min.js" defer></script>
+    <script src="{{ root_path }}/assets/app.js" defer></script>
+    <title>{{ title|default('agent-harness') }} · agent-harness</title>
+  </head>
+  <body>
+    {% if session %}
+      <header class="topbar">
+        <a class="brand" href="{{ url_for('projects') }}">agent-harness</a>
+        <nav aria-label="Primary">
+          <a href="{{ url_for('projects') }}">Projects</a>
+          <a href="{{ url_for('work_page') }}">Work</a>
+          <a href="{{ url_for('holds') }}">Holds</a>
+          <a href="{{ url_for('events') }}">Events</a>
+          <a href="{{ url_for('analytics') }}">Analytics</a>
+          <a href="{{ url_for('workers') }}">Workers</a>
+          <a href="{{ url_for('plans') }}">Plans</a>
+          <a href="{{ url_for('graph') }}">Graph</a>
+          <a href="{{ url_for('sessions') }}">Sessions</a>
+          <a href="{{ url_for('settings') }}">Settings</a>
+        </nav>
+        <form method="post" action="{{ url_for('logout') }}" data-csrf-form>
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+          <button class="quiet" type="submit">Log out</button>
+        </form>
+      </header>
+      <div class="statusline" role="status">
+        <span class="live-dot" aria-hidden="true"></span>
+        <span id="connection-status">Connected to this harness</span>
+        <span class="operator">Signed in as {{ session.operator }}</span>
+      </div>
+    {% endif %}
+    <main class="page" id="main-content">
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

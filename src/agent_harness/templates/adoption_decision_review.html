@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Human adoption gate</p><h1>Review adoption decision</h1></div><span class="mode-badge">{{ decision }}</span></div>
+  <section class="card">
+    <p><strong>Project:</strong> {{ project_id }}<br><strong>Resolved checkout:</strong> <span class="mono">{{ report.repository }}</span><br><strong>Reason:</strong> {{ reason }}</p>
+    <p class="alert warning">No queue row or remote resource has changed. This step records only the human decision; reconciliation is a separate reviewed action.</p>
+    <table><thead><tr><th>Item</th><th>Proposal</th><th>Decision effect</th></tr></thead><tbody>{% for item in report.items %}<tr><td>{{ item.item_id }} — {{ item.title }}</td><td>{{ item.proposed_state }}</td><td>{% if item.item_id in approved_drops %}Explicitly allowed to enter as done{% elif item.requires_drop_approval %}Not approved as done; remains pending{% else %}No drop proposed{% endif %}</td></tr>{% endfor %}</tbody></table>
+    <form method="post" action="{{ url_for('adoption_decision_apply') }}" data-csrf-form><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}"><input type="hidden" name="review_id" value="{{ review.review_id }}"><button type="submit">Confirm {{ decision }}</button></form>
+  </section>
+{% endblock %}

@@ -54,8 +54,10 @@ from pathlib import Path
 from typing import Any
 
 from ..budgets import Budget, Spend
+from ..execution_environment import ExecutionEnvironment, LocalExecutionEnvironment
 from ..guard import CommandGuard, CommandRefused, Refusal
 from ..model_client import ModelClient
+from ..role_runners import API_VERSION, RoleRunRequest, RoleRunResult
 
 #: The role this loop's calls are billed and routed under. The same name the
 #: direct executor uses, so a deployment does not have to configure a second
@@ -433,9 +435,18 @@ def _segments(command: str, depth: int = 0) -> list[list[str]]:
     return out
 
 
-#: Roles a chat-completions endpoint defines. The loop uses `exit` for its own
-#: bookkeeping, which is its business and not a role any API knows.
-_WIRE_ROLES = frozenset({"system", "user", "assistant", "tool"})
+#: Roles a chat-completions endpoint defines **and this function can emit
+#: validly**. The loop uses `exit` for its own bookkeeping, which is its
+#: business and not a role any API knows.
+#:
+#: `tool` is deliberately absent even though endpoints define it. A `tool`
+#: message must carry the `tool_call_id` it answers, and `_for_the_wire`
+#: reduces every message to `role` and `content` — so passing one through
+#: would send a malformed request whose refusal names no message, the exact
+#: shape that cost a live run. An observation goes back as a `user` turn
+#: instead: the pairing is lost, which costs nothing while there is one tool,
+#: and the conversation stays valid.
+_WIRE_ROLES = frozenset({"system", "user", "assistant"})
 
 
 def _for_the_wire(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
@@ -578,10 +589,9 @@ class HarnessModel:
     client: ModelClient
     role: str = IMPLEMENTER
     #: What the loop reports it has spent, and what its own `cost_limit` reads.
-    #: It stayed at 0.0 for the life of a run, so the loop's spend ceiling --
-    #: theirs, defaulting to 3.0 -- could never fire and the only bound on a
-    #: run was the step count. `ModelClient` still owns real pricing and the
-    #: audit; this is that number, folded in per call.
+    #: The harness supplies that limit explicitly (zero when the item is
+    #: unlimited), while `ModelClient` owns real pricing and the audit; this is
+    #: that number, folded in per call.
     cost: float = 0.0
     #: Priced and unpriced calls, kept apart. **Unknown cost is not zero cost**
     #: (`budgets.py`): while `unpriced` is non-zero, `cost` is a LOWER BOUND,
@@ -589,6 +599,7 @@ class HarnessModel:
     spend: Spend = field(default_factory=Spend)
     n_calls: int = 0
     config: Any = None
+    environment: ExecutionEnvironment | None = None
     #: Theirs, read from the same config the prompts come from. Hand-copied,
     #: these drifted: the error template told a model on the *tool call* path
     #: to "provide EXACTLY ONE action in triple backticks" -- the text
@@ -600,6 +611,10 @@ class HarnessModel:
     observation_template: str = field(
         default_factory=lambda: _bundled_model("observation_template")
     )
+    #: Per-call accounting owned by the caller. Reporting only when the loop
+    #: returns loses every call made before a policy refusal or provider
+    #: exception, which is exactly when an item most needs an honest total.
+    on_usage: Callable[[Spend], None] | None = None
 
     def query(self, messages: list[dict[str, str]], **kwargs: Any) -> dict[str, Any]:
         """One turn, as a tool call.
@@ -659,13 +674,15 @@ class HarnessModel:
         which is the honest shape: the loop's ceiling is then a lower bound and
         `measurable` says so, rather than a zero pretending to be a price.
         """
-        before = self.spend.usd
+        call = Spend()
         try:
-            self.spend.add_call(self.client.usage_for(self.role, body))
+            call.add_call(self.client.usage_for(self.role, body))
         except Exception:  # pragma: no cover - a reader that cannot read
-            self.spend.unpriced += 1
-            return 0.0
-        charged = self.spend.usd - before
+            call.unpriced += 1
+        self.spend.add(call)
+        if self.on_usage is not None:
+            self.on_usage(call)
+        charged = call.usd
         self.cost += charged
         return charged
 
@@ -753,7 +770,16 @@ class HarnessEnvironment:
     #: said so. A deployment passes an event writer here; nothing is imported
     #: to reach one, because core must not learn this adapter's name.
     on_refusal: Callable[[str, Refusal], None] | None = None
+    #: The standalone experiment lets a loop correct a refused command. The
+    #: harness execution path does not: AGENTS.md rules a policy refusal
+    #: terminal, so its runner enables this and the exception reaches the
+    #: executor's existing blocked-by-policy handler.
+    terminal_refusals: bool = False
+    #: Item-scoped command progress. The callback owns persistence; this
+    #: adapter supplies only the command and its eventual return code.
+    on_command: Callable[[str, int | None], None] | None = None
     config: Any = None
+    environment: ExecutionEnvironment | None = None
 
     def execute(self, action: dict[str, Any], cwd: str = "") -> dict[str, Any]:
         import subprocess
@@ -766,15 +792,12 @@ class HarnessEnvironment:
         except CommandRefused as refused:
             return self._refuse(str(command), refused)
 
+        if self.on_command is not None:
+            self.on_command(str(command), None)
+
+        backend = self.environment or LocalExecutionEnvironment(self.repo)
         try:
-            result = subprocess.run(  # noqa: S602 - screened above, agent-supplied by design
-                str(command),
-                shell=True,
-                cwd=where,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
+            result = backend.run(str(command), cwd=where, timeout=self.timeout)
         except subprocess.TimeoutExpired as expired:
             # Unhandled, this left `execute` as a `TimeoutExpired` that the
             # loop does not catch: `DefaultAgent.run` records an exit message
@@ -783,8 +806,23 @@ class HarnessEnvironment:
             # instead, in the shape it reads every other result in, and can
             # run something cheaper.
             partial = _text(expired.stdout) + _text(expired.stderr)
-            return {
+            timed_out = {
                 "output": _bounded(partial),
+                "returncode": TIMED_OUT,
+                "exception_info": (
+                    f"the command was killed after {self.timeout}s by this "
+                    "deployment's command timeout; any output above is partial"
+                ),
+            }
+            if self.on_command is not None:
+                self.on_command(str(command), TIMED_OUT)
+            return timed_out
+
+        if result.timed_out:
+            if self.on_command is not None:
+                self.on_command(str(command), TIMED_OUT)
+            return {
+                "output": _bounded(result.stdout + result.stderr),
                 "returncode": TIMED_OUT,
                 "exception_info": (
                     f"the command was killed after {self.timeout}s by this "
@@ -793,6 +831,8 @@ class HarnessEnvironment:
             }
 
         full = result.stdout + result.stderr
+        if self.on_command is not None:
+            self.on_command(str(command), result.returncode)
         # Checked on the WHOLE output, then truncated for the model. The marker
         # has to be the first line, and keeping the last 32k of a command that
         # printed it and then a lot else threw it away -- an agent that had
@@ -822,6 +862,8 @@ class HarnessEnvironment:
         self.refused.append(refused.refusal)
         if self.on_refusal is not None:
             self.on_refusal(command, refused.refusal)
+        if self.terminal_refusals:
+            raise refused
         return {
             "output": (
                 f"REFUSED by this deployment's command policy: {refused}\n"
@@ -873,14 +915,8 @@ class HarnessEnvironment:
         curated: the templates are theirs, and guessing which variables they
         will reference next is how this breaks again on an upgrade.
         """
-        import platform
-
-        return {
-            **platform.uname()._asdict(),
-            **os.environ,
-            "cwd": str(self.repo),
-            **kwargs,
-        }
+        backend = self.environment or LocalExecutionEnvironment(self.repo)
+        return {**backend.template_vars(), **kwargs}
 
     def serialize(self) -> dict[str, Any]:
         """What the trajectory keeps. The refusals themselves, not a count.
@@ -910,6 +946,10 @@ def build(
     budget: Budget | None = None,
     timeout: int = 300,
     on_refusal: Callable[[str, Refusal], None] | None = None,
+    terminal_refusals: bool = False,
+    on_command: Callable[[str, int | None], None] | None = None,
+    on_usage: Callable[[Spend], None] | None = None,
+    environment: ExecutionEnvironment | None = None,
 ) -> Any:
     """A loop wired to this harness's client, guard and budget.
 
@@ -928,22 +968,148 @@ def build(
     (`HarnessModel.spend`), so it can fail to fire and cannot fire early.
     """
     agent_class = _require()
+
+    class BudgetAwareAgent(agent_class):  # type: ignore[misc, valid-type]
+        """Keep an unknown-cost loop from enforcing a known-cost subtotal."""
+
+        def query(self) -> dict[str, Any]:
+            # mini-swe-agent compares its numeric ``cost`` with ``cost_limit``.
+            # Once one call is unpriced that number is only a lower bound, and
+            # budgets.py forbids stopping an item on a number nobody can
+            # defend. Disable only the dollar limit; step and wall-clock
+            # limits remain emergency controls, and the harness reports the
+            # unenforceable spend ceiling at its next boundary.
+            if self.model.spend.unpriced:
+                self.config.cost_limit = 0.0
+            return super().query()  # type: ignore[no-any-return]
+
     prompts = bundled()["agent"]
     limits: dict[str, Any] = {}
     if budget is not None and budget.seconds:
-        limits["wall_time_limit_seconds"] = int(budget.seconds)
-    if budget is not None and budget.spend_usd:
-        limits["cost_limit"] = float(budget.spend_usd)
-    return agent_class(
-        HarnessModel(client=client, role=role),
+        # Zero means unlimited to the loop, so a positive sub-second remainder
+        # must round up rather than silently remove the ceiling.
+        import math
+
+        limits["wall_time_limit_seconds"] = max(1, math.ceil(budget.seconds))
+    # mini-swe-agent's own default is a finite dollar limit. The harness owns
+    # the item budget, whose default is unlimited, so never let an adapter
+    # default silently become a second ceiling.
+    limits["cost_limit"] = (
+        float(budget.spend_usd) if budget is not None and budget.spend_usd else 0.0
+    )
+    return BudgetAwareAgent(
+        HarnessModel(client=client, role=role, on_usage=on_usage),
         HarnessEnvironment(
             repo=repo,
             guard=guard or CommandGuard(),
             timeout=timeout,
             on_refusal=on_refusal,
+            terminal_refusals=terminal_refusals,
+            on_command=on_command,
+            environment=environment,
         ),
         system_template=prompts["system_template"],
         instance_template=prompts["instance_template"],
         step_limit=step_limit,
         **limits,
     )
+
+
+@dataclass(frozen=True)
+class MiniSweRoleRunner:
+    """The installed adapter for core's generic role-runner contract."""
+
+    name: str = "agent-loop"
+    api_version: int = API_VERSION
+
+    @property
+    def version(self) -> str:
+        from importlib.metadata import version
+
+        return version("mini-swe-agent")
+
+    def run(self, request: RoleRunRequest, /) -> RoleRunResult:
+        if not request.writable:
+            raise ValueError("this runner adapter does not yet provide a read-only environment")
+
+        commands = 0
+
+        def command(line: str, returncode: int | None) -> None:
+            nonlocal commands
+            if returncode is None:
+                commands += 1
+            if request.report is not None:
+                request.report(
+                    "runner_command_started" if returncode is None else "runner_command_finished",
+                    line,
+                    {"command_index": commands, "returncode": returncode},
+                )
+
+        def refused(line: str, refusal: Refusal) -> None:
+            if request.report is not None:
+                request.report("runner_command_refused", line, {"refusal": refusal.as_dict()})
+
+        if request.report is not None:
+            request.report(
+                "runner_started",
+                f"{self.name} {self.version} running {request.role}",
+                {
+                    "role": request.role,
+                    "step_limit": request.step_limit,
+                    "budget": request.budget.as_dict(),
+                    "writable": request.writable,
+                    "environment": (
+                        dict(request.environment.describe())
+                        if request.environment is not None
+                        else {"backend": "host", "security_boundary": "none; compatibility backend"}
+                    ),
+                },
+            )
+        agent = build(
+            request.client,
+            request.repo,
+            guard=request.guard,
+            step_limit=request.step_limit,
+            role=request.role,
+            budget=request.budget,
+            timeout=request.command_timeout,
+            on_refusal=refused,
+            terminal_refusals=True,
+            on_command=command,
+            on_usage=request.account,
+            environment=request.environment,
+        )
+        raw = agent.run(
+            request.task,
+            project_id=request.project_id,
+            item_id=request.item_id,
+            attempt=request.attempt,
+        )
+        exit_status = str(raw.get("exit_status") or "")
+        normalized = exit_status
+        if exit_status == "Submitted":
+            normalized = "completed"
+        elif exit_status == "TimeExceeded":
+            normalized = "wall_clock_limit"
+        elif exit_status == "LimitsExceeded":
+            cost_limit = float(getattr(agent.config, "cost_limit", 0.0) or 0.0)
+            spent_out = bool(cost_limit and agent.model.cost >= cost_limit)
+            normalized = "spend_limit" if spent_out else "step_limit"
+        elif not exit_status:
+            normalized = "failed"
+        result = RoleRunResult(
+            exit_status=normalized,
+            submission=str(raw.get("submission") or ""),
+            calls=int(agent.model.n_calls),
+            spend=agent.model.spend,
+        )
+        if request.report is not None:
+            request.report(
+                "runner_finished",
+                normalized,
+                {"calls": result.calls, "commands": commands, "spend": result.spend.as_dict()},
+            )
+        return result
+
+
+RUNNER = MiniSweRoleRunner()

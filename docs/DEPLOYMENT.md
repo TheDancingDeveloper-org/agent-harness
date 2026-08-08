@@ -1,21 +1,21 @@
 # Deploying `agent-harness serve`
 
-The contract between whatever starts this process — systemd, a compose file,
-a Kubernetes manifest, a session host's supervisor — and what the service can
-then actually do.
+The contract between whatever starts this process — systemd, a compose file or
+a Kubernetes manifest — and what the service can then actually do. The JSON API
+and browser GUI are served directly; no host application is required.
 
-There are **two supported modes**, and the difference is deliberate rather
+There are **three supported modes**, and the difference is deliberate rather
 than a degraded state:
 
-| | Monitoring-only | Supervised |
-|---|---|---|
-| Flags | `--db`, `--host`, `--port`, `--root-path` | those, plus `--session-host`, `--agent`, `--reviewer`, `--endpoint` |
-| Reads (work, events, audit, projects) | yes | yes |
-| `POST /api/projects/{id}/start` | **refuses, by design** | starts real workers, after preflight |
-| Who it is for | a dashboard over someone else's harness | the deployment that does the work |
+| | Monitoring-only | Local fleet | Supervised |
+|---|---|---|---|
+| Flags | `--db`, `--host`, `--port`, `--root-path` | those, plus `--role-runner`, `--environment-backend`, `--environment-image`, and model routes | those, plus `--session-host`, `--agent`, `--reviewer`, `--endpoint` |
+| Reads (work, events, audit, projects) | yes | yes | yes |
+| `POST /api/projects/{id}/start` | **refuses, by design** | starts local workers, after preflight | starts session workers, after preflight |
+| Who it is for | a dashboard over someone else's harness | the deployment that does the work without a session host | the deployment that delegates execution to a session host |
 
 The trap this document exists to close: **a monitoring-only process is
-healthy.** `/healthz` returns `ok`, the API answers, the Work tab renders a
+healthy.** `/healthz` returns `ok`, the API answers, the GUI renders a
 backlog — and nothing can execute a single item. A process manager started
 with only the monitoring arguments produces exactly that, and nothing about it
 looks wrong until someone presses start.
@@ -80,13 +80,105 @@ agent-harness --db /var/lib/harness/harness.sqlite serve \
 The process says so on startup:
 
 ```
-monitoring only: no --session-host, so no worker pool is attached and
+monitoring only: no executor is configured, so no worker pool is attached and
 starting a project will be refused.
 ```
 
 `start` returning **409** here is correct behaviour and not something to work
 around. Marking a project `running` with nothing able to claim is the failure
 this refusal exists to prevent.
+
+## Local in-process execution
+
+This mode owns the worker pool in `serve`. It does not require AIDevEnv, a
+terminal session host or a local provider CLI process. The role runner and
+item execution backend are selected through installed metadata; the backend
+must be configured explicitly and ready before the service starts.
+
+```bash
+export HARNESS_TOKEN=…
+export HARNESS_API_KEY=…
+
+agent-harness --db /var/lib/harness/harness.sqlite serve \
+    --role-runner agent-loop \
+    --environment-backend docker \
+    --environment-image registry.example/project-toolchain@sha256:… \
+    --planner claude-sonnet-4-6 \
+    --implementer claude-sonnet-4-6 \
+    --reviewer claude-sonnet-4-6 \
+    --endpoint https://api.your-gateway.example
+```
+
+Local mode does not publish a remote branch. It runs the existing checks,
+checkpoint and reviewer gates and keeps the result local until plan
+integration is implemented. `/api/readiness` reports `mode: local` and the
+execution backend as the capability that makes starting possible.
+
+---
+
+## Containerised execution: a controller and its own daemon
+
+The reference deployment of local in-process execution runs the controller as
+a container beside a **dedicated** Docker daemon, rather than against the
+host's. `Dockerfile` builds it and `indexarr/ops` `personal/agent-harness`
+holds the deployed shape.
+
+The controller is not an agent sandbox. It holds the queue, the gates, the
+model client and every credential; it creates one disposable container per
+item through the selected backend and runs no agent command itself. That is
+why it carries the Docker CLI but no Docker socket: the daemon arrives at
+runtime through `DOCKER_HOST`.
+
+```yaml
+agent-harness-docker:          # privileged, internal network, nothing published
+  image: docker:28-dind
+  volumes: [harness-work:/harness/work]
+
+agent-harness:
+  environment:
+    DOCKER_HOST: tcp://agent-harness-docker:2375
+  volumes: [harness-work:/harness/work]
+```
+
+### The identical-path constraint
+
+**A bind mount is resolved by the daemon that creates the container, not by
+the client that asks for it.** The backend creates each item container with
+`-v <worktree>:/workspace` using the controller's own path. If the daemon does
+not know that exact path, Docker does not fail — it creates an empty directory
+and mounts that. Every agent then gets an empty checkout, and the failure
+looks like a model that could not find the code rather than a mount that was
+never there. This repository has already paid once for a stale-worktree defect
+that blamed the model for four passes (#216); this is the same failure wearing
+a different hat.
+
+So: the worktree volume is mounted at the **same path in both containers**,
+and every project's `work_dir` must be registered underneath it. Registering a
+project anywhere else is not a configuration preference — it is a silent
+outage.
+
+The same reasoning rules out running the live execution tests on the
+`docker`/`publish` CI runners. Those talk to a separate DinD container over
+`DOCKER_HOST` with no shared volume, so a bind mount from the job's workspace
+resolves to nothing on the daemon's side. Acceptance runs against the deployed
+stack's own daemon instead:
+
+```bash
+# Komodo, POST /execute/RunStackService, then poll /read/GetUpdate.
+{"stack": "personal-agent-harness", "service": "agent-harness-tests"}
+```
+
+### Why not the host socket
+
+Mounting `/var/run/docker.sock` into the controller is simpler and was
+rejected. The socket is root-equivalent on the deploy host, and it would make
+every agent sandbox a sibling of every other stack on that machine. A nested
+daemon on an internal network gives the controller exactly one thing it can
+reach and nothing on the host, which is what `STATUS.md` §2.7 asks for.
+
+The nested daemon is `privileged: true`, which is a real cost and is confined
+deliberately: it publishes no port and sits on an `internal: true` network
+whose only other member is the controller.
 
 ---
 
@@ -109,8 +201,8 @@ agent-harness --db /var/lib/harness/harness.sqlite serve \
 What the deployment must provide, and why each one:
 
 | Requirement | Why |
-|---|---|
-| `--session-host` reachable, and `AIDEVENV_TOKEN` accepted by it | Agents run as terminal sessions on it. Without it there is no worker pool and `start` refuses. |
+|---|---|---|---|
+| `--session-host` reachable, and `AIDEVENV_TOKEN` accepted by it | Required only for supervised session execution. A local fleet uses the role-runner and execution-backend requirements instead. |
 | `--agent` runnable **in the session host's environment**, with the credentials it needs to clone, commit and push | The agent — not the harness — does the implementing. Its environment is where `git` and `gh` credentials have to be. The harness never injects them. |
 | `gh` authenticated with **push** permission on each project's repo | Preflight asks GitHub for `permissions.push` rather than looking for a token: a token that exists and lacks the scope fails at the point where an agent has already done the work. |
 | `--reviewer` + `--endpoint`, and `HARNESS_API_KEY` | The reviewer is the only role that needs a model in this mode. With none routed, every review fails closed, so every item fails *after* the implementation has been paid for. |

@@ -1,7 +1,8 @@
 [project]
 name = "agent-harness"
 version = "0.0.0"
-description = "Service-hosted, GUI-driven harness for role-routed coding-agent fleets"
+description = "Service-hosted, self-contained browser GUI and JSON harness for role-routed coding-agent fleets"
+license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -53,12 +54,28 @@ claw-bay = "agent_harness.adapters.claw_bay:PRESET"
 [project.entry-points."agent_harness.dependency_resolvers"]
 github-issue = "agent_harness.adapters.github_issue:resolver"
 
+# Repository-aware role loops, selected by name on the same terms as route
+# presets and dependency resolvers. Core owns the contract and lookup; only
+# installed metadata knows which adapter supplies a selected implementation.
+[project.entry-points."agent_harness.role_runners"]
+agent-loop = "agent_harness.adapters.minisweagent:RUNNER"
+
+[project.entry-points."agent_harness.execution_environments"]
+docker = "agent_harness.adapters.docker:BACKEND"
+
+# Sources of normalized remote review events. Core owns correction semantics
+# and deduplication; a source adapter owns one upstream's authentication,
+# polling and immutable record identity. Nothing in core imports one.
+[project.entry-points."agent_harness.review_sources"]
+github-pr-review = "agent_harness.adapters.github_pr_review:source"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_harness"]
+include = ["src/agent_harness/templates/**", "src/agent_harness/static/**"]
 
 [tool.ruff]
 line-length = 100

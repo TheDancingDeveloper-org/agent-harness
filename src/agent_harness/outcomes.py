@@ -286,6 +286,9 @@ COMMAND_BLOCKED = "command_blocked"
 #: pattern hit is answered by looking at the policy, and this is answered by
 #: looking at what the command was reaching for.
 PATH_ESCAPE = "path_escape"
+# The item gates passed, but its committed delta could not be replayed onto
+# the current local plan head. This is repair work, not a provider failure.
+PLAN_PROMOTION_CONFLICT = "plan_promotion_conflict"
 
 REASON_KINDS = (
     CHECKS_FAILED,
@@ -307,6 +310,7 @@ REASON_KINDS = (
     ITEM_IMPOSSIBLE,
     COMMAND_BLOCKED,
     PATH_ESCAPE,
+    PLAN_PROMOTION_CONFLICT,
 )
 
 

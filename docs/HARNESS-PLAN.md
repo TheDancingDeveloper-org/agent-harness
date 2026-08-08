@@ -411,9 +411,11 @@ Replaces both `pick_model_fn` and the global governor. Five responsibilities:
 
 ```python
 TERMINAL = {"weekly_cost_limit_reached", "invalid_api_key"}
-WINDOW   = {"5h_cost_limit_reached"}
+WINDOW = {"5h_cost_limit_reached"}
+
 
 class CapExhausted(Exception): ...
+
 
 def call_model(client, role, messages, max_attempts=6):
     for attempt in range(max_attempts):
@@ -424,9 +426,9 @@ def call_model(client, role, messages, max_attempts=6):
                 raise
             kind = (e.response.json().get("error", {}) or {}).get("theclawbayError")
             if kind in TERMINAL or kind in WINDOW:
-                raise CapExhausted(kind) from e      # retrying cannot help
+                raise CapExhausted(kind) from e  # retrying cannot help
             ra = e.response.headers.get("retry-after")
-            delay = float(ra) if ra else min(2 ** attempt, 30)
+            delay = float(ra) if ra else min(2**attempt, 30)
             time.sleep(delay + random.uniform(0, delay))
     raise RuntimeError(f"{role}: 429 after {max_attempts} attempts")
 ```

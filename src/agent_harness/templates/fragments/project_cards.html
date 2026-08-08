@@ -1,0 +1,23 @@
+{% for entry in projects.projects %}
+  <article class="card project-card">
+    <div class="card-heading"><div><p class="eyebrow">{{ entry.project.project_id }}</p><h2><a href="{{ url_for('work_page') }}?project_id={{ entry.project.project_id|urlencode }}">{{ entry.project.name }}</a></h2></div><span class="state state-{{ entry.control.state }}">{{ entry.control.state }}</span></div>
+    <dl class="facts">
+      <div><dt>Pending</dt><dd>{{ entry.counts.get('pending', 0) }}</dd></div><div><dt>Claimed</dt><dd>{{ entry.counts.get('claimed', 0) }}</dd></div><div><dt>Held</dt><dd>{{ entry.counts.get('held', 0) }}</dd></div><div><dt>Failed</dt><dd>{{ entry.counts.get('failed', 0) + entry.counts.get('exhausted', 0) }}</dd></div>
+    </dl>
+    <p class="muted">{{ entry.workers }} worker(s) active · {{ entry.stale }} stale lease(s) · {{ entry.worker_failures }} worker failure(s)</p>
+    {% if entry.control.reason %}<p class="reason">{{ entry.control.reason }}</p>{% endif %}
+    {% if entry.last_worker_error %}<p class="alert error">Latest worker failure: {{ entry.last_worker_error }}</p>{% endif %}
+    <p><a class="button secondary" href="{{ url_for('work_page') }}?project_id={{ entry.project.project_id|urlencode }}">Inspect work</a> <a class="button secondary" href="{{ url_for('preflight', project_id=entry.project.project_id) }}">Review preflight</a> <a class="button secondary" href="{{ url_for('project_configuration', project_id=entry.project.project_id) }}">Configure</a></p>
+    <div class="action-row" aria-label="Project controls">
+      {% for target in ['paused', 'draining', 'stopped'] %}
+        <form method="post" action="{{ url_for('project_control_action') }}" data-csrf-form>
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+          <input type="hidden" name="project_id" value="{{ entry.project.project_id }}">
+          <input type="hidden" name="state" value="{{ target }}">
+          <button class="quiet" type="submit" {% if mode == 'monitoring-only' %}disabled title="Monitoring-only: no worker pool is attached"{% endif %}>{{ target|capitalize }}</button>
+        </form>
+      {% endfor %}
+    </div>
+    {% if mode == 'monitoring-only' %}<p class="muted small">Controls disabled: no supervised worker pool is attached.</p>{% endif %}
+  </article>
+{% else %}<section class="empty"><h2>No projects configured</h2><p>Create a project through the typed API, then return here to inspect it.</p></section>{% endfor %}

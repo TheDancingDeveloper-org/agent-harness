@@ -36,6 +36,22 @@ from .store import EventStore
 log = logging.getLogger(__name__)
 
 
+def _environment_mounts(values: Sequence[str]) -> tuple[Any, ...]:
+    """Parse explicit host mounts for an execution backend."""
+    from .execution_environment import EnvironmentMount
+
+    mounts = []
+    for value in values:
+        parts = value.split(":")
+        if len(parts) not in (2, 3) or not parts[0] or not parts[1]:
+            raise ValueError(f"invalid --environment-mount {value!r}; expected SOURCE:TARGET[:rw]")
+        mode = parts[2] if len(parts) == 3 else "ro"
+        if mode not in {"ro", "rw"}:
+            raise ValueError(f"invalid mount mode {mode!r}; use ro or rw")
+        mounts.append(EnvironmentMount(Path(parts[0]).resolve(), parts[1], writable=mode == "rw"))
+    return tuple(mounts)
+
+
 def resolve_sources(args: argparse.Namespace) -> list[Source]:
     """Turn CLI arguments into sources. Adapters are imported lazily so the
     core never depends on one."""
@@ -573,6 +589,67 @@ def _run(args: argparse.Namespace) -> int:
     # that varies per terminal. `agent-harness guard` writes it.
     guard = CommandGuard.from_settings(queue.get_setting(GUARD_KEY))
     checks = Checks(commands=[shlex.split(c) for c in args.check], guard=guard)
+    role_runner = None
+    runner_name = str(args.role_runner or queue.get_setting("role_runner") or "").strip()
+    if runner_name:
+        from .role_runners import describe, resolve
+
+        try:
+            role_runner = resolve(runner_name)
+            runner_detail = describe(role_runner)
+        except Exception as exc:  # noqa: BLE001 - configuration refusal
+            print(f"role runner: {exc}", file=sys.stderr)
+            return 2
+        if args.role_runner and queue.get_setting("role_runner") != runner_name:
+            queue.set_setting("role_runner", runner_name)
+        print(f"role runner: {runner_detail}")
+    else:
+        print("role runner: direct single-shot implementer (historical path)")
+    environment_factory = None
+    environment_mount_spec: tuple[Any, ...] = ()
+    environment_backend = str(
+        args.environment_backend or queue.get_setting("execution_backend") or ""
+    ).strip()
+    environment_image = str(
+        args.environment_image or queue.get_setting("execution_image") or ""
+    ).strip()
+    if environment_backend:
+        if role_runner is None:
+            print(
+                "execution environment: an OS-enforced backend requires --role-runner; "
+                "the historical single-shot path cannot use it",
+                file=sys.stderr,
+            )
+            return 2
+        from .execution_environments import resolve as resolve_environment
+
+        try:
+            environment_factory = resolve_environment(environment_backend)
+            environment_mount_spec = _environment_mounts(args.environment_mount)
+        except Exception as exc:  # noqa: BLE001 - configuration refusal
+            print(f"execution environment: {exc}", file=sys.stderr)
+            return 2
+        if not environment_image:
+            print(
+                "execution environment: --environment-image is required when a backend is selected",
+                file=sys.stderr,
+            )
+            return 2
+        stored_environment = queue.get_setting("execution_backend")
+        if args.environment_backend and stored_environment != environment_backend:
+            queue.set_setting("execution_backend", environment_backend)
+        if environment_image != queue.get_setting("execution_image"):
+            queue.set_setting("execution_image", environment_image)
+        backend_ok, backend_detail = environment_factory.check()
+        if not backend_ok:
+            print(
+                f"execution environment: {environment_backend} is not ready: {backend_detail}",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"execution environment: {environment_backend} ({environment_image})")
+    else:
+        print("execution environment: host compatibility backend (not an OS security boundary)")
     # This project's counts, not the rollup. `--project` decides which queue
     # this run works, so a cross-project total here would report items no
     # worker in this process can claim.
@@ -732,7 +809,7 @@ def _run(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # Before anything claims, and before the first model call: a headless run
+    # Before anything claims, and before the first model call: a direct run
     # works in place and begins each attempt by discarding the working tree, so
     # a dirty checkout is uncommitted work about to be destroyed. Refusing is
     # the only safe default; --allow-dirty is how you say it is disposable.
@@ -839,6 +916,13 @@ def _run(args: argparse.Namespace) -> int:
             # from `default` — which is nobody's project once more than one
             # exists, and reports "nothing to do" over a full queue.
             project_id=args.project,
+            role_runner=role_runner,
+            runner_step_limit=args.runner_step_limit,
+            runner_command_timeout=args.runner_command_timeout,
+            environment_factory=environment_factory,
+            environment_image=environment_image,
+            environment_mounts=environment_mount_spec,
+            environment_network=args.environment_network,
         )
     # Typing `agent-harness run` IS the human deciding to start this project.
     # A project starts `stopped` so a restart never resumes on its own, but
@@ -1466,6 +1550,55 @@ def main(argv: list[str] | None = None) -> int:
         "harness calls the model API directly and there is nothing to watch.",
     )
     p_run.add_argument(
+        "--role-runner",
+        default=os.environ.get("HARNESS_ROLE_RUNNER", ""),
+        metavar="NAME",
+        help="installed role runner for implementation (or $HARNESS_ROLE_RUNNER). "
+        "Resolved by name through installed metadata; empty keeps the historical "
+        "single-shot implementer while the loop path earns delivery evidence.",
+    )
+    p_run.add_argument(
+        "--runner-step-limit",
+        type=int,
+        default=int(os.environ.get("HARNESS_RUNNER_STEP_LIMIT", "") or 80),
+        metavar="N",
+        help="whole-loop model-call ceiling (default 80, or $HARNESS_RUNNER_STEP_LIMIT).",
+    )
+    p_run.add_argument(
+        "--runner-command-timeout",
+        type=int,
+        default=int(os.environ.get("HARNESS_RUNNER_COMMAND_TIMEOUT", "") or 300),
+        metavar="SECONDS",
+        help="timeout for one feedback command inside the role loop (default 300).",
+    )
+    p_run.add_argument(
+        "--environment-backend",
+        default=os.environ.get("HARNESS_EXECUTION_BACKEND", ""),
+        metavar="NAME",
+        help="OS-enforced item command backend resolved through installed metadata "
+        "(or $HARNESS_EXECUTION_BACKEND); empty keeps the fixture-only host path.",
+    )
+    p_run.add_argument(
+        "--environment-image",
+        default=os.environ.get("HARNESS_EXECUTION_IMAGE", ""),
+        metavar="IMAGE",
+        help="pinned OCI image reference used by the selected execution backend "
+        "(or $HARNESS_EXECUTION_IMAGE).",
+    )
+    p_run.add_argument(
+        "--environment-network",
+        choices=("bridge", "none"),
+        default=os.environ.get("HARNESS_EXECUTION_NETWORK", "bridge"),
+        help="container network policy; bridge keeps ordinary outbound access, none disables it.",
+    )
+    p_run.add_argument(
+        "--environment-mount",
+        action="append",
+        default=[],
+        metavar="SOURCE:TARGET[:rw]",
+        help="explicit dependency/toolchain mount, read-only by default; repeatable.",
+    )
+    p_run.add_argument(
         "--agent",
         # The executor's default, not a second one. They disagreed: the
         # executor's carried `--permission-mode acceptEdits` and the CLI's did
@@ -1572,7 +1705,7 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-dirty",
         action="store_true",
         help="run against a checkout that has uncommitted or untracked files. A "
-        "headless run works IN PLACE and discards the working tree before each "
+        "direct run works IN PLACE and discards the working tree before each "
         "attempt — tracked changes are reverted and untracked files are deleted, "
         "neither recoverably — so a dirty checkout is refused by default. Pass "
         "this only when the tree is genuinely disposable.",
@@ -1623,7 +1756,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     p_serve = sub.add_parser(
-        "serve", help="serve the JSON API (headless — the GUI is the session host's)"
+        "serve", help="serve the JSON API and self-contained browser control plane"
     )
     p_serve.add_argument(
         "--audit-db",
@@ -1638,11 +1771,51 @@ def main(argv: list[str] | None = None) -> int:
         "--session-host",
         default=os.environ.get("AIDEVENV_URL", ""),
         metavar="URL",
-        help="base URL of a session host. WITH this, the API can start work: a "
-        "worker pool is attached and each agent runs as a terminal session you can "
-        "attach to. WITHOUT it the service is monitoring-only — every read works "
-        "and starting a project is refused, because starting would mark it running "
-        "with nothing able to claim.",
+        help="optional execution adapter for terminal sessions. WITH this, the "
+        "service can start work. WITHOUT it the packaged GUI and every read work "
+        "in monitoring-only mode, while starting is refused because nothing can claim.",
+    )
+    p_serve.add_argument(
+        "--role-runner",
+        default=os.environ.get("HARNESS_ROLE_RUNNER", ""),
+        metavar="NAME",
+        help="in-process repository-aware role runner for a local fleet; selected through "
+        "installed metadata and paired with an execution backend.",
+    )
+    p_serve.add_argument(
+        "--environment-backend",
+        default=os.environ.get("HARNESS_EXECUTION_BACKEND", ""),
+        metavar="NAME",
+        help="OS-enforced item command backend for a local fleet, resolved through metadata.",
+    )
+    p_serve.add_argument(
+        "--environment-image",
+        default=os.environ.get("HARNESS_EXECUTION_IMAGE", ""),
+        metavar="IMAGE",
+        help="pinned OCI image reference for the local fleet execution backend.",
+    )
+    p_serve.add_argument(
+        "--environment-network",
+        choices=("bridge", "none"),
+        default=os.environ.get("HARNESS_EXECUTION_NETWORK", "bridge"),
+        help="container network policy for the local fleet.",
+    )
+    p_serve.add_argument(
+        "--environment-mount",
+        action="append",
+        default=[],
+        metavar="SOURCE:TARGET[:rw]",
+        help="explicit local-fleet dependency/toolchain mount; read-only by default.",
+    )
+    p_serve.add_argument(
+        "--planner",
+        default=os.environ.get("HARNESS_PLANNER", ""),
+        help="model for the planner in an in-process local fleet.",
+    )
+    p_serve.add_argument(
+        "--implementer",
+        default=os.environ.get("HARNESS_IMPLEMENTER", ""),
+        help="model for the implementer in an in-process local fleet.",
     )
     p_serve.add_argument(
         "--agent",
@@ -1682,6 +1855,18 @@ def main(argv: list[str] | None = None) -> int:
         help="where the fleet appends its event stream. Defaults to events.jsonl beside --db.",
     )
     p_serve.add_argument(
+        "--runner-step-limit",
+        type=int,
+        default=80,
+        help="whole-loop tool-step ceiling for the in-process local fleet.",
+    )
+    p_serve.add_argument(
+        "--runner-command-timeout",
+        type=int,
+        default=300,
+        help="feedback-command timeout inside each local-fleet item environment.",
+    )
+    p_serve.add_argument(
         "--hold-webhook",
         default=os.environ.get("HARNESS_HOLD_WEBHOOK", ""),
         metavar="URL",
@@ -1689,6 +1874,20 @@ def main(argv: list[str] | None = None) -> int:
         "(or $HARNESS_HOLD_WEBHOOK). One URL is the whole configuration; the receiver "
         "decides what a question means to it. Delivery is best-effort and can never "
         "fail or stall the item.",
+    )
+    p_serve.add_argument(
+        "--notification-webhook",
+        default=os.environ.get("HARNESS_NOTIFICATION_WEBHOOK", ""),
+        metavar="URL",
+        help="authenticated endpoint for durable harness notifications. Configure "
+        "HARNESS_NOTIFICATION_TOKEN or HARNESS_NOTIFICATION_SECRET as well.",
+    )
+    p_serve.add_argument(
+        "--notification-db",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="SQLite outbox for notifications. Defaults beside --db.",
     )
     p_serve.add_argument(
         "--no-push", action="store_true", help="commit locally but do not push or open PRs"
@@ -1704,7 +1903,8 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("HARNESS_ROOT_PATH", ""),
         metavar="PREFIX",
         help="prefix this service is reached under when behind a proxy, e.g. "
-        "/api/harness. Without it, Swagger UI tells clients to call URLs that 404.",
+        "/harness. Without it, browser links and OpenAPI advertise URLs clients "
+        "cannot call.",
     )
 
     args = parser.parse_args(argv)
@@ -1779,6 +1979,7 @@ def main(argv: list[str] | None = None) -> int:
     from .audit import open_audit_store
     from .holds import webhook_hook
     from .maintenance import DEFAULT_RETENTION_DAYS, MaintenanceLoop
+    from .notifications import NotificationOutbox, WebhookChannel
     from .work import WorkQueue
 
     # A separate file, deliberately. History must not share a fate with the
@@ -1807,6 +2008,23 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"audit: {audit_path} ({audit.count()} events)")
 
+    notification_path = (
+        args.notification_db
+        or os.environ.get("HARNESS_NOTIFICATION_DB")
+        or Path(args.db).with_name("notifications.sqlite")
+    )
+    notification_url = str(args.notification_webhook or "").strip()
+    notification_channel = None
+    if notification_url:
+        notification_channel = WebhookChannel(
+            notification_url,
+            bearer_token=os.environ.get("HARNESS_NOTIFICATION_TOKEN", ""),
+            hmac_secret=os.environ.get("HARNESS_NOTIFICATION_SECRET", ""),
+        )
+    notifications = NotificationOutbox(notification_path, notification_channel)
+    if notification_url:
+        print(f"notifications: durable outbox at {notification_path}")
+
     # Started here rather than left to cron: retention that depends on an
     # external scheduler silently stops when nobody installs it, and the
     # symptom is a database that grows for months before anyone notices.
@@ -1826,16 +2044,28 @@ def main(argv: list[str] | None = None) -> int:
     maintenance.start()
 
     fleet, reviewer_client, host, executor_roles = _fleet_for_serve(
-        args, queue_for_serve, audit=audit
+        args, queue_for_serve, audit=audit, notifications=notifications
     )
     if fleet is None:
         print(
-            "monitoring only: no --session-host, so no worker pool is attached and "
+            "monitoring only: no executor is configured, so no worker pool is attached and "
             "starting a project will be refused.",
             file=sys.stderr,
         )
 
+    execution_environment_probe = None
+    remote_required = True
+    if fleet is not None and not args.session_host:
+        from .execution_environments import probe as probe_execution_environment
+
+        backend_name = str(queue_for_serve.get_setting("execution_backend") or "")
+        execution_environment_probe = lambda: probe_execution_environment(  # noqa: E731
+            backend_name
+        )
+        remote_required = False
+
     try:
+        notifications.start()
         uvicorn.run(
             create_api(
                 store,
@@ -1843,6 +2073,7 @@ def main(argv: list[str] | None = None) -> int:
                 token=token,
                 root_path=args.root_path,
                 audit=audit,
+                notifications=notifications,
                 fleet=fleet,
                 model_client=reviewer_client,
                 # Readiness probes it with a read. Passing the client rather
@@ -1852,6 +2083,8 @@ def main(argv: list[str] | None = None) -> int:
                 # The same default the workers route with, so a readiness
                 # probe asks the URL the work will actually use.
                 default_preset=args.preset,
+                execution_environment=execution_environment_probe,
+                remote_required=remote_required,
             ),
             host=args.host,
             port=args.port,
@@ -1863,11 +2096,16 @@ def main(argv: list[str] | None = None) -> int:
             # context that makes its work resumable, so in-flight work is
             # joined and only new claims stop.
             fleet.stop_all(reason="the harness process is stopping")
+        notifications.close()
     return 0
 
 
 def _fleet_for_serve(
-    args: argparse.Namespace, queue: Any, *, audit: Any | None = None
+    args: argparse.Namespace,
+    queue: Any,
+    *,
+    audit: Any | None = None,
+    notifications: Any | None = None,
 ) -> tuple[Any | None, Any | None, Any | None, Any | None]:
     """The supervised half of `serve`: a fleet the API's start action can use.
 
@@ -1879,7 +2117,10 @@ def _fleet_for_serve(
     **Nothing is started here.** Building the fleet creates no workers; only
     the API's start action does, and only after preflight passes.
     """
-    if not args.session_host:
+    configured_runner = str(
+        getattr(args, "role_runner", "") or queue.get_setting("role_runner") or ""
+    ).strip()
+    if not args.session_host and not configured_runner:
         return (None, None, None, None)
 
     import json as _json
@@ -1890,12 +2131,72 @@ def _fleet_for_serve(
     from .github import GitHub
     from .holds import fanout
     from .model_client import Chain, ModelClient, chains_from_map, effective_routes
-    from .runtime import ExecutorRoles, session_executor_factory
+    from .runtime import ExecutorRoles, direct_executor_factory, session_executor_factory
     from .session_executor import AgentSpec
     from .session_host import HttpSessionHost
 
     api_key = os.environ.get("HARNESS_API_KEY", "")
     host_token = os.environ.get("AIDEVENV_TOKEN", "") or api_key
+
+    direct_mode = not bool(args.session_host)
+    if direct_mode:
+        from .execution_environments import resolve as resolve_environment
+        from .role_runners import describe as describe_runner
+        from .role_runners import resolve as resolve_runner
+
+        runner_name = configured_runner
+        backend_name = str(
+            getattr(args, "environment_backend", "") or queue.get_setting("execution_backend") or ""
+        ).strip()
+        image = str(
+            getattr(args, "environment_image", "") or queue.get_setting("execution_image") or ""
+        ).strip()
+        if not backend_name or not image:
+            raise SystemExit("local fleet requires --environment-backend and --environment-image")
+        try:
+            runner = resolve_runner(runner_name)
+            backend = resolve_environment(backend_name)
+            ready, detail = backend.check()
+        except Exception as exc:  # noqa: BLE001 - deployment refusal before serving
+            print(f"local fleet: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        if not ready:
+            print(f"local fleet execution backend is not ready: {detail}", file=sys.stderr)
+            raise SystemExit(2)
+        if getattr(args, "role_runner", ""):
+            queue.set_setting("role_runner", runner_name)
+        if getattr(args, "environment_backend", ""):
+            queue.set_setting("execution_backend", backend_name)
+        if getattr(args, "environment_image", ""):
+            queue.set_setting("execution_image", image)
+        if (
+            getattr(args, "planner", "")
+            and args.endpoint
+            and "planner" not in (queue.get_setting(ROLE_MAP_KEY) or {})
+        ):
+            stored = {
+                **(queue.get_setting(ROLE_MAP_KEY) or {}),
+                "planner": {
+                    "model": args.planner,
+                    "endpoint": args.endpoint,
+                    "provider": "claw-bay",
+                },
+            }
+            queue.set_setting(ROLE_MAP_KEY, stored)
+        if (
+            getattr(args, "implementer", "")
+            and args.endpoint
+            and "implementer" not in (queue.get_setting(ROLE_MAP_KEY) or {})
+        ):
+            stored = {
+                **(queue.get_setting(ROLE_MAP_KEY) or {}),
+                "implementer": {
+                    "model": args.implementer,
+                    "endpoint": args.endpoint,
+                    "provider": "claw-bay",
+                },
+            }
+            queue.set_setting(ROLE_MAP_KEY, stored)
 
     # Seed the reviewer route from the flags when the stored map has none.
     # The stored map wins where it has an opinion: re-routing a role live
@@ -1943,6 +2244,11 @@ def _fleet_for_serve(
         )
 
     routes = live_routes()
+    required_roles = {"reviewer"} if not direct_mode else {"planner", "implementer", "reviewer"}
+    if direct_mode and not required_roles <= set(routes):
+        missing = ", ".join(sorted(required_roles - set(routes)))
+        print(f"local fleet: no route for role(s): {missing}", file=sys.stderr)
+        raise SystemExit(2)
     if "reviewer" not in routes:
         # Not fatal, and not silent: preflight blocks the start with exactly
         # this reason, so the fleet may as well exist and say why now.
@@ -1963,48 +2269,52 @@ def _fleet_for_serve(
             # A broken convenience stream must not prevent the durable audit
             # sink below from recording the event, or stop the work itself.
             log.warning("events: could not append %s", events_path, exc_info=True)
-        if audit is None:
-            return
-        # The JSONL stream remains tail-able, but the audit database is the
-        # durable system of record used by every projection. Keep the sink
-        # translation here, at the deployment boundary, so the core remains
-        # generic about producers and their payloads.
-        kind = event.get("kind")
-        if kind not in KINDS:
-            kind = MODEL_CALL
-        known = {
-            "ts",
-            "kind",
-            "source",
-            "worker",
-            "role",
-            "model",
-            "endpoint",
-            "outcome",
-            "error_class",
-            "latency_s",
-        }
-        data = {k: v for k, v in event.items() if k not in known}
-        try:
-            audit.append(
-                [
-                    Event(
-                        ts=float(event.get("ts", time.time())),
-                        kind=kind,
-                        source="serve",
-                        worker=event.get("worker"),
-                        role=event.get("role"),
-                        model=event.get("model"),
-                        endpoint=event.get("endpoint"),
-                        outcome=event.get("outcome"),
-                        error_class=event.get("error_class"),
-                        latency_s=event.get("latency_s"),
-                        data=data,
-                    )
-                ]
-            )
-        except Exception:  # telemetry is never load-bearing
-            log.warning("audit: could not append live event", exc_info=True)
+        if audit is not None:
+            # The JSONL stream remains tail-able, but the audit database is the
+            # durable system of record used by every projection. Keep the sink
+            # translation here, at the deployment boundary, so the core remains
+            # generic about producers and their payloads.
+            kind = event.get("kind")
+            if kind not in KINDS:
+                kind = MODEL_CALL
+            known = {
+                "ts",
+                "kind",
+                "source",
+                "worker",
+                "role",
+                "model",
+                "endpoint",
+                "outcome",
+                "error_class",
+                "latency_s",
+            }
+            data = {k: v for k, v in event.items() if k not in known}
+            try:
+                audit.append(
+                    [
+                        Event(
+                            ts=float(event.get("ts", time.time())),
+                            kind=kind,
+                            source="serve",
+                            worker=event.get("worker"),
+                            role=event.get("role"),
+                            model=event.get("model"),
+                            endpoint=event.get("endpoint"),
+                            outcome=event.get("outcome"),
+                            error_class=event.get("error_class"),
+                            latency_s=event.get("latency_s"),
+                            data=data,
+                        )
+                    ]
+                )
+            except Exception:  # telemetry is never load-bearing
+                log.warning("audit: could not append live event", exc_info=True)
+        if notifications is not None:
+            try:
+                notifications.enqueue_event(event)
+            except Exception:  # notifications are never load-bearing
+                log.warning("notifications: could not enqueue live event", exc_info=True)
 
     # The question goes into the same stream as the work it stopped, next to
     # whatever the operator already configured (#188). Composed rather than
@@ -2018,20 +2328,41 @@ def _fleet_for_serve(
         routes_provider=live_routes,
     )
 
-    host = HttpSessionHost(args.session_host, token=host_token)
-    agent = AgentSpec(command=tuple(shlex.split(args.agent)))
-    factory = session_executor_factory(
-        queue,
-        host=host,
-        agent=agent,
-        reviewer=reviewer_client,
-        routes_for=routes_for,
-        github_for=GitHub,
-        ui_base_url=args.session_host,
-        on_event=emit,
-        push=not args.no_push,
-    )
-    print(f"fleet: `{args.agent}` as sessions on {args.session_host}")
+    host = None
+    if direct_mode:
+        factory = direct_executor_factory(
+            queue,
+            reviewer=reviewer_client,
+            routes_for=routes_for,
+            github_for=GitHub,
+            on_event=emit,
+            push=False,
+            role_runner=runner,
+            runner_step_limit=args.runner_step_limit,
+            runner_command_timeout=args.runner_command_timeout,
+            environment_factory=backend,
+            environment_image=image,
+            environment_mounts=_environment_mounts(args.environment_mount),
+            environment_network=args.environment_network,
+        )
+        print(f"fleet: `{runner.name} {describe_runner(runner)}` in-process")
+        roles = ExecutorRoles()
+    else:
+        host = HttpSessionHost(args.session_host, token=host_token)
+        agent = AgentSpec(command=tuple(shlex.split(args.agent)))
+        factory = session_executor_factory(
+            queue,
+            host=host,
+            agent=agent,
+            reviewer=reviewer_client,
+            routes_for=routes_for,
+            github_for=GitHub,
+            ui_base_url=args.session_host,
+            on_event=emit,
+            push=not args.no_push,
+        )
+        print(f"fleet: `{args.agent}` as sessions on {args.session_host}")
+        roles = ExecutorRoles.for_session(agent)
     print(f"events: {events_path}")
     # The fleet emits into the same stream as the executors: a worker that
     # dies is recorded next to the work it was doing, not in a separate log.
@@ -2041,7 +2372,7 @@ def _fleet_for_serve(
         host,
         # What this deployment will actually call, so the API can stop
         # advertising the two roles the agent process does instead.
-        ExecutorRoles.for_session(agent),
+        roles,
     )
 
 

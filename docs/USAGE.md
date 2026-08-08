@@ -16,8 +16,8 @@ pip install git+https://github.com/TheDancingDeveloper-org/agent-harness
 agent-harness --help
 ```
 
-Inside [AIDevEnv](https://github.com/TheDancingDeveloper-org/aidevenv) it is
-already there, already running, and already behind the Work tab.
+When `agent-harness serve` is running, open its own URL for the packaged GUI.
+No MyDevEnv, AIDevEnv or other host process is required for browser access.
 
 ---
 
@@ -837,7 +837,7 @@ claim ──▶ git worktree on the item's base
 `AIDEVENV_TOKEN` authenticates to the session host; `HARNESS_API_KEY`
 authenticates the reviewer's model calls.
 
-### Without one — headless
+### Without one — direct execution
 
 Omit `--session-host` and the harness calls the model API directly, doing the
 implementing itself. Fully deterministic, and there is nothing to attach to:
@@ -847,6 +847,36 @@ agent-harness run --repo owner/name --work ./target-repo \
     --planner gpt-5.6 --implementer gpt-5.6-terra --reviewer claude-sonnet-4-6 \
     --endpoint https://api.your-gateway.example --check 'pytest -q'
 ```
+
+That command keeps the historical single-shot implementer. To select an
+installed tool-using loop instead:
+
+```bash
+uv sync --extra agent-loop
+
+agent-harness run --repo owner/name --work ./target-repo \
+    --role-runner agent-loop --runner-step-limit 80 \
+    --planner gpt-5.6 --implementer gpt-5.6-terra --reviewer claude-sonnet-4-6 \
+    --endpoint https://api.your-gateway.example --check 'pytest -q'
+```
+
+The runner name is resolved through the installed
+`agent_harness.role_runners` metadata. `run` refuses an unknown or incompatible
+runner before claiming work, stores an explicitly selected name in the queue
+database, and prints the implementation version plus contract compatibility.
+`doctor` and project preflight report that same selection.
+
+The loop may run the declared checks itself for feedback. That result is not a
+gate: after the loop submits, the harness captures the complete candidate tree
+(including new files and local commits), validates and reapplies its diff, and
+runs every declared check again before review. `--runner-step-limit` bounds the
+whole loop; `--runner-command-timeout` bounds one feedback command. Project and
+item wall-clock/spend ceilings still apply across attempts.
+
+This selectable path is the Stage 1 execution path, not the autonomous fleet.
+It still works in the shared checkout and its command subprocess inherits the
+controller environment. Do not use it for a secret-bearing real repository
+until the OS-enforced confinement described in `STATUS.md` Stage 2 is present.
 
 **A role may name several models, in preference order.** The first that
 answers does the work; the others are tried only when it will not:
@@ -903,7 +933,7 @@ Commit or stash it, or pass --allow-dirty if it is genuinely disposable.
 overrides it — loudly, and recorded in the preflight report, because the whole
 point is that the loss is silent and irreversible.
 
-One consequence of working in place: **one worker per checkout**. Two headless
+One consequence of working in place: **one worker per checkout**. Two direct
 workers on one directory would check branches out over each other.
 
 ### The role flags are a seed, not a setting
@@ -1161,9 +1191,22 @@ to any harness module. See
 
 ## 4d. Serve the API *and* the workers
 
-`serve` on its own is monitoring only — it exposes the API and has no workers,
-so starting a project is refused rather than marking it running with nothing
-able to claim. Give it a session host and it owns both:
+`serve` with no executor configuration is monitoring only — it exposes the API
+and has no workers, so starting a project is refused rather than marking it
+running with nothing able to claim. For an AIDevEnv-independent local fleet,
+give it a metadata-selected role runner and execution backend:
+
+```bash
+HARNESS_TOKEN=… HARNESS_API_KEY=… \
+agent-harness --db harness.sqlite serve --port 8099 \
+    --role-runner agent-loop \
+    --environment-backend docker \
+    --environment-image registry.example/project-toolchain@sha256:… \
+    --planner claude-sonnet-4-6 --implementer claude-sonnet-4-6 \
+    --reviewer claude-sonnet-4-6 --endpoint https://api.your-gateway.example
+```
+
+For the supported session-host deployment, give it a session host and it owns both:
 
 ```bash
 HARNESS_TOKEN=… HARNESS_API_KEY=… AIDEVENV_TOKEN=… \
@@ -1197,8 +1240,9 @@ environment must hold and a non-destructive post-deploy smoke test, is in
 
 ## 5. Drive it from the API
 
-The harness serves a full OpenAPI document with Swagger UI. Inside a session
-host, the token that reaches the GUI reaches this too.
+The harness serves a full OpenAPI document with Swagger UI and its browser
+control plane. API clients use the bearer token; browsers exchange it at
+`/login` for an opaque HttpOnly session.
 
 ```bash
 # Directly
@@ -1735,8 +1779,10 @@ Opening a hold now emits one notice — into the event stream the run already
 writes, and to one URL you name:
 
 ```bash
-uv run agent-harness --db harness.sqlite serve --hold-webhook https://your-host/holds
-# or: HARNESS_HOLD_WEBHOOK=https://your-host/holds
+uv run agent-harness --db harness.sqlite serve \
+  --notification-webhook https://your-host/notifications \
+  --notification-db notifications.sqlite
+# Configure HARNESS_NOTIFICATION_TOKEN or HARNESS_NOTIFICATION_SECRET as well.
 ```
 
 ```json
@@ -1752,17 +1798,28 @@ uv run agent-harness --db harness.sqlite serve --hold-webhook https://your-host/
 
 Three things about it are deliberate.
 
-- **It is not a notification system.** One URL, one POST, no retries and no
-  queue. What is on the other end — a session host that already has push
-  notifications, a chat relay you wrote, a log file — is not this service's
-  business, and adding a product here would be the coupling `AGENTS.md`
-  forbids.
+- **Delivery is a durable notification subsystem.** Selected hold, failure,
+  completion and review outcomes enter an append-only outbox and are retried
+  after receiver failure or process restart. The built-in webhook channel
+  requires a bearer token or HMAC secret; other destinations remain opt-in
+  channels rather than core knowledge.
 - **A failed delivery is dropped, never raised.** It cannot fail the item,
   stall it, or un-hold it. This is the rule telemetry already follows, for the
   same reason: the fleet must not depend on it.
 - **It carries no resume token.** `answer_path` says where the answer goes;
   spending it is an authenticated call to the API, which looks the token up
   itself.
+
+### Normalized remote review sources
+
+Remote polling or webhook translation is an adapter concern. An installed
+adapter publishes the `agent_harness.review_sources` entry point and returns
+`ReviewBatch` values; the harness stores the source cursor only after every
+event in that batch is accepted. `POST /api/review-poll` invokes one configured
+source poll through the normal authenticated API and returns typed,
+duplicate-aware results. A repeated batch is safe because `(source,
+remote_id)` is the durable identity journal. No external system is contacted
+unless a source adapter is installed and configured.
 
 Configure nothing and nothing changes: the inbox is still `GET /api/holds`, and
 `GET /api/summary` reports `holds_open` plus a `holds_overdue` entry for any
@@ -1782,6 +1839,9 @@ while one of those exists is exactly the failure this closes.
 | `HARNESS_HOLD_WEBHOOK` | `run`, `serve` | URL POSTed a JSON notice when an item stops to ask a person something (`--hold-webhook`). Unset means nothing is sent and the pull routes are unchanged. Delivery is best-effort: it can never fail or stall the item. |
 | `HARNESS_ROUTE_PRESET` | `run`, `serve` | Default route preset (`--preset`) for roles that name none: the wire protocol, the authentication header, the response reader and a failure classifier, as one name. Default `chat-completions`. |
 | `HARNESS_ROUTE_PRESETS` | all | Extra presets to make resolvable, as `name=module:attribute` pairs. For a preset that lives in your own code rather than in an installed distribution's entry points. |
+| `HARNESS_ROLE_RUNNER` | `run` | Installed role runner selected for implementation (`--role-runner`). Empty keeps the historical single-shot implementer. An explicit flag is stored in the deployment database. |
+| `HARNESS_RUNNER_STEP_LIMIT` | `run` | Whole-loop model-call ceiling (`--runner-step-limit`, default 80). An emergency control, not a call-minimisation target. |
+| `HARNESS_RUNNER_COMMAND_TIMEOUT` | `run` | Timeout in seconds for one feedback command inside the loop (`--runner-command-timeout`, default 300). |
 | `HARNESS_CONTEXT_BUDGET` | `run` | The most characters of repository the implementer may be shown (`--context-budget`, default 60000). A file bigger than this cannot be supplied at all — see [§6a.1](#6a1-when-the-target-does-not-fit-in-the-prompt). A ceiling, not a target. |
 | `HARNESS_CONTEXT_FALLBACK_BUDGET` | `run` | How much of that the *surroundings* — files the planner did not name — may use (`--context-fallback-budget`, default 60000, never more than the budget). Raising the budget for one large target does not raise this. |
 | `HARNESS_ROOT_PATH` | `serve` | Prefix when behind a proxy, e.g. `/api/harness`. |

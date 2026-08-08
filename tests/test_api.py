@@ -12,9 +12,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_harness.api import create_api
+from agent_harness.audit import AuditStore
 from agent_harness.events import MODEL_CALL, UNCLASSIFIED, WORK, Event
+from agent_harness.fleet import WorkerSnapshot
+from agent_harness.github import GitHub
+from agent_harness.process_metrics import ProcessSample
+from agent_harness.redaction import Redactor
 from agent_harness.store import EventStore
-from agent_harness.work import CLAIMED, DONE, PENDING, WorkQueue, WorkRecord
+from agent_harness.work import CLAIMED, DONE, PENDING, Project, WorkQueue, WorkRecord
 from conftest import make_queue
 
 TOKEN = "test-token"  # noqa: S105 - a fixture, not a credential
@@ -65,6 +70,9 @@ def test_healthz_is_open(client: TestClient) -> None:
 #: exactly what stopped anyone checking. A list that does not grow with the
 #: thing it describes is worse than no list, because it reads as coverage.
 OPEN_ROUTES = {
+    "/": "the browser entry point redirects to login or the authenticated app",
+    "/login": "the browser credential exchange",
+    "/assets": "packaged, immutable browser assets",
     "/healthz": "liveness, checked before a credential is available",
     "/docs": "the schema is not secret; the backlog is",
     "/docs/oauth2-redirect": "mounted by FastAPI for Swagger UI",
@@ -125,12 +133,12 @@ def test_no_token_configured_fails_closed(store: EventStore) -> None:
         assert c.get("/healthz").status_code == 200
 
 
-def test_there_is_no_html_anywhere(client: TestClient) -> None:
-    """The GUI belongs to the session host. If HTML creeps back in here, so
-    does a second UI."""
+def test_browser_html_is_separate_from_json_api(client: TestClient) -> None:
+    """The first-party browser client never changes the JSON API contract."""
     response = client.get("/api/work", headers=auth())
     assert response.headers["content-type"].startswith("application/json")
-    assert client.get("/").status_code == 404
+    assert client.get("/", follow_redirects=False).headers["location"].endswith("/login")
+    assert client.get("/login").headers["content-type"].startswith("text/html")
 
 
 # ------------------------------------------------------------------- work
@@ -232,6 +240,37 @@ def test_retry_allows_an_item_whose_lease_expired(tmp_path: Path, store: EventSt
     clock[0] += 100
     with TestClient(create_api(store, queue=q, token=TOKEN)) as c:
         assert c.post("/api/work/W1/retry", headers=auth()).status_code == 200
+
+
+def test_retry_honours_the_queue_clock_not_the_wall_clock(
+    tmp_path: Path, store: EventStore
+) -> None:
+    """The lease belongs to the queue's clock, which is injectable so lease
+    behaviour can be tested at all. A route reading `time.time()` instead
+    opts out of that silently, and reports a live claim as expired."""
+    clock = [1000.0]
+    q = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=10.0, now=lambda: clock[0])
+    q.add([WorkRecord(item_id="W1", title="t", brief="b")])
+    q.claim("worker-a")
+    with TestClient(create_api(store, queue=q, token=TOKEN)) as c:
+        response = c.post("/api/work/W1/retry", headers=auth())
+    assert response.status_code == 409
+    assert "worker-a" in response.json()["detail"]
+    assert q.get("W1").state == CLAIMED  # type: ignore[union-attr]
+
+
+def test_blocking_honours_the_queue_clock_not_the_wall_clock(
+    tmp_path: Path, store: EventStore
+) -> None:
+    clock = [1000.0]
+    q = make_queue(str(tmp_path / "w.sqlite"), lease_seconds=10.0, now=lambda: clock[0])
+    q.add([WorkRecord(item_id="W1", title="t", brief="b")])
+    q.claim("worker-a")
+    with TestClient(create_api(store, queue=q, token=TOKEN)) as c:
+        response = c.post("/api/work/W1/block", json={"reason": "decision"}, headers=auth())
+    assert response.status_code == 409
+    assert "worker-a" in response.json()["detail"]
+    assert q.get("W1").state == CLAIMED  # type: ignore[union-attr]
 
 
 def test_retry_on_an_unknown_item_is_404(client: TestClient) -> None:
@@ -401,6 +440,460 @@ def test_an_empty_poll_keeps_the_cursor(client: TestClient) -> None:
     assert payload["cursor"] == 99
 
 
+def test_event_filters_scan_past_non_matching_rows_and_keep_stream_cursor(
+    client: TestClient, store: EventStore
+) -> None:
+    now = time.time()
+    store.append(
+        [
+            Event(ts=now, kind=WORK, source="s", outcome="other", data={"project_id": "p"}),
+            Event(
+                ts=now,
+                kind=WORK,
+                source="s",
+                outcome="wanted",
+                data={"project_id": "p", "reason_kind": "checks_failed"},
+            ),
+            Event(ts=now, kind=WORK, source="s", outcome="later", data={"project_id": "q"}),
+        ]
+    )
+    payload = client.get(
+        "/api/events?since_id=0&limit=1&project_id=p&reason_kind=checks_failed",
+        headers=auth(),
+    ).json()
+    assert [event["outcome"] for event in payload["events"]] == ["wanted"]
+    assert payload["cursor"] == 2
+
+
+def test_process_metrics_are_typed_and_do_not_read_session_host(tmp_path: Path) -> None:
+    class FakeMetrics:
+        def sample(self) -> ProcessSample:
+            return ProcessSample(
+                sampled_at=120.0,
+                started_at=100.0,
+                uptime_seconds=20.0,
+                pid=42,
+                thread_count=3,
+                cpu_seconds=1.25,
+            )
+
+    class PoisonSessionHost:
+        def __getattribute__(self, name: str) -> Any:
+            raise AssertionError(f"process metrics read session-host state: {name}")
+
+    store = EventStore(tmp_path / "process-events.sqlite")
+    with TestClient(
+        create_api(
+            store,
+            token=TOKEN,
+            session_host=PoisonSessionHost(),
+            process_metrics=FakeMetrics(),
+        )
+    ) as client:
+        payload = client.get("/api/process", headers=auth()).json()
+    assert payload == {
+        "sampled_at": 120.0,
+        "started_at": 100.0,
+        "uptime_seconds": 20.0,
+        "pid": 42,
+        "thread_count": 3,
+        "cpu_seconds": 1.25,
+        "mode": "monitoring-only",
+        "active_workers": 0,
+    }
+
+
+def test_gateway_logs_use_live_redacted_model_calls_and_omit_arbitrary_payload(
+    tmp_path: Path,
+) -> None:
+    secret = "gateway-secret-value"  # noqa: S105 - redaction fixture
+    redact = Redactor([secret])
+    store = EventStore(tmp_path / "ingest.sqlite", redact=redact)
+    audit = AuditStore(tmp_path / "audit.sqlite", redact=redact)
+    store.append([Event(ts=1.0, kind=MODEL_CALL, source="ingest", model="not-live")])
+    audit.append(
+        [
+            Event(ts=2.0, kind=WORK, source="serve", outcome="claimed"),
+            Event(
+                ts=3.0,
+                kind=MODEL_CALL,
+                source="serve",
+                worker="worker-1",
+                role="reviewer",
+                model="model-a",
+                endpoint=f"https://user:{secret}@gateway.example/v1?token={secret}",
+                outcome="error",
+                error_class="rpm",
+                latency_s=0.75,
+                data={
+                    "project_id": "p",
+                    "item_id": "T1",
+                    "attempt": 2,
+                    "detail": f"Bearer {secret}",
+                    "answer": f"arbitrary model output {secret}",
+                },
+            ),
+        ]
+    )
+    with TestClient(create_api(store, audit=audit, token=TOKEN)) as client:
+        response = client.get("/api/gateway-logs", headers=auth())
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == "live_audit"
+    assert payload["configured"] is True
+    assert payload["degraded"] is False
+    assert len(payload["logs"]) == 1
+    row = payload["logs"][0]
+    assert row == {
+        "id": 2,
+        "ts": 3.0,
+        "project_id": "p",
+        "item_id": "T1",
+        "worker": "worker-1",
+        "role": "reviewer",
+        "model": "model-a",
+        "endpoint": "https://gateway.example/v1",
+        "outcome": "error",
+        "error_class": "rpm",
+        "latency_s": 0.75,
+        "attempt": 2,
+        "detail": "Bearer [redacted]",
+    }
+    rendered = response.text
+    assert secret not in rendered
+    assert "arbitrary model output" not in rendered
+    assert "not-live" not in rendered
+
+
+def test_gateway_log_cursor_pages_model_calls_and_falls_back_to_ingest_store(
+    client: TestClient, store: EventStore
+) -> None:
+    store.append(
+        [
+            Event(ts=1.0, kind=MODEL_CALL, source="ingest", model="first"),
+            Event(ts=2.0, kind=WORK, source="ingest", outcome="between"),
+            Event(ts=3.0, kind=MODEL_CALL, source="ingest", model="second"),
+        ]
+    )
+    first = client.get("/api/gateway-logs?since_id=0&limit=1", headers=auth()).json()
+    assert first["source"] == "ingested_events"
+    assert [row["model"] for row in first["logs"]] == ["first"]
+    second = client.get(
+        f"/api/gateway-logs?since_id={first['cursor']}&limit=1", headers=auth()
+    ).json()
+    assert [row["model"] for row in second["logs"]] == ["second"]
+    assert second["cursor"] > first["cursor"]
+
+
+def test_gateway_logs_scope_projects_and_report_degraded_live_history(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "ingest.sqlite")
+    audit = AuditStore(tmp_path / "audit.sqlite")
+    audit.append(
+        [
+            Event(
+                ts=1.0,
+                kind=MODEL_CALL,
+                source="serve",
+                model="project-a",
+                data={"project_id": "a"},
+            ),
+            Event(
+                ts=2.0,
+                kind=MODEL_CALL,
+                source="serve",
+                model="project-b",
+                data={"project_id": "b"},
+            ),
+        ]
+    )
+    with TestClient(create_api(store, audit=audit, token=TOKEN)) as client:
+        scoped = client.get("/api/gateway-logs?project_id=b", headers=auth()).json()
+    assert [row["model"] for row in scoped["logs"]] == ["project-b"]
+    assert scoped["cursor"] == 2
+
+    degraded = AuditStore(tmp_path / "not-opened.sqlite", degraded=True)
+    with TestClient(create_api(store, audit=degraded, token=TOKEN)) as client:
+        unavailable = client.get("/api/gateway-logs?since_id=7", headers=auth()).json()
+    assert unavailable == {
+        "configured": False,
+        "degraded": True,
+        "source": "live_audit",
+        "logs": [],
+        "cursor": 7,
+    }
+
+
+def test_gateway_logs_never_echo_a_malformed_endpoint(
+    client: TestClient, store: EventStore
+) -> None:
+    store.append(
+        [
+            Event(
+                ts=1.0,
+                kind=MODEL_CALL,
+                source="ingest",
+                endpoint="https://secret-user:secret-password@[not-an-ip/v1?token=secret-token",
+            )
+        ]
+    )
+    response = client.get("/api/gateway-logs", headers=auth())
+    assert response.status_code == 200
+    assert response.json()["logs"][0]["endpoint"] == "redacted-endpoint"
+    assert "secret" not in response.text
+
+
+def test_gateway_logs_strip_userinfo_from_endpoints_without_a_scheme(
+    client: TestClient, store: EventStore
+) -> None:
+    store.append(
+        [
+            Event(
+                ts=1.0,
+                kind=MODEL_CALL,
+                source="ingest",
+                endpoint="secret-user:secret-password@gateway.example/v1?token=secret-token",
+            )
+        ]
+    )
+    response = client.get("/api/gateway-logs", headers=auth())
+    assert response.status_code == 200
+    assert response.json()["logs"][0]["endpoint"] == "//gateway.example/v1"
+    assert "secret" not in response.text
+
+
+def test_adoption_http_lifecycle_is_typed_dry_run_first_and_drop_exact(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    plan = repository / "PLAN.md"
+    plan.write_text(
+        "# Existing project\n\n"
+        "- [x] T1: Already delivered\n\nbrief\n\n"
+        "- [ ] T2: Still needed\n\nanother brief\n"
+    )
+    store = EventStore(tmp_path / "events.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(
+        Project(
+            project_id="existing",
+            name="Existing project",
+            work_dir=str(repository),
+            plan_path=str(plan),
+            checks=["pytest -q"],
+            max_workers=2,
+        )
+    )
+
+    def branches(_repo: Path) -> list[str]:
+        return ["harness/T1"]
+
+    with TestClient(
+        create_api(store, queue=queue, token=TOKEN, adoption_branches=branches)
+    ) as client:
+        inspected = client.post(
+            "/api/adoption/existing/inspect", headers=auth(), json={"inspect_remote": False}
+        )
+        assert inspected.status_code == 200
+        proposal = inspected.json()
+        assert proposal["state"] == "proposed"
+        assert proposal["proposed_drops"] == ["T1"]
+        assert proposal["parse"]["items"][0]["id"] == "T1"
+        assert queue.items(project_id="existing") == []
+
+        unknown = client.post(
+            "/api/adoption/existing/decision",
+            headers=auth(),
+            json={
+                "decision": "approve",
+                "approved_drops": ["T2"],
+                "reason": "reviewed",
+                "expected_digest": proposal["digest"],
+            },
+        )
+        assert unknown.status_code == 409
+        assert queue.items(project_id="existing") == []
+
+        approved = client.post(
+            "/api/adoption/existing/decision",
+            headers=auth(),
+            json={
+                "decision": "approve",
+                "approved_drops": ["T1"],
+                "reason": "reviewed",
+                "expected_digest": proposal["digest"],
+            },
+        )
+        assert approved.status_code == 200
+        preview = client.post("/api/adoption/existing/reconcile", headers=auth(), json={})
+        assert preview.status_code == 200
+        assert preview.json()["dry_run"] is True
+        assert queue.items(project_id="existing") == []
+
+        applied = client.post(
+            "/api/adoption/existing/reconcile",
+            headers=auth(),
+            json={
+                "dry_run": False,
+                "expected_digest": proposal["digest"],
+                "expected_approved_drops": ["T1"],
+            },
+        )
+        assert applied.status_code == 200
+    assert {row.item_id: row.state for row in queue.items(project_id="existing")} == {
+        "T1": DONE,
+        "T2": PENDING,
+    }
+    configured = queue.get_project("existing")
+    assert configured is not None
+    assert configured.name == "Existing project"
+    assert configured.checks == ["pytest -q"]
+    assert configured.max_workers == 2
+
+
+def test_adoption_inspection_refuses_missing_persisted_paths(client: TestClient) -> None:
+    response = client.post(
+        "/api/adoption/default/inspect", headers=auth(), json={"inspect_remote": False}
+    )
+    assert response.status_code == 409
+    assert "work_dir" in response.json()["detail"] or "plan_path" in response.json()["detail"]
+
+
+def test_adoption_report_omits_remote_body_and_safely_renders_candidate_url(
+    tmp_path: Path,
+) -> None:
+    secret = "remote-secret-value"
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    plan = repository / "PLAN.md"
+    plan.write_text("# Existing\n\n- [ ] T1: First\n\nbrief\n")
+    store = EventStore(tmp_path / "events.sqlite", redact=Redactor([secret]))
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(
+        Project(
+            project_id="existing",
+            name="Existing",
+            repo="owner/repository",
+            work_dir=str(repository),
+            plan_path=str(plan),
+        )
+    )
+
+    def runner(args: Any, stdin: str | None = None) -> str:
+        del stdin
+        if args[1:3] == ["issue", "list"]:
+            return (
+                '[{"number":7,"title":"T1 remote-secret-value",'
+                '"body":"T1 arbitrary remote prose must stay private remote-secret-value",'
+                '"state":"OPEN","url":"https://alice:remote-secret-value@github.example/'
+                'owner/repository/issues/7?token=remote-secret-value"}]'
+            )
+        if args[1:3] == ["pr", "list"]:
+            return "[]"
+        raise AssertionError(args)
+
+    with TestClient(
+        create_api(
+            store,
+            queue=queue,
+            token=TOKEN,
+            github_factory=lambda repo: GitHub(repo, runner),
+            adoption_branches=lambda _repo: [],
+        )
+    ) as client:
+        response = client.post(
+            "/api/adoption/existing/inspect",
+            headers=auth(),
+            json={"inspect_remote": True},
+        )
+    assert response.status_code == 200
+    candidate = response.json()["items"][0]["candidates"][0]
+    assert "body" not in candidate
+    assert candidate["title"] == "T1 [redacted]"
+    assert candidate["url"] == "https://github.example/owner/repository/issues/7"
+    assert secret not in response.text
+    assert "arbitrary remote prose" not in response.text
+
+
+def test_adoption_remote_inspection_failure_is_generic_and_saves_no_proposal(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    plan = repository / "PLAN.md"
+    plan.write_text("# Existing\n\n- [ ] T1: First\n\nbrief\n")
+    store = EventStore(tmp_path / "events.sqlite")
+    queue = WorkQueue(str(tmp_path / "queue.sqlite"))
+    queue.add_project(
+        Project(
+            project_id="existing",
+            name="Existing",
+            repo="owner/repository",
+            work_dir=str(repository),
+            plan_path=str(plan),
+        )
+    )
+
+    def runner(args: Any, stdin: str | None = None) -> str:
+        del args, stdin
+        raise RuntimeError("transport exposed remote-secret-value")
+
+    with TestClient(
+        create_api(
+            store,
+            queue=queue,
+            token=TOKEN,
+            github_factory=lambda repo: GitHub(repo, runner),
+            adoption_branches=lambda _repo: [],
+        )
+    ) as client:
+        failed = client.post(
+            "/api/adoption/existing/inspect",
+            headers=auth(),
+            json={"inspect_remote": True},
+        )
+        missing = client.get("/api/adoption/existing", headers=auth())
+    assert failed.status_code == 502
+    assert "could not be inspected" in failed.json()["detail"]
+    assert "remote-secret-value" not in failed.text
+    assert missing.status_code == 404
+    assert queue.items(project_id="existing") == []
+
+
+def test_worker_inventory_is_explicitly_monitoring_only_without_fleet(
+    client: TestClient,
+) -> None:
+    payload = client.get("/api/workers", headers=auth()).json()
+    assert payload["configured"] is False
+    assert payload["mode"] == "monitoring-only"
+    assert payload["workers"] == []
+
+
+def test_worker_inventory_joins_live_identity_with_durable_claim(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "e.sqlite")
+    queue = WorkQueue(str(tmp_path / "w.sqlite"), lease_seconds=100.0)
+    queue.add_project(Project(project_id="p", name="P"))
+    queue.add([WorkRecord(item_id="W1", title="First")], project_id="p")
+    queue.set_control("running", project_id="p")
+    assert queue.claim("owner", project_id="p") is not None
+
+    class FakeFleet:
+        def workers(self, project_id: str | None = None) -> list[WorkerSnapshot]:
+            assert project_id in (None, "p")
+            return [WorkerSnapshot("p", "harness-p-1", "owner", 100.0)]
+
+        def failures(self, project_id: str | None = None) -> list[Any]:
+            return []
+
+    with TestClient(create_api(store, queue=queue, token=TOKEN, fleet=FakeFleet())) as client:
+        payload = client.get("/api/workers?project_id=p", headers=auth()).json()
+    assert payload["configured"] is True
+    assert payload["mode"] == "supervised"
+    assert payload["workers"][0]["worker_id"] == "harness-p-1"
+    assert payload["workers"][0]["item_id"] == "W1"
+    assert payload["workers"][0]["claim_owner"] == "owner"
+
+
 # ---------------------------------------------------------------- summary
 
 
@@ -457,6 +950,14 @@ def test_the_schema_documents_response_shapes_not_empty_objects(
         ("/api/summary", "get"),
         ("/api/errors", "get"),
         ("/api/events", "get"),
+        ("/api/gateway-logs", "get"),
+        ("/api/process", "get"),
+        ("/api/workers", "get"),
+        ("/api/analytics", "get"),
+        ("/api/adoption/{project_id}/inspect", "post"),
+        ("/api/adoption/{project_id}", "get"),
+        ("/api/adoption/{project_id}/decision", "post"),
+        ("/api/adoption/{project_id}/reconcile", "post"),
         ("/healthz", "get"),
     ]:
         content = schema["paths"][path][method]["responses"]["200"]["content"]
@@ -507,6 +1008,16 @@ def test_one_item_can_be_fetched(client: TestClient) -> None:
     payload = client.get("/api/work/W1", headers=auth()).json()
     assert payload["item_id"] == "W1"
     assert payload["title"] == "First"
+
+
+def test_project_control_never_resumes_without_start_gate(client: TestClient) -> None:
+    response = client.post(
+        "/api/projects/p/control",
+        headers=auth(),
+        json={"state": "running", "reason": "clicked by operator"},
+    )
+    assert response.status_code == 409
+    assert "preflight" in response.json()["detail"]
 
 
 def test_an_unknown_item_is_404(client: TestClient) -> None:
@@ -579,6 +1090,13 @@ def test_sync_defaults_to_a_dry_run(client: TestClient) -> None:
     assert prop["default"] is True
 
 
+def test_adoption_reconciliation_defaults_to_a_dry_run(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    prop = schema["components"]["schemas"]["AdoptionReconcileRequest"]["properties"]["dry_run"]
+    assert prop["default"] is True
+    assert "first operation" in prop["description"]
+
+
 # --------------------------------------------------------------- control
 
 
@@ -636,6 +1154,59 @@ def test_the_role_map_can_be_read_and_changed(client: TestClient) -> None:
     stored = client.get("/api/roles", headers=auth()).json()["roles"]
     assert stored["implementer"]["model"] == "cheap"
     assert stored["reviewer"]["model"] == "other-vendor"
+
+
+def test_the_role_map_preserves_fallback_preset_and_pricing_fields(client: TestClient) -> None:
+    route = {
+        "models": ["preferred", "fallback"],
+        "endpoint": "https://models.example/v1",
+        "provider": "generic",
+        "preset": "chat-completions",
+        "price_ref": "priced-as-this",
+    }
+    response = client.put("/api/roles", headers=auth(), json={"roles": {"reviewer": route}})
+    assert response.status_code == 200
+    stored = client.get("/api/roles", headers=auth()).json()["roles"]["reviewer"]
+    assert stored["model"] == "preferred"
+    assert stored["models"] == ["preferred", "fallback"]
+    assert stored["preset"] == "chat-completions"
+    assert stored["price_ref"] == "priced-as-this"
+
+
+def test_json_and_browser_plan_sync_share_dependency_refusals(
+    tmp_path: Path, store: EventStore
+) -> None:
+    plan = tmp_path / "PLAN.md"
+    plan.write_text(
+        "# Plan\n\n### T1 — Cannot start\n\ndepends on: T404\n",
+        encoding="utf-8",
+    )
+    queue = WorkQueue(str(tmp_path / "sync.sqlite"))
+    queue.add_project(Project(project_id="p", name="P", repo="o/r", plan_path=str(plan)))
+    with TestClient(create_api(store, queue=queue, token=TOKEN)) as app_client:
+        response = app_client.post(
+            "/api/plan/sync",
+            headers=auth(),
+            json={"path": str(plan), "repo": "o/r", "dry_run": True},
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["unresolved_dependencies"] == {"T1": ["T404"]}
+
+        login = app_client.post(
+            "/login",
+            data={"token": TOKEN},
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        assert login.status_code == 200
+        page = app_client.get("/plans?project_id=p")
+        csrf = page.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+        browser = app_client.post(
+            "/ui/actions/plan-sync/review",
+            data={"csrf_token": csrf, "project_id": "p"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert browser.status_code == 409
+        assert "unresolved" in browser.text.lower()
 
 
 def test_the_role_map_persists_for_a_worker_in_another_process(

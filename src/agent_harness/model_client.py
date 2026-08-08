@@ -39,12 +39,13 @@ this file imports an adapter.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import itertools
 import logging
 import random
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -660,6 +661,27 @@ class ModelClient:
         # not. run_id changes per process, seq is monotonic within it.
         self.run_id = run_id or uuid.uuid4().hex[:12]
         self._seq = itertools.count()
+        # Item identity is context-local rather than an attribute mutated by a
+        # worker. One ModelClient is shared by a fleet, and two workers making
+        # calls concurrently must not stamp each other's project or attempt on
+        # the event stream.
+        self._event_context: contextvars.ContextVar[Mapping[str, Any] | None] = (
+            contextvars.ContextVar(f"model_event_context_{id(self)}", default=None)
+        )
+
+    @contextlib.contextmanager
+    def event_scope(self, **identity: Any) -> Iterator[None]:
+        """Attach caller identity to every model event in this context.
+
+        The model client owns request-attempt identity; the executor owns the
+        project, item and work-attempt identity. Context variables keep the
+        two composable and safe across worker threads.
+        """
+        token = self._event_context.set({**(self._event_context.get() or {}), **identity})
+        try:
+            yield
+        finally:
+            self._event_context.reset(token)
 
     def reviewer_independence(self, implemented_by: str = "") -> tuple[bool, str]:
         """Whether this client's reviewer is independent of the implementer.
@@ -1019,6 +1041,7 @@ class ModelClient:
         with contextlib.suppress(Exception):
             self.on_event(
                 {
+                    **(self._event_context.get() or {}),
                     "run_id": self.run_id,
                     "seq": next(self._seq),
                     "ts": self.now(),

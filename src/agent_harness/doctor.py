@@ -172,6 +172,52 @@ def _resolvers_finding() -> Finding:
     return Finding("dependency resolvers", OK, f"declared: {', '.join(names)}")
 
 
+def _runner_finding(selected: str) -> Finding:
+    """The selected execution loop and whether its contract can load."""
+    from .role_runners import names, probe
+
+    if not selected:
+        available = ", ".join(names()) or "none"
+        return Finding(
+            "role runner",
+            WARN,
+            "none selected — implementation uses the historical single-shot path; "
+            f"installed runner names: {available}",
+        )
+    ok, detail = probe(selected)
+    return Finding("role runner", OK if ok else FAIL, detail, blocking=not ok)
+
+
+def _execution_environment_finding(queue: Any) -> Finding:
+    """Report the item command boundary before a worker can claim anything."""
+    selected = str(queue.get_setting("execution_backend") or "").strip()
+    image = str(queue.get_setting("execution_image") or "").strip()
+    if not selected:
+        return Finding(
+            "execution environment",
+            WARN,
+            "host compatibility execution is selected; it is not an OS security boundary. "
+            "Configure a metadata-selected backend and image before a real workload.",
+            blocking=False,
+        )
+    from .execution_environments import probe
+
+    ok, detail = probe(selected)
+    if not image:
+        return Finding(
+            "execution environment",
+            FAIL,
+            f"backend {selected!r} is selected but no execution image is configured; {detail}",
+            blocking=True,
+        )
+    return Finding(
+        "execution environment",
+        OK if ok else FAIL,
+        f"{detail}; image {image}",
+        blocking=not ok,
+    )
+
+
 def _redaction_finding() -> Finding:
     """What the write-boundary filter can and cannot promise.
 
@@ -576,6 +622,8 @@ def diagnose(queue: Any, projects: list[Any], *, ask: Any = None) -> Report:
     # Deployment-wide, like the role map: the worktrees, the host and the
     # credentials on disk are shared by every project in one database.
     report.environment.append(_guard_finding(queue.get_setting(GUARD_KEY)))
+    report.environment.append(_runner_finding(str(queue.get_setting("role_runner") or "")))
+    report.environment.append(_execution_environment_finding(queue))
     stored = queue.get_setting(ROLE_MAP_KEY) or {}
 
     for project in projects:

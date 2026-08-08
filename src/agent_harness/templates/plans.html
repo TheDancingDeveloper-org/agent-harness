@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading">
+    <div><p class="eyebrow">Inception and plan lifecycle</p><h1>Plans</h1></div>
+    <span class="mode-badge">Human gates</span>
+  </div>
+  <section class="card">
+    <form method="get" action="{{ url_for('plans') }}">
+      <label for="plan-project">Project</label>
+      <select id="plan-project" name="project_id" onchange="this.form.submit()">
+        {% for summary in projects.projects %}
+          <option value="{{ summary.project.project_id }}"{% if summary.project.project_id == project_id %} selected{% endif %}>{{ summary.project.name }} ({{ summary.project.project_id }})</option>
+        {% endfor %}
+      </select>
+    </form>
+  </section>
+  {% if not project_id %}
+    <section class="empty"><h2>No projects configured</h2><p>Describe a project below to open an inception draft.</p></section>
+  {% else %}
+    <section class="card">
+      <h2>Describe a project</h2>
+      <p class="muted">Starting a draft writes only the queue setting. It creates no repository, issue, branch, or queue row.</p>
+      <form method="post" action="{{ url_for('inception_start_action') }}" data-csrf-form>
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label for="inception-project">Project id</label>
+        <input id="inception-project" name="project_id" value="{{ project_id }}" required>
+        <label for="inception-overview">Overview</label>
+        <textarea id="inception-overview" name="overview" rows="4" required placeholder="Describe the outcome in a paragraph."></textarea>
+        <button type="submit">Open inception draft</button>
+      </form>
+    </section>
+    {% if plan_path %}
+      <section class="card">
+        <div class="card-heading"><div><p class="eyebrow">Configured plan</p><h2>Parse review</h2></div><span class="mode-badge">Read-only</span></div>
+        <p class="muted"><code>{{ plan_path }}</code> is parsed without creating or updating issues.</p>
+        {% if parse_result %}
+          <dl class="detail-facts"><dt>Recognized items</dt><dd>{{ parse_result.items|length }}</dd><dt>Skipped headings</dt><dd>{{ parse_result.skipped|length }}</dd><dt>Duplicate ids</dt><dd>{{ parse_result.duplicate_ids|length }}</dd><dt>Dependency cycles</dt><dd>{{ parse_result.dependency_cycles|length }}</dd></dl>
+          {% if parse_result.skipped %}<h3>Skipped headings</h3><ul>{% for finding in parse_result.skipped %}<li>{{ finding }}</li>{% endfor %}</ul>{% endif %}
+          {% if parse_result.duplicate_ids %}<h3>Duplicate ids</h3><ul>{% for item_id, lines in parse_result.duplicate_ids.items() %}<li>{{ item_id }}: lines {{ lines|join(', ') }}</li>{% endfor %}</ul>{% endif %}
+          {% if parse_result.unresolved_dependencies %}<h3>Unresolved dependencies</h3><ul>{% for item_id, deps in parse_result.unresolved_dependencies.items() %}<li>{{ item_id }}: {{ deps|join(', ') }}</li>{% endfor %}</ul>{% endif %}
+          {% if parse_result.malformed_dependencies %}<h3>Malformed dependencies</h3><ul>{% for item_id, deps in parse_result.malformed_dependencies.items() %}<li>{{ item_id }}: {{ deps|join(', ') }}</li>{% endfor %}</ul>{% endif %}
+          {% if parse_result.external_dependencies %}<h3>External dependencies</h3><ul>{% for item_id, deps in parse_result.external_dependencies.items() %}<li>{{ item_id }}: {{ deps|join(', ') }}</li>{% endfor %}</ul>{% endif %}
+          {% if parse_result.decision_dependencies %}<h3>Human decisions</h3><ul>{% for item_id, deps in parse_result.decision_dependencies.items() %}<li>{{ item_id }}: {{ deps|join(', ') }}</li>{% endfor %}</ul>{% endif %}
+          {% if parse_result.cross_project_dependencies %}<h3>Cross-project dependencies</h3><ul>{% for item_id, deps in parse_result.cross_project_dependencies.items() %}<li>{{ item_id }}: {{ deps|join(', ') }}</li>{% endfor %}</ul>{% endif %}
+          {% if parse_result.dependency_cycles %}<h3>Cycles</h3><ul>{% for cycle in parse_result.dependency_cycles %}<li>{{ cycle|join(' → ') }}</li>{% endfor %}</ul>{% endif %}
+          {% if parse_result.unattached_arrows %}<h3>Unattached dependency arrows</h3><ul>{% for finding in parse_result.unattached_arrows %}<li>{{ finding }}</li>{% endfor %}</ul>{% endif %}
+        {% else %}<p class="alert warning">The configured plan file is missing or unreadable. Nothing was silently dropped.</p>{% endif %}
+        {% if repo and plan_path and project_id and parse_result and not parse_result.duplicate_ids and not parse_result.unresolved_dependencies and not parse_result.malformed_dependencies and not parse_result.dependency_cycles and not parse_result.unattached_arrows %}
+          <form method="post" action="{{ url_for('plan_sync_review') }}" data-csrf-form><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}"><button type="submit">Preview GitHub sync</button></form>
+        {% elif plan_path and not repo %}
+          <p class="alert warning">Configure a repository before previewing an external plan sync.</p>
+        {% endif %}
+        {% if sync_error %}<p class="alert error" role="alert">{{ sync_error }}</p>{% endif %}
+      </section>
+    {% endif %}
+    <section class="card">
+      <div class="card-heading"><div><p class="eyebrow">Existing work</p><h2>Adoption</h2></div><span class="mode-badge">Proposal, never decision</span></div>
+      {% if adoption_available %}
+        <p class="muted">Inspect the persisted checkout and plan. Inspection may read the configured remote repository, but creates no queue rows and edits nothing outside the harness.</p>
+        <form method="post" action="{{ url_for('adoption_inspect_action') }}" data-csrf-form>
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}">
+          {% if repo %}<label class="choice"><input type="checkbox" name="inspect_remote" value="yes" checked> Inspect configured remote repository {{ repo }} read-only</label>{% endif %}
+          <button type="submit">{{ 'Inspect again' if adoption else 'Inspect existing work' }}</button>
+        </form>
+      {% else %}
+        <p class="alert warning">Configure both a checkout and plan path before adoption can inspect existing work.</p>
+      {% endif %}
+      {% if adoption %}
+        <div class="card-heading"><div><p class="eyebrow">{{ adoption.state }}</p><h3>Adoption proposal</h3></div><span class="attention">{{ adoption.items|length }} items</span></div>
+        <p><strong>Resolved checkout:</strong> <span class="mono">{{ adoption.repository }}</span><br><strong>Plan:</strong> <span class="mono">{{ adoption.plan_path }}</span>{% if adoption.inspect_remote %}<br><strong>Remote evidence:</strong> {{ adoption.configured_repo }}{% endif %}</p>
+        {% if adoption.parse and (adoption.parse.skipped or adoption.parse.duplicate_ids or adoption.parse.unresolved_dependencies or adoption.parse.malformed_dependencies or adoption.parse.dependency_cycles or adoption.parse.unattached_arrows) %}<p class="alert warning">The plan has parse findings. They remain visible in the parse review above; adoption did not silently discard them.</p>{% endif %}
+        <p class="alert warning">Nothing has been dropped and no queue row has been created by this proposal.</p>
+        <div class="table-scroll"><table><thead><tr><th>Item</th><th>Proposal</th><th>Evidence / ambiguity</th><th>Proposed changes</th></tr></thead><tbody>
+          {% for item in adoption.items %}<tr><td><strong>{{ item.item_id }}</strong><br>{{ item.title }}</td><td>{{ item.proposed_state }}{% if item.requires_drop_approval %}<br><span class="attention">Needs named drop approval</span>{% endif %}</td><td>{% if item.ambiguity %}<span class="warning">{{ item.ambiguity }}</span>{% endif %}<ul>{% for evidence in item.evidence %}<li>{{ evidence.kind }} / {{ evidence.outcome }}: {{ evidence.detail }}{% if evidence.citations %} ({{ evidence.citations|join(', ') }}){% endif %}</li>{% else %}<li>No affirmative evidence</li>{% endfor %}</ul></td><td><ul>{% for mutation in item.mutations %}<li>{{ mutation.kind }} — {{ mutation.target }}: {{ mutation.detail }}{% if mutation.requires_approval %} (approval required){% endif %}</li>{% endfor %}</ul></td></tr>{% endfor %}
+        </tbody></table></div>
+        {% if adoption.state == 'proposed' %}
+          <form method="post" action="{{ url_for('adoption_decision_review') }}" data-csrf-form>
+            <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}">
+            {% if adoption.proposed_drops %}<fieldset><legend>Items allowed to enter as done</legend>{% for item_id in adoption.proposed_drops %}<label class="choice"><input type="checkbox" name="approve_drop:{{ item_id }}" value="yes"> {{ item_id }} — explicitly approve this drop</label>{% endfor %}</fieldset>{% endif %}
+            <label>Decision<select name="decision"><option value="approve">Approve proposal</option><option value="revise">Request a new inspection</option><option value="reject">Reject proposal</option></select></label>
+            <label>Reason<input name="reason" required placeholder="Why this exact decision?"></label>
+            <button type="submit">Review decision</button>
+          </form>
+        {% elif adoption.state == 'approved' %}
+          <p class="success">Approved drops: {{ adoption.approved_drops|join(', ') if adoption.approved_drops else 'none' }}. Approval alone still created no queue rows.</p>
+          <form method="post" action="{{ url_for('adoption_reconcile_review') }}" data-csrf-form><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}"><label>Reconciliation reason<input name="reason" required placeholder="Why apply this adoption now?"></label><button type="submit">Review first mutation</button></form>
+        {% elif adoption.state in ['rejected', 'revise'] %}
+          <p class="warning">Decision: {{ adoption.decision_reason }}. Inspect again to create a fresh proposal.</p>
+        {% elif adoption.state == 'stopped' %}
+          <p class="success">Reconciled. Earlier queue progress and project configuration were preserved.</p>
+        {% endif %}
+      {% endif %}
+    </section>
+    {% if proposal %}
+      <section class="card">
+        <div class="card-heading"><div><p class="eyebrow">Revision {{ proposal.revision }}</p><h2>{{ proposal.goal or 'Proposal' }}</h2></div><span class="attention">{{ proposal.item_count }} items</span></div>
+        {% if proposal.assumptions %}<h3>Assumptions</h3><ul>{% for value in proposal.assumptions %}<li>{{ value }}</li>{% endfor %}</ul>{% endif %}
+        {% if proposal.non_goals %}<h3>Not doing</h3><ul>{% for value in proposal.non_goals %}<li>{{ value }}</li>{% endfor %}</ul>{% endif %}
+        {% if proposal.risks %}<h3>Risks</h3><ul>{% for value in proposal.risks %}<li>{{ value }}</li>{% endfor %}</ul>{% endif %}
+        <form method="post" action="{{ url_for('inception_scope_action') }}" data-csrf-form>
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}">
+          <label for="scope-feedback">Revision feedback (optional)</label><textarea id="scope-feedback" name="feedback" rows="2"></textarea>
+          <button type="submit">{{ 'Revise proposal' if proposal.feedback else 'Generate proposal' }}</button>
+        </form>
+      </section>
+      <section class="card">
+        <div class="card-heading"><div><p class="eyebrow">Approval gate</p><h2>Open questions</h2></div><span class="mode-badge">{{ proposal.blocking_open }} blocking</span></div>
+        {% if proposal.questions %}
+          {% for question in proposal.questions %}
+            <article class="question{% if question.severity == 'blocking' and not question.answer and not question.deferred_reason %} question-blocking{% endif %}">
+              <h3>{{ question.id }} · {{ question.question }}</h3><p>{{ question.why_it_matters }}</p>
+              {% if question.answer %}<p class="success">Answered by {{ question.resolved_by or 'operator' }}: {{ question.answer }}</p>{% elif question.deferred_reason %}<p class="muted">Deferred: {{ question.deferred_reason }}</p>{% else %}
+                <form method="post" action="{{ url_for('inception_question_action') }}" data-csrf-form>
+                  <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}"><input type="hidden" name="question_id" value="{{ question.id }}">
+                  <label for="answer-{{ question.id }}">Answer</label><textarea id="answer-{{ question.id }}" name="answer" rows="2"></textarea>
+                  <label for="defer-{{ question.id }}">Or defer with a reason</label><input id="defer-{{ question.id }}" name="defer_reason">
+                  <label for="severity-{{ question.id }}">Severity</label><select id="severity-{{ question.id }}" name="severity"><option value="">Keep {{ question.severity }}</option><option value="blocking">Blocking</option><option value="deferrable">Deferrable</option></select>
+                  <button type="submit">Resolve question</button>
+                </form>
+              {% endif %}
+            </article>
+          {% endfor %}
+        {% else %}<p class="muted">The proposal has no open questions.</p>{% endif %}
+        <form method="post" action="{{ url_for('inception_approve_action') }}" data-csrf-form>
+          <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}">
+          <button type="submit"{% if proposal.blocking_open %} disabled title="Answer every blocking question first"{% endif %}>Approve scope</button>
+        </form>
+      </section>
+      {% if plan_markdown %}
+        <section class="card"><div class="card-heading"><div><p class="eyebrow">Generated document</p><h2>PLAN.md preview</h2></div><a class="button secondary" download="PLAN.md" href="data:text/markdown;charset=utf-8,{{ plan_markdown|urlencode }}">Download</a></div><pre class="plan-preview"><code>{{ plan_markdown }}</code></pre></section>
+      {% endif %}
+    {% else %}
+      <section class="empty"><h2>No proposal yet</h2><p>Open a draft, then generate a proposal through the scoping role.</p></section>
+    {% endif %}
+  {% endif %}
+{% endblock %}

@@ -1,0 +1,97 @@
+name: build and deploy
+
+# Self-hosted runners only. GitHub-hosted runners are not permitted in this
+# org and `runs-on: ubuntu-latest` is rejected -- see ops docs/CI-RUNNER-GATES.md.
+# The `docker`/`publish` labels are advertised only by the two
+# Docker-in-Docker-backed workers, which this job needs to build and push.
+#
+# The four repository gates run inside the image itself, as the `test` build
+# target, rather than through setup-uv on the runner. Two reasons: the gates
+# then run against the exact Python and toolchain the deployed image ships,
+# and `ci.yml` keeps its own faster path for pull requests.
+#
+# What this workflow deliberately does NOT do: run the Stage 2 live execution
+# tests. Those need a daemon that shares a filesystem with the process asking
+# for the bind mount, and the publish runners talk to a separate DinD container
+# over `DOCKER_HOST` with no shared volume -- a bind mount there would resolve
+# to an empty directory on the daemon's side and prove nothing. The live suite
+# runs against the deployed stack's own daemon instead, through Komodo's
+# RunStackService. See docs/DEPLOYMENT.md.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: repo.indexarr.net/indexarr/agent-harness
+  # A separate repository, not another tag on IMAGE_NAME. `komodo-deploy.sh`
+  # rewrites every `image: ${IMAGE_NAME}:*` line in the stack, so a test image
+  # sharing that name would be silently rewritten to the runtime tag and the
+  # acceptance service would quietly run a container with no pytest in it.
+  TEST_IMAGE_NAME: repo.indexarr.net/indexarr/agent-harness-test
+  STACK_NAME: personal-agent-harness
+  STACK_DIR: personal/agent-harness
+
+jobs:
+  test-build-push:
+    runs-on: [self-hosted, node-b, linux, x64, docker, publish]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Gates, in the image that will be deployed
+        run: docker build --target test -t agent-harness-test .
+
+      - name: Log in to the Forgejo registry
+        run: |
+          echo "${{ secrets.FORGEJO_TOKEN }}" \
+            | docker login repo.indexarr.net -u "${{ secrets.FORGEJO_USER }}" --password-stdin
+
+      - name: Build and push
+        run: |
+          docker build --target runtime \
+            -t "${IMAGE_NAME}:latest" \
+            -t "${IMAGE_NAME}:${GITHUB_SHA}" \
+            .
+          docker push "${IMAGE_NAME}:latest"
+          docker push "${IMAGE_NAME}:${GITHUB_SHA}"
+          # The test target is published too: Stage 2's acceptance runs the
+          # live suite on the deployed host, so the tests must be a deployable
+          # artefact rather than something only CI ever holds. Same commit as
+          # the runtime image above, from the same build.
+          docker tag agent-harness-test "${TEST_IMAGE_NAME}:latest"
+          docker tag agent-harness-test "${TEST_IMAGE_NAME}:${GITHUB_SHA}"
+          docker push "${TEST_IMAGE_NAME}:latest"
+          docker push "${TEST_IMAGE_NAME}:${GITHUB_SHA}"
+
+      - name: Log out
+        if: always()
+        run: docker logout repo.indexarr.net || true
+
+  deploy:
+    needs: test-build-push
+    runs-on: [self-hosted, node-b, linux, x64]
+    steps:
+      - name: Bump the ops compose tag and trigger Komodo
+        env:
+          STACK_NAME: ${{ env.STACK_NAME }}
+          STACK_DIR: ${{ env.STACK_DIR }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_TAG: ${{ github.sha }}
+          GIT_AUTH_TOKEN: ${{ secrets.GIT_AUTH_TOKEN }}
+          KOMODO_API_KEY: ${{ secrets.KOMODO_API_KEY }}
+          KOMODO_API_SECRET: ${{ secrets.KOMODO_API_SECRET }}
+          KOMODO_GIT_ACCOUNT: sprooty
+          KOMODO_URL: http://192.168.1.75:3011
+        run: |
+          # Reuse the shared deploy step body from the ops repo rather than
+          # reimplementing the tag bump and DeployStack poll here.
+          curl -fsSL \
+            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            "https://repo.indexarr.net/api/v1/repos/indexarr/ops/raw/scripts/komodo-deploy.sh" \
+            -o komodo-deploy.sh
+          bash komodo-deploy.sh

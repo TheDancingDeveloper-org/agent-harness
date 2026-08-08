@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+  <p class="breadcrumb"><a href="{{ url_for('plans') }}?project_id={{ project_id|urlencode }}">Plans</a> / Sync review</p>
+  <div class="page-heading"><div><p class="eyebrow">Explicit confirmation</p><h1>Review plan sync</h1></div><span class="attention">No external writes yet</span></div>
+  <section class="card">
+    <h2>Resolved target</h2>
+    <dl class="detail-facts"><dt>Project</dt><dd>{{ project_id }}</dd><dt>Repository</dt><dd>{{ repo }}</dd><dt>Plan</dt><dd><code>{{ plan_path }}</code></dd><dt>Recognized items</dt><dd>{{ parsed.items|length }}</dd><dt>Skipped headings</dt><dd>{{ parsed.skipped|length }}</dd><dt>Orphaned issues</dt><dd>{{ preview.orphaned|length }} (left untouched)</dd></dl>
+    {% if parsed.duplicate_ids or parsed.unresolved_dependencies or parsed.malformed_dependencies or parsed.dependency_cycles or parsed.unattached_arrows %}
+      <p class="alert error">The plan has parser or dependency findings. Sync is refused until the preview is clean.</p>
+    {% endif %}
+    <div class="analytics-grid"><div class="card"><h3>Would create</h3><p class="metric">{{ preview.created|length }}</p><p class="muted">new issues</p></div><div class="card"><h3>Would update</h3><p class="metric">{{ preview.updated|length }}</p><p class="muted">existing marked issues</p></div><div class="card"><h3>Unchanged</h3><p class="metric">{{ preview.unchanged|length }}</p><p class="muted">already matching</p></div><div class="card"><h3>Metadata</h3><p class="metric">{{ preview.labels_created|length + preview.milestones_created|length }}</p><p class="muted">labels/milestones requested</p></div></div>
+    {% if preview.created %}<h3>Creates</h3><ul>{% for item_id in preview.created %}<li>{{ item_id }}</li>{% endfor %}</ul>{% endif %}
+    {% if preview.updated %}<h3>Updates</h3><ul>{% for item_id in preview.updated %}<li>{{ item_id }}</li>{% endfor %}</ul>{% endif %}
+    {% if preview.orphaned %}<h3>Orphans left open</h3><ul>{% for item_id in preview.orphaned %}<li>{{ item_id }}</li>{% endfor %}</ul>{% endif %}
+    <div class="alert warning" role="note"><strong>Consequences:</strong> applying creates or updates only marked GitHub issues and requested labels/milestones. It never closes, reopens, deletes, or silently drops an issue. The server rechecks the exact plan bytes and remote preview immediately before writing.</div>
+    <form method="post" action="{{ url_for('plan_sync_apply') }}" data-csrf-form><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}"><input type="hidden" name="review_id" value="{{ review.review_id }}"><button type="submit"{% if parsed.duplicate_ids or parsed.unresolved_dependencies or parsed.malformed_dependencies or parsed.dependency_cycles or parsed.unattached_arrows %} disabled title="Resolve plan findings before syncing"{% endif %}>Apply reviewed sync</button> <a class="button secondary" href="{{ url_for('plans') }}?project_id={{ project_id|urlencode }}">Cancel</a></form>
+  </section>
+{% endblock %}

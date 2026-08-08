@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Backlog</p><h1>Work</h1></div><span class="mode-badge">Read-only slice</span></div>
+  <form class="filterbar" method="get" action="{{ url_for('work_page') }}"><label for="project_id">Project</label><input id="project_id" name="project_id" value="{{ project_id or '' }}" placeholder="all projects"><button class="secondary" type="submit">Filter</button></form>
+  {% if not work.configured %}<section class="empty"><h2>Monitoring without a queue</h2><p>{{ work.reason }}</p></section>{% elif not work.items %}<section class="empty"><h2>No work items</h2><p>The queue is configured but contains no items.</p></section>{% else %}<section class="work-groups" id="work-rows" hx-get="{{ url_for('work_fragment') }}{% if project_id %}?project_id={{ project_id|urlencode }}{% endif %}" hx-trigger="every 10s" hx-swap="innerHTML">{% include "fragments/work_rows.html" %}</section>{% endif %}
+{% endblock %}

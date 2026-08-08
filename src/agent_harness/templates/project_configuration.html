@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+  <p class="breadcrumb"><a href="{{ url_for('projects') }}">Projects</a> / {{ project.project_id }} / Configuration</p>
+  <div class="page-heading"><div><p class="eyebrow">Project {{ project.project_id }}</p><h1>Project configuration</h1></div><span class="mode-badge">Review required</span></div>
+  <p class="muted">Submitting this page changes nothing. The server validates the same typed project contract as the JSON API and shows a separate review before applying it.</p>
+  {% if error %}<p class="alert error" role="alert">{{ error }}</p>{% endif %}
+  <form method="post" action="{{ url_for('project_configuration_review') }}" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project.project_id }}">
+    <section class="card"><h2>Repository and checkout</h2><div class="form-grid">
+      <div><label for="project-name">Name</label><input id="project-name" name="name" value="{{ project.name }}" required></div>
+      <div><label for="base-branch">Base branch</label><input id="base-branch" name="base_branch" value="{{ project.base_branch }}" required></div>
+      <div><label for="repo">Repository</label><input id="repo" name="repo" value="{{ project.repo or '' }}" placeholder="owner/name"></div>
+      <div><label for="work-dir">Checkout directory</label><input id="work-dir" name="work_dir" value="{{ project.work_dir or '' }}"></div>
+      <div><label for="plan-path">Plan path</label><input id="plan-path" name="plan_path" value="{{ project.plan_path or '' }}"></div>
+      <div><label for="durability">Attempt durability</label><select id="durability" name="durability"><option value=""{% if not project.durability %} selected{% endif %}>Deployment default</option>{% for mode in ['exit', 'boundary', 'sync'] %}<option value="{{ mode }}"{% if project.durability == mode %} selected{% endif %}>{{ mode }}</option>{% endfor %}</select></div>
+    </div></section>
+    <section class="card"><h2>Concurrency and ceilings</h2><p class="muted">Zero means unlimited only where stated. These are harness item ceilings, not provider cost caps, and changing them never retries a provider cap.</p><div class="form-grid">
+      <div><label for="max-workers">Maximum workers</label><input id="max-workers" name="max_workers" type="number" min="1" step="1" value="{{ project.max_workers }}" required></div>
+      <div><label for="max-attempts">Maximum attempts</label><input id="max-attempts" name="max_attempts" type="number" min="0" step="1" value="{{ project.max_attempts }}" required></div>
+      <div><label for="max-seconds">Item wall-clock seconds</label><input id="max-seconds" name="max_item_seconds" type="number" min="0" step="any" value="{{ project.max_item_seconds }}" required></div>
+      <div><label for="max-spend">Item spend ceiling (USD)</label><input id="max-spend" name="max_item_spend_usd" type="number" min="0" step="any" value="{{ project.max_item_spend_usd }}" required></div>
+      <div><label for="max-hold">Hold expiry seconds</label><input id="max-hold" name="max_hold_seconds" type="number" min="0" step="any" value="{{ project.max_hold_seconds }}" required></div>
+      <div><label for="disk-floor">Minimum free disk (GiB)</label><input id="disk-floor" name="min_free_disk_gb" type="number" min="0" step="any" value="{{ project.min_free_disk_gb }}" required></div>
+    </div></section>
+    <section class="card"><h2>Checks, fixes, and role routes</h2><p class="muted">Stored command and route values are not rendered back into HTML because they can contain credentials. They remain unchanged unless the corresponding replacement is explicitly selected.</p>
+      <p>{{ project.checks|length }} check(s), {{ project.fixes|length }} fix mapping(s), {{ (project.roles or {})|length }} role override(s) are configured.</p>
+      <label class="choice"><input type="checkbox" name="replace_checks" value="yes"> Replace checks</label><label for="checks">One argv command per line</label><textarea id="checks" name="checks" rows="4" autocomplete="off"></textarea>
+      <label class="choice"><input type="checkbox" name="replace_fixes" value="yes"> Replace fix map</label><label for="fixes">JSON object mapping a declared check to an argv list</label><textarea id="fixes" name="fixes" rows="4" autocomplete="off" placeholder="{}"></textarea>
+      <label class="choice"><input type="checkbox" name="replace_roles" value="yes"> Replace project role routes</label><label for="roles">JSON object using the public RoleRoute schema</label><textarea id="roles" name="roles" rows="4" autocomplete="off" placeholder="{}"></textarea>
+    </section>
+    <button type="submit">Review configuration</button>
+  </form>
+{% endblock %}

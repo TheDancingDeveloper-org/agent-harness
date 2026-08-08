@@ -339,6 +339,66 @@ def test_cost_reports_unpriced_calls_separately(client) -> None:  # type: ignore
     assert body["total_unpriced"] == 1, "an unpriced call was folded into the total"
 
 
+def test_analytics_projection_keeps_classes_denominators_and_baselines(client) -> None:  # type: ignore[no-untyped-def]
+    client.audit.append(
+        [
+            ev(
+                kind=MODEL_CALL,
+                error_class="rpm",
+                data={"run_id": "r", "seq": 1, "project_id": "p", "tokens_in": 10},
+            ),
+            ev(
+                kind=MODEL_CALL,
+                error_class="unclassified",
+                data={"run_id": "r", "seq": 2, "project_id": "p"},
+            ),
+            ev(
+                kind=WORK,
+                outcome="done",
+                data={"run_id": "r", "seq": 3, "project_id": "p", "item_id": "T1"},
+            ),
+        ]
+    )
+    body = client.get("/api/analytics?window=all&project_id=p", headers=hdr())
+    assert body.status_code == 200
+    payload = body.json()
+    assert payload["rate_limits"]["classified"]["rpm"] == 1
+    assert payload["rate_limits"]["unclassified"] == 1
+    assert payload["rate_limits"]["total"] == 1
+    assert payload["rate_limits"]["denominator"] == 2
+    assert payload["cost"]["denominator"] == 2
+    assert payload["delivery"]["denominator"] == 1
+    assert payload["audit_health"]["events"] == 3
+
+    baseline = {
+        "baseline_id": "p-before",
+        "project_id": "p",
+        "label": "before",
+        "window_days": 7,
+        "items_done": 12,
+    }
+    assert client.post("/api/audit/baselines", headers=hdr(), json=baseline).status_code == 200
+    refreshed = client.get("/api/analytics?window=all&project_id=p", headers=hdr()).json()
+    assert refreshed["baselines"]["baselines"][0]["items_done"] == 12
+
+
+def test_analytics_projection_marks_partial_history_and_degraded_store(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from agent_harness.api import create_api
+
+    blocker = tmp_path / "blocked"
+    blocker.write_text("not a directory")
+    audit = open_audit_store(blocker / "audit.sqlite", required=False)
+    with TestClient(
+        create_api(EventStore(tmp_path / "harness.sqlite"), token="tok", audit=audit)
+    ) as c:  # noqa: S106
+        payload = c.get("/api/analytics?window=7d", headers=hdr()).json()
+    assert payload["audit_health"]["configured"] is True
+    assert payload["audit_health"]["degraded"] is True
+    assert payload["cost"]["denominator"] == 0
+
+
 def test_a_window_longer_than_the_history_is_flagged_partial(client) -> None:  # type: ignore[no-untyped-def]
     """A chart labelled '7 days' drawn from one hour of history is not wrong
     about the data, it is wrong about the question -- and the numbers alone

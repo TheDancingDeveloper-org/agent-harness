@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Start gate</p><h1>Project preflight</h1></div><span class="mode-badge">{{ 'Ready' if result.ready else 'Blocked' }}</span></div>
+  <section class="card"><div class="card-heading"><div><p class="eyebrow">Project {{ project_id }}</p><h2>{{ result.summary }}</h2></div><a class="button secondary" href="{{ url_for('projects') }}">Back to projects</a></div>
+    <p class="muted">This report uses the same preflight checks as the JSON start contract. A blocked result refuses start; warnings remain visible and are not silently overridden.</p>
+    <div class="list">{% for check in result.checks %}<article class="card"><div class="card-heading"><h3>{{ check.name }}</h3><span class="{{ 'success' if check.ok else ('attention' if not check.blocking else 'danger') }}">{{ 'passed' if check.ok else ('warning' if not check.blocking else 'blocked') }}</span></div><p>{{ check.detail }}</p></article>{% endfor %}</div>
+  </section>
+  <section class="card"><div class="card-heading"><div><p class="eyebrow">Expensive check</p><h2>Base branch checks</h2></div><span class="mode-badge">{{ base.state }}</span></div>
+    {% if base.detail %}<p>{{ base.detail }}</p>{% else %}<p class="muted">No base-check run has been started.</p>{% endif %}
+    <form method="post" action="{{ url_for('base_check_action') }}" data-csrf-form><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><input type="hidden" name="project_id" value="{{ project_id }}"><button type="submit">{{ 'Join running check' if base.state == 'running' else 'Run base checks' }}</button></form>
+  </section>
+{% endblock %}

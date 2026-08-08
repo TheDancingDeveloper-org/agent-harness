@@ -209,6 +209,15 @@ class EventStore:
         sql += f" GROUP BY {field}, error_class ORDER BY n DESC"
         return [dict(r) for r in self._connect().execute(sql, args)]
 
+    def rate_limit_denominator(self, since: float | None = None) -> int:
+        """All observed classified and unclassified rate-limit rows."""
+        sql = "SELECT COUNT(*) FROM events WHERE error_class IS NOT NULL"
+        args: list[Any] = []
+        if since is not None:
+            sql += " AND ts >= ?"
+            args.append(since)
+        return int(self._connect().execute(sql, args).fetchone()[0])
+
     def outcome_counts(self, kind: str | None = None, since: float | None = None) -> dict[str, int]:
         sql = "SELECT outcome, COUNT(*) AS n FROM events WHERE outcome IS NOT NULL"
         args: list[Any] = []
@@ -259,6 +268,23 @@ class EventStore:
             "SELECT * FROM events WHERE id > ? ORDER BY id LIMIT ?", (event_id, limit)
         )
         return [self._row_to_dict(r) for r in rows]
+
+    def item_events(self, project_id: str, item_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+        """Retained history for one item, oldest first.
+
+        The legacy ingest store predates indexed project/item columns, so the
+        identity lives in JSON. Keep the query here, beside that storage
+        knowledge, rather than teaching an API or template how rows happen to
+        be laid out.
+        """
+        rows = self._connect().execute(
+            "SELECT * FROM events "
+            "WHERE json_extract(data, '$.item_id') = ? "
+            "AND COALESCE(json_extract(data, '$.project_id'), 'default') = ? "
+            "ORDER BY id LIMIT ?",
+            (item_id, project_id, limit),
+        )
+        return [self._row_to_dict(row) for row in rows]
 
     def max_id(self) -> int:
         row = self._connect().execute("SELECT MAX(id) FROM events").fetchone()

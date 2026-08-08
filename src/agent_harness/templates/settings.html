@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Deployment</p><h1>Settings</h1></div><span class="mode-badge">{{ mode }}</span></div>
+  {% if mode == 'monitoring-only' %}
+    <section class="alert warning" role="status"><strong>Monitoring-only deployment.</strong> No worker pool is attached, so execution controls are disabled. This is a readiness condition, not a failed action.</section>
+  {% endif %}
+  <section class="card"><h2>Readiness</h2><p class="muted">This page never probes or mutates execution. Use the typed readiness API for an explicit, potentially expensive check.</p><dl class="detail-facts"><dt>Queue</dt><dd>{{ 'configured' if queue_configured else 'not configured' }}</dd><dt>Browser identity</dt><dd>{{ session.operator }}</dd><dt>Audit</dt><dd>Append-only history is shown separately from queue state.</dd></dl><p><a class="button secondary" href="{{ root_path }}/docs">Open API documentation</a></p></section>
+  <section class="card">
+    <div class="card-heading"><div><p class="eyebrow">Global configuration</p><h2>Role routing</h2></div><span class="mode-badge">Explicit review</span></div>
+    <p class="muted">The active executor determines whether each registered role is used. Project routes may override this global map.</p>
+    {% if routes %}
+      <p class="alert {{ 'warning' if not routes.reviewer_independent else 'success' }}"><strong>Reviewer independence:</strong> {{ routes.reviewer_note }}</p>
+      {% if role_rows %}<div class="table-scroll"><table><thead><tr><th>Role</th><th>Models</th><th>Endpoint</th><th>Preset / classifier</th><th>Pricing</th><th>Use</th></tr></thead><tbody>{% for route in role_rows %}<tr><th>{{ route.name }}</th><td>{{ route.models|join(' → ') }}</td><td><code>{{ route.endpoint }}</code></td><td>{{ route.preset or 'deployment default' }} / {{ route.provider }}</td><td>{{ route.price_ref or 'model id' }}</td><td>{% if route.used %}Used by this executor{% else %}<span class="warning">Unused: {{ route.unused_reason }}</span>{% endif %}</td></tr>{% endfor %}</tbody></table></div>{% else %}<p class="empty">No global role routes are configured.</p>{% endif %}
+      <form method="post" action="{{ url_for('roles_review') }}" data-csrf-form>
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label for="global-roles">Complete replacement map (JSON)</label>
+        <textarea id="global-roles" name="roles" rows="8" spellcheck="false" autocomplete="off" placeholder='{"reviewer":{"models":["preferred","fallback"],"endpoint":"https://models.example/v1","provider":"generic","preset":"","price_ref":""}}' required></textarea>
+        <p class="muted small">For credential safety the current map is not copied into the form. Submit the complete replacement; an empty object removes all global routes. Every public <code>RoleRoute</code> field is preserved.</p>
+        {% if route_error %}<p class="alert error" role="alert">{{ route_error }}</p>{% endif %}
+        <button type="submit">Review routing change</button>
+      </form>
+    {% else %}<p class="alert warning">Configure the queue before editing role routes.</p>{% endif %}
+  </section>
+{% endblock %}

@@ -1,0 +1,5 @@
+{% set groups = ['held', 'blocked', 'failed', 'exhausted', 'claimed', 'pending', 'done'] %}
+{% for state in groups %}
+  {% set rows = work.items|selectattr('state', 'equalto', state)|list %}
+  {% if rows %}<section class="work-group" aria-labelledby="group-{{ state }}"><h2 id="group-{{ state }}">{{ state|capitalize }} <span class="count">{{ rows|length }}</span></h2><div class="list">{% for item in rows %}<article class="work-row"><div class="row-main"><a href="{{ url_for('work_item_page', item_id=item.id) }}?project_id={{ item.project_id|default(project_id or 'default')|urlencode }}"><strong>{{ item.title }}</strong></a><span class="mono">{{ item.id }}</span>{% if item.hold %}<span class="attention">Waiting for a person</span>{% endif %}</div><p>{{ item.brief|truncate(180) }}</p><div class="row-meta"><span>{{ item.attempts }} attempt(s)</span>{% if item.latest %}<span>{{ item.latest.outcome }}</span>{% endif %}{% if item.unpriced_calls %}<span class="warning">{{ item.unpriced_calls }} unpriced call(s)</span>{% endif %}</div></article>{% endfor %}</div></section>{% endif %}
+{% else %}<section class="empty"><h2>No work items</h2></section>{% endfor %}

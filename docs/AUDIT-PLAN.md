@@ -29,8 +29,8 @@ than timestamp. That foundation is sound and none of it needs replacing.
 ### 0.1 The audit log shares a file with the operational queue
 
 ```python
-queue = WorkQueue(args.db)      # mutable: claims, leases, retries
-store = EventStore(args.db)     # append-only: what happened, forever
+queue = WorkQueue(args.db)  # mutable: claims, leases, retries
+store = EventStore(args.db)  # append-only: what happened, forever
 ```
 
 Same database. So the history shares fate with the state: a queue migration

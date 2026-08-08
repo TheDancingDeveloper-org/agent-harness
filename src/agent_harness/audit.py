@@ -531,6 +531,18 @@ class AuditStore:
             )
         ]
 
+    def item_events(self, project_id: str, item_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+        """Retained history for one item, oldest first."""
+        if self.degraded:
+            return []
+        return [
+            dict(row)
+            for row in self._connect().execute(
+                "SELECT * FROM events WHERE project_id = ? AND item_id = ? ORDER BY id LIMIT ?",
+                (project_id, item_id, limit),
+            )
+        ]
+
     def max_id(self) -> int:
         if self.degraded:
             return 0
@@ -547,6 +559,17 @@ class AuditStore:
             params.append(since)
         sql += " GROUP BY error_class ORDER BY n DESC"
         return {r["error_class"]: r["n"] for r in self._connect().execute(sql, params)}
+
+    def rate_limit_denominator(self, since: float | None = None) -> int:
+        """All observed classified and unclassified rate-limit rows."""
+        if self.degraded:
+            return 0
+        sql = "SELECT COUNT(*) FROM events WHERE error_class IS NOT NULL"
+        params: list[Any] = []
+        if since is not None:
+            sql += " AND ts >= ?"
+            params.append(since)
+        return int(self._connect().execute(sql, params).fetchone()[0])
 
     def group_counts(
         self, field: str, since: float | None = None, rate_limits_only: bool = True
@@ -620,6 +643,22 @@ class AuditStore:
             params.append(project_id)
         sql += " GROUP BY project_id, outcome ORDER BY n DESC"
         return [dict(r) for r in self._connect().execute(sql, params)]
+
+    def delivery_denominator(
+        self, since: float | None = None, project_id: str | None = None
+    ) -> int:
+        """Distinct work items represented by delivery rows in a window."""
+        if self.degraded:
+            return 0
+        sql = "SELECT COUNT(DISTINCT item_id) FROM events WHERE kind = 'work'"
+        params: list[Any] = []
+        if since is not None:
+            sql += " AND ts >= ?"
+            params.append(since)
+        if project_id is not None:
+            sql += " AND project_id = ?"
+            params.append(project_id)
+        return int(self._connect().execute(sql, params).fetchone()[0])
 
     def baselines(self, project_id: str | None = None) -> list[dict[str, Any]]:
         if self.degraded:

@@ -79,7 +79,7 @@ on.
             │
     context selection ────── primary target does not fit? ESCALATE, do not guess
             │
-      implementer ────────── asked for EDIT BLOCKS; the harness computes the diff
+      implementer ────────── direct EDIT BLOCKS, or a selected tool-using loop
             │
      validate the patch ──── before git is touched at all
             │
@@ -107,7 +107,7 @@ on.
 | **Tree sync** | The tree is at the item's base *before* anything reads it, and before the branch is cut. The context selector reads the file at the base while the edit applier reads the working tree; when those disagreed, the second item to touch a file was told its own correctly-quoted text did not occur. The branch is cut late, so an item producing no usable diff leaves no branch behind. |
 | **Planner** | Named targets, in importance order, plus an explicit `cannot_identify_target`. That last field is a first-class answer, not an error. |
 | **Context selection** | The implementer is never asked to change a file it was not shown. If the primary target alone exceeds the budget the item escalates (`context_unavailable`) rather than proceeding — retrying cannot change the size of a file. |
-| **Implementer** | A change expressed as text to find and text to put there. See §2.1. |
+| **Implementer** | In direct mode, a change expressed as text to find and text to put there (§2.1). With a role runner selected, a bounded loop works in the repository and the harness computes the complete candidate diff against the item base, including new files and local commits. Both paths then enter the same validator and gates. |
 | **Patch validation** | A reply that is not a well-formed diff is diagnosed as a *model* failure before git is involved, because once it reaches `git apply: corrupt patch at line 549` it is indistinguishable from a patch written against the wrong base — and the two are fixed in completely different places. |
 | **Apply** | Either the change is in the tree, or the branch is destroyed and the patch is kept on disk for whoever diagnoses it. |
 | **Checks** | The project's own commands answered on the *applied* tree, with five distinct outcomes (§6.4) — not a boolean. |
@@ -185,8 +185,10 @@ form. One refusal precedes the ladder entirely: a hunk header claiming
 `@@ -0,0` against a file that exists with content is rejected outright, because
 `--unidiff-zero` would "succeed" by inserting the whole thing at line 1.
 
-The ladder is why the *applied* diff — `git diff HEAD`, re-read after the apply
-and again if a declared fix touched the tree — is what the reviewer sees.
+The ladder is why the *applied* diff — re-read after the apply and again if a
+declared fix touched the tree — is what the reviewer sees. The reader uses a
+temporary Git index so untracked files are included without changing the real
+index; a plain `git diff HEAD` would silently omit a newly created module.
 Reviewing the model's text instead would reject good work for an artefact of
 the plumbing and, worse, make the gate structurally unable to catch a diff that
 claims more than it did.
@@ -210,29 +212,42 @@ its gates:
   sequence, and where the two executors once disagreed about a gate, they no
   longer do.
 
-- **An agent loop** (`adapters/minisweagent.py`) supplies what the other two
-  lack: turns. Its `Model` routes every call through `ModelClient` — so
+- **A selected role runner** replaces the direct implementer call without
+  replacing the executor. Core defines `RoleRunner` and `RoleRunRequest` in
+  `role_runners.py`, resolves the configured name through installed metadata,
+  and knows no adapter module path. The shipped agent-loop adapter
+  (`adapters/minisweagent.py`) supplies what the other two paths lack: turns.
+  Its `Model` routes every call through `ModelClient` — so
   fallback chains, the retry ladder, per-endpoint parking, classification,
   pricing and the recorded answer all still apply, and the loop never learns
   what a provider is — and its `Environment` puts every command the agent runs
   through the same `CommandGuard` that screens check commands. A call is billed
   before its body is parsed, because a reply nobody could parse was still paid
   for and a ceiling that counts only the calls that went well is not a ceiling.
-  **It is not yet reachable from `run`** (#215): the queue, the gates, the
-  audit, the attempt record and the budgets have never seen a loop-executed
-  item, and its budget mapping is therefore enforceable rather than enforced.
+  `run --role-runner NAME` selects it before any item is claimed; the choice is
+  stored for doctor and preflight. The loop may run declared checks for
+  feedback, but its complete candidate tree is converted to a diff and enters
+  the existing `_from_diff` path, where the harness runs those checks again as
+  the authoritative gate, checkpoints, reviews and records the attempt.
+
+  Whole-item wall-clock and spend bounds are translated to their remaining
+  values before the loop starts, while the step ceiling remains an independent
+  emergency control. Usage is folded into the item on every successful reply,
+  including a reply whose body cannot be parsed. Once any call is unpriced, a
+  dollar total is only a lower bound, so the dollar ceiling becomes
+  unenforceable rather than stopping the item on a known subtotal; step and
+  wall-clock bounds still hold.
 
 Which files inside the repository an agent touches is deliberately *not*
 constrained. An agent using the whole repository to reach an outcome is how
 work gets done; "it changed something the item did not ask for" is a question
 for the reviewer. The guard bounds what is **dangerous**, not what is untidy.
 
-**The direction of travel.** Issue #195 reframes the single-shot model call as
-the defect rather than any one prompt or format: every role that answers
-questions about a repository — planner, implementer, reviewer, surveyor,
-assessor, scoper — is today a context someone guessed at, one call, and parsed
-text, and the correct shape is a bounded loop with tools and, for the gates,
-read-only access. This document describes the pipeline that exists.
+**The remaining direction.** Issue #195 reframes the single-shot model call as
+the defect rather than any one prompt or format. The implementer now has a
+selectable bounded loop; planner, reviewer, surveyor, assessor and scoper still
+use one call over context assembled for them. A gate converted to a loop needs
+a read-only environment rather than the writable implementation environment.
 
 ---
 
@@ -480,8 +495,10 @@ wrapper- and heredoc-aware — and screens each. Its `execute` is one method, an
 one method is the entire attack surface.
 
 **It is not a sandbox**, and nothing here should be described as one. The
-session host owns process isolation, and a second worse copy of it does not
-belong here. It cannot see inside an inline program — `sh -c '…'` and
+current direct runner still needs the OS-enforced item boundary specified in
+`STATUS.md` Stage 2; an optional session host may provide its own isolation,
+but that does not satisfy the harness-owned execution target. The guard cannot
+see inside an inline program — `sh -c '…'` and
 `python -c '…'` are one argv token — so a deployment that runs a shell as a
 check has an unscreened shell. Pattern matching bounds the obvious reaches, not
 the clever ones: it converts a class of catastrophic outcomes into a legible
@@ -1092,16 +1109,22 @@ than setting a flag no worker acts on. With one, the same API gains a worker
 pool its start action can use — and still nothing runs until someone starts a
 project.
 
-### Why there is no GUI here
+### The browser control plane is another client
 
-The GUI belongs to the session host. It already owns tabs, token
-authentication, push notifications, a mobile story and the PTY sessions the
-agents run in. A web UI in this repository would mean a second URL, a second
-login, no notifications and no phone — worse, for the same work.
+The browser application is packaged and served by `agent-harness` from the
+same process and origin as the JSON API. It uses server-rendered templates,
+vendored static assets and bounded opaque browser sessions established by a
+one-time exchange of the configured bearer token. The token is not rendered,
+stored in frontend code or placed in a URL. Browser mutations require CSRF
+validation and explicit review; HTML controllers delegate to the same typed
+application services and gate checks as JSON routes.
 
-This is not an aesthetic position; it is the same reasoning as everywhere else
-in this document. The harness owns the decisions and the record. It serves JSON,
-and the host renders it.
+This does not make the GUI part of execution. A monitoring-only service renders
+the same views while refusing start actions it cannot fulfil, and execution
+continues when the GUI is offline. A session host remains an optional executor
+adapter for PTY-backed agents, not the owner of browser authentication, routes,
+assets or deployment. The later in-repository chat/terminal subsystem described
+in `GUI_PLAN.md` is not implemented.
 
 ---
 
@@ -1126,7 +1149,7 @@ from agent_harness.providers import VendorEnvelopeProvider
 PRESET = RoutePreset(
     name="somevendor",
     request=JsonChatRequest(path="/v2/generate", model_key="model_id", messages_key="turns"),
-    auth=BearerAuth(header="x-api-key", scheme=""),      # no scheme word
+    auth=BearerAuth(header="x-api-key", scheme=""),  # no scheme word
     reader=JsonResponseReader(text_paths=("result.reply",), usage_key="counters"),
     classifier=VendorEnvelopeProvider(vendor_field="problem", quota_categories=("budget",)),
 )
@@ -1151,6 +1174,26 @@ way.
 format lives in `adapters/` and is declared under
 `agent_harness.dependency_resolvers`. A dotted module path written into
 `graph.py` would still be core knowing what a particular tracker is called.
+
+**Role runners, the same door again.** Core publishes the versioned contract
+and resolves `agent_harness.role_runners` entry points by name. The distribution
+declares its shipped loop in metadata; `executor.py` receives only a structural
+runner and neither imports nor names its adapter. An incompatible contract is a
+configuration failure before work is claimed, not a substitution.
+
+**Review sources, the same door once more.** `review_events.py` owns what a
+piece of remote feedback *becomes* — one correction item, one hold, or nothing
+— and deduplicates on an immutable source identity. It never owns what a
+particular forge's record looks like, and it never asks a model whether a
+human's comment was actionable. An adapter declared under
+`agent_harness.review_sources` supplies that upstream's authentication,
+polling, identity and an **explicit** disposition; the shipped
+`github-pr-review` adapter reaches core through that entry point like anyone
+else's would. Its disposition rules are deterministic and legible — explicit
+markers first, then review state — and anything unmarked defaults to
+`ambiguous`, which opens a hold for a person. Defaulting the other way would
+put an agent to work on a guess about what somebody meant, which is the
+failure this whole contract exists to prevent.
 
 **Adapters generally.** Log readers, telemetry export and the agent loop are all
 opt-in and lazily loaded, and nothing in core imports any of them. Telemetry is
@@ -1187,8 +1230,13 @@ Named here rather than left for a reader to discover.
   messages and human participation over the API are designed and not built, and
   two modules currently spell an item's room differently — harmless only
   because nothing in production constructs a ledger.
-- **The single-shot call is the known shape defect** (§2.3), and is why #195
-  exists.
+- **The host compatibility path still works in one shared checkout.** It remains
+  useful for fixtures and explicitly selected local development, but it inherits
+  the controller's environment and `CommandGuard` remains screening rather than
+  an OS security boundary. When an execution backend is selected, the role runner
+  gets a disposable per-item Git worktree and the backend owns the command
+  boundary; the shipped Docker backend still requires live-daemon acceptance
+  evidence before a secret-bearing real workload is authorised.
 
 Where to go next: [`AGENTS.md`](../AGENTS.md) for the binding rules,
 [`STATUS.md`](STATUS.md) for what is built and what has been proven,

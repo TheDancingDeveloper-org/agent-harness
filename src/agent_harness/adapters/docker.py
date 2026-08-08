@@ -61,13 +61,18 @@ class DockerItemEnvironment:
             raise DockerEnvironmentError(f"docker command failed to start: {exc}") from exc
 
     def check(self) -> tuple[bool, str]:
+        """The same answer the factory gives, from the same helpers.
+
+        This was a second, divergent copy of the daemon check, and it kept the
+        `--format` defect after the factory's copy was fixed: an unreachable
+        daemon reported a Go template error instead of naming the daemon.
+        """
         if shutil.which("docker") is None:
             return False, "docker is not installed or is not on PATH"
-        result = self._docker("info", "--format", "{{.ServerVersion}}", timeout=5)
+        result = self._docker("info", timeout=10)
         if result.returncode != 0:
-            detail = result.stderr.strip().splitlines()[-1:] or ["Docker daemon is unavailable"]
-            return False, detail[0]
-        return True, f"Docker daemon {result.stdout.strip() or 'available'}"
+            return False, f"Docker daemon is unreachable: {_diagnosis(result.stderr)}"
+        return True, f"Docker daemon {_server_version(result.stdout) or 'available'}"
 
     def _ensure_started(self) -> None:
         if self.started:
@@ -139,7 +144,16 @@ class DockerItemEnvironment:
         target = "/workspace" if str(relative) == "." else f"/workspace/{relative}"
         # `timeout` is inside the container so a client-side timeout cannot
         # leave a test process running after docker exec has gone away.
-        wrapped = f"timeout --signal=TERM {timeout}s /bin/sh -lc {shlex.quote(command)}"
+        #
+        # `-s TERM` and bare seconds, not `--signal=TERM 30s`: the long option
+        # and the unit suffix are GNU coreutils, and an agent image is not
+        # required to ship those. Against BusyBox -- Alpine, which is the
+        # small acceptance image -- the GNU form made EVERY command fail with
+        # `timeout: unrecognized option: signal=TERM` and returncode 1, which
+        # reads as the agent's command failing rather than the harness's own
+        # wrapper being unportable. Found on the first live run against a real
+        # daemon. Both GNU and BusyBox accept this form.
+        wrapped = f"timeout -s TERM {timeout} /bin/sh -lc {shlex.quote(command)}"
         result = self._docker(
             "exec",
             "--user",

@@ -2247,8 +2247,27 @@ def _fleet_for_serve(
     required_roles = {"reviewer"} if not direct_mode else {"planner", "implementer", "reviewer"}
     if direct_mode and not required_roles <= set(routes):
         missing = ", ".join(sorted(required_roles - set(routes)))
-        print(f"local fleet: no route for role(s): {missing}", file=sys.stderr)
-        raise SystemExit(2)
+        # Not fatal, for the same reason the reviewer case below is not, and
+        # this used to exit(2) three lines from that argument.
+        #
+        # `serve` is a supervised deployment. Exiting means the API and the
+        # GUI never come up, so nobody can read *why* — and a process manager
+        # restarts it into the same missing configuration for ever. Observed
+        # on the Node B deployment: a container restarting every 60 seconds,
+        # with the one sentence explaining it visible only to whoever thought
+        # to read container logs.
+        #
+        # Nothing unsafe is allowed by starting. Preflight already refuses to
+        # start a project whose roles are not routed, and a fleet with no
+        # routes claims nothing. Coming up means `/api/readiness` can say what
+        # is missing, which is the whole point of having it.
+        print(
+            f"warning: local fleet has no route for role(s): {missing}. "
+            "Monitoring and every read work; preflight will refuse to start a "
+            "project until they are routed — set them with --planner/--implementer/"
+            "--reviewer and --endpoint, or PUT /api/roles.",
+            file=sys.stderr,
+        )
     if "reviewer" not in routes:
         # Not fatal, and not silent: preflight blocks the start with exactly
         # this reason, so the fleet may as well exist and say why now.

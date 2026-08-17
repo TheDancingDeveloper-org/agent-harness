@@ -102,6 +102,18 @@ def test_a_reply_with_no_json_is_an_error() -> None:
         parse_proposal("I would rather not.", 1, 1000.0)
 
 
+def test_scoper_receives_generic_exploration_defaults(queue: WorkQueue) -> None:
+    inc = inception(queue)
+    inc.start("w", "reconcile widgets")
+    inc.scope("w")
+
+    prompt = inc.model_client.prompts[0]
+    assert "Generic exploration defaults" in prompt
+    assert "phase headings as tracking-only containers" in prompt
+    assert "credentials before durable writes" in prompt
+    assert "Rainmon" not in prompt
+
+
 # ------------------------------------------------------------- questions
 
 
@@ -221,11 +233,9 @@ def test_the_proposal_becomes_a_plan_the_parser_can_read(queue: WorkQueue) -> No
     markdown = inc.plan_markdown("w", name="Widgets")
 
     plan = parse_plan(markdown)
-    # The phase heading is an item too. That is the parser working as
-    # intended rather than a leak: real plans track phases as work (NGMS has
-    # P0..P7 as issues), and a generated plan should behave the same way a
-    # hand-written one does.
-    assert [i.id for i in plan.items] == ["P0", "T1", "T2"]
+    # Phase headings are containers by default; only explicit work items are
+    # claimable.
+    assert [i.id for i in plan.items] == ["T1", "T2"]
     assert plan.duplicate_ids() == {}
     assert plan.unresolved_dependencies() == {}
     assert {i.id: i.depends_on for i in plan.items}["T2"] == ["T1"]

@@ -30,6 +30,9 @@ from fastapi import Path as PathParam
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import __version__
+from .admission_service import AdmissionError
+from .admission_service import apply as admission_apply
+from .admission_service import preview as admission_preview
 from .adoption_service import (
     AdoptionConfigurationError,
     AdoptionInspectionFailure,
@@ -46,9 +49,11 @@ from .audit_service import maintain_audit, reconcile_repository
 from .events import RATE_LIMIT_CLASSES, UNCLASSIFIED
 from .events import Event as AuditEvent
 from .maintenance import DEFAULT_RETENTION_DAYS
+from .plan_revisions import revision_items
 from .plan_service import PlanSyncConflict, PlanSyncFailure
 from .plan_service import execute as execute_plan_sync
 from .plan_service import parse_result as plan_parse_result
+from .plan_validation import validate_plan_file
 from .preflight import BaseChecks
 from .process_metrics import ProcessMetricsSampler, ProcessMetricsSource
 from .project_service import configure_project, project_spec
@@ -58,6 +63,10 @@ from .routing_service import configure_roles, role_map_view
 from .schemas import (
     AddItemsRequest,
     AddItemsResult,
+    AdmissionApplyRequest,
+    AdmissionApplyResult,
+    AdmissionPreviewRequest,
+    AdmissionPreviewResult,
     AdoptionDecisionRequest,
     AdoptionInspectRequest,
     AdoptionReconcileRequest,
@@ -100,8 +109,11 @@ from .schemas import (
     OpenQuestion,
     OverdueHold,
     PlanParseResult,
+    PlanRevisionDetail,
+    PlanRevisionSummary,
     PlanSyncRequest,
     PlanSyncResult,
+    PlanValidationResult,
     PreflightCheck,
     PreflightResult,
     ProcessMetrics,
@@ -1897,6 +1909,159 @@ def create_api(
         return _role_map_view(app.state, queue)
 
     # ---------------------------------------------------------------- plan
+
+    @app.post(
+        "/api/plans/admission/preview",
+        tags=["plan"],
+        summary="Preview local plan admission without mutation",
+        response_model=AdmissionPreviewResult,
+        responses={400: {"description": "The plan or local Git facts are invalid."}},
+    )
+    def plan_admission_preview(
+        request: AdmissionPreviewRequest,
+        _: None = Depends(require_token),
+    ) -> AdmissionPreviewResult:
+        try:
+            proposal = admission_preview(
+                need_queue(),
+                project_id=request.project_id,
+                plan_path=request.plan_path,
+                worktree=request.worktree,
+            )
+        except AdmissionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return AdmissionPreviewResult.model_validate(proposal.as_dict())
+
+    @app.post(
+        "/api/plans/admission/apply",
+        tags=["plan"],
+        summary="Apply an exact reviewed admission proposal",
+        response_model=AdmissionApplyResult,
+        responses={409: {"description": "The reviewed proposal is stale."}},
+    )
+    def plan_admission_apply(
+        request: AdmissionApplyRequest,
+        _: None = Depends(require_token),
+    ) -> AdmissionApplyResult:
+        try:
+            proposal = admission_preview(
+                need_queue(),
+                project_id=request.project_id,
+                plan_path=request.plan_path,
+                worktree=request.worktree,
+            )
+            idempotent = False
+            if proposal.proposal_digest != request.proposal_digest:
+                existing = need_queue()._connect()
+                try:
+                    same_plan = existing.execute(
+                        "SELECT 1 FROM plan_revisions WHERE project_id = ? AND plan_digest = ?",
+                        (request.project_id, proposal.plan_digest),
+                    ).fetchone()
+                finally:
+                    existing.close()
+                if same_plan is None:
+                    raise AdmissionError("proposal digest does not match the current preview")
+                idempotent = same_plan is not None
+            else:
+                existing = need_queue()._connect()
+                try:
+                    idempotent = (
+                        existing.execute(
+                            "SELECT 1 FROM plan_revisions WHERE project_id = ? AND plan_digest = ?",
+                            (request.project_id, proposal.plan_digest),
+                        ).fetchone()
+                        is not None
+                    )
+                finally:
+                    existing.close()
+            revision = admission_apply(
+                need_queue(),
+                proposal=proposal,
+                plan_path=request.plan_path,
+                worktree=request.worktree,
+                operator=request.operator,
+                expected_base_sha=request.expected_base_sha,
+                expected_current_revision=request.expected_current_revision,
+                removed_items=request.removed_items,
+                reopen_items=set(request.reopen_items),
+                high_risk_removals=set(request.high_risk_removals),
+            )
+        except AdmissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return AdmissionApplyResult(
+            project_id=request.project_id,
+            revision=revision,
+            idempotent=idempotent,
+            state="stopped",
+        )
+
+    @app.get(
+        "/api/projects/{project_id}/plan-revisions",
+        tags=["plan"],
+        summary="List immutable admitted plan revisions",
+        response_model=list[PlanRevisionSummary],
+    )
+    def plan_revisions(
+        project_id: str = PathParam(description="Project id."),
+        _: None = Depends(require_token),
+    ) -> list[PlanRevisionSummary]:
+        connection = need_queue()._connect()
+        try:
+            rows = connection.execute(
+                "SELECT project_id, revision, plan_digest, manifest_digest, repository_identity, "
+                "initial_base_sha, integration_ref, finalise_ref, admitted_by, admitted_at "
+                "FROM plan_revisions WHERE project_id = ? ORDER BY revision",
+                (project_id,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return [PlanRevisionSummary.model_validate(dict(row)) for row in rows]
+
+    @app.get(
+        "/api/projects/{project_id}/plan-revisions/{revision}",
+        tags=["plan"],
+        summary="Read one immutable admitted plan revision",
+        response_model=PlanRevisionDetail,
+        responses={404: {"description": "No such plan revision."}},
+    )
+    def plan_revision_detail(
+        project_id: str = PathParam(description="Project id."),
+        revision: int = PathParam(description="Immutable revision number."),
+        _: None = Depends(require_token),
+    ) -> PlanRevisionDetail:
+        connection = need_queue()._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM plan_revisions WHERE project_id = ? AND revision = ?",
+                (project_id, revision),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            raise HTTPException(status_code=404, detail="plan revision not found")
+        return PlanRevisionDetail(
+            **dict(row),
+            items=revision_items(need_queue(), project_id, revision),
+        )
+
+    @app.post(
+        "/api/plans/validate",
+        tags=["plan"],
+        summary="Validate a plan without writing anything",
+        response_model=PlanValidationResult,
+        responses={404: {"description": "No such file"}},
+    )
+    def plans_validate(
+        path: str = Query(..., description="Path to the plan markdown."),
+        _: None = Depends(require_token),
+    ) -> PlanValidationResult:
+        """Return the complete deterministic contract report."""
+        target = Path(path)
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail=f"no plan at {path!r}")
+        report = validate_plan_file(target)
+        return PlanValidationResult.model_validate(report.as_dict())
 
     @app.post(
         "/api/plan/parse",

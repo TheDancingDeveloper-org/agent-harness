@@ -5,6 +5,7 @@
 > A proposal about how the harness talks to an agent. Overtaken by #195, which reframes the problem: the single-shot model call is the defect, and every role that answers questions about a repository must be a loop.
 >
 > **Current documentation:**
+> [`minimal.md`](../minimal.md) — the current generic local-only target.
 > [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
 > [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
 >

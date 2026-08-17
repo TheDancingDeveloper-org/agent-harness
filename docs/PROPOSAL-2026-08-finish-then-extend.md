@@ -5,6 +5,7 @@
 > A sequencing proposal. Its decisions D11–D14 are recorded in `AGENTS.md` and remain in force; the sequencing itself is spent.
 >
 > **Current documentation:**
+> [`minimal.md`](../minimal.md) — the current generic local-only target.
 > [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
 > [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
 >

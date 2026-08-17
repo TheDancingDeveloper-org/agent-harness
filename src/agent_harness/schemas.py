@@ -920,6 +920,112 @@ class PlanParseResult(BaseModel):
     )
 
 
+class PlanFinding(BaseModel):
+    """One deterministic plan validation diagnostic."""
+
+    code: str = Field(description="Stable PLAN-* diagnostic code.")
+    severity: Literal["error", "warning", "info"] = Field(
+        description="Diagnostic severity; errors make the plan invalid."
+    )
+    message: str = Field(description="What is wrong, in plain language.")
+    remediation: str = Field(description="The smallest useful correction.")
+    path: str = Field(description="Source path or logical plan name.")
+    line: int | None = Field(None, description="One-based source line, when known.")
+    column: int | None = Field(None, description="One-based source column, when known.")
+    pointer: str | None = Field(None, description="Stable logical pointer, when known.")
+
+
+class PlanValidationResult(BaseModel):
+    """Complete deterministic validation output, including every finding."""
+
+    valid: bool = Field(description="True when no finding has error severity.")
+    findings: list[PlanFinding] = Field(
+        description="All independently discoverable findings, in stable source order."
+    )
+
+
+class AdmissionPreviewRequest(BaseModel):
+    """Local facts needed to prepare a reviewable admission proposal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_id: str = Field(description="Stable local project identity.")
+    plan_path: str = Field(description="Path to the user-authored plan markdown.")
+    worktree: str = Field(description="Path to the local Git repository being admitted.")
+
+
+class AdmissionPreviewResult(BaseModel):
+    """Read-only admission proposal bound to exact plan and Git facts."""
+
+    proposal_digest: str = Field(description="Digest required to bind a later apply action.")
+    plan_digest: str = Field(description="SHA-256 digest of the exact plan bytes.")
+    manifest_digest: str = Field(description="SHA-256 digest of canonical manifest semantics.")
+    project_id: str = Field(description="Stable local project identity.")
+    worktree: str = Field(description="Canonical local repository path.")
+    repository_identity: str = Field(description="Canonical Git repository root.")
+    base_ref: str = Field(description="Local base ref named by the plan.")
+    base_sha: str = Field(description="Exact base commit resolved without fetch.")
+    integration_ref: str = Field(description="Local integration ref named by the plan.")
+    finalise_ref: str | None = Field(None, description="Optional reviewed local finalisation ref.")
+    current_revision: int | None = Field(None, description="Currently admitted revision, if any.")
+    validation: PlanValidationResult = Field(description="The deterministic validation report.")
+
+
+class AdmissionApplyRequest(AdmissionPreviewRequest):
+    """Explicit approval facts for applying one reviewed proposal."""
+
+    proposal_digest: str = Field(description="Digest returned by the reviewed preview.")
+    expected_base_sha: str = Field(description="Base SHA returned by the reviewed preview.")
+    expected_current_revision: int | None = Field(
+        None, description="Current revision returned by preview, or null for first admission."
+    )
+    operator: str = Field(description="Authenticated operator identity recorded in the revision.")
+    removed_items: dict[str, str] = Field(
+        default_factory=dict,
+        description="Explicit item removal reasons, required for omitted items.",
+    )
+    reopen_items: list[str] = Field(
+        default_factory=list,
+        description="Done item ids explicitly approved for reopening after a specification change.",
+    )
+    high_risk_removals: list[str] = Field(
+        default_factory=list,
+        description="Started or completed item ids explicitly approved for removal.",
+    )
+
+
+class AdmissionApplyResult(BaseModel):
+    """The admitted immutable revision identity."""
+
+    project_id: str = Field(description="Project whose plan was admitted.")
+    revision: int = Field(description="Immutable admitted plan revision number.")
+    idempotent: bool = Field(
+        description="Whether this was an exact replay of an existing admission."
+    )
+    state: Literal["stopped"] = Field(description="Admission always leaves the project stopped.")
+
+
+class PlanRevisionSummary(BaseModel):
+    project_id: str = Field(description="Project owning the immutable revision.")
+    revision: int = Field(description="Monotonic immutable revision number.")
+    plan_digest: str = Field(description="SHA-256 digest of the admitted plan bytes.")
+    manifest_digest: str = Field(description="Digest of canonical manifest semantics.")
+    repository_identity: str = Field(description="Canonical local Git repository root.")
+    initial_base_sha: str = Field(description="Exact base commit admitted for this revision.")
+    integration_ref: str = Field(description="Immutable integration ref selected by the plan.")
+    finalise_ref: str | None = Field(None, description="Optional local finalisation ref.")
+    admitted_by: str = Field(description="Operator identity recorded at admission.")
+    admitted_at: float = Field(description="Unix timestamp at which the revision was admitted.")
+
+
+class PlanRevisionDetail(PlanRevisionSummary):
+    plan_markdown: str = Field(description="Exact plan markdown stored for this revision.")
+    manifest_json: str = Field(description="Canonical manifest JSON stored for this revision.")
+    items: list[dict[str, Any]] = Field(
+        description="Immutable item snapshots, including inactive historical removals."
+    )
+
+
 class PlanSyncRequest(BaseModel):
     path: str = Field(description="Path to the plan markdown, on the harness's filesystem.")
     repo: str = Field(description="GitHub repo as `owner/name`.")

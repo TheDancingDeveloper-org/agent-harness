@@ -88,6 +88,17 @@ def test_the_project_s_own_roadmap_reaches_the_prompt(repo: Path) -> None:
     assert "Upgrade the runtime to Node 22" in ask.prompts[0]
 
 
+def test_the_surveyor_receives_generic_exploration_defaults(repo: Path) -> None:
+    ask = answering(proposal_json([item("T1")]))
+    survey("upgrade to Node 22", repo, ask=ask)
+
+    prompt = ask.prompts[0]
+    assert "Generic exploration defaults" in prompt
+    assert "one correction item" in prompt
+    assert "project’s own plan" in prompt
+    assert "Rainmon" not in prompt
+
+
 def test_a_named_document_that_is_missing_is_reported_not_skipped(repo: Path) -> None:
     """Asking for the roadmap and silently planning without it is the bug."""
     evidence = gather(repo, ["docs/no-such-file.md"])

@@ -39,7 +39,7 @@ env:
 
 jobs:
   test-build-push:
-    runs-on: [self-hosted, node-b, linux, x64, docker, publish]
+    runs-on: [self-hosted, publish]
     steps:
       - uses: actions/checkout@v5
 
@@ -74,7 +74,7 @@ jobs:
 
   deploy:
     needs: test-build-push
-    runs-on: [self-hosted, node-b, linux, x64]
+    runs-on: [self-hosted]
     steps:
       - name: Bump the ops compose tag and trigger Komodo
         env:

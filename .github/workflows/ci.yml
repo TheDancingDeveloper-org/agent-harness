@@ -18,7 +18,7 @@ jobs:
   # request forever, which is worse than running it. So the jobs always run and
   # always report; what changes is whether they do the expensive part.
   changes:
-    runs-on: [self-hosted, node-b, linux, x64]
+    runs-on: [self-hosted]
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
@@ -47,7 +47,7 @@ jobs:
 
   lint:
     needs: changes
-    runs-on: [self-hosted, node-b, linux, x64]
+    runs-on: [self-hosted]
     steps:
       - uses: actions/checkout@v5
         if: needs.changes.outputs.code == 'true'
@@ -68,7 +68,7 @@ jobs:
 
   test:
     needs: changes
-    runs-on: [self-hosted, node-b, linux, x64]
+    runs-on: [self-hosted]
     steps:
       - uses: actions/checkout@v5
         if: needs.changes.outputs.code == 'true'

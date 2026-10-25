@@ -3,6 +3,15 @@
 A worked example, end to end, with real output. Everything below was run
 against [`examples/PLAN.md`](../examples/PLAN.md) in this repository.
 
+> **Target boundary — 2026-08-09:** This guide describes commands the current
+> pre-alpha implementation exposes, including optional remote issue/PR paths.
+> The minimum product is now the local-only lifecycle in
+> [`minimal.md`](../minimal.md). Its deterministic plan admission,
+> per-project execution profile, and final local product deployment lifecycle
+> are not implemented yet; [`STATUS.md`](STATUS.md) tracks those gaps. Do not
+> read `--repo`, GitHub sync, hosted CI, or interactive inception below as a
+> prerequisite for the target product.
+
 If you only read one thing: **every destructive step has a `--dry-run`, and
 the sync defaults to one.** Run those first. They tell you exactly what would
 happen without doing any of it.
@@ -21,7 +30,7 @@ No MyDevEnv, AIDevEnv or other host process is required for browser access.
 
 ---
 
-## Which way in?
+## Which way into the current implementation?
 
 Four routes, and they are not alternatives to each other so much as different
 starting points. Find your row.
@@ -29,8 +38,8 @@ starting points. Find your row.
 | Where you are | Start at | What you get |
 |---|---|---|
 | **You want to see whether this thing works at all** | [§0a](#0a-the-first-run-no-credentials-no-network-no-model) — `init --demo` | A real git repo, a plan and a queue, and one item taken end to end. No credentials, no network, no model. |
-| **New project, and you have not written the plan yet** | [§0b](#0b-or-dont-write-a-plan--describe-it-and-argue) — inception, **over the API** | Describe it in a paragraph, argue with the proposed scope, get a `PLAN.md`. Nothing external exists until you approve. |
-| **New project, and you already have a plan** | [§1](#1-write-a-plan) — `plan` | Your markdown parsed into work items, then synced to issues. |
+| **New project, and you have not written the plan yet** | [§0b](#0b-or-dont-write-a-plan--describe-it-and-argue) — optional inception, **over the API** | Use the current authoring helper to get a draft `PLAN.md`. Target admission does not require this interview. |
+| **New project, and you already have a plan** | [§1](#1-write-a-plan) — `plan` | The current parser reads work items. Remote issue sync is an optional legacy/extension action. |
 | **Existing project, already part-built** | [§0c](#0c-or-adopt-a-project-that-is-already-half-built) — `adopt` | What is *already done* proposed rather than assumed, with the evidence for each claim. Nothing is dropped unless you name it. |
 
 They converge. **Every route ends at a `PLAN.md` and a project in the queue**,
@@ -296,6 +305,24 @@ curl -sH "Authorization: Bearer $TOKEN" -X POST \
   -d '{"feedback": "drop the importer, we already have one; and this needs to
                     survive the feed being unavailable for a day"}'
 ```
+
+### Experimental authoring defaults — not admission policy
+
+The current scoper receives defaults for a new project. They are an
+experimental authoring convenience, not facts about the project, admitted
+configuration, or automatic authorisation. Repository evidence or an operator
+can override them, and material overrides remain in the proposal as assumptions
+or questions.
+
+Some current defaults recommend a private hosted repository, CI runners,
+Compose deployment, an orchestrator, and a publication policy. Those are
+opinionated proposal text and are explicitly **outside** the generic minimum
+contract. They must not become plan-admission defaults. The target requires the
+user to declare their local agent profile and local product topology, then
+validates the complete plan in one pass.
+
+No repository, remote, branch, issue, queue row, publication, or deployment is
+created merely because a current authoring default was supplied.
 
 **Resolve the questions.** Answer, defer with a reason, or overrule the
 severity — the model proposes it so you are not triaging a flat list, but you
@@ -729,21 +756,20 @@ The edge keeps its real state; the override is recorded next to it, and it
 applies to **that graph revision only** — a later correction re-blocks the
 item rather than inheriting a judgement nobody made about it.
 
-### What it could not read is part of the answer
+### What the current item parser could not read is part of the answer
 
 ```bash
 $ agent-harness plan examples/PLAN.md --repo owner/name --dry-run
-dependencies:
-  W4: external target(s) external:github-issue:owner/name#42 — needs a resolver
-4 work items, 3 headings skipped as narrative
+4 work items, additional plan-contract headings reported as narrative
 would create missing labels: area:api, area:docs
 would sync: created 4, updated 0, unchanged 0
 ```
 
-Those 3 skipped headings are `Widget service`, `Background` and `Dependencies`
-— narrative and the graph block, as expected. **A large skip count relative to
-items means your plan does not use a recognised shape**, and the harness would
-rather tell you than quietly find three items in a fifty-item plan.
+The current parser recognises work-item headings and reports every other
+heading rather than silently dropping it. The target validator must go further:
+the project-level headings in the example become required, validated content
+rather than merely reported narrative. **A large skip count relative to items
+still means the current parser may not understand the plan's work shape.**
 
 The `dependencies:` block above it is the other half of the same idea: every
 line there is something that *will* hold work back, said before the issues
@@ -751,7 +777,10 @@ exist rather than after the queue has stopped.
 
 ---
 
-## 2. Sync it to GitHub
+## 2. Optional legacy/extension path: sync it to GitHub
+
+This is implemented behaviour, not a step in the minimum local lifecycle. Skip
+it for a local-only run.
 
 ```bash
 agent-harness plan examples/PLAN.md --repo owner/name

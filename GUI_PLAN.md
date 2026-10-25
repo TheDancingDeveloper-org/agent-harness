@@ -1,7 +1,16 @@
 # Agent Harness GUI Implementation Plan
 
-**Status:** Imported into the current core tree on 2026-08-06; implementation remains
-incomplete. `docs/STATUS.md` is the authority for current and remaining work.
+> **Target alignment — 2026-08-09:** This is no longer a current product
+> sequence. The generic local-only target is [`minimal.md`](minimal.md), and
+> current state is [`docs/STATUS.md`](docs/STATUS.md). Remote Git, hosted CI/CD,
+> publication, organisation-wide RBAC, and session-host expansion below are
+> outside the minimum target. The implemented same-origin GUI remains part of
+> the product and should expose local admission, integration, and delivery
+> evidence as those capabilities land.
+
+**Status:** Historical implementation plan. Imported into the current core tree
+on 2026-08-06; `minimal.md` and `docs/STATUS.md` now define the target and
+remaining work.
 **Plan date:** 2026-08-05
 **Product boundary:** The GUI is built, packaged, served, tested, and documented entirely
 inside `agent-harness`.

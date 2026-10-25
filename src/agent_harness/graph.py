@@ -727,7 +727,7 @@ class DependencyGraph:
         self, conn: sqlite3.Connection, project_id: str, item_id: str, kind: str
     ) -> _Resolution:
         row = conn.execute(
-            "SELECT state FROM work WHERE project_id = ? AND item_id = ?",
+            "SELECT state FROM work WHERE project_id = ? AND item_id = ? AND active = 1",
             (project_id, item_id),
         ).fetchone()
         if row is None:
@@ -1050,7 +1050,7 @@ class DependencyGraph:
             items = [
                 row["item_id"]
                 for row in connection.execute(
-                    "SELECT item_id FROM work WHERE project_id = ? ORDER BY item_id",
+                    "SELECT item_id FROM work WHERE project_id = ? AND active = 1 ORDER BY item_id",
                     (project_id,),
                 )
             ]
@@ -1153,10 +1153,10 @@ class DependencyGraph:
         """
         connection, owned = self._with_conn(conn)
         try:
-            sql = "SELECT project_id, item_id, depends_on FROM work"
+            sql = "SELECT project_id, item_id, depends_on FROM work WHERE active = 1"
             params: list[Any] = []
             if project_id is not None:
-                sql += " WHERE project_id = ?"
+                sql += " AND project_id = ?"
                 params.append(project_id)
             sql += " ORDER BY project_id, item_id"
             rows = connection.execute(sql, params).fetchall()

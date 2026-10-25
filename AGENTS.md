@@ -64,6 +64,8 @@ trade and it is rejected.
 
 | Thing | Location |
 |---|---|
+| **Minimum generic product target and plan template** | `minimal.md` — local-only lifecycle and its acceptance contract |
+| **Exploration-complete implementation backlog** | `BACKLOG.md` — dependencies, decisions, tests, and evidence for every target gap |
 | How to use it | `docs/USAGE.md` — worked example, real output |
 | **Starting a project from nothing** | `docs/USAGE.md` §0 — the four routes in, and which to pick |
 | **Taking on a project already in flight** | `agent-harness adopt`; `src/agent_harness/adoption.py`. **A proposal is never a decision** — nothing is dropped unless a human names it |
@@ -71,7 +73,7 @@ trade and it is rejected.
 | What is configured and what is missing | `agent-harness doctor`; `src/agent_harness/doctor.py` — reports, spends nothing |
 | How to deploy it | `docs/DEPLOYMENT.md` — the two serve modes, and a non-destructive smoke test |
 | Sample plan | `examples/PLAN.md` |
-| The original plan | `docs/HARNESS-PLAN.md` (superseded in part) |
+| The original plan | `docs/HARNESS-PLAN.md` (historical and superseded) |
 | Issue tracker | GitHub, per D1. The only place an issue's *state* lives. |
 | The manifest that seeded those issues | `docs/backlog-seed-2026-08-02.json` — historical, carries no state, not kept in sync |
 | What a route is made of, and how a vendor is added | `src/agent_harness/protocols.py` |

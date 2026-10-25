@@ -1,19 +1,22 @@
 # agent-harness
 
-Turns a plan you wrote in markdown into work that coding agents actually do, and tells you
-honestly what happened.
+Turns a plan you wrote in Markdown into locally integrated, locally accepted
+work that coding agents actually do, and tells you honestly what happened.
 
 ```
-PLAN.md ──▶ GitHub issues ──▶ claim ──▶ agent in a terminal ──▶ checks ──▶ review ──▶ PR
-                                          │
-                                          └── you can attach to it, on any device
+PLAN.md ──▶ validate ──▶ local queue ──▶ isolated agents ──▶ gates and review
+                                                               │
+                                                               v
+local Git integration ──▶ local build/deploy/accept/teardown ──▶ evidence
 ```
 
-It is **not tied to any particular project, language or workload.** You supply the plan, the
-provider and the checks; the harness supplies the queue, the claims, the failure model and
-the record of what happened.
+It is **not tied to any particular project, language or workload.** You supply
+the plan, local topology, execution profile, provider and checks; the harness
+supplies the queue, claims, gates, local integration and record of what
+happened. The target contract is [`minimal.md`](minimal.md). Remote Git,
+hosted CI/CD and non-local deployment are optional extensions, not prerequisites.
 
-## Status: pre-alpha — deterministic paths are tested; real use is observed, not proven
+## Status: pre-alpha — foundations exist; the minimal local lifecycle is not complete
 
 It runs as a standalone service; [AIDevEnv](https://github.com/TheDancingDeveloper-org/aidevenv)
 is an optional reference session host,
@@ -25,6 +28,11 @@ It lacks a common run ID, complete configuration, raw-artifact checksums and a c
 follow-up run, so it is an observation, not proof that the harness works against a real
 fleet. Deterministic fixture success proves wiring, not model quality or unattended
 reliability.
+
+It also lacks deterministic admission of the new minimum plan, a pinned
+per-project execution profile, and final local build/deploy/readiness/acceptance/
+teardown for the product under development. See
+[`docs/STATUS.md`](docs/STATUS.md) for the capability-by-capability comparison.
 
 Three words are used precisely throughout this README, and they are not
 interchangeable:
@@ -102,35 +110,43 @@ worker killed mid-item releases it by doing nothing. A heartbeat keeps genuinely
 alive, because "slow" and "dead" look identical from outside and only a live process can
 keep stamping one.
 
-## Definition of done for v1
+## Definition of done for the minimal local product
 
-Expressed as observed behaviour, not internal completeness.
+The full acceptance contract is in [`minimal.md`](minimal.md). In summary:
 
-- [ ] The fleet runs 7 days unattended with no manual restart.
-- [ ] Every failure is diagnosable from the GUI alone, without opening a log file.
-- [ ] Rate-limit errors are classified, and cost caps are never retried.
-- [ ] No single worker's failure pauses another worker.
-- [ ] Reviewer-approved work survives a killed worker.
-- [ ] Delivery rate is no worse than the workload's own pre-harness baseline, at lower cost.
-- [ ] The role→model map can be changed without a redeploy.
-- [ ] Two projects run concurrently without either starving the other.
-- [ ] Deleting `harness.sqlite` changes no audited answer.
+- [ ] An invalid minimum plan gets one complete deterministic rejection report
+  and creates no executable state.
+- [ ] A valid plan and local Git repo are admitted atomically without remote
+  credentials.
+- [ ] A pinned per-project execution profile passes preflight before work begins.
+- [ ] Work survives the existing checks, review, durability, budget and policy
+  gates and is promoted into a local integration branch.
+- [ ] The integrated commit builds, deploys locally, becomes ready, passes
+  acceptance, and tears down with durable evidence.
+- [ ] Two materially different projects complete without changes to core
+  execution-path modules.
+- [ ] The repository gates and genericity enforcement pass.
 
-If all seven hold, v1 is done regardless of what remains unimplemented.
+None of those unchecked outcomes should be inferred from component tests.
 
 ## Documentation
 
-Two documents carry the current state. Everything else is a how-to, an
-operational runbook, or history.
+Four documents separate the target, implementation backlog, implemented
+design, and current state.
+
+- **[`minimal.md`](minimal.md) — what the smallest useful generic product must
+  do.** This is the local-only target and includes the minimum plan template.
+- **[`BACKLOG.md`](BACKLOG.md) — the exploration-complete work to reach that
+  target.** Each item fixes its boundary, dependencies, implementation
+  decision, failure behaviour, tests, evidence, and non-goals.
 
 - **[`docs/DESIGN.md`](docs/DESIGN.md) — how the harness works, and why it is
   shaped that way.** The execution pipeline, the invariants and the failure
   each one came from, model routing and failure classification, the dependency
   graph, durability, and the extension points. Start here to understand it.
 - **[`docs/STATUS.md`](docs/STATUS.md) — where it stands, and everything
-  outstanding.** What is proven, observed and merely tested; the open work in
-  the order it can be done; and how to run the harness against **rdpapp**, the
-  first application it is being tested against.
+  outstanding.** The direct comparison with `minimal.md`, retained foundations,
+  misalignments, milestone exits, and evidence boundary.
 
 ### How to use it
 
@@ -180,6 +196,11 @@ It has no state field and is not kept in sync; GitHub is the tracker (D1).
 
 A five-minute tour. The full walkthrough, with real output, is in
 [`docs/USAGE.md`](docs/USAGE.md).
+
+The commands below document the current pre-alpha implementation. Some still
+expose optional GitHub publication because that capability predates the local
+target. The end-to-end `minimal.md` path is not available until the gaps in
+`docs/STATUS.md` are closed.
 
 ### 0. See it work, before you configure anything
 

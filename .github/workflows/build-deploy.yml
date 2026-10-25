@@ -81,6 +81,7 @@ jobs:
           STACK_NAME: ${{ env.STACK_NAME }}
           STACK_DIR: ${{ env.STACK_DIR }}
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          TEST_IMAGE_NAME: ${{ env.TEST_IMAGE_NAME }}
           IMAGE_TAG: ${{ github.sha }}
           GIT_AUTH_TOKEN: ${{ secrets.GIT_AUTH_TOKEN }}
           KOMODO_API_KEY: ${{ secrets.KOMODO_API_KEY }}
@@ -94,4 +95,15 @@ jobs:
             -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
             "https://repo.indexarr.net/api/v1/repos/indexarr/ops/raw/scripts/komodo-deploy.sh" \
             -o komodo-deploy.sh
+
+          # The acceptance image first, then the runtime image.
+          #
+          # Both are pinned to this commit's sha, and that is not tidiness. The
+          # acceptance service used to pin `:latest`, and `docker compose run`
+          # does not re-pull a tag it already holds -- so the Stage 2 live suite
+          # silently executed a STALE image and reproduced a defect that had
+          # already been fixed and deployed. Evidence from an image nobody can
+          # name is not evidence. The script only rewrites `image: $IMAGE_NAME:*`
+          # lines, so each call touches exactly its own service.
+          IMAGE_NAME="${TEST_IMAGE_NAME}" bash komodo-deploy.sh
           bash komodo-deploy.sh

@@ -8,6 +8,16 @@ here. **Where a claim here disagrees with the code, the code is right and this
 document is wrong**; that is rule 7 of [`AGENTS.md`](../AGENTS.md) and it
 applies to this file first.
 
+The target product boundary is now [`minimal.md`](../minimal.md): validated
+plans, local agent execution, local Git integration, and local product
+build/deploy/acceptance. This file still describes remote issue, branch, pull
+request, and reconciliation capabilities because they exist in the pre-alpha
+implementation. They are optional legacy/extension paths, not prerequisites or
+the target lifecycle. Missing target capabilities are recorded only in
+[`STATUS.md`](STATUS.md); their exploration-complete implementation work and
+dependency spine are in [`BACKLOG.md`](../BACKLOG.md). This design document
+does not duplicate that roadmap.
+
 What is built, what is half-built, what has never run against a real fleet, and
 what is blocked on what: [`docs/STATUS.md`](STATUS.md) owns all of it. Nothing
 here is a status claim, and where a design element exists but is not yet
@@ -17,13 +27,19 @@ reachable, this says so in one clause and moves on.
 
 ## 1. What this is, and the one idea
 
-A queue and a delivery pipeline for a fleet of coding agents.
+A queue and gated execution foundation for a fleet of coding agents. The
+currently implemented remote path is:
 
 ```
 PLAN.md ──▶ issues ──▶ claim ──▶ implement ──▶ checks ──▶ review ──▶ PR
                                                      │
                                every stage recorded, append-only
 ```
+
+The target minimum path replaces the remote endpoints with deterministic plan
+admission, a local queue and integration branch, then an integrated local
+build/deploy/readiness/acceptance/teardown lifecycle. Those gaps are not
+silently treated as implemented here.
 
 You supply the plan, the model provider and the checks. The harness supplies
 the queue, the leases, the failure model, the gates and the record of what

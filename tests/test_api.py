@@ -11,6 +11,8 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from agent_harness.admission_service import apply as admission_apply
+from agent_harness.admission_service import preview as admission_preview
 from agent_harness.api import create_api
 from agent_harness.audit import AuditStore
 from agent_harness.events import MODEL_CALL, UNCLASSIFIED, WORK, Event
@@ -1067,6 +1069,85 @@ def test_a_plan_can_be_parsed_without_writing_anything(client: TestClient, tmp_p
 
 def test_parsing_a_missing_plan_is_404(client: TestClient) -> None:
     assert client.post("/api/plan/parse?path=/nope/PLAN.md", headers=auth()).status_code == 404
+
+
+def test_plan_validation_is_typed_and_protected(client: TestClient, tmp_path: Path) -> None:
+    plan = tmp_path / "PLAN.md"
+    plan.write_text(Path("examples/PLAN.md").read_text(encoding="utf-8"), encoding="utf-8")
+
+    anonymous = client.post(f"/api/plans/validate?path={plan}")
+    assert anonymous.status_code == 401
+    response = client.post(f"/api/plans/validate?path={plan}", headers=auth())
+    assert response.status_code == 200
+    assert response.json() == {"valid": True, "findings": []}
+
+
+def test_admission_preview_is_typed_and_non_mutating(client: TestClient, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    import subprocess
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "Test")
+    (repo / "README").write_text("demo\n")
+    git("add", "README")
+    git("commit", "-qm", "initial")
+    git("branch", "-M", "main")
+    plan = tmp_path / "PLAN.md"
+    plan.write_text(Path("examples/PLAN.md").read_text(encoding="utf-8"), encoding="utf-8")
+    response = client.post(
+        "/api/plans/admission/preview",
+        headers=auth(),
+        json={"project_id": "widgets", "plan_path": str(plan), "worktree": str(repo)},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["project_id"] == "widgets"
+    assert payload["current_revision"] is None
+    assert payload["validation"] == {"valid": True, "findings": []}
+
+
+def test_plan_revision_reads_are_typed_and_protected(
+    client: TestClient, queue: WorkQueue, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    import subprocess
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "Test")
+    (repo / "README").write_text("demo\n")
+    git("add", "README")
+    git("commit", "-qm", "initial")
+    git("branch", "-M", "main")
+    plan = tmp_path / "PLAN.md"
+    plan.write_text(Path("examples/PLAN.md").read_text(encoding="utf-8"), encoding="utf-8")
+    proposal = admission_preview(queue, project_id="widgets", plan_path=plan, worktree=repo)
+    admission_apply(
+        queue,
+        proposal=proposal,
+        plan_path=plan,
+        worktree=repo,
+        operator="test-operator",
+        expected_base_sha=proposal.base_sha,
+        expected_current_revision=None,
+    )
+    listing = client.get("/api/projects/widgets/plan-revisions", headers=auth())
+    assert listing.status_code == 200
+    assert listing.json()[0]["revision"] == 1
+    detail = client.get("/api/projects/widgets/plan-revisions/1", headers=auth())
+    assert detail.status_code == 200
+    assert detail.json()["admitted_by"] == "test-operator"
+    assert len(detail.json()["items"]) == 4
+    assert client.get("/api/projects/widgets/plan-revisions/1").status_code == 401
 
 
 def test_sync_refuses_a_plan_with_duplicate_ids(client: TestClient, tmp_path: Path) -> None:

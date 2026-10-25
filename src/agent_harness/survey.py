@@ -41,6 +41,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .exploration_defaults import render_exploration_defaults
 from .inception import Proposal, parse_proposal, render_plan
 
 log = logging.getLogger(__name__)
@@ -76,6 +77,8 @@ writing code and not starting work.
 ## The objective
 
 {objective}
+
+{exploration_defaults}
 
 ## The project
 
@@ -273,7 +276,11 @@ def survey(
         raise ValueError("a survey needs an objective; there is nothing to plan towards")
 
     evidence = gather(repo, docs)
-    prompt = SURVEY_PROMPT.format(objective=objective.strip(), evidence=evidence.render())
+    prompt = SURVEY_PROMPT.format(
+        objective=objective.strip(),
+        evidence=evidence.render(),
+        exploration_defaults=render_exploration_defaults(),
+    )
     proposal = parse_proposal(ask(prompt), 1, now)
 
     # Phase headings are containers here, not work. Their brief would be the

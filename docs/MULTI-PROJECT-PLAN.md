@@ -5,6 +5,7 @@
 > Project scoping, inception and the GUI that scoping was to make possible. Phases 0–2 are built and are described in `DESIGN.md`; the rest is not a current plan.
 >
 > **Current documentation:**
+> [`minimal.md`](../minimal.md) — the current generic local-only target.
 > [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
 > [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
 >

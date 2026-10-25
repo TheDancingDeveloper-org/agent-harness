@@ -38,6 +38,8 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .exploration_defaults import render_exploration_defaults
+
 log = logging.getLogger(__name__)
 
 #: The role that scopes a project. Deliberately separate from `planner`, which
@@ -63,6 +65,8 @@ writing code and not starting work.
 {overview}
 
 {feedback_section}
+
+{exploration_defaults}
 
 ## What to produce
 
@@ -193,7 +197,7 @@ def parse_proposal(text: str, revision: int, now: float, feedback: str | None = 
     )
 
 
-def render_plan(proposal: Proposal, name: str, *, phases_as_items: bool = True) -> str:
+def render_plan(proposal: Proposal, name: str, *, phases_as_items: bool = False) -> str:
     """A proposal as a PLAN.md the existing parser can read.
 
     Headings use the `### T1 — Title` shape the parser recognises, so the
@@ -201,9 +205,8 @@ def render_plan(proposal: Proposal, name: str, *, phases_as_items: bool = True) 
 
     **`phases_as_items` decides whether a phase heading is itself work.** A
     heading of `## P0 Upgrade` matches the parser's item pattern, because `P0`
-    is a well-formed id, so by default each phase becomes an item as well as a
-    container. That is deliberate for `inception` — real hand-written plans do
-    track phases as issues, and a generated plan should behave like one.
+    is a well-formed id. The safe default is a tracking-only phase container;
+    callers must explicitly opt in if a phase itself is claimable work.
 
     It is wrong for a plan meant to be executed straight away. The phase item's
     brief is the phase's *rationale* — "because we need the runtime current" —
@@ -331,6 +334,7 @@ class Inception:
         prompt = SCOPE_PROMPT.format(
             overview=record.get("overview", ""),
             feedback_section=previous,
+            exploration_defaults=render_exploration_defaults(),
         )
         reply = self.model_client.call(SCOPER, [{"role": "user", "content": prompt}])
         text = reply if isinstance(reply, str) else str(reply)
@@ -425,7 +429,7 @@ class Inception:
         proposal = self.current(project_id)
         if proposal is None:
             raise ValueError("nothing has been scoped yet")
-        return render_plan(proposal, name or project_id)
+        return render_plan(proposal, name or project_id, phases_as_items=False)
 
 
 def new_project_id(name: str) -> str:

@@ -144,6 +144,92 @@ def _plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _plan_validate(args: argparse.Namespace) -> int:
+    """Validate a local plan and print the complete deterministic report."""
+    import json as _json
+
+    from .plan_validation import validate_plan_file
+
+    report = validate_plan_file(args.work if args.work is not None else args.path)
+    payload = report.as_dict()
+    if args.json:
+        print(_json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        if report.valid:
+            print("valid plan")
+        else:
+            for finding in report.findings:
+                location = (
+                    f"{finding.path}:{finding.line}:{finding.column}"
+                    if finding.line is not None and finding.column is not None
+                    else finding.path
+                )
+                print(f"{finding.code} [{finding.severity}] {location}: {finding.message}")
+                print(f"  fix: {finding.remediation}")
+    return 0 if report.valid else 2
+
+
+def _plan_admit(args: argparse.Namespace) -> int:
+    """Preview or apply a digest-bound local plan admission."""
+    import json as _json
+
+    from .admission_service import AdmissionError, apply, preview, revision_preview
+    from .plan_contract import parse_plan_contract
+    from .work import WorkQueue
+
+    markdown = args.path.read_text(encoding="utf-8")
+    project_id = parse_plan_contract(markdown).project.key
+    queue = WorkQueue(args.db)
+    try:
+        proposal = preview(queue, project_id=project_id, plan_path=args.path, worktree=args.work)
+        changes = revision_preview(
+            queue,
+            admission=proposal,
+            plan_path=args.path,
+            worktree=args.work,
+            removed_items=dict(item.split("=", 1) for item in args.remove),
+            reopen_items=set(args.reopen),
+            high_risk_removals=set(args.high_risk_remove),
+        )
+        payload = changes.as_dict()
+        if args.approve_digest is None:
+            print(
+                _json.dumps(payload, indent=2, sort_keys=True)
+                if args.json
+                else proposal.proposal_digest
+            )
+            return 0
+        if args.approve_digest != proposal.proposal_digest:
+            print("approval digest does not match this preview", file=sys.stderr)
+            return 2
+        revision = apply(
+            queue,
+            proposal=proposal,
+            plan_path=args.path,
+            worktree=args.work,
+            operator=args.operator,
+            expected_base_sha=proposal.base_sha,
+            expected_current_revision=proposal.current_revision,
+            removed_items=dict(item.split("=", 1) for item in args.remove),
+            reopen_items=set(args.reopen),
+            high_risk_removals=set(args.high_risk_remove),
+        )
+        result = {
+            "project_id": project_id,
+            "revision": revision,
+            "proposal_digest": proposal.proposal_digest,
+        }
+        print(
+            _json.dumps(result, sort_keys=True)
+            if args.json
+            else f"admitted {project_id} revision {revision}"
+        )
+        return 0
+    except (AdmissionError, ValueError, OSError) as exc:
+        print(f"admission: {exc}", file=sys.stderr)
+        return 2
+
+
 def _init(args: argparse.Namespace) -> int:
     """Build the deterministic demo, and say what it is and is not.
 
@@ -1247,8 +1333,25 @@ def main(argv: list[str] | None = None) -> int:
         help="re-ingest every SECONDS instead of exiting",
     )
 
-    p_plan = sub.add_parser("plan", help="sync a plan .md into a GitHub backlog")
-    p_plan.add_argument("path", type=Path, help="the plan markdown file")
+    p_plan = sub.add_parser("plan", help="validate or sync a plan markdown file")
+    p_plan.add_argument("path", type=Path, nargs="?", help="the plan markdown file")
+    p_plan.add_argument(
+        "action",
+        nargs="?",
+        help="validate locally, or publish issues using the compatibility workflow",
+    )
+    p_plan.add_argument("--json", action="store_true", help="emit validation as JSON")
+    p_plan.add_argument("--work", type=Path, help="plan path for `plan validate`")
+    p_plan.add_argument(
+        "--semantic-review", action="store_true", help="include semantic review in the proposal"
+    )
+    p_plan.add_argument(
+        "--approve-digest", help="apply only when this exact preview digest matches"
+    )
+    p_plan.add_argument("--operator", default="cli", help="operator identity recorded at admission")
+    p_plan.add_argument("--remove", action="append", default=[], metavar="ID=REASON")
+    p_plan.add_argument("--reopen", action="append", default=[], metavar="ID")
+    p_plan.add_argument("--high-risk-remove", action="append", default=[], metavar="ID")
     # Not required with --dry-run: a dry run contacts GitHub for nothing and
     # writes nothing, so demanding an owner/name meant inventing a repository
     # that does not exist in order to ask a purely local question — what can
@@ -1921,6 +2024,31 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.command == "plan":
+        # Keep the old `plan PLAN.md` spelling while accepting the clearer
+        # nested command spelling without introducing a second parser.
+        if str(args.path) in {"validate", "publish-issues", "admit"} and args.action:
+            action, plan_path = str(args.path), Path(args.action)
+            args.path, args.action = plan_path, action
+        if args.action == "validate":
+            if args.work is None:
+                if args.path is None:
+                    print("plan validate requires PLAN.md", file=sys.stderr)
+                    return 2
+                args.work = args.path
+            return _plan_validate(args)
+        if args.action == "admit":
+            if args.path is None or args.work is None:
+                print("plan admit requires PLAN.md and --work REPO", file=sys.stderr)
+                return 2
+            return _plan_admit(args)
+        if args.action == "publish-issues":
+            if args.path is None:
+                print("plan publish-issues requires PLAN.md", file=sys.stderr)
+                return 2
+            return _plan(args)
+        if args.path is None:
+            print("plan requires PLAN.md or `validate PLAN.md`", file=sys.stderr)
+            return 2
         return _plan(args)
 
     if args.command == "run":

@@ -5,6 +5,7 @@
 > The proposal the fit-for-purpose programme ran against. The programme finished; its report is in `docs/evidence/2026-08-04-programme-report.md`.
 >
 > **Current documentation:**
+> [`minimal.md`](../minimal.md) — the current generic local-only target.
 > [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
 > [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
 >

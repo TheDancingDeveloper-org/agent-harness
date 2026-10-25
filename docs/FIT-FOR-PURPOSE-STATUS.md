@@ -5,6 +5,7 @@
 > Frozen at 2026-08-04 by its own header, and superseded on 2026-08-06 by `docs/STATUS.md`. Its stage-by-stage record is still the account of how each stage was verified in isolation.
 >
 > **Current documentation:**
+> [`minimal.md`](../minimal.md) — the current generic local-only target.
 > [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
 > [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
 >

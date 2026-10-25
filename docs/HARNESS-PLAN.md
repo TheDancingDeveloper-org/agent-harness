@@ -5,6 +5,7 @@
 > The original design document. It assumes one named consumer throughout, and the harness is generic — an owner ruling recorded in `AGENTS.md`. Its phase order was overtaken and its §0.1 already said so.
 >
 > **Current documentation:**
+> [`minimal.md`](../minimal.md) — the current generic local-only target.
 > [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
 > [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
 >

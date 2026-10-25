@@ -150,12 +150,62 @@ CREATE TABLE IF NOT EXISTS projects (
     updated_at  REAL NOT NULL DEFAULT 0
 );
 
+-- Immutable admitted plan content. The mutable `plans` projection above is
+-- still the integration runtime; these tables are the historical contract
+-- that work and evidence were admitted against.
+CREATE TABLE IF NOT EXISTS plan_revisions (
+    project_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    plan_digest TEXT NOT NULL,
+    manifest_digest TEXT NOT NULL,
+    plan_markdown TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    repository_identity TEXT NOT NULL,
+    initial_base_sha TEXT NOT NULL,
+    integration_ref TEXT NOT NULL,
+    finalise_ref TEXT,
+    adapter_versions_json TEXT NOT NULL DEFAULT '{}',
+    admitted_by TEXT NOT NULL,
+    admitted_at REAL NOT NULL,
+    PRIMARY KEY (project_id, revision),
+    UNIQUE (project_id, plan_digest)
+);
+
+CREATE TABLE IF NOT EXISTS plan_revision_items (
+    project_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    item_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    brief TEXT NOT NULL,
+    deliverable TEXT NOT NULL,
+    depends_on_json TEXT NOT NULL,
+    acceptance_json TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (project_id, revision, item_id),
+    FOREIGN KEY (project_id, revision)
+        REFERENCES plan_revisions(project_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS plan_questions (
+    project_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    question_id TEXT NOT NULL,
+    pointer TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    question TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    answer TEXT,
+    PRIMARY KEY (project_id, revision, question_id)
+);
+
 -- (project_id, item_id), never item_id alone. Two plans that both name T1
 -- are two items, and before this they were one row that silently overwrote
 -- the other.
 CREATE TABLE IF NOT EXISTS work (
     project_id  TEXT NOT NULL DEFAULT 'default',
     item_id     TEXT NOT NULL,
+    active      INTEGER NOT NULL DEFAULT 1,
     issue       INTEGER,
     title       TEXT NOT NULL,
     brief       TEXT NOT NULL DEFAULT '',
@@ -498,6 +548,7 @@ class Project:
     max_workers: int = 1
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     min_free_disk_gb: float = 0.0
+    current_plan_revision: int | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -552,11 +603,15 @@ class WorkRecord:
     first_started_at: float = 0.0
     #: When this hold gives up and returns the item. Zero when not held.
     held_until: float = 0.0
+    #: Whether this row belongs to the current admitted plan revision. A
+    #: retired row remains queryable for history but is never claimable.
+    active: bool = True
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> WorkRecord:
         data = dict(row)
         data["depends_on"] = json.loads(data.get("depends_on") or "[]")
+        data["active"] = bool(data.get("active", 1))
         return cls(**data)
 
     def dependency_specs(self, provenance: str = WORK_DECLARATION) -> list[DependencySpec]:
@@ -683,6 +738,7 @@ class WorkQueue:
     #: still reads its own columns.
     ADDED_COLUMNS = {
         "projects": {
+            "current_plan_revision": "INTEGER",
             "max_attempts": "INTEGER NOT NULL DEFAULT 5",
             "min_free_disk_gb": "REAL NOT NULL DEFAULT 0",
             # Stage K. Additive; an older build ignores it and a project that
@@ -702,6 +758,7 @@ class WorkQueue:
         # column it knows and simply ignores this one. The migration plan is
         # docs/MIGRATION-graph.md.
         "work": {
+            "active": "INTEGER NOT NULL DEFAULT 1",
             "admitted_revision": "INTEGER NOT NULL DEFAULT 0",
             # Stage K. Additive for the same reason: an older build reads
             # every column it knows and ignores these two, and an upgraded
@@ -739,6 +796,33 @@ class WorkQueue:
             for name, declaration in columns.items():
                 if name not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS plan_revisions ("
+            "project_id TEXT NOT NULL, revision INTEGER NOT NULL, "
+            "plan_digest TEXT NOT NULL, manifest_digest TEXT NOT NULL, "
+            "plan_markdown TEXT NOT NULL, manifest_json TEXT NOT NULL, "
+            "repository_identity TEXT NOT NULL, initial_base_sha TEXT NOT NULL, "
+            "integration_ref TEXT NOT NULL, finalise_ref TEXT, "
+            "adapter_versions_json TEXT NOT NULL DEFAULT '{}', admitted_by TEXT NOT NULL, "
+            "admitted_at REAL NOT NULL, PRIMARY KEY(project_id, revision), "
+            "UNIQUE(project_id, plan_digest))"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS plan_revision_items ("
+            "project_id TEXT NOT NULL, revision INTEGER NOT NULL, item_id TEXT NOT NULL, "
+            "ordinal INTEGER NOT NULL, title TEXT NOT NULL, brief TEXT NOT NULL, "
+            "deliverable TEXT NOT NULL, depends_on_json TEXT NOT NULL, "
+            "acceptance_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, "
+            "PRIMARY KEY(project_id, revision, item_id))"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS plan_questions ("
+            "project_id TEXT NOT NULL, revision INTEGER NOT NULL, question_id TEXT NOT NULL, "
+            "pointer TEXT NOT NULL, severity TEXT NOT NULL, question TEXT NOT NULL, "
+            "rationale TEXT NOT NULL, answer TEXT, "
+            "PRIMARY KEY(project_id, revision, question_id))"
+        )
 
     def _migrate_work_to_projects(self, conn: sqlite3.Connection) -> None:
         conn.execute("BEGIN IMMEDIATE")
@@ -1806,7 +1890,7 @@ class WorkQueue:
             cursor_attempts, cursor_item = -1, ""
             while True:
                 page = conn.execute(
-                    "SELECT * FROM work WHERE project_id = ? "
+                    "SELECT * FROM work WHERE project_id = ? AND active = 1 "
                     "AND (state = ? OR (state = ? AND lease_until < ?)) "
                     "AND (attempts > ? OR (attempts = ? AND item_id > ?)) "
                     "ORDER BY attempts, item_id LIMIT ?",
@@ -2499,8 +2583,8 @@ class WorkQueue:
         """Every item currently held by a worker, expired lease or not."""
         conn = self._connect()
         try:
-            sql = "SELECT * FROM work WHERE state = ?"
-            params: list[Any] = [CLAIMED]
+            sql = "SELECT * FROM work WHERE state IN (?, ?) AND active = 1"
+            params: list[Any] = [CLAIMED, HELD]
             if project_id is not None:
                 sql += " AND project_id = ?"
                 params.append(project_id)
@@ -2549,10 +2633,13 @@ class WorkQueue:
         conn = self._connect()
         try:
             if project_id is None:
-                rows = conn.execute("SELECT * FROM work ORDER BY project_id, item_id")
+                rows = conn.execute(
+                    "SELECT * FROM work WHERE active = 1 ORDER BY project_id, item_id"
+                )
             else:
                 rows = conn.execute(
-                    "SELECT * FROM work WHERE project_id = ? ORDER BY item_id", (project_id,)
+                    "SELECT * FROM work WHERE project_id = ? AND active = 1 ORDER BY item_id",
+                    (project_id,),
                 )
             return [WorkRecord.from_row(r) for r in rows]
         finally:
@@ -2580,10 +2667,13 @@ class WorkQueue:
         conn = self._connect()
         try:
             if project_id is None:
-                rows = conn.execute("SELECT state, COUNT(*) AS n FROM work GROUP BY state")
+                rows = conn.execute(
+                    "SELECT state, COUNT(*) AS n FROM work WHERE active = 1 GROUP BY state"
+                )
             else:
                 rows = conn.execute(
-                    "SELECT state, COUNT(*) AS n FROM work WHERE project_id = ? GROUP BY state",
+                    "SELECT state, COUNT(*) AS n FROM work "
+                    "WHERE project_id = ? AND active = 1 GROUP BY state",
                     (project_id,),
                 )
             return {r["state"]: r["n"] for r in rows}

@@ -5,6 +5,7 @@
 > The durable audit layer, which is built. What survives is in `DESIGN.md`; the plan itself is history.
 >
 > **Current documentation:**
+> [`minimal.md`](../minimal.md) — the current generic local-only target.
 > [`docs/DESIGN.md`](DESIGN.md) — how the harness works and why.
 > [`docs/STATUS.md`](STATUS.md) — where it stands and what is left to do.
 >

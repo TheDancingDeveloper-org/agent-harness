@@ -76,22 +76,11 @@ jobs:
     needs: test-build-push
     runs-on: [self-hosted]
     steps:
-      - name: Bump the ops compose tag and trigger Komodo
+      - name: Bump ops pin
         env:
-          STACK_NAME: ${{ env.STACK_NAME }}
-          STACK_DIR: ${{ env.STACK_DIR }}
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          IMAGE_TAG: ${{ github.sha }}
-          GIT_AUTH_TOKEN: ${{ secrets.GIT_AUTH_TOKEN }}
-          KOMODO_API_KEY: ${{ secrets.KOMODO_API_KEY }}
-          KOMODO_API_SECRET: ${{ secrets.KOMODO_API_SECRET }}
-          KOMODO_GIT_ACCOUNT: sprooty
-          KOMODO_URL: http://192.168.1.75:3011
+          OPS_BUMP_TOKEN: ${{ secrets.OPS_BUMP_TOKEN }}
         run: |
-          # Reuse the shared deploy step body from the ops repo rather than
-          # reimplementing the tag bump and DeployStack poll here.
-          curl -fsSL \
-            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
-            "https://repo.indexarr.net/api/v1/repos/indexarr/ops/raw/scripts/komodo-deploy.sh" \
-            -o komodo-deploy.sh
-          bash komodo-deploy.sh
+          docker run --rm -e OPS_BUMP_TOKEN \
+            -e GITHUB_REPOSITORY -e GITHUB_SHA -e GITHUB_RUN_ID -e GITHUB_SERVER_URL \
+            repo.indexarr.net/indexarr/apps-bump:latest \
+            --app personal-agent-harness --image "${{ env.IMAGE_NAME }}" --tag "$GITHUB_SHA"
